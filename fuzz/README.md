@@ -5,19 +5,25 @@ architecture.md §9）。種は `seeds/<対象>/`（コミットする）、育�
 
 | 対象 | 中身 | 入り口 |
 |---|---|---|
-| `mem_ops` | mem の入れ物（MVec・SortedVec・SortedMap・stable_sort）を上限つきで動かし、不変の条件・見積もり ≥ 実際を確かめる | `sumie::fuzzing::mem_ops` |
+| `mem_ops` | mem の入れ物（MVec・SortedVec・SortedMap・stable_sort）を上限つきで動かし、不変の条件と、操作ごとの手間と確保の山 ≤ `cost` の式（見積もり）を確かめる。ヒープの実際の量との照らしは確保を数える確保器が要るので `crates/sumie/tests/mutate.rs` が行う | `sumie::fuzzing::mem_ops` |
 | `math_ops` | math の max・min・clamp・powi の性質と、超越関数が panic しないこと | `sumie::fuzzing::math_ops` |
 
+種は `crates/sumie/tests/mutate.rs` の `MEM_SEEDS` と同じにする（試験 `fuzz_seeds_match_mem_seeds` が照らす）。
 M1 から `xml`・`dtd`・`css`・`values`・`document` を足す。Kura のファズのコーパス（`/Users/redjet/aruma/repos/zredjet/kura/fuzz/corpus/decode_svg/`。
 約 8,000 件。読むだけ）は SVG の対象の種に使う（ADR-21。写さずに、読む場所として渡す）。
 
 ## 回し方
+
+nightly は CI と同じ `nightly-2026-10-15`（`.github/workflows/ci.yml`）。手元の `+nightly` が違う日付なら
+`+nightly-2026-10-15` を使う。
 
 ```bash
 cd fuzz
 cargo +nightly fuzz build
 mkdir -p corpus/mem_ops
 cargo +nightly fuzz run mem_ops corpus/mem_ops seeds/mem_ops -- -max_total_time=3600 -rss_limit_mb=4096 -timeout=20
+# 種を流し直すだけ（CI と scripts/verify.sh）
+cargo +nightly fuzz run mem_ops seeds/mem_ops -- -runs=0
 ```
 
 `cargo fuzz` の既定（debug-assertions と overflow-checks が入る）で回し、示しそこなったあふれを panic として見つける

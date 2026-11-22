@@ -1,10 +1,18 @@
-# CI（ADR-22・ADR-44 (7)）。push ごとに 3 つのターゲットで試験とゴールデンを回す（D1・D2 をターゲットをまたいで照らす）。
-# 手元の全チェックは scripts/verify.sh。
+# CI（ADR-22・ADR-44 (7)）。push ごとに 3 つのターゲットで試験を回す（D1・D2 をターゲットをまたいで照らす）。
+# 手元の全チェックは scripts/verify.sh（同じスクリプトを呼ぶ。手元だけの段は verify.sh の頭を見る）。
 name: ci
 
+# push だけで回す（PR を開いても同じ試験を 2 度回さない。含まれる時間の節約。ADR-22・ADR-35）
 on:
   push:
-  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,6 +21,7 @@ env:
 jobs:
   test:
     name: test (${{ matrix.os }})
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -24,17 +33,24 @@ jobs:
       - name: ツールチェーン（rust-toolchain.toml の 1.99.0）
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: clippy（引けない口も拾う）
+        run: scripts/clippy.sh
       - name: 試験（debug）
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
       - name: 試験（release）
-        run: cargo test -p sumie --release
+        run: cargo test --locked -p sumie --release
+      - name: 試験（release・target-cpu=native。値がビルドの設定に依らない）
+        # native の成果物をキャッシュに入れない（CPU の違う走らせ手で使い回されないように）
+        env:
+          RUSTFLAGS: -C target-cpu=native
+          CARGO_TARGET_DIR: ${{ runner.temp }}/native
+        run: cargo test --locked -p sumie --release
       - name: 本番の依存
         run: scripts/check-deps.sh
 
   checks:
     name: checks (ubuntu)
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,26 +65,48 @@ jobs:
           cargo fmt --manifest-path scripts/lint-probe/Cargo.toml -- --check
           cargo fmt --manifest-path fuzz/Cargo.toml -- --check
       - name: 禁じる口の一覧（std の文書から作り直したものと同じか）
-        run: cargo run -q -p sumie-tools -- gen-disallowed --check
+        run: cargo run --locked -q -p sumie-tools -- gen-disallowed --check
       - name: 禁じる口の試し
-        run: cargo run -q -p sumie-tools -- check-lint-probe
+        run: cargo run --locked -q -p sumie-tools -- check-lint-probe
       - name: ゴールデンは追記だけ
+        env:
+          BEFORE: ${{ github.event.before }}
         run: |
-          git fetch -q origin main || true
           scripts/check-goldens-append-only.sh --self-test
-          scripts/check-goldens-append-only.sh
-      - name: 試験（release・target-cpu=native）
-        run: RUSTFLAGS="-C target-cpu=native" cargo test -p sumie --release
+          git fetch -q origin main
+          # 基準：push の前の先頭（新しいブランチなら main との分かれ目）。main への push でも自分と比べない
+          if [[ -n "$BEFORE" && ! "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "基準：push の前の先頭 $BEFORE"
+            scripts/check-goldens-append-only.sh --strict "$BEFORE"
+          else
+            base="$(git merge-base HEAD origin/main)"
+            echo "基準：origin/main との分かれ目 $base"
+            if [[ "$base" == "$(git rev-parse HEAD)" ]]; then
+              echo "比べる変更がない（新しいブランチで、main と同じ）"
+            else
+              scripts/check-goldens-append-only.sh "$base"
+            fi
+          fi
 
-  fuzz-build:
-    name: fuzz build (nightly)
+  fuzz:
+    name: fuzz (nightly)
+    timeout-minutes: 30
     runs-on: ubuntu-latest
+    env:
+      # 手元と同じ nightly（fuzz/README.md）
+      NIGHTLY: nightly-2026-10-15
     steps:
       - uses: actions/checkout@v4
       - name: nightly と cargo-fuzz
         run: |
-          rustup toolchain install nightly --profile minimal
-          cargo +nightly install cargo-fuzz --locked
+          rustup toolchain install "$NIGHTLY" --profile minimal
+          cargo "+$NIGHTLY" install cargo-fuzz --locked --version 0.13.2
       - name: 組み立て
         working-directory: fuzz
-        run: cargo +nightly fuzz build
+        run: cargo "+$NIGHTLY" fuzz build
+      - name: 種を流し直す（落ちないこと）
+        working-directory: fuzz
+        run: |
+          for t in mem_ops math_ops; do
+            cargo "+$NIGHTLY" fuzz run "$t" "seeds/$t" -- -runs=0
+          done
