@@ -32,4 +32,18 @@ determinism.md §10。入力と画素のダイジェストを版つきで凍結�
 （`check-goldens-append-only.sh`）。古い版の例の名前は、すべて次の版のファイルにもある（版を上げたら全部の例を描き
 直す。ADR-41 (7)）。
 
-`estimate.jsonl` の形は、見積もりの口ができる M1 で決めてここに書く。
+`estimate.jsonl` の 1 行（D2。ADR-63 (4)。鍵はこの順で、値はすべて文字列。行のバイトは正規の形）：
+
+| 鍵 | 中身 |
+|---|---|
+| `name` | 入力の道（workspace の根からの相対） |
+| `input` | 入力の SVG のバイト列の BLAKE3 |
+| `parse` | 既定の設定（`ParseOptions::DEFAULT`）の `estimate_parse` の結果：`ok 手間 山 持ち続ける量` か `err 誤り`（誤りは `Debug` の字句。`parse` も同じ誤りを返す） |
+| `build` | `estimate_build` の結果（同じ書き方。読めなければ `-`） |
+| `report` | 警告（`w 種類 位置` を位置の順）と読まなかった参照（`u 中身の 16 進 位置`）の行の数と、行をつないだものの BLAKE3 |
+| `needs` | 要るもの（文字・ラスターの画像・SVG の画像を `0`・`1` で） |
+| `size` | `Document::size`（Rust の `{}` の字句で `幅 高さ`）か、中身で決まるなら `content` |
+
+入れる入力は `tests/svg/` のすべてと、`corpus/` のうち BLAKE3 の頭の 16 進が 0・1・2 のもの（3/16）。全ターゲット
+（debug・release・`target-cpu=native`・x86_64）で `cargo test -p sumie --test golden` が照らす。見積もりの式・警告・誤りの
+変わる rev では `cargo test -p sumie --test golden -- --ignored regenerate_estimates` で作り直し、同じコミットに入れる。

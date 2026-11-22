@@ -339,3 +339,125 @@ fn canonical_lexemes() {
     assert!(is_canonical_scale("1") && is_canonical_scale("0.5") && is_canonical_scale("2.25"));
     assert!(is_canonical_uint("0") && is_canonical_uint("10") && !is_canonical_uint("01") && !is_canonical_uint(""));
 }
+
+// ---- D2 のゴールデン（goldens/estimate.jsonl。ADR-63 (4)・goldens/README.md） ----
+
+/// estimate.jsonl の行の鍵（この順。値はすべて文字列）。
+const ESTIMATE_KEYS: &[&str] = &["name", "input", "parse", "build", "report", "needs", "size"];
+
+/// 見積もりの結果の字句（`ok 手間 山 持ち続ける量` か `err 誤り`）。
+fn estimate_text(r: Result<sumie::Estimate, sumie::Error>) -> String {
+    match r {
+        Ok(e) => format!("ok {} {} {}", e.work, e.peak_bytes, e.result_bytes),
+        Err(e) => format!("err {e:?}"),
+    }
+}
+
+/// 入力 `data` の見積もりの行（`estimate_parse`・`estimate_build` の結果、警告と読まなかった参照の並びの数とダイジェスト、
+/// 要るもの（文字・ラスターの画像・SVG の画像を 0 と 1 で）、大きさ（Rust の `{}` の字句か `content`）。読めなければ
+/// 読んだあとの欄は `-`）。
+fn estimate_line(name: &str, data: &[u8]) -> Line {
+    let opts = sumie::ParseOptions::DEFAULT;
+    let parse = estimate_text(sumie::estimate_parse(data, &opts, &sumie::Never));
+    let (build, report, needs, size) = match sumie::parse(data, &opts, &sumie::Never) {
+        Ok(d) => {
+            let mut text = String::new();
+            let mut n = 0usize;
+            for w in d.report().warnings() {
+                text.push_str(&format!("w {:?} {:?}\n", w.kind, w.position));
+                n += 1;
+            }
+            for u in d.report().unread_refs() {
+                let hex: String = u.href.iter().map(|b| format!("{b:02x}")).collect();
+                text.push_str(&format!("u {hex} {}\n", u.position));
+                n += 1;
+            }
+            let nd = d.needs();
+            let bit = |b: bool| if b { '1' } else { '0' };
+            (
+                estimate_text(d.estimate_build(&sumie::Never)),
+                format!("{n} {}", blake3::hash(text.as_bytes()).to_hex()),
+                format!("{}{}{}", bit(nd.text), bit(nd.raster_images), bit(nd.svg_images)),
+                match d.size() {
+                    Some(s) => format!("{} {}", s.width, s.height),
+                    None => "content".to_string(),
+                },
+            )
+        }
+        Err(_) => ("-".into(), "-".into(), "-".into(), "-".into()),
+    };
+    Line::new()
+        .str("name", name)
+        .str("input", blake3::hash(data).to_hex().to_string())
+        .str("parse", parse)
+        .str("build", build)
+        .str("report", report)
+        .str("needs", needs)
+        .str("size", size)
+}
+
+/// estimate.jsonl に入れる入力：`tests/svg/` のすべてと、`corpus/` のうち BLAKE3 の頭の 16 進が 0・1・2 のもの（3/16。
+/// rev ごとに作り直すファイルを小さく保つ）。名前は道。
+fn estimate_inputs(index: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = index
+        .iter()
+        .filter(|(h, p)| p.starts_with("tests/svg/") || h.starts_with(['0', '1', '2']))
+        .map(|(h, p)| (p.clone(), h.clone()))
+        .collect();
+    v.sort();
+    v
+}
+
+/// 見積もり・誤り・警告が、このターゲットとビルドの設定でゴールデンと同じ（D2。全ターゲットで同じファイルを照らす）。
+#[test]
+fn estimates_match_the_golden() {
+    let root = workspace();
+    let text = std::fs::read_to_string(goldens().join("estimate.jsonl")).unwrap();
+    let index = input_index(&root);
+    let mut errs = Vec::new();
+    let mut n = 0usize;
+    for (i, raw) in text.lines().enumerate() {
+        let line = Line::parse(raw).unwrap();
+        let keys: Vec<&str> = line.fields.iter().map(|(k, _)| k.as_str()).collect();
+        if keys != ESTIMATE_KEYS {
+            errs.push(format!("{} 行：鍵が {ESTIMATE_KEYS:?} でない", i + 1));
+            continue;
+        }
+        let (name, input) = (line.get_str("name").unwrap(), line.get_str("input").unwrap());
+        let Some(path) = index.get(input) else {
+            errs.push(format!("{} 行：入力 {input} が tests/svg・corpus にない", i + 1));
+            continue;
+        };
+        let data = std::fs::read(root.join(path)).unwrap();
+        let got = estimate_line(name, &data).to_json();
+        if got != raw {
+            errs.push(format!("{name}：\n  ゴールデン {raw}\n  このターゲット {got}"));
+        }
+        n += 1;
+    }
+    assert!(
+        n >= 100,
+        "estimate.jsonl の行が少ない（{n}）。`cargo test -p sumie --test golden -- --ignored regenerate_estimates` で作る"
+    );
+    assert!(
+        errs.is_empty(),
+        "D2 がゴールデンと違う（{} 件）：\n{}",
+        errs.len(),
+        errs.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
+    );
+}
+
+/// estimate.jsonl を作り直す（rev ごとに作り直してよい。`cargo test -p sumie --test golden -- --ignored regenerate_estimates`）。
+#[test]
+#[ignore]
+fn regenerate_estimates() {
+    let root = workspace();
+    let index = input_index(&root);
+    let mut out = String::new();
+    for (path, _) in estimate_inputs(&index) {
+        let data = std::fs::read(root.join(&path)).unwrap();
+        out.push_str(&estimate_line(&path, &data).to_json());
+        out.push('\n');
+    }
+    std::fs::write(goldens().join("estimate.jsonl"), out).unwrap();
+}
