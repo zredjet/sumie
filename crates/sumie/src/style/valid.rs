@@ -13,18 +13,23 @@ use crate::xml::lex::Span;
 pub(crate) enum Wide {
     Inherit,
     Initial,
+    /// `unset` と `revert`（利用者の段の規則を持たないので、`revert` は `unset` と同じ）
     Unset,
+    /// `revert-layer`（その宣言がないものとして、弱い宣言に戻す。ADR-74）
+    RevertLayer,
 }
 
-/// 値が CSS の全体の言葉だけか（`revert`・`revert-layer` は利用者の段の規則を持たないので `unset` と同じ）。
+/// 値が CSS の全体の言葉だけか。
 pub(crate) fn wide(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<Option<Wide>, Error> {
     let mut v = Values::new(s, range, budget_ref(budget));
     let w = if v.eat_ident(b"inherit")? {
         Wide::Inherit
     } else if v.eat_ident(b"initial")? {
         Wide::Initial
-    } else if v.eat_ident(b"unset")? || v.eat_ident(b"revert")? || v.eat_ident(b"revert-layer")? {
+    } else if v.eat_ident(b"unset")? || v.eat_ident(b"revert")? {
         Wide::Unset
+    } else if v.eat_ident(b"revert-layer")? {
+        Wide::RevertLayer
     } else {
         return Ok(None);
     };
@@ -35,11 +40,32 @@ fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {
     b
 }
 
-/// 値が `kind` の形か。`attr` はプレゼンテーション属性か（`transform` 属性は SVG の書き方）。
-pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, attr: bool, budget: &Budget<'_>) -> Result<bool, Error> {
+/// 確かめる文脈。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Ctx {
+    /// プレゼンテーション属性か（`transform` 属性・`d` 属性は SVG の書き方）
+    pub(crate) attr: bool,
+    /// 単位のない長さを受けるか（属性はどれも受ける。CSS では SVG のプロパティだけ。ADR-74）
+    pub(crate) unitless: bool,
+    /// 表示の領域で決まる単位（vw など）を受けるか（文書の大きさが決まるとき）
+    pub(crate) viewport: bool,
+}
+
+/// 長さか割合（単位のない数は `cx.unitless` のとき。表示の領域の単位は `cx.viewport` のとき）。
+fn len_of(v: &mut Values<'_, '_>, cx: Ctx) -> Result<Option<values::Length>, Error> {
+    Ok(v.length(cx.unitless)?.filter(|l| cx.viewport || !l.unit.viewport()))
+}
+
+/// 値が `kind` の形か。
+pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) -> Result<bool, Error> {
     let budget = budget_ref(budget);
-    if kind == Kind::Transform {
-        return Ok(values::transform(s, range, attr, 16.0, budget)?.is_some());
+    match kind {
+        Kind::Transform if cx.attr => return Ok(values::transform_attr(s, range, budget)?.is_some()),
+        Kind::Transform => return values::transform_css_valid(s, range, cx.viewport, budget),
+        // `d` 属性はパスの書き方（SVG 2 では壊れた所までを描くので、形はパスを作る段で確かめる）
+        Kind::Path if cx.attr => return Ok(true),
+        Kind::Font => return Ok(font_parts(s, range, cx, budget)?.is_some()),
+        _ => {}
     }
     let mut v = Values::new(s, range, budget);
     if v.at_end()? {
@@ -52,9 +78,9 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, attr: bool, budget: &Budg
             let t = v.next()?;
             t.finite && matches!(t.kind, Tk::Number | Tk::Percentage)
         }
-        Kind::Length => v.length(true)?.is_some(),
-        Kind::LengthNonNeg => v.length(true)?.is_some_and(|l| l.value >= 0.0),
-        Kind::LengthAuto => v.eat_ident(b"auto")? || v.length(true)?.is_some_and(|l| l.value >= 0.0),
+        Kind::Length => len_of(&mut v, cx)?.is_some(),
+        Kind::LengthNonNeg => len_of(&mut v, cx)?.is_some_and(|l| l.value >= 0.0),
+        Kind::LengthAuto => v.eat_ident(b"auto")? || len_of(&mut v, cx)?.is_some_and(|l| l.value >= 0.0),
         Kind::MiterLimit => v.number()?.is_some_and(|n| n >= 1.0),
         Kind::Keywords(list) => {
             let t = v.next()?;
@@ -65,11 +91,13 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, attr: bool, budget: &Budg
             if v.eat_ident(b"none")? {
                 true
             } else {
+                // 数も書ける（SVG 2）
+                let cx = Ctx { unitless: true, ..cx };
                 let mut ok = true;
                 let mut any = false;
                 while !v.at_end()? {
                     budget.spend(crate::cost::OP_STEP)?;
-                    match v.length(true)? {
+                    match len_of(&mut v, cx)? {
                         Some(l) if l.value >= 0.0 => any = true,
                         _ => {
                             ok = false;
@@ -87,61 +115,15 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, attr: bool, budget: &Budg
                 ok && any
             }
         }
-        Kind::FontFamily => font_family(&mut v)?,
-        Kind::FontSize => {
-            const WORDS: &[&[u8]] = &[
-                b"xx-small",
-                b"x-small",
-                b"small",
-                b"medium",
-                b"large",
-                b"x-large",
-                b"xx-large",
-                b"xxx-large",
-                b"larger",
-                b"smaller",
-            ];
-            let t = v.peek()?;
-            if t.kind == Tk::Ident {
-                v.next()?;
-                WORDS.iter().any(|w| ident_is(s, t.inner, t.escaped, w))
-            } else {
-                v.length(true)?.is_some_and(|l| l.value >= 0.0)
-            }
-        }
-        Kind::FontWeight => {
-            let t = v.next()?;
-            match t.kind {
-                Tk::Ident => [b"normal".as_slice(), b"bold", b"bolder", b"lighter"]
-                    .iter()
-                    .any(|w| ident_is(s, t.inner, t.escaped, w)),
-                Tk::Number => t.finite && (1.0..=1000.0).contains(&t.value),
-                _ => false,
-            }
-        }
-        Kind::Spacing => v.eat_ident(b"normal")? || v.length(true)?.is_some(),
+        Kind::FontFamily => font_family(&mut v, budget)?,
+        Kind::FontSize => font_size(&mut v, cx)?,
+        Kind::FontWeight => font_weight(&mut v)?,
+        Kind::LineHeight => line_height(&mut v, cx)?,
+        Kind::Spacing => v.eat_ident(b"normal")? || len_of(&mut v, cx)?.is_some(),
         Kind::BaselineShift => {
-            v.eat_ident(b"baseline")? || v.eat_ident(b"sub")? || v.eat_ident(b"super")? || v.length(true)?.is_some()
+            v.eat_ident(b"baseline")? || v.eat_ident(b"sub")? || v.eat_ident(b"super")? || len_of(&mut v, cx)?.is_some()
         }
-        Kind::TransformOrigin => {
-            let mut n = 0usize;
-            let mut ok = true;
-            while !v.at_end()? && n < 3 {
-                budget.spend(crate::cost::OP_STEP)?;
-                let keyword = v.eat_ident(b"left")?
-                    || v.eat_ident(b"center")?
-                    || v.eat_ident(b"right")?
-                    || v.eat_ident(b"top")?
-                    || v.eat_ident(b"bottom")?;
-                // 3 つめは長さだけ（割合は書けない）
-                if !keyword && !v.length(true)?.is_some_and(|l| n < 2 || l.unit != Unit::Percent) {
-                    ok = false;
-                    break;
-                }
-                n = n.saturating_add(1);
-            }
-            ok && n > 0
-        }
+        Kind::TransformOrigin => transform_origin(&mut v, cx, budget)?,
         Kind::PaintOrder => {
             if v.eat_ident(b"normal")? {
                 true
@@ -229,6 +211,7 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, attr: bool, budget: &Budg
             }
         }
         Kind::Path => {
+            // CSS の `d` は `none` か `path("…")`
             if v.eat_ident(b"none")? {
                 true
             } else {
@@ -251,7 +234,7 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, attr: bool, budget: &Budg
             }
             true
         }
-        Kind::Transform => false,
+        Kind::Transform | Kind::Font => false,
     };
     Ok(ok && v.at_end()?)
 }
@@ -273,18 +256,17 @@ fn url(v: &mut Values<'_, '_>) -> Result<bool, Error> {
     }
 }
 
-/// 関数の引数を `)` まで飛ばす（かっこは組で）。
+/// 関数の引数を組の `)` まで飛ばす（かっこは種類ごとに組で）。
 fn skip_args(v: &mut Values<'_, '_>) -> Result<(), Error> {
-    let mut depth: u32 = 0;
+    let mut nest = crate::css::lex::Nest::new(v.budget());
     loop {
         let t = v.next()?;
         match t.kind {
             Tk::Eof => return Ok(()),
-            Tk::RParen if depth == 0 => return Ok(()),
-            Tk::Function | Tk::LParen => depth = depth.saturating_add(1),
-            Tk::RParen => depth = depth.saturating_sub(1),
+            Tk::RParen if nest.top() => return Ok(()),
             _ => {}
         }
+        nest.feed(&t)?;
     }
 }
 
@@ -307,27 +289,254 @@ fn functions_or_urls(v: &mut Values<'_, '_>, fns: &[&[u8]]) -> Result<bool, Erro
     Ok(any)
 }
 
-/// 書体の名前の並び（文字列か ident の続き。`,` で区切る）。
-fn font_family(v: &mut Values<'_, '_>) -> Result<bool, Error> {
-    let mut want = true;
+/// 書体の名前に使えない言葉（CSS の全体の言葉と `default`。CSS Fonts 4 §2.1）。
+const RESERVED_FAMILY: &[&[u8]] = &[b"inherit", b"initial", b"unset", b"revert", b"revert-layer", b"default"];
+
+/// 書体の名前の並び（文字列か、ident の続き。`,` で区切る）。ident 1 つだけの名前に全体の言葉は書けない。
+fn font_family(v: &mut Values<'_, '_>, budget: &Budget<'_>) -> Result<bool, Error> {
+    // 0：名前を待つ、1：文字列のあと、2：ident の続きのあと
+    let mut state = 0u8;
+    let mut idents = 0u32;
+    let mut reserved = false;
     let mut any = false;
     while !v.at_end()? {
+        budget.spend(crate::cost::OP_STEP)?;
         let t = v.next()?;
-        match t.kind {
-            Tk::Str if want => {
-                want = false;
+        match (t.kind, state) {
+            (Tk::Str, 0) => {
+                state = 1;
                 any = true;
             }
-            Tk::Ident => {
-                // ident の続き（`Times New Roman`）は 1 つの名前
+            (Tk::Ident, 0 | 2) => {
+                if state == 0 {
+                    idents = 0;
+                    reserved = false;
+                }
+                idents = idents.saturating_add(1);
+                reserved |= RESERVED_FAMILY.iter().any(|w| ident_is(v.s, t.inner, t.escaped, w));
+                state = 2;
                 any = true;
-                want = false;
             }
-            Tk::Comma if !want => want = true,
+            (Tk::Comma, 1 | 2) => {
+                if state == 2 && idents == 1 && reserved {
+                    return Ok(false);
+                }
+                state = 0;
+            }
             _ => return Ok(false),
         }
     }
-    Ok(any && !want)
+    if state == 2 && idents == 1 && reserved {
+        return Ok(false);
+    }
+    Ok(any && state != 0)
+}
+
+/// 文字の大きさの言葉。
+const FONT_SIZE_WORDS: &[&[u8]] = &[
+    b"xx-small",
+    b"x-small",
+    b"small",
+    b"medium",
+    b"large",
+    b"x-large",
+    b"xx-large",
+    b"xxx-large",
+    b"larger",
+    b"smaller",
+];
+
+fn font_size(v: &mut Values<'_, '_>, cx: Ctx) -> Result<bool, Error> {
+    let t = v.peek()?;
+    if t.kind == Tk::Ident {
+        v.next()?;
+        return Ok(FONT_SIZE_WORDS.iter().any(|w| ident_is(v.s, t.inner, t.escaped, w)));
+    }
+    Ok(len_of(v, cx)?.is_some_and(|l| l.value >= 0.0))
+}
+
+fn font_weight(v: &mut Values<'_, '_>) -> Result<bool, Error> {
+    let t = v.next()?;
+    Ok(match t.kind {
+        Tk::Ident => {
+            [b"normal".as_slice(), b"bold", b"bolder", b"lighter"].iter().any(|w| ident_is(v.s, t.inner, t.escaped, w))
+        }
+        Tk::Number => t.finite && (1.0..=1000.0).contains(&t.value),
+        _ => false,
+    })
+}
+
+/// `line-height`：`normal`・負でない数・負でない長さか割合。
+fn line_height(v: &mut Values<'_, '_>, cx: Ctx) -> Result<bool, Error> {
+    if v.eat_ident(b"normal")? {
+        return Ok(true);
+    }
+    if let Some(n) = v.number()? {
+        return Ok(n >= 0.0);
+    }
+    Ok(len_of(v, Ctx { unitless: false, ..cx })?.is_some_and(|l| l.value >= 0.0))
+}
+
+/// `transform-origin`（CSS Transforms 1 §6）：1 つ・2 つ（横・縦。言葉 2 つは順を問わない）・それに長さ。
+fn transform_origin(v: &mut Values<'_, '_>, cx: Ctx, budget: &Budget<'_>) -> Result<bool, Error> {
+    // 項の種類：0 横の言葉（left・right）、1 縦の言葉（top・bottom）、2 center、3 長さか割合
+    let mut items = [0u8; 3];
+    let mut n = 0usize;
+    let mut third_is_length = false;
+    while !v.at_end()? {
+        budget.spend(crate::cost::OP_STEP)?;
+        if n >= 3 {
+            return Ok(false);
+        }
+        let item = if v.eat_ident(b"left")? || v.eat_ident(b"right")? {
+            0
+        } else if v.eat_ident(b"top")? || v.eat_ident(b"bottom")? {
+            1
+        } else if v.eat_ident(b"center")? {
+            2
+        } else {
+            match len_of(v, cx)? {
+                Some(l) => {
+                    if n == 2 {
+                        third_is_length = l.unit != Unit::Percent;
+                    }
+                    3
+                }
+                None => return Ok(false),
+            }
+        };
+        if let Some(x) = items.get_mut(n) {
+            *x = item;
+        }
+        n = n.saturating_add(1);
+    }
+    let [a, b, _] = items;
+    let pair_ok = || match (a, b) {
+        // 言葉 2 つは順を問わない（同じ向きの 2 つは書けない）
+        (0, 0) | (1, 1) => false,
+        (0..=2, 0..=2) => true,
+        // 長さを含む形は 横、縦 の順
+        (x, y) => matches!(x, 0 | 2 | 3) && matches!(y, 1..=3),
+    };
+    Ok(match n {
+        1 => true,
+        2 => pair_ok(),
+        3 => pair_ok() && third_is_length,
+        _ => false,
+    })
+}
+
+/// `font` のまとめの書き方を長い名前ごとの範囲に分けたもの（書いていないものは None）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FontParts {
+    pub(crate) style: Option<Span>,
+    pub(crate) variant: Option<Span>,
+    pub(crate) weight: Option<Span>,
+    pub(crate) stretch: Option<Span>,
+    pub(crate) size: Option<Span>,
+    pub(crate) line_height: Option<Span>,
+    pub(crate) family: Option<Span>,
+    /// システムの書体の言葉（`caption` など。環境で決まるので、どの長い名前も初期の値にする。ADR-74）
+    pub(crate) system: bool,
+}
+
+/// 文字の幅の言葉（`font-stretch`）。
+const STRETCH: &[&[u8]] = &[
+    b"ultra-condensed",
+    b"extra-condensed",
+    b"condensed",
+    b"semi-condensed",
+    b"semi-expanded",
+    b"expanded",
+    b"extra-expanded",
+    b"ultra-expanded",
+];
+
+/// `font`（CSS Fonts 4 §2.8）：`[ 字形 || small-caps || 太さ || 幅 ]? 大きさ [ / 行の高さ ]? 書体の並び` か、システムの
+/// 書体の言葉。長い名前ごとの範囲に分ける。
+pub(crate) fn font_parts(s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) -> Result<Option<FontParts>, Error> {
+    let budget = budget_ref(budget);
+    let cx = Ctx { unitless: false, ..cx };
+    let mut v = Values::new(s, range, budget);
+    let mut p = FontParts::default();
+    let first = v.peek()?;
+    if first.kind == Tk::Ident
+        && [b"caption".as_slice(), b"icon", b"menu", b"message-box", b"small-caption", b"status-bar"]
+            .iter()
+            .any(|w| ident_is(s, first.inner, first.escaped, w))
+    {
+        v.next()?;
+        p.system = true;
+        return Ok(v.at_end()?.then_some(p));
+    }
+    // 頭の 4 つ（どれも 1 度だけ。`normal` はどれにも数える）
+    let mut count = 0u32;
+    while count < 4 {
+        budget.spend(crate::cost::OP_STEP)?;
+        let t = v.peek()?;
+        let is = |w: &[u8]| t.kind == Tk::Ident && ident_is(s, t.inner, t.escaped, w);
+        if is(b"normal") {
+            v.next()?;
+        } else if p.style.is_none() && (is(b"italic") || is(b"oblique")) {
+            v.next()?;
+            let mut span = t.span;
+            if is(b"oblique") {
+                let a = v.peek()?;
+                if a.kind == Tk::Dimension && v.angle(false)?.is_some() {
+                    span.end = a.span.end;
+                }
+            }
+            p.style = Some(span);
+        } else if p.variant.is_none() && is(b"small-caps") {
+            v.next()?;
+            p.variant = Some(t.span);
+        } else if p.weight.is_none()
+            && (is(b"bold")
+                || is(b"bolder")
+                || is(b"lighter")
+                || (t.kind == Tk::Number && t.finite && (1.0..=1000.0).contains(&t.value)))
+        {
+            v.next()?;
+            p.weight = Some(t.span);
+        } else if p.stretch.is_none() && STRETCH.iter().any(|w| is(w)) {
+            v.next()?;
+            p.stretch = Some(t.span);
+        } else {
+            break;
+        }
+        count = count.saturating_add(1);
+    }
+    // 大きさ（書かなければ壊れている）
+    let t = v.peek()?;
+    let size_ok = if t.kind == Tk::Ident {
+        v.next()?;
+        FONT_SIZE_WORDS.iter().any(|w| ident_is(s, t.inner, t.escaped, w))
+    } else {
+        len_of(&mut v, cx)?.is_some_and(|l| l.value >= 0.0)
+    };
+    if !size_ok {
+        return Ok(None);
+    }
+    p.size = Some(t.span);
+    if v.peek()?.is_delim(b'/') {
+        v.next()?;
+        let lh = v.peek()?;
+        if !line_height(&mut v, cx)? {
+            return Ok(None);
+        }
+        p.line_height = Some(lh.span);
+    }
+    let f = v.peek()?;
+    if f.kind == Tk::Eof {
+        return Ok(None);
+    }
+    let family = Span { start: f.span.start, end: range.end.max(f.span.start) };
+    let mut fv = Values::new(s, family, budget);
+    if !font_family(&mut fv, budget)? {
+        return Ok(None);
+    }
+    p.family = Some(family);
+    Ok(Some(p))
 }
 
 #[cfg(test)]

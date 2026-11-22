@@ -39,6 +39,10 @@ pub(crate) enum Kind {
     FontWeight,
     /// `normal` か長さ（`letter-spacing`・`word-spacing`）
     Spacing,
+    /// `line-height`（`normal`・数・長さか割合）
+    LineHeight,
+    /// `font` のまとめ（カスケードで長い名前に分ける）
+    Font,
     /// `baseline`・`sub`・`super` か長さか割合
     BaselineShift,
     /// CSS の `transform`
@@ -64,14 +68,22 @@ pub(crate) struct Prop {
     pub(crate) inherited: bool,
     /// プレゼンテーション属性として読むか（`mix-blend-mode`・`transform`（属性は別に読む）・まとめのプロパティは読まない）
     pub(crate) attr: bool,
+    /// CSS でも単位のない長さを受けるか（SVG のプロパティ。CSS のプロパティは属性でだけ受ける。Chrome と同じ。ADR-74）
+    pub(crate) unitless: bool,
     pub(crate) kind: Kind,
 }
 
 const fn p(name: &'static [u8], inherited: bool, attr: bool, kind: Kind) -> Prop {
-    Prop { name, inherited, attr, kind }
+    Prop { name, inherited, attr, unitless: false, kind }
+}
+
+/// CSS でも単位のない長さを受けるプロパティ。
+const fn pu(name: &'static [u8], inherited: bool, attr: bool, kind: Kind) -> Prop {
+    Prop { name, inherited, attr, unitless: true, kind }
 }
 
 const LINECAP: &[&[u8]] = &[b"butt", b"round", b"square"];
+// `miter-clip`・`arcs` は SVG 2 にあり FR-PT-03 で読む（Chrome は読まないが仕様に合わせる。ADR-74）
 const LINEJOIN: &[&[u8]] = &[b"miter", b"miter-clip", b"round", b"bevel", b"arcs"];
 const RULE: &[&[u8]] = &[b"nonzero", b"evenodd"];
 const VISIBILITY: &[&[u8]] = &[b"visible", b"hidden", b"collapse"];
@@ -82,8 +94,6 @@ const DISPLAY: &[&[u8]] = &[
     b"inline-block",
     b"list-item",
     b"run-in",
-    b"compact",
-    b"marker",
     b"table",
     b"inline-table",
     b"table-row-group",
@@ -103,6 +113,7 @@ const DISPLAY: &[&[u8]] = &[
 ];
 const OVERFLOW: &[&[u8]] = &[b"visible", b"hidden", b"scroll", b"auto", b"clip"];
 const RENDERING: &[&[u8]] = &[b"auto", b"optimizespeed", b"crispedges", b"geometricprecision"];
+const COLOR_RENDERING: &[&[u8]] = &[b"auto", b"optimizespeed", b"optimizequality"];
 const TEXT_RENDERING: &[&[u8]] = &[b"auto", b"optimizespeed", b"optimizelegibility", b"geometricprecision"];
 const IMAGE_RENDERING: &[&[u8]] =
     &[b"auto", b"optimizespeed", b"optimizequality", b"smooth", b"high-quality", b"crisp-edges", b"pixelated"];
@@ -187,9 +198,6 @@ const ALIGNMENT: &[&[u8]] = &[
     b"alphabetic",
     b"hanging",
     b"mathematical",
-    b"top",
-    b"center",
-    b"bottom",
     b"text-top",
     b"text-bottom",
 ];
@@ -214,17 +222,17 @@ const POINTER_EVENTS: &[&[u8]] = &[
 /// 表（名前のバイトの順）。
 pub(crate) const PROPS: &[Prop] = &[
     p(b"alignment-baseline", false, true, Kind::Keywords(ALIGNMENT)),
-    p(b"baseline-shift", false, true, Kind::BaselineShift),
+    pu(b"baseline-shift", false, true, Kind::BaselineShift),
     p(b"clip", false, true, Kind::Raw),
     p(b"clip-path", false, true, Kind::ClipPath),
     p(b"clip-rule", true, true, Kind::Keywords(RULE)),
     p(b"color", true, true, Kind::Color),
     p(b"color-interpolation", true, true, Kind::Keywords(INTERPOLATION)),
     p(b"color-interpolation-filters", true, true, Kind::Keywords(INTERPOLATION)),
-    p(b"color-rendering", true, true, Kind::Keywords(RENDERING)),
+    p(b"color-rendering", true, true, Kind::Keywords(COLOR_RENDERING)),
     p(b"cursor", true, true, Kind::Raw),
-    p(b"cx", false, true, Kind::Length),
-    p(b"cy", false, true, Kind::Length),
+    pu(b"cx", false, true, Kind::Length),
+    pu(b"cy", false, true, Kind::Length),
     p(b"d", false, true, Kind::Path),
     p(b"direction", true, true, Kind::Keywords(DIRECTION)),
     p(b"display", false, true, Kind::Keywords(DISPLAY)),
@@ -236,16 +244,16 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"filter", false, true, Kind::Filter),
     p(b"flood-color", false, true, Kind::Color),
     p(b"flood-opacity", false, true, Kind::Opacity),
-    p(b"font", true, false, Kind::Raw),
+    p(b"font", true, false, Kind::Font),
     p(b"font-family", true, true, Kind::FontFamily),
-    p(b"font-feature-settings", true, true, Kind::Raw),
-    p(b"font-kerning", true, true, Kind::Keywords(FONT_KERNING)),
+    p(b"font-feature-settings", true, false, Kind::Raw),
+    p(b"font-kerning", true, false, Kind::Keywords(FONT_KERNING)),
     p(b"font-size", true, true, Kind::FontSize),
     p(b"font-size-adjust", true, true, Kind::Raw),
     p(b"font-stretch", true, true, Kind::Keywords(FONT_STRETCH)),
     p(b"font-style", true, true, Kind::Keywords(FONT_STYLE)),
     p(b"font-variant", true, true, Kind::Raw),
-    p(b"font-variation-settings", true, true, Kind::Raw),
+    p(b"font-variation-settings", true, false, Kind::Raw),
     p(b"font-weight", true, true, Kind::FontWeight),
     p(b"glyph-orientation-horizontal", true, true, Kind::Raw),
     p(b"glyph-orientation-vertical", true, true, Kind::Raw),
@@ -255,6 +263,7 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"kerning", true, true, Kind::Raw),
     p(b"letter-spacing", true, true, Kind::Spacing),
     p(b"lighting-color", false, true, Kind::Color),
+    p(b"line-height", true, false, Kind::LineHeight),
     p(b"marker", true, false, Kind::UrlOrNone),
     p(b"marker-end", true, true, Kind::UrlOrNone),
     p(b"marker-mid", true, true, Kind::UrlOrNone),
@@ -266,25 +275,25 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"overflow", false, true, Kind::Keywords(OVERFLOW)),
     p(b"paint-order", true, true, Kind::PaintOrder),
     p(b"pointer-events", true, true, Kind::Keywords(POINTER_EVENTS)),
-    p(b"r", false, true, Kind::LengthNonNeg),
-    p(b"rx", false, true, Kind::LengthAuto),
-    p(b"ry", false, true, Kind::LengthAuto),
+    pu(b"r", false, true, Kind::LengthNonNeg),
+    pu(b"rx", false, true, Kind::LengthAuto),
+    pu(b"ry", false, true, Kind::LengthAuto),
     p(b"shape-rendering", true, true, Kind::Keywords(RENDERING)),
     p(b"stop-color", false, true, Kind::Color),
     p(b"stop-opacity", false, true, Kind::Opacity),
     p(b"stroke", true, true, Kind::Paint),
     p(b"stroke-dasharray", true, true, Kind::Dasharray),
-    p(b"stroke-dashoffset", true, true, Kind::Length),
+    pu(b"stroke-dashoffset", true, true, Kind::Length),
     p(b"stroke-linecap", true, true, Kind::Keywords(LINECAP)),
     p(b"stroke-linejoin", true, true, Kind::Keywords(LINEJOIN)),
     p(b"stroke-miterlimit", true, true, Kind::MiterLimit),
     p(b"stroke-opacity", true, true, Kind::Opacity),
-    p(b"stroke-width", true, true, Kind::LengthNonNeg),
+    pu(b"stroke-width", true, true, Kind::LengthNonNeg),
     p(b"text-anchor", true, true, Kind::Keywords(TEXT_ANCHOR)),
     p(b"text-decoration", false, true, Kind::Raw),
     p(b"text-rendering", true, true, Kind::Keywords(TEXT_RENDERING)),
     p(b"transform", false, false, Kind::Transform),
-    p(b"transform-box", false, true, Kind::Keywords(TRANSFORM_BOX)),
+    p(b"transform-box", false, false, Kind::Keywords(TRANSFORM_BOX)),
     p(b"transform-origin", false, true, Kind::TransformOrigin),
     p(b"unicode-bidi", false, true, Kind::Keywords(UNICODE_BIDI)),
     p(b"vector-effect", false, true, Kind::Keywords(VECTOR_EFFECT)),
@@ -293,8 +302,8 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"width", false, true, Kind::LengthAuto),
     p(b"word-spacing", true, true, Kind::Spacing),
     p(b"writing-mode", true, true, Kind::Keywords(WRITING_MODE)),
-    p(b"x", false, true, Kind::Length),
-    p(b"y", false, true, Kind::Length),
+    pu(b"x", false, true, Kind::Length),
+    pu(b"y", false, true, Kind::Length),
 ];
 
 /// 名前（`lower` なら ASCII を小文字にして比べる。CSS の宣言）でプロパティを引く。

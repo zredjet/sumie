@@ -89,6 +89,9 @@ pub(crate) const ALLOC_STEP: u64 = 64;
 /// 入れ物の操作 1 回の決まった手間（容量の確かめ・勘定・std の口を呼ぶ分。push を 1 単位 ≈ 1 ns に合わせる）。
 pub(crate) const OP_STEP: u64 = 4;
 
+/// プロパティの表を名前で引く手間（名前を小文字にして写し、表を二分探索する。表は 100 の内なので 7 回ほど比べる）。
+pub(crate) const LOOKUP: u64 = 32;
+
 /// 伸ばしたあとの容量（`cap` で `need` 個が入らないとき。倍々・最小 4）。入れ物と見積もりの両方がこれを使う。
 pub(crate) const fn grow_cap(cap: u64, need: u64) -> u64 {
     let doubled = cap.saturating_mul(2);

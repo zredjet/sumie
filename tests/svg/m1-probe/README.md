@@ -91,7 +91,7 @@
 | `paint-order` | `paint-order` 属性 | 効く | 効く |
 | `mix-blend-mode` | `mix-blend-mode` 属性（multiply で白を重ねると下の緑のまま） | 効かない | 効かない |
 | `mix-blend-mode-css` | CSS の `mix-blend-mode`（`style` 属性） | 効く | 効く |
-| `isolation` | `isolation` 属性（切り離すと multiply の下は透明で、白のまま） | 効く | 効く |
+| `isolation` | `isolation` 属性（切り離すと multiply の下は透明で、白のまま） | 効く | 効く（見た目。ただし getComputedStyle では属性を読んでいない。M3 で照らし直す） |
 | `mask-type` | `mask-type="alpha"` 属性（黒い不透明の中身で、α なら見える） | 効く | 効く |
 | `vector-effect` | `vector-effect="non-scaling-stroke"` 属性 | どちらでもない（127,64,0） | 効く |
 | `geometry-css-width` | CSS の `width`・`height`（rect の幾何のプロパティ） | 効かない | 効く |

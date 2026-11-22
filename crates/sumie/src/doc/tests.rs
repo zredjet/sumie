@@ -121,3 +121,38 @@ fn estimate_is_exact_and_cancel_is_prompt() {
     }
     assert!(cancelled >= (k / step).saturating_sub(1), "{cancelled}");
 }
+
+/// `@media` を照らす大きさは FR-OUT-01 の属性の規則（% は viewBox に対する割合、片方は縦横の比で補う、em は既定の文字の
+/// 大きさ）。`<style type>` の前後の空白は捨てない。
+#[test]
+fn media_size_follows_attribute_rules() {
+    let stroke = |root: &str, cond: &str| -> bool {
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" {root}><style>@media {cond} {{ rect {{ stroke: red }} }}</style><rect/></svg>"
+        );
+        let doc = parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+        let rect =
+            doc.xml().nodes.as_slice().iter().position(|n| n.local.of(svg.as_bytes()) == b"rect").unwrap() as u32;
+        doc.styles().of(rect).iter().any(|s| crate::style::props::prop(s.prop).unwrap().name == b"stroke")
+    };
+    let pct = "width=\"50%\" height=\"50%\" viewBox=\"0 0 120 160\"";
+    assert!(stroke(pct, "(width: 60px) and (height: 80px)"));
+    assert!(stroke("width=\"auto\" height=\"50\" viewBox=\"0 0 100 50\"", "(width: 100px)"));
+    assert!(stroke("width=\"30\" viewBox=\"0 0 100 50\"", "(height: 15px)"));
+    assert!(stroke("viewBox=\"0 0 100 50\"", "(width: 100px)"));
+    assert!(stroke("width=\"10em\" height=\"1in\"", "(width: 120px) and (height: 96px)"));
+    // viewBox がなく片方が欠ける・% なら、大きさは中身で決まる（大きさの条件は偽）
+    assert!(!stroke("width=\"10em\"", "(min-width: 1px)"));
+    assert!(!stroke("width=\"50%\" height=\"10\"", "(min-width: 1px)"));
+    // `type` の前後に空白があれば CSS として当てない（Chrome と同じ）
+    let svg =
+        b"<svg xmlns=\"http://www.w3.org/2000/svg\"><style type=\" text/css \">rect { fill: red }</style><rect/></svg>";
+    let doc = parse(svg, &ParseOptions::DEFAULT, &Never).unwrap();
+    let rect = doc.xml().nodes.as_slice().iter().position(|n| n.local.of(svg) == b"rect").unwrap() as u32;
+    assert!(doc.styles().of(rect).is_empty());
+    let svg =
+        b"<svg xmlns=\"http://www.w3.org/2000/svg\"><style type=\"TEXT/CSS\">rect { fill: red }</style><rect/></svg>";
+    let doc = parse(svg, &ParseOptions::DEFAULT, &Never).unwrap();
+    let rect = doc.xml().nodes.as_slice().iter().position(|n| n.local.of(svg) == b"rect").unwrap() as u32;
+    assert_eq!(doc.styles().of(rect).len(), 1);
+}

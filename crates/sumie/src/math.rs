@@ -124,15 +124,20 @@ pub(crate) fn min(a: f64, b: f64) -> f64 {
     }
 }
 
-/// `max(lo, min(x, hi))`。panic しない（`f64::clamp` は NaN と上下の逆で panic する）。`lo > hi` なら `lo`。
-/// NaN の `x` は `hi` を経て `max(lo, hi)` になる（NaN は値に入れないので、来たら不具合）。
-/// 正の `m` で割った、0 以上 `m` 未満の余り（f64 の `%` は正しく丸める。NaN・∞ は呼び手が入れない）。
-#[allow(dead_code, reason = "M1 の values（色の hsl）から使う")]
+/// 正の `m` で割った、0 以上 `m` 未満の余り（f64 の `%` は正しく丸める。NaN・∞ は呼び手が入れない）。負の小さな `x` で
+/// `r + m` が丸めで `m` になるときは 0 にする（`rem_euclid(-1e-14, 360.0)` は 0）。
 pub(crate) fn rem_euclid(x: f64, m: f64) -> f64 {
     let r = x % m;
-    if r < 0.0 { r + m } else { r }
+    if r < 0.0 {
+        let s = r + m;
+        if s >= m { 0.0 } else { s }
+    } else {
+        r
+    }
 }
 
+/// `max(lo, min(x, hi))`。panic しない（`f64::clamp` は NaN と上下の逆で panic する）。`lo > hi` なら `lo`。
+/// NaN の `x` は `hi` を経て `max(lo, hi)` になる（NaN は値に入れないので、来たら不具合）。
 pub(crate) fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
     max(lo, min(x, hi))
 }

@@ -4,18 +4,23 @@
 //!   特徴は「分からない」で、最後に偽）。環境は決まった値（D1）：明暗は呼び手の設定、`prefers-*` は `no-preference`、
 //!   色は 8 ビット、解像度は 1dppx（96dpi）、`hover`・`pointer` は `none`、`update` は `none`。幅・高さ・縦横比・向きは文書の
 //!   大きさ（CSS の px。width・height・viewBox で決まるとき）で照らし、決まらなければ偽。長さの em・rem は 16px（初期の値）
-//! - `@supports`：`(名前: 値)` は sumie が読めるプロパティと形か、`selector()` は sumie が読めるセレクタか。`not`・`and`・`or`
+//! - `@supports`：`(名前: 値 [!important])` は sumie が読めるプロパティと形か、`selector()` は sumie が読めるセレクタか。
+//!   `not`・`and`・`or`。知らない形（general-enclosed）は偽（CSS Conditional 3 §6.1）
+//! - 書き方は仕様のとおりに確かめる：`not` の段には `and`・`or` を書けない、`and` と `or` を同じ段に混ぜない、媒体の種類の
+//!   あとには `or` を書けない。特徴の値は特徴ごとの形（長さ・解像度・比・整数）だけ。範囲の形の 2 つの比べは同じ向き
 //! - 再帰しない（入れ子のかっこは明示の積み上げ）
 
 use crate::budget::Budget;
 use crate::cost;
-use crate::css::lex::{Kind, Lexer, Token, ident_is};
+use crate::css::decl::{Item, parse_declarations};
+use crate::css::lex::{Kind, Lexer, Nest, Token, ident_is};
 use crate::css::select::{NsTable, Tables, parse_selector_list};
 use crate::error::Error;
 use crate::mem::{MVec, Plain};
 use crate::style::ColorScheme;
-use crate::style::props::{lookup, prop};
-use crate::style::valid::{valid, wide};
+use crate::style::cascade::decl_prop;
+use crate::style::props::prop;
+use crate::style::valid::{Ctx, valid, wide};
 use crate::xml::lex::Span;
 
 /// 照らす環境。
@@ -72,6 +77,8 @@ struct Cur<'s, 'b> {
     s: &'s [u8],
     lex: Lexer<'s, 'b>,
     peeked: Option<Token>,
+    /// 読む範囲の終わり
+    end: u32,
 }
 
 impl Cur<'_, '_> {
@@ -96,7 +103,7 @@ impl Cur<'_, '_> {
 
     /// 読む範囲の終わり。
     fn lex_end(&self) -> u32 {
-        self.s.len() as u32
+        self.end
     }
 
     fn ident(&mut self, w: &[u8]) -> Result<bool, Error> {
@@ -108,22 +115,38 @@ impl Cur<'_, '_> {
         Ok(false)
     }
 
-    /// かっこの中身を `)` まで読み飛ばし、中身の範囲を返す（`(` は読んだあと）。
+    /// かっこの中身を組の `)` まで読み飛ばし、中身の範囲を返す（`(` は読んだあと。かっこは種類ごとに組で）。
     fn skip_parens(&mut self) -> Result<Span, Error> {
         let start = self.peek()?.span.start;
         let mut end = start;
-        let mut depth: u32 = 0;
+        let mut nest = Nest::new(self.lex.budget());
         loop {
             let t = self.next()?;
             match t.kind {
                 Kind::Eof => return Ok(Span { start, end }),
-                Kind::RParen if depth == 0 => return Ok(Span { start, end }),
-                Kind::LParen | Kind::Function | Kind::LBracket | Kind::LBrace => depth = depth.saturating_add(1),
-                Kind::RParen | Kind::RBracket | Kind::RBrace => depth = depth.saturating_sub(1),
+                Kind::RParen if nest.top() => return Ok(Span { start, end }),
                 _ => {}
             }
+            nest.feed(&t)?;
             end = t.span.end;
         }
+    }
+
+    /// 開いたままの `depth` 個のかっこを閉じるまで読み飛ばす（壊れた条件の残り。中の `,` で次の問いを始めない）。
+    fn close_open(&mut self, depth: usize) -> Result<(), Error> {
+        let mut need = depth;
+        let mut nest = Nest::new(self.lex.budget());
+        while need > 0 {
+            let t = self.next()?;
+            match t.kind {
+                Kind::Eof => return Ok(()),
+                Kind::RParen if nest.top() => need = need.saturating_sub(1),
+                _ => {
+                    nest.feed(&t)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -142,7 +165,9 @@ struct Frame {
     started: bool,
     /// この段で使ったつなぎ（0 まだ、1 and、2 or。and と or を同じ段に混ぜるのは誤り）
     chain: u8,
-    pad: [u8; 3],
+    /// この段は `not` で始まった（`and`・`or` を書けない）
+    negated: bool,
+    pad: [u8; 2],
 }
 
 impl Plain for Frame {}
@@ -152,23 +177,39 @@ type Leaf<'f> = &'f mut dyn FnMut(&mut Cur<'_, '_>, Span) -> Result<Tri, Error>;
 
 /// `not`・`and`・`or` とかっこの条件を読む（かっこの中身が条件か特徴かは `leaf` が見分ける前に、`(` のあとが `not`・`(` で
 /// 始まるかで決める）。
-fn condition(
-    c: &mut Cur<'_, '_>,
-    budget: &Budget<'_>,
-    leaf: Leaf<'_>,
-    ns: NsTable<'_>,
+/// 条件の読み方。
+#[derive(Clone, Copy)]
+struct Mode<'a> {
+    ns: NsTable<'a>,
+    /// 問いの並びの `,` で止まる（`@media`）
     stop_at_comma: bool,
-) -> Result<Tri, Error> {
+    /// いちばん外の段に `or` を書けない（媒体の種類のあとの条件）
+    without_or: bool,
+    /// 知らない形（general-enclosed）の値（`@media` は分からない、`@supports` は偽）
+    general: Tri,
+}
+
+fn condition(c: &mut Cur<'_, '_>, budget: &Budget<'_>, leaf: Leaf<'_>, mode: Mode<'_>) -> Result<Tri, Error> {
+    let stop_at_comma = mode.stop_at_comma;
     let mut stack: MVec<'_, Frame> = MVec::new(budget_ref(budget));
-    stack.push(Frame { acc: Tri::True, op: 0, negate: false, started: false, chain: 0, pad: [0; 3] })?;
+    stack.push(Frame {
+        acc: Tri::True,
+        op: 0,
+        negate: false,
+        started: false,
+        chain: 0,
+        negated: false,
+        pad: [0; 2],
+    })?;
     loop {
         budget.spend(cost::OP_STEP)?;
         let t = c.peek()?;
         let Some(mut f) = stack.last().copied() else { return Ok(Tri::Unknown) };
         // 1 つの項
         let term: Option<Tri> = if !f.started || f.op != 0 || f.negate {
-            if !f.started && c.ident(b"not")? {
+            if !f.started && !f.negate && c.ident(b"not")? {
                 f.negate = true;
+                f.negated = true;
                 if let Some(x) = stack.last_mut() {
                     *x = f;
                 }
@@ -186,7 +227,8 @@ fn condition(
                             negate: false,
                             started: false,
                             chain: 0,
-                            pad: [0; 3],
+                            negated: false,
+                            pad: [0; 2],
                         })?;
                         continue;
                     }
@@ -197,7 +239,7 @@ fn condition(
                     // `selector(…)` などの関数（葉に渡す。知らない関数は分からない）
                     c.next()?;
                     let inner = c.skip_parens()?;
-                    Some(function_leaf(c.s, t, inner, ns, budget)?)
+                    Some(function_leaf(c.s, t, inner, mode, budget)?)
                 }
                 _ => None,
             }
@@ -246,21 +288,24 @@ fn condition(
             }
             continue;
         }
+        let depth = stack.len().saturating_sub(1);
         if end_here {
             if stack.len() > 1 || !f.started || f.op != 0 {
                 return Ok(Tri::Unknown);
             }
             return Ok(f.acc);
         }
-        if f.started && f.op == 0 {
+        if f.started && f.op == 0 && !f.negated {
             let op = if c.ident(b"and")? {
                 1
             } else if c.ident(b"or")? {
                 2
             } else {
+                c.close_open(depth)?;
                 return Ok(Tri::Unknown);
             };
-            if f.chain != 0 && f.chain != op {
+            if (f.chain != 0 && f.chain != op) || (op == 2 && mode.without_or && stack.len() == 1) {
+                c.close_open(depth)?;
                 return Ok(Tri::Unknown);
             }
             if let Some(x) = stack.last_mut() {
@@ -269,23 +314,29 @@ fn condition(
             }
             continue;
         }
+        c.close_open(depth)?;
         return Ok(Tri::Unknown);
     }
 }
 
-/// `selector(…)` の葉（`@supports`）。ほかの関数は分からない。
-fn function_leaf(s: &[u8], f: Token, inner: Span, ns: NsTable<'_>, budget: &Budget<'_>) -> Result<Tri, Error> {
+/// `selector(…)` の葉（`@supports`）。ほかの関数は知らない形。
+fn function_leaf(s: &[u8], f: Token, inner: Span, mode: Mode<'_>, budget: &Budget<'_>) -> Result<Tri, Error> {
     if !ident_is(s, f.inner, f.escaped, b"selector") {
-        return Ok(Tri::Unknown);
+        return Ok(mode.general);
     }
     let mut t = Tables::new(budget_ref(budget));
-    Ok(Tri::of(parse_selector_list(s, inner, ns, &mut t, budget)?.is_some()))
+    Ok(Tri::of(parse_selector_list(s, inner, mode.ns, &mut t, budget)?.is_some()))
+}
+
+/// `@media` の条件の読み方。
+const fn media_mode(without_or: bool) -> Mode<'static> {
+    Mode { ns: NsTable::EMPTY, stop_at_comma: true, without_or, general: Tri::Unknown }
 }
 
 /// `@media` の問いの並び（`range` は字句の範囲）が真か。空の並びは真。
 pub(crate) fn media(s: &[u8], range: Span, env: &Env, budget: &Budget<'_>) -> Result<bool, Error> {
     let budget = budget_ref(budget);
-    let mut c = Cur { s, lex: Lexer::over(s, range, budget), peeked: None };
+    let mut c = Cur { s, lex: Lexer::over(s, range, budget), peeked: None, end: range.end };
     if c.peek()?.kind == Kind::Eof {
         return Ok(true);
     }
@@ -354,7 +405,7 @@ fn media_query(c: &mut Cur<'_, '_>, env: &Env, budget: &Budget<'_>) -> Result<Tr
         let n = c.peek()?;
         if n.kind == Kind::Ident && ident_is(c.s, n.inner, n.escaped, b"and") {
             c.next()?;
-            let rest = condition(c, budget, &mut leaf, NsTable::EMPTY, true)?;
+            let rest = condition(c, budget, &mut leaf, media_mode(true))?;
             v = v.and(rest);
         } else if !matches!(n.kind, Kind::Eof | Kind::Comma) {
             return Ok(Tri::Unknown);
@@ -369,36 +420,15 @@ fn media_query(c: &mut Cur<'_, '_>, env: &Env, budget: &Budget<'_>) -> Result<Tr
             v
         });
     }
-    let v = condition(c, budget, &mut leaf, NsTable::EMPTY, true)?;
+    let v = condition(c, budget, &mut leaf, media_mode(false))?;
     Ok(if v == Tri::Unknown { Tri::False } else { v })
 }
 
 /// 媒体の特徴（かっこの中身）。
 fn feature(s: &[u8], inner: Span, env: &Env, budget: &Budget<'_>) -> Result<Tri, Error> {
     let budget = budget_ref(budget);
-    let mut c = Cur { s, lex: Lexer::over(s, inner, budget), peeked: None };
+    let mut c = Cur { s, lex: Lexer::over(s, inner, budget), peeked: None, end: inner.end };
     let first = c.next()?;
-    // 範囲の形（`width >= 10px`・`10px <= width <= 20px`。`<=`・`>=` は間に空白を書けない）
-    let cmp = |c: &mut Cur<'_, '_>| -> Result<Option<(u8, bool)>, Error> {
-        let t = c.peek()?;
-        let op = if t.is_delim(b'<') {
-            b'<'
-        } else if t.is_delim(b'>') {
-            b'>'
-        } else if t.is_delim(b'=') {
-            b'='
-        } else {
-            return Ok(None);
-        };
-        c.next()?;
-        let mut eq = op == b'=';
-        let n = c.peek()?;
-        if op != b'=' && n.is_delim(b'=') && n.span.start == t.span.end {
-            c.next()?;
-            eq = true;
-        }
-        Ok(Some((op, eq)))
-    };
     if first.kind == Kind::Ident {
         let name_tok = first;
         let t = c.peek()?;
@@ -408,31 +438,40 @@ fn feature(s: &[u8], inner: Span, env: &Env, budget: &Budget<'_>) -> Result<Tri,
         }
         if t.kind == Kind::Colon {
             c.next()?;
-            let v = c.next()?;
-            if c.peek()?.kind != Kind::Eof {
-                return Ok(Tri::Unknown);
-            }
-            return Ok(value_feature(s, name_tok, v, env));
+            return value_feature(&mut c, name_tok, env);
         }
         if let Some((op, eq)) = cmp(&mut c)? {
-            let v = c.next()?;
+            let Some((cur, ty)) = env_value(s, name_tok, env) else { return Ok(Tri::Unknown) };
+            let Some(x) = read_value(&mut c, ty, None)? else { return Ok(Tri::Unknown) };
             if c.peek()?.kind != Kind::Eof {
                 return Ok(Tri::Unknown);
             }
-            return Ok(range_feature(s, name_tok, op, eq, v, false, env));
+            return Ok(compare(cur, op, eq, x, false));
         }
         return Ok(Tri::Unknown);
     }
-    // `値 < 名前 [< 値]`
+    // `値 op 名前 [op 値]`（2 つの比べは同じ向き。`=` は 1 つの比べだけ）
+    let lead = first;
+    let ratio_rest = if c.peek()?.is_delim(b'/') {
+        c.next()?;
+        Some(c.next()?)
+    } else {
+        None
+    };
     let Some((op1, eq1)) = cmp(&mut c)? else { return Ok(Tri::Unknown) };
     let name_tok = c.next()?;
     if name_tok.kind != Kind::Ident {
         return Ok(Tri::Unknown);
     }
-    let mut r = range_feature(s, name_tok, op1, eq1, first, true, env);
+    let Some((cur, ty)) = env_value(s, name_tok, env) else { return Ok(Tri::Unknown) };
+    let Some(x1) = value_of(s, ty, lead, ratio_rest) else { return Ok(Tri::Unknown) };
+    let mut r = compare(cur, op1, eq1, x1, true);
     if let Some((op2, eq2)) = cmp(&mut c)? {
-        let v2 = c.next()?;
-        r = r.and(range_feature(s, name_tok, op2, eq2, v2, false, env));
+        if op1 == b'=' || op2 != op1 {
+            return Ok(Tri::Unknown);
+        }
+        let Some(x2) = read_value(&mut c, ty, None)? else { return Ok(Tri::Unknown) };
+        r = r.and(compare(cur, op2, eq2, x2, false));
     }
     if c.peek()?.kind != Kind::Eof {
         return Ok(Tri::Unknown);
@@ -440,37 +479,76 @@ fn feature(s: &[u8], inner: Span, env: &Env, budget: &Budget<'_>) -> Result<Tri,
     Ok(r)
 }
 
+/// 範囲の形の比べ（`<`・`>`・`=`。`<=`・`>=` は間に空白を書けない）。
+fn cmp(c: &mut Cur<'_, '_>) -> Result<Option<(u8, bool)>, Error> {
+    let t = c.peek()?;
+    let op = if t.is_delim(b'<') {
+        b'<'
+    } else if t.is_delim(b'>') {
+        b'>'
+    } else if t.is_delim(b'=') {
+        b'='
+    } else {
+        return Ok(None);
+    };
+    c.next()?;
+    let mut eq = op == b'=';
+    let n = c.peek()?;
+    if op != b'=' && n.is_delim(b'=') && n.span.start == t.span.end {
+        c.next()?;
+        eq = true;
+    }
+    Ok(Some((op, eq)))
+}
+
+/// 特徴の値の形。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ty {
+    Length,
+    Resolution,
+    Ratio,
+    Integer,
+    Word,
+}
+
 /// 特徴の今の値（数か、言葉の比べ方）。
+#[derive(Clone, Copy)]
 enum Val {
     Num(f64),
     Word(&'static [u8]),
     Unknown,
 }
 
-fn env_value(s: &[u8], name: Token, env: &Env) -> (Val, bool) {
+/// 特徴の今の値と値の形（知らない特徴は None）。
+fn env_value(s: &[u8], name: Token, env: &Env) -> Option<(Val, Ty)> {
     let is = |w: &[u8]| ident_is(s, name.inner, name.escaped, w);
-    // （値、範囲で比べてよいか）
     let size = env.size;
     if is(b"width") {
-        return (size.map_or(Val::Unknown, |(w, _)| Val::Num(w)), true);
+        return Some((size.map_or(Val::Unknown, |(w, _)| Val::Num(w)), Ty::Length));
     }
     if is(b"height") {
-        return (size.map_or(Val::Unknown, |(_, h)| Val::Num(h)), true);
+        return Some((size.map_or(Val::Unknown, |(_, h)| Val::Num(h)), Ty::Length));
     }
     if is(b"aspect-ratio") {
-        return (size.map_or(Val::Unknown, |(w, h)| if h > 0.0 { Val::Num(w / h) } else { Val::Unknown }), true);
+        return Some((
+            size.map_or(Val::Unknown, |(w, h)| if h > 0.0 { Val::Num(w / h) } else { Val::Unknown }),
+            Ty::Ratio,
+        ));
     }
     if is(b"orientation") {
-        return (size.map_or(Val::Unknown, |(w, h)| Val::Word(if h >= w { b"portrait" } else { b"landscape" })), false);
+        return Some((
+            size.map_or(Val::Unknown, |(w, h)| Val::Word(if h >= w { b"portrait" } else { b"landscape" })),
+            Ty::Word,
+        ));
     }
     if is(b"resolution") {
-        return (Val::Num(1.0), true);
+        return Some((Val::Num(1.0), Ty::Resolution));
     }
     if is(b"color") {
-        return (Val::Num(8.0), true);
+        return Some((Val::Num(8.0), Ty::Integer));
     }
     if is(b"color-index") || is(b"monochrome") || is(b"grid") {
-        return (Val::Num(0.0), true);
+        return Some((Val::Num(0.0), Ty::Integer));
     }
     let word: &'static [u8] = if is(b"prefers-color-scheme") {
         match env.color_scheme {
@@ -502,45 +580,59 @@ fn env_value(s: &[u8], name: Token, env: &Env) -> (Val, bool) {
     } else if is(b"color-gamut") {
         b"srgb"
     } else {
-        return (Val::Unknown, false);
+        return None;
     };
-    (Val::Word(word), false)
+    Some((Val::Word(word), Ty::Word))
 }
 
 fn boolean_feature(s: &[u8], name: Token, env: &Env) -> Tri {
-    match env_value(s, name, env).0 {
-        Val::Num(n) => Tri::of(n != 0.0),
-        Val::Word(w) => Tri::of(w != b"none" && w != b"no-preference"),
-        Val::Unknown => Tri::Unknown,
+    match env_value(s, name, env).map(|x| x.0) {
+        Some(Val::Num(n)) => Tri::of(n != 0.0),
+        Some(Val::Word(w)) => Tri::of(w != b"none" && w != b"no-preference"),
+        _ => Tri::Unknown,
     }
 }
 
-/// 特徴の値の字句を数にする（長さは px、解像度は dppx、比は `a/b` の頭だけ）。
-fn value_num(s: &[u8], v: Token) -> Option<f64> {
-    if !v.finite {
+/// 値の字句を特徴の形で数にする（長さは px（em・rem は 16px）、解像度は dppx、比は `a / b`）。`ratio_rest` は比の `/` の
+/// あとの字句。
+fn value_of(s: &[u8], ty: Ty, v: Token, ratio_rest: Option<Token>) -> Option<f64> {
+    if !v.finite || (ratio_rest.is_some() && ty != Ty::Ratio) {
         return None;
     }
-    match v.kind {
-        Kind::Number => Some(v.value),
-        Kind::Dimension => {
-            let is = |w: &[u8]| ident_is(s, v.inner, v.escaped, w);
-            let k = if is(b"px") {
-                1.0
-            } else if is(b"em") || is(b"rem") {
-                16.0
-            } else if is(b"in") {
-                96.0
-            } else if is(b"cm") {
-                96.0 / 2.54
-            } else if is(b"mm") {
-                96.0 / 25.4
-            } else if is(b"q") {
-                96.0 / 101.6
-            } else if is(b"pt") {
-                96.0 / 72.0
-            } else if is(b"pc") {
-                16.0
-            } else if is(b"dppx") || is(b"x") {
+    let is = |w: &[u8]| ident_is(s, v.inner, v.escaped, w);
+    match ty {
+        Ty::Length => match v.kind {
+            // 単位のない数は 0 だけ
+            Kind::Number if v.value == 0.0 => Some(0.0),
+            Kind::Dimension => {
+                let k = if is(b"px") {
+                    1.0
+                } else if is(b"em") || is(b"rem") {
+                    16.0
+                } else if is(b"in") {
+                    96.0
+                } else if is(b"cm") {
+                    96.0 / 2.54
+                } else if is(b"mm") {
+                    96.0 / 25.4
+                } else if is(b"q") {
+                    96.0 / 101.6
+                } else if is(b"pt") {
+                    96.0 / 72.0
+                } else if is(b"pc") {
+                    16.0
+                } else {
+                    return None;
+                };
+                Some(v.value * k).filter(|x| x.is_finite())
+            }
+            _ => None,
+        },
+        Ty::Resolution => {
+            if v.kind != Kind::Dimension {
+                return None;
+            }
+            let k = if is(b"dppx") || is(b"x") {
                 1.0
             } else if is(b"dpi") {
                 1.0 / 96.0
@@ -551,12 +643,41 @@ fn value_num(s: &[u8], v: Token) -> Option<f64> {
             };
             Some(v.value * k)
         }
-        _ => None,
+        Ty::Integer => (v.kind == Kind::Number && v.flag).then_some(v.value),
+        Ty::Ratio => {
+            if v.kind != Kind::Number || v.value < 0.0 {
+                return None;
+            }
+            match ratio_rest {
+                None => Some(v.value),
+                Some(b) if b.kind == Kind::Number && b.finite && b.value > 0.0 => {
+                    Some(v.value / b.value).filter(|x| x.is_finite())
+                }
+                _ => None,
+            }
+        }
+        Ty::Word => None,
     }
 }
 
-fn value_feature(s: &[u8], name: Token, v: Token, env: &Env) -> Tri {
-    // min-・max- の頭
+/// 値を読む（比は `a / b` の 3 つの字句）。
+fn read_value(c: &mut Cur<'_, '_>, ty: Ty, first: Option<Token>) -> Result<Option<f64>, Error> {
+    let v = match first {
+        Some(t) => t,
+        None => c.next()?,
+    };
+    let rest = if ty == Ty::Ratio && c.peek()?.is_delim(b'/') {
+        c.next()?;
+        Some(c.next()?)
+    } else {
+        None
+    };
+    Ok(value_of(c.s, ty, v, rest))
+}
+
+/// `名前: 値`（`min-`・`max-` の頭は範囲の比べ）。
+fn value_feature(c: &mut Cur<'_, '_>, name: Token, env: &Env) -> Result<Tri, Error> {
+    let s = c.s;
     let raw = name.inner.of(s);
     let (prefix, base_len) = if raw.len() > 4 && raw.get(..4).is_some_and(|p| p.eq_ignore_ascii_case(b"min-")) {
         (Some(b'>'), 4usize)
@@ -567,34 +688,33 @@ fn value_feature(s: &[u8], name: Token, v: Token, env: &Env) -> Tri {
     };
     let base =
         Token { inner: Span { start: name.inner.start.saturating_add(base_len as u32), end: name.inner.end }, ..name };
-    let (cur, rangeable) = env_value(s, base, env);
-    match (prefix, cur) {
-        (Some(_), _) if !rangeable => Tri::Unknown,
-        (Some(op), Val::Num(n)) => match value_num(s, v) {
-            Some(x) => Tri::of(if op == b'>' { n >= x } else { n <= x }),
-            None => Tri::Unknown,
-        },
-        (None, Val::Num(n)) => match value_num(s, v) {
-            Some(x) => Tri::of(n == x),
-            None => Tri::Unknown,
-        },
-        (None, Val::Word(w)) => {
-            if v.kind == Kind::Ident {
-                Tri::of(ident_is(s, v.inner, v.escaped, w))
-            } else {
-                Tri::Unknown
-            }
+    let Some((cur, ty)) = env_value(s, base, env) else { return Ok(Tri::Unknown) };
+    if ty == Ty::Word {
+        if prefix.is_some() {
+            return Ok(Tri::Unknown);
         }
-        _ => Tri::Unknown,
+        let v = c.next()?;
+        if c.peek()?.kind != Kind::Eof || v.kind != Kind::Ident {
+            return Ok(Tri::Unknown);
+        }
+        return Ok(match cur {
+            Val::Word(w) => Tri::of(ident_is(s, v.inner, v.escaped, w)),
+            _ => Tri::Unknown,
+        });
     }
+    let Some(x) = read_value(c, ty, None)? else { return Ok(Tri::Unknown) };
+    if c.peek()?.kind != Kind::Eof {
+        return Ok(Tri::Unknown);
+    }
+    Ok(match prefix {
+        Some(op) => compare(cur, op, true, x, false),
+        None => compare(cur, b'=', true, x, false),
+    })
 }
 
-/// 範囲の形の 1 つの比べ（`flip` なら `値 op 名前`）。
-fn range_feature(s: &[u8], name: Token, op: u8, eq: bool, v: Token, flip: bool, env: &Env) -> Tri {
-    let (cur, rangeable) = env_value(s, name, env);
-    let (Val::Num(n), true) = (cur, rangeable) else { return Tri::Unknown };
-    let Some(x) = value_num(s, v) else { return Tri::Unknown };
-    // 名前 op 値 の形にそろえる
+/// 今の値 `cur` と `x` を比べる（`flip` なら `x op 今の値`）。今の値が分からなければ分からない。
+fn compare(cur: Val, op: u8, eq: bool, x: f64, flip: bool) -> Tri {
+    let Val::Num(n) = cur else { return Tri::Unknown };
     let (lhs, rhs) = if flip { (x, n) } else { (n, x) };
     Tri::of(match (op, eq) {
         (b'<', false) => lhs < rhs,
@@ -608,27 +728,35 @@ fn range_feature(s: &[u8], name: Token, op: u8, eq: bool, v: Token, flip: bool, 
 /// `@supports` の条件が真か。
 pub(crate) fn supports(s: &[u8], range: Span, ns: NsTable<'_>, budget: &Budget<'_>) -> Result<bool, Error> {
     let budget = budget_ref(budget);
-    let mut c = Cur { s, lex: Lexer::over(s, range, budget), peeked: None };
+    let mut c = Cur { s, lex: Lexer::over(s, range, budget), peeked: None, end: range.end };
     let mut leaf = |cur: &mut Cur<'_, '_>, inner: Span| declaration_leaf(cur.s, inner, budget);
-    Ok(condition(&mut c, budget, &mut leaf, ns, false)? == Tri::True)
+    let mode = Mode { ns, stop_at_comma: false, without_or: false, general: Tri::False };
+    Ok(condition(&mut c, budget, &mut leaf, mode)? == Tri::True)
 }
 
-/// `(名前: 値)` が sumie の読める宣言か。
+/// `(名前: 値 [!important])` が sumie の読める宣言か（名前の escape を解く。宣言でない形は偽）。
 fn declaration_leaf(s: &[u8], inner: Span, budget: &Budget<'_>) -> Result<Tri, Error> {
     let budget = budget_ref(budget);
-    let mut c = Cur { s, lex: Lexer::over(s, inner, budget), peeked: None };
-    let name = c.next()?;
-    if name.kind != Kind::Ident || c.next()?.kind != Kind::Colon {
-        return Ok(Tri::Unknown);
-    }
-    let vstart = c.peek()?.span.start;
-    let value = Span { start: vstart, end: inner.end.max(vstart) };
-    let id = if name.escaped { None } else { lookup(name.inner.of(s), true) };
-    let Some(p) = id.and_then(prop) else { return Ok(Tri::False) };
-    if wide(s, value, budget)?.is_some() {
+    let mut lex = Lexer::over(s, inner, budget);
+    let mut first = None;
+    let mut count = 0u32;
+    parse_declarations(&mut lex, s, false, budget, &mut |it| {
+        if let Item::Decl(d) = it {
+            count = count.saturating_add(1);
+            if first.is_none() {
+                first = Some(d);
+            }
+        }
+        Ok(())
+    })?;
+    let (Some(d), 1) = (first, count) else { return Ok(Tri::False) };
+    let Some(p) = decl_prop(s, &d, budget)?.and_then(prop) else { return Ok(Tri::False) };
+    if wide(s, d.value, budget)?.is_some() {
         return Ok(Tri::True);
     }
-    Ok(Tri::of(valid(p.kind, s, value, false, budget)?))
+    // 形だけを見る（表示の領域の単位も受ける）
+    let cx = Ctx { attr: false, unitless: p.unitless, viewport: true };
+    Ok(Tri::of(valid(p.kind, s, d.value, cx, budget)?))
 }
 
 #[cfg(test)]

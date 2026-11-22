@@ -134,6 +134,10 @@ impl<'a, 'b> Lexer<'a, 'b> {
         Lexer { s, i: start, meter: ScanMeter::new(start, end), budget }
     }
 
+    pub(crate) fn budget(&self) -> &'b Budget<'b> {
+        self.budget
+    }
+
     /// `i` のバイト（字句を進めずに見る。払う）。
     pub(crate) fn byte_at(&mut self, i: usize) -> Result<Option<u8>, Error> {
         self.at(i)

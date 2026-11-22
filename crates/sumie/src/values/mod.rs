@@ -1,19 +1,20 @@
 //! 段 2：値（architecture.md §4.2・requirements.md FR-ST-11・FR-SH-04・FR-PT-02・ADR-66 (4)）。プロパティの値を読む。
 //!
 //! - 値は CSS の字句（[`crate::css::lex`]）で読む（プレゼンテーション属性も CSS の値として読む。SVG 2）。`transform` 属性
-//!   だけは SVG の書き方（単位のない数・省いてよい `,`・`rotate(a cx cy)`）も受ける
-//! - 数は有限のものだけ（FR-ST-15。有限でない数は壊れた値）
-//! - 長さは単位のまま持ち、em・ex・%・vw などは計算した値を求めるとき（文脈が要る）に解く
+//!   は SVG 1.1 の書き方だけ（6 つの関数・名前は大文字小文字を区別・単位のない数・省いてよい `,`・名前と `(` の間の空白。
+//!   CSS Transforms 1 §7.2・Chrome と同じ）
+//! - 数は有限のものだけ（FR-ST-15。有限でない数は壊れた値。単位を換えたあとも確かめる）
+//! - 長さは単位のまま持ち、em・ex・ch・ic・cap・lh・%・vw などは計算した値を求めるとき（文脈が要る）に解く（ADR-74）
 //! - 色は sRGB の 0〜255（丸めない）と α の 0〜1（塗る段で 8 ビットにする。M3）
 //! - 壊れた値は None（呼び手は宣言・属性を無視して警告する）
 
-#![allow(dead_code, reason = "M1 の style の単位で、プロパティの表から使う")]
+#![allow(dead_code, reason = "値そのものは木を作る段（M2）から使う。M1 は形の確かめだけ")]
 
 pub(crate) mod names;
 
 use crate::budget::Budget;
 use crate::cost;
-use crate::css::lex::{Kind, Lexer, Token, ident_is};
+use crate::css::lex::{Kind, Lexer, Token, decode, ident_is};
 use crate::error::Error;
 use crate::math;
 use crate::mem::{Plain, lower_bound};
@@ -34,12 +35,32 @@ pub(crate) enum Unit {
     Q,
     Em,
     Ex,
+    /// 文字の幅（フォントがないので 0.5em。CSS Values 4 の代わりの値。ADR-74）
+    Ch,
+    /// 表意文字の幅（1em）
+    Ic,
+    /// 大文字の高さ（0.7em）
+    Cap,
+    /// 行の高さ（`line-height` の計算した値）
+    Lh,
+    /// 根の要素の行の高さ
+    Rlh,
     Rem,
     Percent,
     Vw,
     Vh,
     Vmin,
     Vmax,
+    /// 行の向きと並びの向きの表示の領域の 1%（横書きなので vw・vh と同じ）
+    Vi,
+    Vb,
+}
+
+impl Unit {
+    /// 表示の領域（文書の大きさ）で決まる単位か（大きさの決まらない文書では壊れた値。ADR-66 (4)）。
+    pub(crate) const fn viewport(self) -> bool {
+        matches!(self, Unit::Vw | Unit::Vh | Unit::Vmin | Unit::Vmax | Unit::Vi | Unit::Vb)
+    }
 }
 
 impl Plain for Unit {}
@@ -72,7 +93,7 @@ impl Length {
             Unit::Pc => 16.0,
             _ => return None,
         };
-        Some(self.value * k)
+        Some(self.value * k).filter(|v| v.is_finite())
     }
 }
 
@@ -212,6 +233,10 @@ impl<'s, 'b> Values<'s, 'b> {
         Values { s, lex: Lexer::over(s, range, budget), peeked: None, budget }
     }
 
+    pub(crate) fn budget(&self) -> &'b Budget<'b> {
+        self.budget
+    }
+
     /// 次の空白でない字句を見る。
     pub(crate) fn peek(&mut self) -> Result<Token, Error> {
         if let Some(t) = self.peeked {
@@ -275,8 +300,22 @@ impl<'s, 'b> Values<'s, 'b> {
             Unit::Em
         } else if is(b"ex") {
             Unit::Ex
+        } else if is(b"ch") {
+            Unit::Ch
+        } else if is(b"ic") {
+            Unit::Ic
+        } else if is(b"cap") {
+            Unit::Cap
+        } else if is(b"lh") {
+            Unit::Lh
+        } else if is(b"rlh") {
+            Unit::Rlh
         } else if is(b"rem") {
             Unit::Rem
+        } else if is(b"vi") {
+            Unit::Vi
+        } else if is(b"vb") {
+            Unit::Vb
         } else if is(b"vw") {
             Unit::Vw
         } else if is(b"vh") {
@@ -343,6 +382,9 @@ impl<'s, 'b> Values<'s, 'b> {
             }
             _ => return Ok(None),
         };
+        if !deg.is_finite() {
+            return Ok(None);
+        }
         self.next()?;
         Ok(Some(deg))
     }
@@ -354,7 +396,8 @@ impl<'s, 'b> Values<'s, 'b> {
         match t.kind {
             Kind::Hash => {
                 self.next()?;
-                Ok(hex(t.inner.of(self.s)).filter(|_| !t.escaped).map(ColorValue::Color))
+                let mut buf = [0u8; 24];
+                Ok(short_name(self.s, &t, &mut buf).and_then(hex).map(ColorValue::Color))
             }
             Kind::Ident => {
                 self.next()?;
@@ -364,10 +407,8 @@ impl<'s, 'b> Values<'s, 'b> {
                 if ident_is(self.s, t.inner, t.escaped, b"transparent") {
                     return Ok(Some(ColorValue::Color(Color::TRANSPARENT)));
                 }
-                if t.escaped {
-                    return Ok(None);
-                }
-                Ok(named(t.inner.of(self.s)).map(ColorValue::Color))
+                let mut buf = [0u8; 24];
+                Ok(short_name(self.s, &t, &mut buf).and_then(named).map(ColorValue::Color))
             }
             Kind::Function => {
                 self.next()?;
@@ -442,7 +483,7 @@ impl<'s, 'b> Values<'s, 'b> {
             Kind::Number => Comp::Num(t.value),
             Kind::Percentage => Comp::Pct(t.value),
             Kind::Dimension => match self.angle(false)? {
-                Some(d) => return Ok(Some(Comp::Num(d))),
+                Some(d) => return Ok(Some(Comp::Angle(d))),
                 None => return Ok(None),
             },
             Kind::Ident if ident_is(self.s, t.inner, t.escaped, b"none") => Comp::NoneKw,
@@ -457,9 +498,13 @@ impl<'s, 'b> Values<'s, 'b> {
         let ch = |x: Comp| match x {
             Comp::Num(v) => math::clamp(v, 0.0, 255.0),
             Comp::Pct(p) => math::clamp(p * 2.55, 0.0, 255.0),
-            Comp::NoneKw | Comp::None => 0.0,
+            Comp::NoneKw | Comp::None | Comp::Angle(_) => 0.0,
         };
-        // 昔の書き方は、3 つとも数か 3 つとも割合（CSS Color 4 §5.1）。角度は rgb() に書けない
+        // 角度は rgb() に書けない
+        if c.iter().any(|x| matches!(x, Comp::Angle(_))) {
+            return Ok(None);
+        }
+        // 昔の書き方は、3 つとも数か 3 つとも割合（CSS Color 4 §5.1）
         let pct = c.iter().filter(|x| matches!(x, Comp::Pct(_))).count();
         if legacy && pct != 0 && pct != 3 {
             return Ok(None);
@@ -473,8 +518,9 @@ impl<'s, 'b> Values<'s, 'b> {
         if legacy && !(matches!(c[1], Comp::Pct(_)) && matches!(c[2], Comp::Pct(_))) {
             return Ok(None);
         }
+        // 色相だけが角度を書ける
         let h = match c[0] {
-            Comp::Num(v) => v,
+            Comp::Num(v) | Comp::Angle(v) => v,
             Comp::NoneKw => 0.0,
             _ => return Ok(None),
         };
@@ -482,7 +528,7 @@ impl<'s, 'b> Values<'s, 'b> {
             Comp::Pct(p) => Some(math::clamp(p, 0.0, 100.0) / 100.0),
             Comp::Num(n) => Some(math::clamp(n, 0.0, 100.0) / 100.0),
             Comp::NoneKw => Some(0.0),
-            Comp::None => None,
+            Comp::None | Comp::Angle(_) => None,
         };
         let (Some(s), Some(l)) = (pct(c[1]), pct(c[2])) else { return Ok(None) };
         let (r, g, b) = hsl_to_rgb(h, s, l);
@@ -492,7 +538,7 @@ impl<'s, 'b> Values<'s, 'b> {
     fn hwb(&mut self) -> Result<Option<Color>, Error> {
         let Some((c, a, _)) = self.components(false)? else { return Ok(None) };
         let h = match c[0] {
-            Comp::Num(v) => v,
+            Comp::Num(v) | Comp::Angle(v) => v,
             Comp::NoneKw => 0.0,
             _ => return Ok(None),
         };
@@ -500,7 +546,7 @@ impl<'s, 'b> Values<'s, 'b> {
             Comp::Pct(p) => Some(math::clamp(p, 0.0, 100.0) / 100.0),
             Comp::Num(n) => Some(math::clamp(n, 0.0, 100.0) / 100.0),
             Comp::NoneKw => Some(0.0),
-            Comp::None => None,
+            Comp::None | Comp::Angle(_) => None,
         };
         let (Some(w), Some(bk)) = (pct(c[1]), pct(c[2])) else { return Ok(None) };
         let (r, g, b) = if w + bk >= 1.0 {
@@ -587,7 +633,31 @@ enum Comp {
     None,
     Num(f64),
     Pct(f64),
+    /// 角度（度。色相だけに書ける）
+    Angle(f64),
     NoneKw,
+}
+
+/// 短い名前（ident・hash の中身）を escape を解いて ASCII で `buf` に写す（長いか ASCII でなければ None）。
+fn short_name<'a>(s: &[u8], t: &Token, buf: &'a mut [u8; 24]) -> Option<&'a [u8]> {
+    if !t.escaped {
+        let raw = t.inner.of(s);
+        let n = raw.len();
+        if n > buf.len() {
+            return None;
+        }
+        for (d, &b) in buf.iter_mut().zip(raw) {
+            *d = b;
+        }
+        return buf.get(..n);
+    }
+    let mut n = 0usize;
+    for c in decode(s, t.inner) {
+        let b = u8::try_from(c).ok().filter(u8::is_ascii)?;
+        *buf.get_mut(n)? = b;
+        n = n.saturating_add(1);
+    }
+    buf.get(..n)
 }
 
 /// `#rgb`・`#rgba`・`#rrggbb`・`#rrggbbaa`（16 進は大文字小文字を問わない）。
@@ -642,16 +712,15 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (f64, f64, f64) {
     (f(0.0), f(8.0), f(4.0))
 }
 
-/// `transform` を読む（`attr` なら SVG の属性の書き方も受ける。CSS のプロパティは CSS Transforms の書き方だけ）。em・ex・
-/// % の長さは解けないので、文脈の要らない値だけを行列にする（`font_size` は em の大きさ。% は None）。
-pub(crate) fn transform(
-    s: &[u8],
-    range: Span,
-    attr: bool,
-    font_size: f64,
-    budget: &Budget<'_>,
-) -> Result<Option<Transform>, Error> {
+/// `transform` 属性（SVG 1.1 の書き方。CSS Transforms 1 §7.2）を行列にする。関数は `matrix`・`translate`・`scale`・
+/// `rotate`・`skewX`・`skewY`（名前は大文字小文字を区別する）、引数は単位のない数で `,` は省いてよく、名前と `(` の間に
+/// 空白を書ける。CSS の注釈（`/` を含むもの）は書けない。空の値と `none` は単位の行列。読めなければ None。
+pub(crate) fn transform_attr(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<Option<Transform>, Error> {
     let budget = budget_ref(budget);
+    // `/` は SVG の書き方にない（CSS の字句は注釈を黙って飛ばすので、先にバイトで見る）
+    if has_byte(s, range, b'/', budget)? {
+        return Ok(None);
+    }
     let mut v = Values::new(s, range, budget);
     let mut m = Transform::IDENTITY;
     if v.eat_ident(b"none")? {
@@ -661,17 +730,53 @@ pub(crate) fn transform(
     loop {
         budget.spend(cost::OP_STEP)?;
         if v.at_end()? {
-            return Ok(if first { if attr { Some(m) } else { None } } else { Some(m) });
+            return Ok(Some(m));
         }
-        if !first && attr {
-            v.eat(Kind::Comma)?;
-        }
-        let f = v.next()?;
-        if f.kind != Kind::Function {
+        if !first && v.eat(Kind::Comma)? && v.at_end()? {
+            // 終わりの `,`
             return Ok(None);
         }
-        let name = |w: &[u8]| ident_is(s, f.inner, f.escaped, w);
-        let Some(t) = transform_fn(&mut v, &name, attr, font_size)? else { return Ok(None) };
+        let f = v.next()?;
+        let name = match f.kind {
+            Kind::Function if !f.escaped => f.inner.of(s),
+            // 名前と `(` の間の空白
+            Kind::Ident if !f.escaped && v.eat(Kind::LParen)? => f.inner.of(s),
+            _ => return Ok(None),
+        };
+        let (min, max): (usize, usize) = match name {
+            b"matrix" => (6, 6),
+            b"translate" | b"scale" => (1, 2),
+            b"rotate" => (1, 3),
+            b"skewX" | b"skewY" => (1, 1),
+            _ => return Ok(None),
+        };
+        let mut a = [0.0f64; 6];
+        let mut n = 0usize;
+        loop {
+            if v.eat(Kind::RParen)? {
+                break;
+            }
+            if n >= max || (n > 0 && v.eat(Kind::Comma)? && v.peek()?.kind == Kind::RParen) {
+                return Ok(None);
+            }
+            let Some(x) = v.number()? else { return Ok(None) };
+            if let Some(slot) = a.get_mut(n) {
+                *slot = x;
+            }
+            n = n.saturating_add(1);
+        }
+        if n < min || (name == b"rotate" && n == 2) {
+            return Ok(None);
+        }
+        let [a0, a1, a2, a3, a4, a5] = a;
+        let t = match name {
+            b"matrix" => Transform { a: a0, b: a1, c: a2, d: a3, e: a4, f: a5 },
+            b"translate" => Transform { e: a0, f: if n > 1 { a1 } else { 0.0 }, ..Transform::IDENTITY },
+            b"scale" => Transform { a: a0, d: if n > 1 { a1 } else { a0 }, ..Transform::IDENTITY },
+            b"rotate" => rotate(a0, if n == 3 { Some((a1, a2)) } else { None }),
+            b"skewX" => Transform { c: math::tan(a0 * math::DEG_TO_RAD), ..Transform::IDENTITY },
+            _ => Transform { b: math::tan(a0 * math::DEG_TO_RAD), ..Transform::IDENTITY },
+        };
         m = m.then(&t);
         if !m.finite() {
             return Ok(None);
@@ -680,111 +785,121 @@ pub(crate) fn transform(
     }
 }
 
+/// `deg` 度の回転（`center` があればその点のまわり）。
+fn rotate(deg: f64, center: Option<(f64, f64)>) -> Transform {
+    let rad = deg * math::DEG_TO_RAD;
+    let (sn, cs) = (math::sin(rad), math::cos(rad));
+    let r = Transform { a: cs, b: sn, c: -sn, d: cs, e: 0.0, f: 0.0 };
+    match center {
+        Some((cx, cy)) => {
+            let to = Transform { e: cx, f: cy, ..Transform::IDENTITY };
+            let back = Transform { e: -cx, f: -cy, ..Transform::IDENTITY };
+            to.then(&r).then(&back)
+        }
+        None => r,
+    }
+}
+
+/// `range` の中に `b` があるか（読むバイトを塊ずつ払う）。
+fn has_byte(s: &[u8], range: Span, b: u8, budget: &Budget<'_>) -> Result<bool, Error> {
+    let bytes = range.of(s);
+    let mut meter = crate::xml::lex::ScanMeter::new(0, bytes.len());
+    for (i, &c) in bytes.iter().enumerate() {
+        meter.pay(budget, i)?;
+        if c == b {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// CSS の `transform` プロパティの形が正しいか（CSS Transforms 1・2 の 2 次元の関数。長さはどの単位も受け、行列にするのは
+/// 木を作る段で文脈を使って行う。`viewport` が偽なら vw などの単位は壊れた値）。3 次元の関数は読まない（壊れた値。ADR-74）。
+pub(crate) fn transform_css_valid(s: &[u8], range: Span, viewport: bool, budget: &Budget<'_>) -> Result<bool, Error> {
+    let budget = budget_ref(budget);
+    let mut v = Values::new(s, range, budget);
+    if v.eat_ident(b"none")? {
+        return v.at_end();
+    }
+    if v.at_end()? {
+        return Ok(false);
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Arg {
+        /// 長さか割合
+        Lp,
+        Ang,
+        /// 数か割合（scale）
+        NumPct,
+        Num,
+    }
+    while !v.at_end()? {
+        budget.spend(cost::OP_STEP)?;
+        let f = v.next()?;
+        if f.kind != Kind::Function {
+            return Ok(false);
+        }
+        let is = |w: &[u8]| ident_is(s, f.inner, f.escaped, w);
+        let (kind, min, max) = if is(b"matrix") {
+            (Arg::Num, 6usize, 6usize)
+        } else if is(b"translate") {
+            (Arg::Lp, 1, 2)
+        } else if is(b"translatex") || is(b"translatey") {
+            (Arg::Lp, 1, 1)
+        } else if is(b"scale") {
+            (Arg::NumPct, 1, 2)
+        } else if is(b"scalex") || is(b"scaley") {
+            (Arg::NumPct, 1, 1)
+        } else if is(b"rotate") || is(b"rotatez") || is(b"skewx") || is(b"skewy") {
+            (Arg::Ang, 1, 1)
+        } else if is(b"skew") {
+            (Arg::Ang, 1, 2)
+        } else {
+            return Ok(false);
+        };
+        let mut n = 0usize;
+        loop {
+            if v.eat(Kind::RParen)? {
+                break;
+            }
+            if n >= max || (n > 0 && !v.eat(Kind::Comma)?) {
+                return Ok(false);
+            }
+            let ok = match kind {
+                Arg::Num => v.number()?.is_some(),
+                Arg::Ang => v.angle(false)?.is_some(),
+                Arg::NumPct => {
+                    let t = v.peek()?;
+                    let ok = t.finite && matches!(t.kind, Kind::Number | Kind::Percentage);
+                    if ok {
+                        v.next()?;
+                    }
+                    ok
+                }
+                Arg::Lp => v.length(false)?.is_some_and(|l| viewport || !l.unit.viewport()),
+            };
+            if !ok {
+                return Ok(false);
+            }
+            n = n.saturating_add(1);
+        }
+        if n < min {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {
     b
 }
 
-/// 変形の関数の引数（`(` を読んだあと。`)` まで）。
-fn transform_fn(
-    v: &mut Values<'_, '_>,
-    name: &dyn Fn(&[u8]) -> bool,
-    attr: bool,
-    font_size: f64,
-) -> Result<Option<Transform>, Error> {
-    // 引数：数・長さ・角度を `,` で区切る（属性では `,` を省いてよい）
-    #[derive(Clone, Copy)]
-    enum Arg {
-        Len,
-        Ang,
-        Num,
-    }
-    let (kinds, min, max): (&[Arg], usize, usize) = if name(b"matrix") {
-        (&[Arg::Num; 6], 6, 6)
-    } else if name(b"translate") {
-        (&[Arg::Len, Arg::Len], 1, 2)
-    } else if name(b"translatex") || name(b"translatey") {
-        (&[Arg::Len], 1, 1)
-    } else if name(b"scale") {
-        (&[Arg::Num, Arg::Num], 1, 2)
-    } else if name(b"scalex") || name(b"scaley") {
-        (&[Arg::Num], 1, 1)
-    } else if name(b"rotate") {
-        if attr { (&[Arg::Ang, Arg::Num, Arg::Num], 1, 3) } else { (&[Arg::Ang], 1, 1) }
-    } else if name(b"skew") {
-        (&[Arg::Ang, Arg::Ang], 1, 2)
-    } else if name(b"skewx") || name(b"skewy") {
-        (&[Arg::Ang], 1, 1)
-    } else {
-        return Ok(None);
-    };
-    let mut vals = [0.0f64; 6];
-    let mut n = 0usize;
-    loop {
-        if v.eat(Kind::RParen)? {
-            break;
-        }
-        if n >= max {
-            return Ok(None);
-        }
-        if n > 0 && !v.eat(Kind::Comma)? && !attr {
-            return Ok(None);
-        }
-        let Some(&k) = kinds.get(n) else { return Ok(None) };
-        let x = match k {
-            Arg::Num => v.number()?,
-            Arg::Ang => v.angle(attr)?,
-            Arg::Len => match v.length(attr)? {
-                Some(l) if l.unit == Unit::Em => Some(l.value * font_size),
-                Some(l) => l.absolute_px(),
-                None => None,
-            },
-        };
-        let Some(x) = x else { return Ok(None) };
-        if let Some(slot) = vals.get_mut(n) {
-            *slot = x;
-        }
-        n = n.saturating_add(1);
-    }
-    if n < min || (name(b"rotate") && attr && n == 2) {
-        return Ok(None);
-    }
-    let [a0, a1, a2, a3, a4, a5] = vals;
-    let rad = |d: f64| d * math::DEG_TO_RAD;
-    Ok(Some(if name(b"matrix") {
-        Transform { a: a0, b: a1, c: a2, d: a3, e: a4, f: a5 }
-    } else if name(b"translate") {
-        Transform { e: a0, f: if n > 1 { a1 } else { 0.0 }, ..Transform::IDENTITY }
-    } else if name(b"translatex") {
-        Transform { e: a0, ..Transform::IDENTITY }
-    } else if name(b"translatey") {
-        Transform { f: a0, ..Transform::IDENTITY }
-    } else if name(b"scale") {
-        Transform { a: a0, d: if n > 1 { a1 } else { a0 }, ..Transform::IDENTITY }
-    } else if name(b"scalex") {
-        Transform { a: a0, ..Transform::IDENTITY }
-    } else if name(b"scaley") {
-        Transform { d: a0, ..Transform::IDENTITY }
-    } else if name(b"rotate") {
-        let (sn, cs) = (math::sin(rad(a0)), math::cos(rad(a0)));
-        let r = Transform { a: cs, b: sn, c: -sn, d: cs, e: 0.0, f: 0.0 };
-        if n == 3 {
-            let to = Transform { e: a1, f: a2, ..Transform::IDENTITY };
-            let back = Transform { e: -a1, f: -a2, ..Transform::IDENTITY };
-            to.then(&r).then(&back)
-        } else {
-            r
-        }
-    } else if name(b"skew") {
-        Transform { c: math::tan(rad(a0)), b: if n > 1 { math::tan(rad(a1)) } else { 0.0 }, ..Transform::IDENTITY }
-    } else if name(b"skewx") {
-        Transform { c: math::tan(rad(a0)), ..Transform::IDENTITY }
-    } else {
-        Transform { b: math::tan(rad(a0)), ..Transform::IDENTITY }
-    }))
-}
-
 /// `viewBox`（4 つの数。幅と高さは負でない。0 は呼び手が扱う）。
 pub(crate) fn view_box(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<Option<ViewBox>, Error> {
+    // SVG の数の並び（CSS の注釈は書けない）
+    if has_byte(s, range, b'/', budget)? {
+        return Ok(None);
+    }
     let mut v = Values::new(s, range, budget_ref(budget));
     let mut xs = [0.0f64; 4];
     let mut k = 0usize;
@@ -802,10 +917,12 @@ pub(crate) fn view_box(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<Opt
     Ok((w >= 0.0 && h >= 0.0).then_some(ViewBox { x, y, w, h }))
 }
 
-/// `preserveAspectRatio`（`defer` は読み飛ばす）。
+/// `preserveAspectRatio`（言葉は大文字小文字を区別する。SVG 2 で除かれた `defer` は書けない。Chrome と同じ）。
 pub(crate) fn aspect(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<Option<Aspect>, Error> {
+    if has_byte(s, range, b'/', budget)? {
+        return Ok(None);
+    }
     let mut v = Values::new(s, range, budget_ref(budget));
-    v.eat_ident(b"defer")?;
     let t = v.next()?;
     if t.kind != Kind::Ident || t.escaped {
         return Ok(None);
@@ -823,11 +940,12 @@ pub(crate) fn aspect(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<Optio
         b"xMaxYMax" => Align::XMaxYMax,
         _ => return Ok(None),
     };
-    let slice = if v.eat_ident(b"slice")? {
-        true
-    } else {
-        v.eat_ident(b"meet")?;
-        false
+    let n = v.next()?;
+    let slice = match n.kind {
+        Kind::Eof => return Ok(Some(Aspect { align, slice: false })),
+        Kind::Ident if !n.escaped && n.inner.of(s) == b"meet" => false,
+        Kind::Ident if !n.escaped && n.inner.of(s) == b"slice" => true,
+        _ => return Ok(None),
     };
     Ok(v.at_end()?.then_some(Aspect { align, slice }))
 }

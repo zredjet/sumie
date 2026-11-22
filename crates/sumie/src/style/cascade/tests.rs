@@ -148,3 +148,63 @@ fn foreign_elements_have_no_styles() {
     assert!(out.iter().find(|(i, _)| i == "f").unwrap().1.is_empty());
     assert_eq!(get(&out, "r", "stroke"), Some("blue"));
 }
+
+/// `font` のまとめは長い名前に分け、書いていない長い名前は initial（あとの長い名前の宣言との順が残る。Chrome と同じ）。
+#[test]
+fn font_shorthand_expands() {
+    let svg = format!(
+        "<svg {SVG}><text id=\"a\" style=\"font-size:10px; font: italic 30px/2 serif\"/><text id=\"b\" style=\"font: 30px serif; font-size:10px\"/><text id=\"c\" style=\"font: inherit\"/><text id=\"d\" style=\"font: caption\"/></svg>"
+    );
+    let out = run(&svg, "");
+    assert_eq!(get(&out, "a", "font-size"), Some("30px"));
+    assert_eq!(get(&out, "a", "font-style"), Some("italic"));
+    assert_eq!(get(&out, "a", "line-height"), Some("2"));
+    assert_eq!(get(&out, "a", "font-family"), Some("serif"));
+    assert_eq!(get(&out, "a", "font-weight"), Some("initial"));
+    assert_eq!(get(&out, "a", "font-kerning"), Some("initial"));
+    assert_eq!(get(&out, "b", "font-size"), Some("10px"));
+    assert_eq!(get(&out, "b", "font-family"), Some("serif"));
+    assert_eq!(get(&out, "c", "font-size"), Some("inherit"));
+    assert_eq!(get(&out, "c", "font-family"), Some("inherit"));
+    assert_eq!(get(&out, "d", "font-family"), Some("initial"));
+}
+
+/// `revert-layer` は宣言がないものとして弱い宣言に戻す。名前の escape を解く。`d` 属性はパスの書き方。アニメーションの
+/// 要素の `fill` は塗りでない。
+#[test]
+fn revert_layer_escapes_and_attributes() {
+    let svg = format!(
+        "<svg {SVG}><rect id=\"r\" fill=\"green\" style=\"fill: revert-layer; f\\69ll-opacity: .5\"/><path id=\"p\" d=\"M0 0 L1 1\"/><animate id=\"a\" fill=\"freeze\"/></svg>"
+    );
+    let out = run(&svg, "@layer a { rect { stroke: blue } } rect { stroke: revert-layer }");
+    assert_eq!(get(&out, "r", "fill"), Some("green"));
+    assert_eq!(get(&out, "r", "fill-opacity"), Some(".5"));
+    assert_eq!(get(&out, "r", "stroke"), Some("blue"));
+    assert_eq!(get(&out, "p", "d"), Some("M0 0 L1 1"));
+    assert_eq!(get(&out, "a", "fill"), None);
+}
+
+/// 大きさの決まらない文書では vw などは壊れた値（警告して属性の値に戻る）。CSS の width は単位のない数を受けない。
+#[test]
+fn viewport_units_and_unitless_css() {
+    let svg = format!(
+        "<svg {SVG}><rect id=\"r\" width=\"5\" style=\"width: 10vw\"/><rect id=\"s\" width=\"5\" style=\"width: 100\"/></svg>"
+    );
+    let input = svg.as_bytes();
+    let b0 = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let counts = crate::xml::count(input, &Limits::DEFAULT, &b0, Stage::Parse).unwrap();
+    let doc = crate::xml::build(input, &counts, &Limits::DEFAULT, &b0, Stage::Parse).unwrap();
+    let sb = SheetBuilder::new(&b0);
+    let sheet = sb.finish().unwrap();
+    let env = Env { color_scheme: ColorScheme::Light, size: None };
+    let st = cascade(&doc, input, &sheet, &env, &b0).unwrap();
+    // どちらも属性の width が勝ち、警告が 2 つ
+    for node in [1u32, 2] {
+        let w: Vec<_> = st.of(node).iter().filter(|s| prop(s.prop).unwrap().name == b"width").collect();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].origin, ORIGIN_ATTR);
+    }
+    assert_eq!(st.warnings.len(), 2);
+    let out = run(&svg, "");
+    assert_eq!(get(&out, "r", "width"), Some("10vw"));
+}

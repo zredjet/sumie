@@ -78,3 +78,55 @@ fn supports_conditions() {
     assert!(sp("((fill: red) or (bogus: 1)) and (opacity: 1)"));
     assert!(!sp("unknown(1)"));
 }
+
+/// 書き方の確かめ（Media Queries 4 の文法。Chrome 157 と同じ）と、特徴ごとの値の形。
+#[test]
+fn media_grammar_and_value_types() {
+    let s = Some((100.0, 50.0));
+    let l = ColorScheme::Light;
+    for (q, want) in [
+        ("(min-aspect-ratio: 1/1)", true),
+        ("(aspect-ratio: 2/1)", true),
+        ("(aspect-ratio: 2 / 1)", true),
+        ("(max-aspect-ratio: 1/1)", false),
+        ("(aspect-ratio > 1/1)", true),
+        ("screen and (color) or (monochrome)", false),
+        ("screen and ((color) or (monochrome))", true),
+        ("not (monochrome) and (color)", false),
+        ("(color) and not (monochrome)", false),
+        ("(100px <= width >= 50px)", false),
+        ("(50px < width < 150px)", true),
+        ("(150px > width > 50px)", true),
+        ("(50px = width = 50px)", false),
+        ("(min-width: 100)", false),
+        ("(min-width: 0)", true),
+        ("(resolution: 1px)", false),
+        ("(resolution: 96dpi)", true),
+        ("(min-resolution: 1x)", true),
+        ("(color: 8.0)", false),
+        ("(color: 8)", true),
+        ("((color) foo, (color)", false),
+        ("(color) foo, (color)", true),
+    ] {
+        assert_eq!(m(q, s, l), want, "{q}");
+    }
+}
+
+#[test]
+fn supports_general_enclosed_and_important() {
+    let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let sp =
+        |q: &str| supports(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap();
+    // 知らない形は偽（CSS Conditional 3 §6.1）
+    assert!(sp("not (foo)"));
+    assert!(sp("(fill: red) and (not (foo))"));
+    assert!(!sp("(foo)"));
+    assert!(sp("not unknown(1)"));
+    // `!important` と名前の escape
+    assert!(sp("(fill: red !important)"));
+    assert!(sp("(f\\69ll: red)"));
+    // `not` の段に and を書けない
+    assert!(!sp("not (fill: red) and (stroke: red)"));
+    // 表示の領域の単位は形だけを見る
+    assert!(sp("(width: 10vw)"));
+}

@@ -97,7 +97,8 @@ fn pipeline<'s>(svg: &'s [u8], opts: &ParseOptions<'_>, budget: &Budget<'_>) -> 
     let counts = xml::count(svg, limits, budget, Stage::Parse)?;
     let doc = xml::build(svg, &counts, limits, budget, Stage::Parse)?;
     let sheet = read_sheets(&doc, svg, budget)?;
-    let env = Env { color_scheme: opts.style.color_scheme, size: attribute_size(&doc, svg, budget)? };
+    let env =
+        Env { color_scheme: opts.style.color_scheme, size: attribute_size(&doc, svg, opts.style.font_size, budget)? };
     let styles = cascade(&doc, svg, &sheet, &env, budget)?;
     let report = report(&sheet, &styles, budget)?;
     Ok(Document { input: svg, xml: doc, sheet, styles, limits: opts.limits, report })
@@ -139,11 +140,11 @@ fn each_style(
         if n.kind != KIND_ELEMENT || n.ns != NS_SVG || n.local.of(input) != b"style" {
             continue;
         }
-        if let Some(t) = doc.attr(input, n, NS_NONE, b"type", budget)? {
-            let t = trim(t);
-            if !(t.is_empty() || t.eq_ignore_ascii_case(b"text/css")) {
-                continue;
-            }
+        // `type` は空か `text/css`（大文字小文字を問わない。前後の空白は捨てない。Chrome と同じ）
+        if let Some(t) = doc.attr(input, n, NS_NONE, b"type", budget)?
+            && !(t.is_empty() || t.eq_ignore_ascii_case(b"text/css"))
+        {
+            continue;
         }
         scratch.clear();
         let mut c = n.first_child;
@@ -161,40 +162,46 @@ fn each_style(
     Ok(())
 }
 
-fn trim(mut s: &[u8]) -> &[u8] {
-    while let [first, rest @ ..] = s
-        && matches!(first, b' ' | b'\t' | b'\n' | b'\r')
-    {
-        s = rest;
-    }
-    while let [rest @ .., last] = s
-        && matches!(last, b' ' | b'\t' | b'\n' | b'\r')
-    {
-        s = rest;
-    }
-    s
-}
-
-/// `@media` を照らす文書の大きさ：外側の `svg` の `width`・`height` 属性（絶対の長さか単位のない数）と `viewBox` から
-/// （ADR-66 (2)。CSS の width・height は見ない）。中身で決まるとき・相対の長さのときは None。
-fn attribute_size(doc: &XmlDoc, input: &[u8], budget: &Budget<'_>) -> Result<Option<(f64, f64)>, Error> {
+/// `@media` と表示の領域の単位（vw など）に使う文書の大きさ（FR-OUT-01 のうち、属性で決まる所。ADR-74）：外側の `svg` の
+/// `width`・`height`（絶対の長さか単位のない数。em・ex・ch・ic・cap・rem は `font_size` で解く）。`viewBox` があれば、% は
+/// viewBox の大きさに対する割合、片方だけ（か壊れた値）なら viewBox の縦横の比で補い、どちらもなければ viewBox の大きさ。
+/// viewBox がなく、どちらかが欠ける・%・壊れた値なら、大きさは中身で決まる（None）。0 か負も None（木を作る段で断る）。
+fn attribute_size(
+    doc: &XmlDoc,
+    input: &[u8],
+    font_size: f64,
+    budget: &Budget<'_>,
+) -> Result<Option<(f64, f64)>, Error> {
     let budget = budget_ref(budget);
-    let Some(root) = doc.nodes.as_slice().iter().find(|n| n.kind == KIND_ELEMENT && n.parent == xml::NONE) else {
+    let Some(root) = doc.nodes.as_slice().first().filter(|n| n.kind == KIND_ELEMENT) else {
         return Ok(None);
     };
     if root.ns != NS_SVG || root.local.of(input) != b"svg" {
         return Ok(None);
     }
-    let len = |name: &[u8]| -> Result<Option<Option<f64>>, Error> {
-        // 外の None は属性がない、内の None は解けない長さ
-        let Some(a) = doc.find_attr(input, root, NS_NONE, name, budget)? else {
-            return Ok(None);
-        };
+    /// 幅か高さの属性：絶対の大きさ、割合、なしか壊れた値。
+    enum Dim {
+        Abs(f64),
+        Pct(f64),
+        No,
+    }
+    let len = |name: &[u8]| -> Result<Dim, Error> {
+        let Some(a) = doc.find_attr(input, root, NS_NONE, name, budget)? else { return Ok(Dim::No) };
         let (buf, span) = attr_buf(doc, input, a);
         let mut v = Values::new(buf, span, budget);
         let l: Option<Length> = v.length(true)?;
-        let ok = v.at_end()?;
-        Ok(Some(l.filter(|_| ok).filter(|l| l.unit != Unit::Percent).and_then(|l| l.absolute_px())))
+        if !v.at_end()? {
+            return Ok(Dim::No);
+        }
+        let Some(l) = l else { return Ok(Dim::No) };
+        let px = match l.unit {
+            Unit::Percent => return Ok(Dim::Pct(l.value)),
+            Unit::Em | Unit::Rem | Unit::Ic => Some(l.value * font_size),
+            Unit::Ex | Unit::Ch => Some(l.value * font_size * 0.5),
+            Unit::Cap => Some(l.value * font_size * 0.7),
+            _ => l.absolute_px(),
+        };
+        Ok(px.filter(|x| x.is_finite()).map_or(Dim::No, Dim::Abs))
     };
     let w = len(b"width")?;
     let h = len(b"height")?;
@@ -205,13 +212,29 @@ fn attribute_size(doc: &XmlDoc, input: &[u8], budget: &Budget<'_>) -> Result<Opt
         }
         None => None,
     };
-    Ok(match (w, h, vb) {
-        (Some(Some(w)), Some(Some(h)), _) => Some((w, h)),
-        (Some(Some(w)), None, Some(v)) => Some((w, w * v.h / v.w)),
-        (None, Some(Some(h)), Some(v)) => Some((h * v.w / v.h, h)),
-        (None, None, Some(v)) => Some((v.w, v.h)),
+    let size = match (w, h, vb) {
+        (Dim::Abs(w), Dim::Abs(h), _) => Some((w, h)),
+        (w, h, Some(v)) => {
+            let rw = match w {
+                Dim::Abs(x) => Some(x),
+                Dim::Pct(p) => Some(v.w * p / 100.0),
+                Dim::No => None,
+            };
+            let rh = match h {
+                Dim::Abs(x) => Some(x),
+                Dim::Pct(p) => Some(v.h * p / 100.0),
+                Dim::No => None,
+            };
+            match (rw, rh) {
+                (Some(w), Some(h)) => Some((w, h)),
+                (Some(w), None) => Some((w, w * v.h / v.w)),
+                (None, Some(h)) => Some((h * v.w / v.h, h)),
+                (None, None) => Some((v.w, v.h)),
+            }
+        }
         _ => None,
-    })
+    };
+    Ok(size.filter(|&(w, h)| w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0))
 }
 
 /// 属性の値の置き場と範囲。

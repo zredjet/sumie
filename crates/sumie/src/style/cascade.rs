@@ -11,16 +11,16 @@
 use crate::budget::Budget;
 use crate::cost;
 use crate::css::decl::{Decl, Item, parse_declarations};
-use crate::css::lex::Lexer;
+use crate::css::lex::{Lexer, decode};
 use crate::css::matcher::{MatchSink, match_rules};
 use crate::css::select::NONE;
 use crate::css::sheet::{COND_MEDIA, Sheet};
 use crate::error::Error;
-use crate::mem::{Frozen, MVec, Plain};
+use crate::mem::{Frozen, MVec, Plain, stable_sort};
 use crate::report::WarningKind;
 use crate::style::cond::{Env, media, supports};
 use crate::style::props::{PROPS, PropertyId, lookup, prop};
-use crate::style::valid::{Wide, valid, wide};
+use crate::style::valid::{Ctx, Wide, font_parts, valid, wide};
 use crate::xml::lex::Span;
 use crate::xml::{FLAG_IN_STORE, NS_NONE, NS_SVG, Node, XmlDoc};
 
@@ -44,7 +44,7 @@ pub(crate) struct Specified {
     pub(crate) prop: u16,
     pub(crate) src: u8,
     pub(crate) origin: u8,
-    /// CSS の全体の言葉（0 なし、1 inherit、2 initial、3 unset）
+    /// CSS の全体の言葉（0 なし、1 inherit、2 initial、3 unset。`revert-layer` の宣言は勝たないので持たない）
     pub(crate) wide: u8,
     pub(crate) pad: [u8; 3],
 }
@@ -135,13 +135,27 @@ impl Slot {
     }
 }
 
+/// `Specified::wide` の値。
+pub(crate) const WIDE_NONE: u8 = 0;
+pub(crate) const WIDE_INHERIT: u8 = 1;
+pub(crate) const WIDE_INITIAL: u8 = 2;
+pub(crate) const WIDE_UNSET: u8 = 3;
+/// `revert-layer`（候補にしない。弱い宣言に戻す）
+const WIDE_REVERT_LAYER: u8 = 4;
+
 const fn wide_code(w: Option<Wide>) -> u8 {
     match w {
-        None => 0,
-        Some(Wide::Inherit) => 1,
-        Some(Wide::Initial) => 2,
-        Some(Wide::Unset) => 3,
+        None => WIDE_NONE,
+        Some(Wide::Inherit) => WIDE_INHERIT,
+        Some(Wide::Initial) => WIDE_INITIAL,
+        Some(Wide::Unset) => WIDE_UNSET,
+        Some(Wide::RevertLayer) => WIDE_REVERT_LAYER,
     }
+}
+
+/// アニメーションの要素（`fill` 属性は時の扱いで、塗りではない）。
+fn animation(local: &[u8]) -> bool {
+    matches!(local, b"animate" | b"animateMotion" | b"animateTransform" | b"animateColor" | b"set" | b"discard")
 }
 
 /// 幾何のプロパティのプレゼンテーション属性を、この要素で読むか。
@@ -190,6 +204,8 @@ pub(crate) fn cascade(
     }
     // 層の順位（真の条件の所で名前を書いた順）
     let ranks = sheet.layer_ranks(cond_ok.as_slice(), budget)?;
+    // 表示の領域の単位（vw など）は文書の大きさが決まるときだけ読める
+    let viewport = env.size.is_some();
     // 規則の宣言を 1 度だけ確かめる（宣言は規則の順に続いて並ぶ。規則の外の宣言はない）
     let mut warns: MVec<'_, Warn> = MVec::new(budget);
     let mut infos: MVec<'_, DeclInfo> = MVec::with_capacity(budget, sheet.decls.len())?;
@@ -198,7 +214,7 @@ pub(crate) fn cascade(
         for k in r.decls.start..r.decls.end {
             budget.spend(cost::OP_STEP)?;
             let Some(d) = sheet.decls.as_slice().get(k as usize) else { continue };
-            let info = check_decl(text, d, budget)?;
+            let info = check_decl(text, d, viewport, budget)?;
             if info.prop != u16::MAX && info.ok == 0 {
                 warns.push(Warn { pos: r.pos, kind: WarningKind::InvalidValue, pad: 0 })?;
             }
@@ -215,8 +231,10 @@ pub(crate) fn cascade(
         sheet,
         infos: infos.as_slice(),
         ranks: ranks.as_slice(),
+        viewport,
         budget,
         slots: MVec::with_capacity(budget, PROPS.len())?,
+        touched: MVec::with_capacity(budget, PROPS.len())?,
         cur: NONE,
         specs: MVec::new(budget),
         index: MVec::with_capacity(budget, nodes.saturating_add(1))?,
@@ -244,15 +262,34 @@ fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {
     b
 }
 
+/// 宣言の名前（escape を解く）でプロパティを引く。
+pub(crate) fn decl_prop(text: &[u8], d: &Decl, budget: &Budget<'_>) -> Result<Option<PropertyId>, Error> {
+    budget.spend(cost::LOOKUP)?;
+    if d.name_escaped == 0 {
+        return Ok(lookup(d.name.of(text), true));
+    }
+    // 名前は 32 バイトの内の ASCII（表のどの名前もそう）
+    let mut buf = [0u8; 32];
+    let mut n = 0usize;
+    for c in decode(text, d.name) {
+        let Some(b) = u8::try_from(c).ok().filter(u8::is_ascii) else { return Ok(None) };
+        let Some(x) = buf.get_mut(n) else { return Ok(None) };
+        *x = b;
+        n = n.saturating_add(1);
+    }
+    Ok(lookup(buf.get(..n).unwrap_or(&[]), true))
+}
+
 /// 宣言の名前と値を確かめる（知らない名前は prop が u16::MAX）。
-fn check_decl(text: &[u8], d: &Decl, budget: &Budget<'_>) -> Result<DeclInfo, Error> {
-    let name = d.name.of(text);
-    let id = if d.name_escaped != 0 { None } else { lookup(name, true) };
-    let Some(id) = id else { return Ok(DeclInfo { prop: u16::MAX, wide: 0, ok: 0 }) };
+fn check_decl(text: &[u8], d: &Decl, viewport: bool, budget: &Budget<'_>) -> Result<DeclInfo, Error> {
+    let Some(id) = decl_prop(text, d, budget)? else { return Ok(DeclInfo { prop: u16::MAX, wide: 0, ok: 0 }) };
     let w = wide(text, d.value, budget)?;
     let ok = match (w, prop(id)) {
         (Some(_), _) => true,
-        (None, Some(p)) => valid(p.kind, text, d.value, false, budget)?,
+        (None, Some(p)) => {
+            let cx = Ctx { attr: false, unitless: p.unitless, viewport };
+            valid(p.kind, text, d.value, cx, budget)?
+        }
         (None, None) => false,
     };
     Ok(DeclInfo { prop: id, wide: wide_code(w), ok: u8::from(ok) })
@@ -288,8 +325,12 @@ struct Out<'a, 'b> {
     infos: &'a [DeclInfo],
     /// まとめた層ごとの順位
     ranks: &'a [u32],
+    /// 表示の領域の単位を読めるか
+    viewport: bool,
     budget: &'b Budget<'b>,
     slots: MVec<'b, Slot>,
+    /// この要素で候補を置いたプロパティ（書き出すときに並べる）
+    touched: MVec<'b, u16>,
     /// 決めている要素（なければ NONE）
     cur: u32,
     specs: MVec<'b, Specified>,
@@ -302,37 +343,93 @@ impl Out<'_, '_> {
         self.doc.node(self.cur)
     }
 
-    /// 候補を置く（強ければ入れ替える）。
+    /// 候補を置く（強ければ入れ替える）。まとめのプロパティ（`marker`・`font`）は長い名前に分ける。`revert-layer` は
+    /// 候補にしない（弱い宣言に戻す）。
     fn offer(&mut self, prop: PropertyId, key: Key, spec: Specified) -> Result<(), Error> {
         self.budget.spend(cost::OP_STEP)?;
-        // marker のまとめは 3 つに分ける
-        if PROPS.get(usize::from(prop)).is_some_and(|p| p.name == b"marker") {
+        if spec.wide == WIDE_REVERT_LAYER {
+            return Ok(());
+        }
+        let name = PROPS.get(usize::from(prop)).map_or(&[][..], |p| p.name);
+        if name == b"marker" {
             for name in [b"marker-start".as_slice(), b"marker-mid", b"marker-end"] {
                 if let Some(id) = lookup(name, false) {
-                    self.put(id, key, Specified { prop: id, ..spec });
+                    self.put(id, key, Specified { prop: id, ..spec })?;
                 }
             }
             return Ok(());
         }
-        self.put(prop, key, spec);
+        if name == b"font" {
+            return self.offer_font(key, spec);
+        }
+        self.put(prop, key, spec)
+    }
+
+    /// `font` を長い名前に分ける（書いていない長い名前と、`font` が初期の値にするほかの長い名前は `initial`）。
+    fn offer_font(&mut self, key: Key, spec: Specified) -> Result<(), Error> {
+        let buf = match spec.src {
+            SRC_SHEET => self.sheet.text.as_slice(),
+            SRC_STORE => self.doc.store.as_slice(),
+            _ => self.input,
+        };
+        let parts = if spec.wide == WIDE_NONE {
+            let cx = Ctx { attr: false, unitless: false, viewport: self.viewport };
+            match font_parts(buf, spec.value, cx, self.budget)? {
+                Some(p) => Some(p),
+                None => return Ok(()),
+            }
+        } else {
+            None
+        };
+        let longhands: [(&[u8], Option<Span>); 11] = {
+            let p = parts.unwrap_or_default();
+            [
+                (b"font-style", p.style),
+                (b"font-variant", p.variant),
+                (b"font-weight", p.weight),
+                (b"font-stretch", p.stretch),
+                (b"font-size", p.size),
+                (b"line-height", p.line_height),
+                (b"font-family", p.family),
+                (b"font-size-adjust", None),
+                (b"font-kerning", None),
+                (b"font-feature-settings", None),
+                (b"font-variation-settings", None),
+            ]
+        };
+        for (name, part) in longhands {
+            let Some(id) = lookup(name, false) else { continue };
+            let s = match (parts, part) {
+                // `font: inherit` などは長い名前もみな同じ言葉
+                (None, _) => Specified { prop: id, ..spec },
+                (Some(_), Some(range)) => Specified { prop: id, value: range, wide: WIDE_NONE, ..spec },
+                (Some(_), None) => Specified { prop: id, value: Span::default(), wide: WIDE_INITIAL, ..spec },
+            };
+            self.put(id, key, s)?;
+        }
         Ok(())
     }
 
-    fn put(&mut self, prop: PropertyId, key: Key, spec: Specified) {
-        if let Some(s) = self.slots.get_mut(usize::from(prop))
-            && (s.set == 0 || key >= s.key())
-        {
-            *s = Slot {
-                set: 1,
-                pad: [0; 3],
-                key_tier: u32::from(key.tier),
-                key_layer: key.layer,
-                key_spec: key.spec,
-                key_order: key.order,
-                key_idx: key.idx,
-                spec,
-            };
+    fn put(&mut self, prop: PropertyId, key: Key, spec: Specified) -> Result<(), Error> {
+        let Some(s) = self.slots.get_mut(usize::from(prop)) else { return Ok(()) };
+        if s.set != 0 && key < s.key() {
+            return Ok(());
         }
+        let first = s.set == 0;
+        *s = Slot {
+            set: 1,
+            pad: [0; 3],
+            key_tier: u32::from(key.tier),
+            key_layer: key.layer,
+            key_spec: key.spec,
+            key_order: key.order,
+            key_idx: key.idx,
+            spec,
+        };
+        if first {
+            self.touched.push(prop)?;
+        }
+        Ok(())
     }
 
     /// 要素の決めた指定の値を書き出し、次の要素のために空にする。プレゼンテーション属性と style 属性をここで足す。
@@ -351,18 +448,19 @@ impl Out<'_, '_> {
             self.budget.spend(cost::OP_STEP)?;
             self.index.push(start)?;
         }
-        for k in 0..self.slots.len() {
+        // 候補を置いたプロパティだけを、番号の順に書き出す
+        stable_sort(self.budget, self.touched.as_mut_slice(), |a, b| a < b)?;
+        for k in 0..self.touched.len() {
             self.budget.spend(cost::OP_STEP)?;
-            let Some(s) = self.slots.get_mut(k) else { continue };
-            if s.set == 0 {
-                continue;
-            }
+            let Some(&id) = self.touched.get(k) else { continue };
+            let Some(s) = self.slots.get_mut(usize::from(id)) else { continue };
             s.set = 0;
             let spec = Specified { node: e, ..s.spec };
             if n.ns == NS_SVG {
                 self.specs.push(spec)?;
             }
         }
+        self.touched.clear();
         self.cur = NONE;
         Ok(())
     }
@@ -373,7 +471,8 @@ impl Out<'_, '_> {
         let input = self.input;
         let local = n.local.of(input);
         for (k, a) in doc.attrs_of(n).iter().enumerate() {
-            self.budget.spend(cost::OP_STEP)?;
+            // 名前でプロパティを引く手間も払う
+            self.budget.spend(cost::LOOKUP)?;
             if a.ns != NS_NONE {
                 continue;
             }
@@ -388,11 +487,12 @@ impl Out<'_, '_> {
             let id = if name == b"transform" { lookup(b"transform", false) } else { lookup(name, false) };
             let Some(id) = id else { continue };
             let Some(p) = prop(id) else { continue };
-            if !(p.attr || name == b"transform") || !geometry_ok(local, name) {
+            if !(p.attr || name == b"transform") || !geometry_ok(local, name) || (name == b"fill" && animation(local)) {
                 continue;
             }
             let w = wide(buf, a.value, self.budget)?;
-            if w.is_none() && !valid(p.kind, buf, a.value, true, self.budget)? {
+            let cx = Ctx { attr: true, unitless: true, viewport: self.viewport };
+            if w.is_none() && !valid(p.kind, buf, a.value, cx, self.budget)? {
                 self.warns.push(Warn { pos: a.pos, kind: WarningKind::InvalidValue, pad: 0 })?;
                 continue;
             }
@@ -420,7 +520,7 @@ impl Out<'_, '_> {
         })?;
         for (k, d) in list.as_slice().iter().enumerate() {
             budget.spend(cost::OP_STEP)?;
-            let info = check_decl(buf, d, budget)?;
+            let info = check_decl(buf, d, self.viewport, budget)?;
             if info.prop == u16::MAX {
                 continue;
             }
