@@ -3,7 +3,7 @@
 //! 入力のバイト列を、行きがけの順の節の配列（[`XmlDoc`]）にする。2 つの段で読む：
 //!
 //! 1. 数える段（[`count`]）：整形式・名前空間・属性の重なり・実体を確かめ、節・属性・文字の置き場のバイト数と、作る段の
-//!    手間を数える。`estimate_parse` はこの段だけを走らせる
+//!    手間を数える
 //! 2. 作る段（[`build`]）：数えた量の容量を最初に取り（伸ばさない）、同じ歩き（[`walk`]）で節を作る
 //!
 //! 歩きの手間と確保は 2 つの段でぴったり同じ（同じ字句・同じ確かめ・同じ一時の入れ物）。作る段の手間は「数える段で
@@ -889,6 +889,20 @@ fn walk<'b>(
                             x.broken = 1;
                         }
                     }
+                    // 壊れた宣言を表から除く（並びは保つ。要素ごとに当てるときに回らない）
+                    let mut keep = 0usize;
+                    for k in 0..w.attlists.len() {
+                        budget.spend(cost::OP_STEP)?;
+                        let Some(&d) = w.attlists.get(k) else { continue };
+                        if d.broken != 0 {
+                            continue;
+                        }
+                        if let Some(x) = w.attlists.get_mut(keep) {
+                            *x = d;
+                        }
+                        keep = keep.saturating_add(1);
+                    }
+                    w.attlists.truncate(keep);
                 }
             }
             Event::Start { pos, name } => {
@@ -922,7 +936,8 @@ fn walk<'b>(
                 // ATTLIST：書いた属性の型を知り、書いていない属性に既定の値を足す（名前空間を解く前。xmlns の既定も効く）
                 apply_attlists(&w, qname, &mut raw)?;
                 let mark = bindings.len() as u32;
-                let mut default_bound = false;
+                // 既定の名前空間を束ねる宣言（文書の順に最初のもの。`xmlns` と `b:xmlns` のどちらでも。roxmltree と同じ）
+                let mut default_decl: Option<(usize, u8)> = None;
                 // 名前空間の宣言を束ねる（既定の値で足した属性の名前は、DOCTYPE で確かめてある）
                 for k in 0..raw.len() {
                     budget.spend(cost::OP_STEP)?;
@@ -964,17 +979,21 @@ fn walk<'b>(
                     // （SVG でも なし でもない「そのほか」）。既定の名前空間の宣言が重なれば最初のものを使う（roxmltree と同じ。
                     // 重なりの確かめでも誤りにしない）
                     let ns = if !pb.is_empty() && u.is_empty() { NS_OTHER } else { ns_of_uri(u) };
-                    if !(pb.is_empty() && default_bound) {
+                    if pb.is_empty() {
+                        if default_decl.is_none() {
+                            default_decl = Some((k, ns));
+                        }
+                    } else {
                         bindings.push(Binding { prefix: p, ns, pad: [0; 3] })?;
                     }
-                    default_bound |= pb.is_empty();
                 }
                 // 局所名が xmlns で接頭辞を束ねていない属性（`b:xmlns`）は、roxmltree と同じに既定の名前空間の宣言として
-                // 読む（名前空間 1.0 では束ねていない接頭辞の誤りだが、断らない。束ねた接頭辞なら仕様のとおりふつうの属性）
+                // 読む（名前空間 1.0 では束ねていない接頭辞の誤りだが、断らない。束ねた接頭辞なら仕様のとおりふつうの属性）。
+                // ATTLIST の既定の値で足したものは、束ねていない接頭辞の属性として捨てる（ADR-69 (3)）
                 for k in 0..raw.len() {
                     budget.spend(cost::OP_STEP)?;
                     let Some(&a) = raw.get(k) else { continue };
-                    if a.ns == NS_XMLNS || a.dropped != 0 {
+                    if a.ns == NS_XMLNS || a.dropped != 0 || a.from_decl != 0 {
                         continue;
                     }
                     let (prefix, local) = split_qname(b, a.name, budget)?;
@@ -1000,18 +1019,17 @@ fn walk<'b>(
                     if u == URI_XMLNS || u == URI_XML {
                         return Err(xml_err(a.pos as usize));
                     }
-                    if !default_bound {
-                        bindings.push(Binding {
-                            prefix: Span::new(a.name.end as usize, a.name.end as usize),
-                            ns: ns_of_uri(u),
-                            pad: [0; 3],
-                        })?;
-                        default_bound = true;
+                    if default_decl.is_none_or(|(at, _)| k < at) {
+                        default_decl = Some((k, ns_of_uri(u)));
                     }
                     if let Some(r) = raw.get_mut(k) {
                         r.ns = NS_XMLNS;
                         r.local = Span::new(a.name.end as usize, a.name.end as usize);
                     }
+                }
+                if let Some((at, ns)) = default_decl {
+                    let end = raw.get(at).map_or(0, |a| a.name.end as usize);
+                    bindings.push(Binding { prefix: Span::new(end, end), ns, pad: [0; 3] })?;
                 }
                 let resolve = |prefix: Option<Span>,
                                default_ns: bool,
@@ -1060,7 +1078,7 @@ fn walk<'b>(
                         }
                     }
                 }
-                // 属性の重なり（名前空間と局所名で並べて隣を比べる。名前を比べる分を前払いする。既定の値で足した属性が
+                // 属性の重なり（名前空間と局所名で並べて隣を比べる。名前のバイトは比べる中で払う。既定の値で足した属性が
                 // 重なれば、その属性を捨てる）
                 check_duplicates(b, &mut raw, budget)?;
                 // xml:space（揃えたあとの値で見る。`preserve`・`default` のほかの値は無いものとして親から受け継ぐ）
@@ -1143,12 +1161,12 @@ fn apply_attlists(w: &Walk<'_, '_>, qname: Span, raw: &mut MVec<'_, RawAttr>) ->
     let written = raw.len();
     let mut last: Option<Span> = None;
     for k in lo..hi {
+        w.budget.spend(cost::OP_STEP)?;
         let Some(&d) = w.attlists.get(k) else { continue };
         if d.broken != 0 {
             continue;
         }
         let name = d.name.of(b);
-        w.budget.spend(cost::OP_STEP)?;
         if let Some(l) = last
             && bytes_eq(w.budget, l.of(b), name)?
         {
@@ -1188,8 +1206,7 @@ fn apply_attlists(w: &Walk<'_, '_>, qname: Span, raw: &mut MVec<'_, RawAttr>) ->
 
 /// 開きのタグの属性の重なりを確かめる（名前空間と局所名）。`raw` の並びは変える。
 fn check_duplicates(b: &[u8], raw: &mut MVec<'_, RawAttr>, budget: &Budget<'_>) -> Result<(), Error> {
-    let n = raw.len() as u64;
-    if n < 2 {
+    if raw.len() < 2 {
         return Ok(());
     }
     // そのほかの名前空間は URI を持たないので、修飾つきの名前で比べる（同じ接頭辞の重なりを拾う）
@@ -1202,7 +1219,6 @@ fn check_duplicates(b: &[u8], raw: &mut MVec<'_, RawAttr>, budget: &Budget<'_>) 
         }
         Ok(bytes_cmp(budget, kx.1, ky.1)? == core::cmp::Ordering::Less)
     };
-    let _ = n;
     stable_sort_try(budget, raw.as_mut_slice(), less)?;
     let same = |x: &RawAttr, y: &RawAttr| -> Result<bool, Error> {
         let (kx, ky) = (key(x), key(y));
@@ -1416,7 +1432,7 @@ impl Sink for BuildSink<'_> {
     }
 }
 
-/// 数える段（`estimate_parse` と `parse` の前半）。前置きから歩きの終わりまでを `budget` で払い、作る段の容量と手間の
+/// 数える段（読む段の道の頭。ADR-70）。前置きから歩きの終わりまでを `budget` で払い、作る段の容量と手間の
 /// 上限を返す。実体を展開したあとのバイト数が上限を超えれば、超えた所で `Limit`（展開する前に、実体ごとに求めた長さで
 /// 数える）。歩きの手間は払った差から読む。確保の山は `budget` の通算から読むので、まだ何も確保していない `budget` を
 /// 渡す（確保の山は差で読めない）。
@@ -1432,7 +1448,9 @@ pub(crate) fn count(b: &[u8], limits: &Limits, budget: &Budget<'_>, stage: Stage
         return Err(Error::limit(Resource::Nodes, sink.nodes, most, stage));
     }
     if sink.attrs > most {
-        return Err(Error::limit(Resource::Memory, sink.attrs, most, stage));
+        // 属性の表のバイト数で表す（上限は番号の上限の分の表）
+        let size = size_of::<Attr>() as u64;
+        return Err(Error::limit(Resource::Memory, sink.attrs.saturating_mul(size), most.saturating_mul(size), stage));
     }
     Ok(XmlCounts {
         nodes: sink.nodes,

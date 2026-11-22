@@ -353,7 +353,7 @@ pub(crate) fn bytes_eq_ignore_case(budget: &Budget<'_>, a: &[u8], b: &[u8]) -> R
     }
 }
 
-/// 2 つのバイト列が同じか（長さが違えば払わずに偽。同じ長さなら [`bytes_cmp`] と同じに払う）。
+/// 2 つのバイト列が同じか（長さが違えば 1 単位払って偽。同じ長さなら [`bytes_cmp`] と同じに払う）。
 pub(crate) fn bytes_eq(budget: &Budget<'_>, a: &[u8], b: &[u8]) -> Result<bool, Error> {
     if a.len() != b.len() {
         budget.spend(1)?;

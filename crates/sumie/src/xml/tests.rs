@@ -19,8 +19,8 @@ fn parse_with(src: &[u8], limits: &Limits) -> Result<(XmlDoc, XmlCounts), Error>
     let o = xml_parse_with(src, limits);
     assert_eq!(o.check, Check::Ok, "{o:?}");
     assert!(o.build_work <= o.build_estimate && o.build_peak <= o.build_peak_estimate, "{o:?}");
-    let eb = Budget::new(Stage::EstimateParse, limits.estimate_work, limits.estimate_bytes, &Never);
-    let counts = count(src, limits, &eb, Stage::EstimateParse)?;
+    let eb = Budget::new(Stage::Parse, limits.parse_work, limits.parse_bytes, &Never);
+    let counts = count(src, limits, &eb, Stage::Parse)?;
     let b = Budget::new(Stage::Parse, counts.build_work(), counts.build_peak(), &Never);
     let doc = build(src, &counts, limits, &b, Stage::Parse)?;
     // 結果の量は数えた結果の量と同じ
@@ -861,4 +861,31 @@ fn long_names_in_sorts_are_paid_as_compared() {
     let o = xml_parse_with(src.as_bytes(), &Limits::DEFAULT);
     assert_eq!(o.check, Check::Ok);
     assert!(o.error.is_none(), "{:?}", o.error);
+}
+
+/// ATTLIST の既定の値で足した `b:xmlns` は束ねていない接頭辞の属性として捨て、文書を断らない（ADR-69 (3)）。書いた
+/// `b:xmlns` と `xmlns` は文書の順に最初のものが既定の名前空間（roxmltree と同じ）。
+#[test]
+fn prefixed_xmlns_from_defaults_and_order() {
+    let ns = |s: &str| parse(s).map(|d| d.nodes.as_slice().iter().map(|n| n.ns).collect::<Vec<_>>());
+    for uri in ["http://www.w3.org/XML/1998/namespace", "http://www.w3.org/2000/xmlns/", "http://www.w3.org/2000/svg"] {
+        let src = format!("<!DOCTYPE svg [<!ATTLIST svg b:xmlns CDATA \"{uri}\">]><svg/>");
+        assert_eq!(ns(&src).unwrap(), [NS_NONE], "{uri}");
+        let doc = parse(&src).unwrap();
+        assert_eq!(doc.attrs_of(doc.node(0).unwrap()).len(), 0);
+    }
+    assert_eq!(ns("<svg b:xmlns=\"urn:x\" xmlns=\"http://www.w3.org/2000/svg\"/>").unwrap(), [NS_OTHER]);
+    assert_eq!(ns("<svg xmlns=\"http://www.w3.org/2000/svg\" b:xmlns=\"urn:x\"/>").unwrap(), [NS_SVG]);
+}
+
+/// 壊れた ATTLIST の宣言は表から除くので、要素ごとに回らない（宣言 K × 要素 N の手間にならない）。
+#[test]
+fn broken_attlists_are_not_walked_per_element() {
+    let decls: String = (0..20_000).map(|_| " a CDATA \"&n;\"").collect();
+    let src = format!("<!DOCTYPE svg [<!ATTLIST g{decls}>]><svg {SVG}>{}</svg>", "<g/>".repeat(5_000));
+    let o = xml_parse_with(src.as_bytes(), &Limits::DEFAULT);
+    assert_eq!(o.check, Check::Ok);
+    assert!(o.error.is_none());
+    // 宣言 2 万 × 要素 5 千（1 億）よりずっと小さい
+    assert!(o.build_work < 20_000_000, "{}", o.build_work);
 }

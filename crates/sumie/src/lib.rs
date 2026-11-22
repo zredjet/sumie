@@ -38,16 +38,17 @@ pub use crate::style::{ColorScheme, GenericFamilies, ParseOptions, StyleDefaults
 /// 描画器の識別子。値を変える変更で数を上げる（determinism.md §8）。開発中は 0、M7 で 1 に凍結する。
 pub const RENDERER: &str = "sumie-render/0";
 
-/// 読む段の見積もり（architecture.md §3）。本文を 1 度だけ字句に分けて数え、`parse` の手間（中で走らせる数える段を含む
-/// 全体）・確保の山・持ち続ける量を返す。見積もり自身は `Limits::estimate_work`・`estimate_bytes` の内で払う。見積もりが
-/// `Limits::parse_work`・`parse_bytes` を超えれば `Limit`。誤り（整形式・符号化・上限）は `parse` と同じ（D2）。これが通れば、
-/// 同じ入力・同じ設定の `parse` は `Limit` にならない（確保器の失敗と中止を除く）。
+/// 読む段の見積もり（architecture.md §3・ADR-70）。読む段の道（XML を数えて節を作り、`<style>` を読んでカスケードし、
+/// 報告にする）を `parse` と同じ上限（`Limits::parse_work`・`parse_bytes`）で走らせ、払った手間・確保の山・持ち続ける量を
+/// 返す（見積もりは `parse` の実際とぴったり同じ）。誤り（整形式・符号化・上限）は `parse` と同じ（D2）。これが通れば、
+/// 同じ入力・同じ設定の `parse` は `Limit` にならない（確保器の失敗と中止を除く）。`Limits::estimate_work`・
+/// `estimate_bytes` は読む段には効かない。
 pub fn estimate_parse(svg: &[u8], opts: &ParseOptions<'_>, cancel: &dyn Cancel) -> Result<Estimate, Error> {
     doc::estimate_parse(svg, opts, cancel)
 }
 
-/// 読む（architecture.md §3）。中で `estimate_parse` と同じ見積もりを取り、上限の内なら見積もりの値を上限にして読む。
-/// `Document` は入力を借りる。
+/// 読む（architecture.md §3）。`estimate_parse` と同じ道を 1 度だけ走らせ、結果を持つ（ADR-70）。`Document` は入力を
+/// 借りる。
 pub fn parse<'s>(svg: &'s [u8], opts: &ParseOptions<'_>, cancel: &dyn Cancel) -> Result<Document<'s>, Error> {
     doc::parse(svg, opts, cancel)
 }
