@@ -1,0 +1,1 @@
+:nth-child(2n+1 of .a), :nth-last-child(-n+3), :nth-of-type(odd) { fill: red } :has(> rect), g:not(:has(path)) { x: y } :lang(en, "fr") { fill: green } a:link:hover::before, ::part(x):hover, ::-webkit-foo { fill: red } :where(.a, %) :is(::before, g) { fill: blue } :dir(ltr) { stroke-width: 2 }

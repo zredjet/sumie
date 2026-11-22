@@ -452,8 +452,9 @@ pub fn xml_parse_cancel(data: &[u8], limits: &crate::limits::Limits, cancel: &dy
         build_peak: 0,
         build_peak_estimate: 0,
     };
-    let est_budget = Budget::new(Stage::EstimateParse, limits.estimate_work, limits.estimate_bytes, cancel);
-    let counts = match crate::xml::count(data, limits, &est_budget, Stage::EstimateParse) {
+    // 数える段は読む段の上限で払う（読む段の道の頭。ADR-70）
+    let est_budget = Budget::new(Stage::Parse, limits.parse_work, limits.parse_bytes, cancel);
+    let counts = match crate::xml::count(data, limits, &est_budget, Stage::Parse) {
         Ok(c) => c,
         Err(e) => {
             out.error = Some(e);
@@ -535,10 +536,75 @@ pub fn xml_parse_cancel(data: &[u8], limits: &crate::limits::Limits, cancel: &dy
     out
 }
 
+/// [`xml_tree`] が知らせる節。名前空間は種類の名前（`svg`・`xlink`・`xml`・空・`other`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeItem<'a> {
+    /// 要素（深さは根の要素が 0）
+    Element { depth: u32, ns: &'static str, local: &'a [u8] },
+    /// 直前の要素の属性（名前空間の宣言は知らせない）
+    Attr { ns: &'static str, local: &'a [u8], value: &'a [u8] },
+    /// 文字（親の深さ）
+    Text { depth: u32, text: &'a [u8] },
+}
+
+fn ns_name(ns: u8) -> &'static str {
+    match ns {
+        crate::xml::NS_NONE => "",
+        crate::xml::NS_SVG => "svg",
+        crate::xml::NS_XLINK => "xlink",
+        crate::xml::NS_XML => "xml",
+        crate::xml::NS_XMLNS => "xmlns",
+        _ => "other",
+    }
+}
+
+/// 入力を読み（[`xml_parse`] と同じ上限）、木を行きがけの順に `f` に知らせる（照らしの道具が roxmltree の木と比べる）。
+/// 読めなければ偽。
+pub fn xml_tree(data: &[u8], f: &mut dyn FnMut(TreeItem<'_>)) -> bool {
+    let limits = crate::limits::Limits::DEFAULT;
+    let budget = Budget::new(Stage::Parse, limits.parse_work, limits.parse_bytes, &Never);
+    let Ok(counts) = crate::xml::count(data, &limits, &budget, Stage::Parse) else { return false };
+    let Ok(doc) = crate::xml::build(data, &counts, &limits, &budget, Stage::Parse) else { return false };
+    let nodes = doc.nodes.as_slice();
+    // 深さ（親は子より前）
+    let budget2 = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let mut depth: MVec<'_, u32> = MVec::new(&budget2);
+    for n in nodes {
+        let d = if n.parent == crate::xml::NONE {
+            0
+        } else {
+            depth.get(n.parent as usize).copied().unwrap_or(0).saturating_add(1)
+        };
+        if depth.push(d).is_err() {
+            return false;
+        }
+    }
+    for (i, n) in nodes.iter().enumerate() {
+        let d = depth.get(i).copied().unwrap_or(0);
+        if n.kind == crate::xml::KIND_ELEMENT {
+            f(TreeItem::Element { depth: d, ns: ns_name(n.ns), local: n.local.of(data) });
+            for a in doc.attrs_of(n) {
+                if a.ns == crate::xml::NS_XMLNS {
+                    continue;
+                }
+                f(TreeItem::Attr { ns: ns_name(a.ns), local: a.local.of(data), value: doc.value(data, a) });
+            }
+        } else {
+            f(TreeItem::Text { depth: d.saturating_sub(1), text: doc.text(data, n) });
+        }
+    }
+    true
+}
+
 /// DTD の内部のサブセットを `data` にして、実体を本文と属性から参照する文書を [`xml_parse`] に通す（ファズの `dtd` の対象）。
 pub fn dtd_parse(data: &[u8]) -> XmlOutcome {
-    // 先頭の 1 バイトで、参照する実体の名前（a〜p）を選ぶ
-    let name = b"abcdefghijklmnop".get(usize::from(data.first().copied().unwrap_or(0) % 16)).copied().unwrap_or(b'a');
+    // 先頭の 1 バイトで、参照する実体の名前を選ぶ（英小文字ならそのまま、ほかは a〜p に写す）
+    let first = data.first().copied().unwrap_or(b'a');
+    let name = if first.is_ascii_lowercase() {
+        first
+    } else {
+        b"abcdefghijklmnop".get(usize::from(first % 16)).copied().unwrap_or(b'a')
+    };
     let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
     let mut doc: MVec<'_, u8> = MVec::new(&budget);
     let parts: [&[u8]; 3] =
@@ -554,6 +620,24 @@ pub fn dtd_parse(data: &[u8]) -> XmlOutcome {
     }
     xml_parse(doc.as_slice())
 }
+
+/// 入力を CSS として、決まった文書の `<style>` に入れて読む段の全体に通す（ファズの `css` の対象。確かめることは
+/// [`document_parse`] と同じ）。文書には、型・id・class・言語・名前空間・リンク・空の要素・深い入れ子を置く。
+pub fn css_parse(data: &[u8]) -> DocOutcome {
+    let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let mut doc: MVec<'_, u8> = MVec::new(&budget);
+    for p in [CSS_HEAD, data, CSS_TAIL] {
+        if doc.append_slice(p).is_err() {
+            return document_parse(&[]);
+        }
+    }
+    document_parse(doc.as_slice())
+}
+
+/// [`css_parse`] の文書の頭（CSS の前）。
+pub const CSS_HEAD: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:x=\"urn:x\" xmlns:xl=\"http://www.w3.org/1999/xlink\" width=\"120\" height=\"80\" xml:lang=\"en-US\"><style><![CDATA[";
+/// [`css_parse`] の文書の終わり（CSS のあと）。
+pub const CSS_TAIL: &[u8] = b"]]></style><g id=\"g\" class=\"a b\" fill=\"red\"><rect id=\"r\" class=\"c\" width=\"5\" height=\"5\" style=\"stroke: blue\"/><x:q id=\"q\"/><circle r=\"1\" lang=\"fr\"/><g><g><path d=\"M0 0\"/></g></g><a xl:href=\"#r\"><text>t</text></a><g/></g></svg>";
 
 /// [`document_parse`] の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use sumie::Cancel;
 use sumie::fuzzing::{
-    Check, document_parse, document_parse_cancel, dtd_parse, math_ops, mem_ops, mem_ops_with, xml_parse,
+    CSS_HEAD, CSS_TAIL, Check, css_parse, document_parse, document_parse_cancel, dtd_parse, math_ops, mem_ops,
+    mem_ops_with, xml_parse,
 };
 use sumie_testkit::alloc::{assert_heap_within, measure};
 use sumie_testkit::mutate::cases;
@@ -186,11 +187,35 @@ fn xml_survives_seeded_mutations() {
     assert!(ok > 30 && err > 100, "読めた {ok}・読めない {err}");
 }
 
+/// DTD の目印の字句（XML の目印に足す）。
+const DTD_DICT: &[&[u8]] = &[
+    b"<!ATTLIST svg ",
+    b"<!ATTLIST g a ",
+    b"<!ENTITY a \"x\">",
+    b"<!ENTITY b \"&a;&a;\">",
+    b"<!ELEMENT svg ANY>",
+    b" CDATA ",
+    b" NMTOKENS ",
+    b" ID ",
+    b" (a|b) ",
+    b"#IMPLIED",
+    b"#REQUIRED",
+    b"#FIXED ",
+    b"\"&a;\"",
+    b"&#32;",
+    b"xmlns",
+    b"b:xmlns",
+    b"xml:space",
+    b">",
+    b"\"",
+];
+
 #[test]
 fn dtd_survives_seeded_mutations() {
     let seeds = fuzz_seeds("dtd");
     let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
-    for (n, case) in cases(0x5eed_0005, 3000, &refs, XML_DICT, 1024).iter().enumerate() {
+    let dict: Vec<&[u8]> = XML_DICT.iter().chain(DTD_DICT).copied().collect();
+    for (n, case) in cases(0x5eed_0005, 3000, &refs, &dict, 1024).iter().enumerate() {
         let (out, heap) = measure(|| dtd_parse(case));
         assert_eq!(out.check, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
         assert_heap_within(&heap, out.count_peak.max(out.build_peak).saturating_add(4096), 0, &format!("{n} 件目"));
@@ -211,6 +236,74 @@ fn document_survives_seeded_mutations() {
         if out.error.is_some() { err += 1 } else { ok += 1 }
     }
     assert!(ok > 30 && err > 100, "読めた {ok}・読めない {err}");
+}
+
+/// CSS の目印の字句（変異で差し込む）。
+const CSS_DICT: &[&[u8]] = &[
+    b"{",
+    b"}",
+    b"(",
+    b")",
+    b"[",
+    b"]",
+    b";",
+    b":",
+    b",",
+    b"!important",
+    b"/*",
+    b"*/",
+    b"\\",
+    b"\\61 ",
+    b"\"",
+    b"'",
+    b"url(",
+    b"@media (min-width: 10px) {",
+    b"@supports (fill: red) {",
+    b"@layer a",
+    b"@layer a.b, c;",
+    b"@namespace x url(urn:x);",
+    b"@import url(x.css);",
+    b"@font-face { src: url(f) }",
+    b":is(",
+    b":not(",
+    b":where(",
+    b":has(",
+    b":nth-child(2n+1 of ",
+    b"::before",
+    b"x|",
+    b"*|",
+    b"|",
+    b"#r",
+    b".c",
+    b"&",
+    b" > ",
+    b" + ",
+    b" ~ ",
+    b"1e999",
+    b"-.5e-3",
+    b"rgb(1 2 3 / 50%)",
+    b"var(--x)",
+    b"calc(1px + 2%)",
+    "鞍".as_bytes(),
+];
+
+#[test]
+fn css_survives_seeded_mutations() {
+    let seeds = fuzz_seeds("css");
+    let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
+    let (mut ok, mut err) = (0usize, 0usize);
+    for (n, case) in cases(0x5eed_0007, 2000, &refs, CSS_DICT, 4096).iter().enumerate() {
+        // 文書に入れるのは試験の側で（入れ物の確保を量に入れない）。css_parse と同じ文書
+        let doc = [CSS_HEAD, case.as_slice(), CSS_TAIL].concat();
+        assert_eq!(css_parse(case).check, document_parse(&doc).check);
+        let (out, heap) = measure(|| document_parse(&doc));
+        assert_eq!(out.check, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
+        assert_heap_within(&heap, out.peak, 0, &format!("{n} 件目"));
+        assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
+        if out.error.is_some() { err += 1 } else { ok += 1 }
+    }
+    // 読める件も読めない件（壊れた UTF-8・`]]>` など）もある
+    assert!(ok > 500 && err > 10, "読めた {ok}・読めない {err}");
 }
 
 /// 読む段の全体を途中で中止しても（数える段でも本体でも）、勘定が崩れず、確保をすべて返す。

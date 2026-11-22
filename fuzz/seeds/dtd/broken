@@ -1,0 +1,1 @@
+a<!ENTITY a "v"><!ATTLIST svg c CDATA "&nope;" d CDATA "&#0;" e:f:g CDATA "" h CDATA "ok"><!ATTLIST svg c CDATA "second"><!ATTLIST g x CDATA "&nope;">

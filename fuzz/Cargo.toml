@@ -50,3 +50,11 @@ path = "fuzz_targets/document.rs"
 test = false
 doc = false
 bench = false
+
+
+[[bin]]
+name = "css"
+path = "fuzz_targets/css.rs"
+test = false
+doc = false
+bench = false

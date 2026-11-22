@@ -1,0 +1,1 @@
+a<!ENTITY a " p  q "><!ATTLIST svg k NMTOKENS "&a; r" n NMTOKEN "&a;" b NMTOKENS #IMPLIED>

@@ -109,7 +109,14 @@ fn edge_cases() -> Vec<(&'static str, String)> {
         ("dtd-element-apostrophe", format!("<!DOCTYPE svg [<!ELEMENT svg it's>]><svg {svg}/>")),
         ("dtd-notation-quote", format!("<!DOCTYPE svg [<!NOTATION n SYSTEM' \"x\">]><svg {svg}/>")),
         ("xmlns-unbound-prefix", "<svg b:xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>".to_string()),
+        // 束ねた接頭辞の `a:xmlns` は仕様のとおりふつうの属性（roxmltree は既定の名前空間の宣言にする。残す違い。ADR-71 (4)）
         ("xmlns-bound-prefix", "<svg xmlns:a=\"urn:a\" a:xmlns=\"http://www.w3.org/2000/svg\"/>".to_string()),
+        // ATTLIST の既定の値の `b:xmlns` は捨てる（ADR-69 (3)。roxmltree は ATTLIST を読まない）
+        ("attlist-prefixed-xmlns-xml", "<!DOCTYPE svg [<!ATTLIST svg b:xmlns CDATA \"http://www.w3.org/XML/1998/namespace\">]><svg/>".to_string()),
+        ("attlist-prefixed-xmlns-xmlns", "<!DOCTYPE svg [<!ATTLIST svg b:xmlns CDATA \"http://www.w3.org/2000/xmlns/\">]><svg/>".to_string()),
+        ("attlist-prefixed-xmlns-svg", "<!DOCTYPE svg [<!ATTLIST svg b:xmlns CDATA \"http://www.w3.org/2000/svg\">]><svg/>".to_string()),
+        // 書いた `b:xmlns` と `xmlns` は文書の順に最初のもの（roxmltree と同じ）
+        ("xmlns-prefixed-first", "<svg b:xmlns=\"urn:x\" xmlns=\"http://www.w3.org/2000/svg\"/>".to_string()),
         ("xmlns-xml-twice", format!("<svg {svg} xmlns:xml=\"http://www.w3.org/XML/1998/namespace\" xmlns:xml=\"http://www.w3.org/XML/1998/namespace\"/>")),
         ("attlist-token-entity", format!("<!DOCTYPE svg [<!ATTLIST svg v NMTOKENS #IMPLIED><!ENTITY e \"  a  \">]><svg {svg} v=\"&e;&e;\"/>")),
     ]);
@@ -126,14 +133,113 @@ enum Verdict {
     SumieUnsupported,
     SumieLimit,
     SumieViolation,
+    /// どちらも読むが木（要素の名前空間と名前・属性・文字）が違う
+    TreeDiff,
+}
+
+/// 木を比べる形（行の並び）にする：要素は `E深さ 名前空間|名前`、属性は名前で並べて `A 名前空間|名前=値`、続く文字は
+/// 1 つにまとめて `T深さ 文字`。名前空間は種類（svg・xlink・xml・空・other）。
+fn rox_tree(doc: &roxmltree::Document<'_>) -> Vec<String> {
+    // roxmltree は `xmlns=""` の要素を空の URI の名前空間にする（名前空間なしと同じ）
+    let class = |uri: Option<&str>| match uri {
+        None | Some("") => "",
+        Some("http://www.w3.org/2000/svg") => "svg",
+        Some("http://www.w3.org/1999/xlink") => "xlink",
+        Some("http://www.w3.org/XML/1998/namespace") => "xml",
+        Some(_) => "other",
+    };
+    let mut out = Vec::new();
+    let mut text: Option<(usize, String)> = None;
+    for n in doc.root().descendants() {
+        let depth = n.ancestors().filter(|a| a.is_element()).count();
+        if n.is_text() {
+            let d = depth.saturating_sub(1);
+            match &mut text {
+                Some((td, t)) if *td == d => t.push_str(n.text().unwrap_or("")),
+                _ => {
+                    if let Some((td, t)) = text.take() {
+                        out.push(format!("T{td} {t:?}"));
+                    }
+                    text = Some((d, n.text().unwrap_or("").to_string()));
+                }
+            }
+            continue;
+        }
+        if !n.is_element() {
+            continue;
+        }
+        if let Some((td, t)) = text.take() {
+            out.push(format!("T{td} {t:?}"));
+        }
+        let d = depth.saturating_sub(1);
+        out.push(format!("E{d} {}|{}", class(n.tag_name().namespace()), n.tag_name().name()));
+        let mut attrs: Vec<String> =
+            n.attributes().map(|a| format!("A {}|{}={:?}", class(a.namespace()), a.name(), a.value())).collect();
+        attrs.sort();
+        out.extend(attrs);
+    }
+    if let Some((td, t)) = text.take() {
+        out.push(format!("T{td} {t:?}"));
+    }
+    out
+}
+
+fn sumie_tree(data: &[u8]) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut attrs: Vec<String> = Vec::new();
+    let mut text: Option<(u32, String)> = None;
+    let ok = sumie::fuzzing::xml_tree(data, &mut |it| match it {
+        sumie::fuzzing::TreeItem::Element { depth, ns, local } => {
+            out.append(&mut std::mem::take(&mut attrs).into_iter().collect());
+            if let Some((td, t)) = text.take() {
+                out.push(format!("T{td} {t:?}"));
+            }
+            out.push(format!("E{depth} {ns}|{}", String::from_utf8_lossy(local)));
+        }
+        sumie::fuzzing::TreeItem::Attr { ns, local, value } => {
+            attrs.push(format!("A {ns}|{}={:?}", String::from_utf8_lossy(local), String::from_utf8_lossy(value)));
+            attrs.sort();
+        }
+        sumie::fuzzing::TreeItem::Text { depth, text: t } => {
+            out.append(&mut std::mem::take(&mut attrs).into_iter().collect());
+            let t = String::from_utf8_lossy(t);
+            match &mut text {
+                Some((td, s)) if *td == depth => s.push_str(&t),
+                _ => {
+                    if let Some((td, s)) = text.take() {
+                        out.push(format!("T{td} {s:?}"));
+                    }
+                    text = Some((depth, t.to_string()));
+                }
+            }
+        }
+    });
+    out.append(&mut attrs);
+    if let Some((td, t)) = text.take() {
+        out.push(format!("T{td} {t:?}"));
+    }
+    ok.then_some(out)
+}
+
+/// 2 つの木の最初の違い。
+fn first_tree_diff(a: &[String], b: &[String]) -> Option<String> {
+    let n = a.len().max(b.len());
+    (0..n).find_map(|i| {
+        let (x, y) = (a.get(i), b.get(i));
+        (x != y).then(|| format!("{i} 行目：roxmltree {x:?} ／ sumie {y:?}"))
+    })
 }
 
 fn judge(data: &[u8]) -> (Verdict, String, String) {
+    let mut rox_lines: Option<Vec<String>> = None;
     let rox = match std::str::from_utf8(data) {
         Ok(s) => {
             let opt = roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() };
             match roxmltree::Document::parse_with_options(s, opt) {
-                Ok(_) => Ok(()),
+                Ok(d) => {
+                    rox_lines = Some(rox_tree(&d));
+                    Ok(())
+                }
                 Err(e) => Err(e.to_string()),
             }
         }
@@ -162,7 +268,17 @@ fn judge(data: &[u8]) -> (Verdict, String, String) {
     }
     let v = match (&rox, &s) {
         (_, Err(Error::Limit(_))) => Verdict::SumieLimit,
-        (Ok(()), Ok(())) => Verdict::Both,
+        (Ok(()), Ok(())) => {
+            // 木も比べる（ATTLIST の既定の値は sumie だけが当てる。ADR-66 (7)。その文書は比べない）
+            let attlist = data.windows(9).any(|w| w == b"<!ATTLIST");
+            match (&rox_lines, sumie_tree(data)) {
+                (Some(r), Some(t)) if !attlist => match first_tree_diff(r, &t) {
+                    Some(d) => return (Verdict::TreeDiff, rox_text, d),
+                    None => Verdict::Both,
+                },
+                _ => Verdict::Both,
+            }
+        }
         (Err(_), Err(_)) => Verdict::Neither,
         (Ok(()), Err(Error::Unsupported(_))) => Verdict::SumieUnsupported,
         (Ok(()), Err(_)) => Verdict::RoxOnly,
@@ -217,8 +333,29 @@ pub fn run(args: &[String]) -> Result<(), String> {
     if mutations > 0 {
         let seeds: Vec<Vec<u8>> =
             items.iter().filter(|i| i.0 == "照合の集まり").take(300).map(|i| i.2.clone()).collect();
-        let dict: &[&[u8]] =
-            &[b"<", b">", b"&", b";", b"--", b"]]>", b"<!DOCTYPE svg [", b"]>", b"\"", b"'", b"\x01", b"&#1;"];
+        let dict: &[&[u8]] = &[
+            b"<",
+            b">",
+            b"&",
+            b";",
+            b"--",
+            b"]]>",
+            b"<!DOCTYPE svg [",
+            b"]>",
+            b"\"",
+            b"'",
+            b"\x01",
+            b"&#1;",
+            b"<!ENTITY a \"x\">",
+            b"&a;",
+            b"<!ATTLIST svg a CDATA ",
+            b" NMTOKENS ",
+            b"#IMPLIED",
+            b"#FIXED ",
+            b"xmlns:p=\"urn:p\"",
+            b"b:xmlns=",
+            b"xml:space=\"preserve\"",
+        ];
         let mut rng = ChaCha::from_u64(0x5eed_0101);
         for k in 0..mutations {
             let Some(seed) = seeds.get(k % seeds.len().max(1)) else { break };
@@ -241,13 +378,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .str("sumie", sumie.as_str());
         lines.push_str(&l.to_json());
         lines.push('\n');
-        if matches!(v, Verdict::RoxOnly | Verdict::SumieOnly | Verdict::SumieLimit | Verdict::SumieViolation)
-            || src == "端の例"
+        if matches!(
+            v,
+            Verdict::RoxOnly | Verdict::SumieOnly | Verdict::SumieLimit | Verdict::SumieViolation | Verdict::TreeDiff
+        ) || src == "端の例"
         {
             let _ = writeln!(diffs, "| {src} | `{name}` | {key} | {rox} | {sumie} |");
         }
         // 食い違った入力は diff/ に写す（手元の調べのため。local/ の中だけ）
-        if matches!(v, Verdict::RoxOnly | Verdict::SumieOnly | Verdict::SumieViolation) {
+        if matches!(v, Verdict::RoxOnly | Verdict::SumieOnly | Verdict::SumieViolation | Verdict::TreeDiff) {
             let dir = out_dir.join("diff");
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let file = name.replace(['/', '\\'], "_");

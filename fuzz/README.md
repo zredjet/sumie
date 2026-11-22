@@ -8,13 +8,15 @@ architecture.md §9）。種は `seeds/<対象>/`（コミットする）、育�
 | `mem_ops` | mem の入れ物（MVec・SortedVec・SortedMap・stable_sort）を上限つきで動かし、不変の条件と、操作ごとの手間と確保の山 ≤ `cost` の式（見積もり）を確かめる。ヒープの実際の量との照らしは確保を数える確保器が要るので `crates/sumie/tests/mutate.rs` が行う | `sumie::fuzzing::mem_ops` |
 | `math_ops` | math の max・min・clamp・powi の性質と、超越関数が panic しないこと | `sumie::fuzzing::math_ops` |
 | `xml` | XML の段（数える段と作る段）。作る段が数える段の見積もりを超えないこと・1 回の払いが中止の間隔を超えないこと・節の鎖と属性の範囲 | `sumie::fuzzing::xml_parse` |
-| `dtd` | 入力を DTD の内部のサブセットにして、実体を本文と属性から参照する文書を `xml` と同じに確かめる | `sumie::fuzzing::dtd_parse` |
+| `dtd` | 入力を DTD の内部のサブセットにして、実体を本文と属性から参照する文書を `xml` と同じに確かめる（頭の 1 バイトが参照する実体の名前。英小文字ならそのまま） | `sumie::fuzzing::dtd_parse` |
+| `css` | 入力を CSS として、決まった文書（型・id・class・言語・名前空間・リンク・空の要素・深い入れ子）の `<style>` に入れ、`document` と同じに確かめる | `sumie::fuzzing::css_parse` |
 | `document` | 読む段の全体（公開の `estimate_parse`・`parse`）。2 つの誤りが同じ（D2）・見積もりが通れば読める・持ち続ける量が見積もりと同じ・数える段と本体の勘定（1 回の払い・返しすぎ）・全体の手間と山 ≤ 見積もり・上限を見積もりのちょうどにすれば読め、1 少なければ同じ `Limit` | `sumie::fuzzing::document_parse` |
 
 種は `crates/sumie/tests/mutate.rs` の `MEM_SEEDS` と同じにする（試験 `fuzz_seeds_match_mem_seeds` が照らす）。
-`xml`・`dtd`・`document` の種は `crates/sumie/tests/mutate.rs` の種つきの変異の試験も使う。libFuzzer の既定の長さ（4096 バイト）
+`xml`・`dtd`・`css`・`document` の種は `crates/sumie/tests/mutate.rs` の種つきの変異の試験も使う（`dtd` は DTD の、`css` は
+CSS の目印の字句で変異させる）。libFuzzer の既定の長さ（4096 バイト）
 では、長い名前・大きな実体のような長い入力の場合に届かないので、それは `crates/sumie/src/xml/tests.rs` の試験が受け持つ。
-M1 の残りで `css`・`values` を足す。Kura のファズのコーパス（`/Users/redjet/aruma/repos/zredjet/kura/fuzz/corpus/decode_svg/`。
+M1 の残りで `values` を足す。Kura のファズのコーパス（`/Users/redjet/aruma/repos/zredjet/kura/fuzz/corpus/decode_svg/`。
 約 8,000 件。読むだけ）は SVG の対象の種に使う（ADR-21。写さずに、読む場所として渡す）。
 
 ## 回し方

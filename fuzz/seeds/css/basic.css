@@ -1,0 +1,1 @@
+rect { fill: green } g > .c:first-child, #r:not(.x) { stroke: red !important } @media (min-width: 100px) and (prefers-color-scheme: light) { circle { opacity: .5 } } @supports (fill: red) and selector(:is(a)) { path { fill: blue } }

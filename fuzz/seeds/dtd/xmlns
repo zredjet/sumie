@@ -1,0 +1,1 @@
+a<!ENTITY a "u"><!ATTLIST svg xmlns CDATA "http://www.w3.org/2000/svg" xml:space CDATA "preserve" b:xmlns CDATA "urn:x" xmlns:q CDATA "urn:q" q:z CDATA "&a;">
