@@ -22,6 +22,8 @@ pub enum WarningKind {
     AtRule,
     /// 参照の輪（輪の参照を取り除いた。FR-CO-05）
     ReferenceCycle,
+    /// 壊れたセレクタ・閉じない規則（規則ごと捨てた。FR-ST-07）
+    InvalidSelector,
 }
 
 impl Plain for WarningKind {}

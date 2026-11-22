@@ -78,6 +78,11 @@ pub(crate) const fn scan(bytes: u64) -> u64 {
     bytes
 }
 
+/// 数の字句を f64 に読む手間（`str::parse::<f64>`。字句のバイト数に比例する。読む分の `scan` とは別に払う）。
+pub(crate) const fn number(bytes: u64) -> u64 {
+    bytes.saturating_mul(4).saturating_add(OP_STEP)
+}
+
 /// 1 回の確保の決まった手間（確保器を呼ぶ分。取った領域に触れる分は fill・copy で数える）。
 pub(crate) const ALLOC_STEP: u64 = 64;
 
