@@ -93,6 +93,10 @@ pub(crate) const OP_STEP: u64 = 4;
 /// ≈ 1 ns になるように。M7 で校正する）。
 pub(crate) const TOKEN: u64 = 16;
 
+/// 木を作る段の、展開したあとの要素 1 つあたりの手間と確保（M1 の仮の値。木を作る段（M2）で式に置き換える）。
+pub(crate) const BUILD_PER_INSTANCE: u64 = 256;
+pub(crate) const BUILD_BYTES_PER_INSTANCE: u64 = 128;
+
 /// プロパティの表を名前で引く手間（名前を小文字にして写し、表を二分探索する。表は 100 の内なので 7 回ほど比べる）。
 pub(crate) const LOOKUP: u64 = 32;
 

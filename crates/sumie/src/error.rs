@@ -48,6 +48,8 @@ pub enum Resource {
     Nodes,
     /// 入れ子の深さ（`Limits::depth`）
     Depth,
+    /// 展開したあとの要素の数（`Limits::instances`。use・marker・pattern などを参照ごとに数える）
+    Instances,
 }
 
 /// 段（どこで断ったか）。

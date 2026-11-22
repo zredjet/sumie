@@ -190,7 +190,7 @@
 | 実体を展開したあとのバイト数 | 64 MiB | 読む前（読む段の道を走らせて測る。ADR-70）・読む | `MAX_EXPANDED` |
 | XML の節の数 | 2²¹ | 読む前・読む | `MAX_ELEMENTS`（roxmltree の `nodes_limit`） |
 | 入れ子の深さ | 1,024 | 読む前・読む | Kura は 64（usvg の再帰のため）。再帰しないので広げる。深さに比べた手間は数える |
-| 展開したあとの要素の数（use・marker・複製） | 2²¹ | 木を作る前 | `MAX_ELEMENTS` |
+| 展開したあとの要素の数（use・marker・複製） | 2²¹ | 木を作る前（`estimate_build`。`Resource::Instances`） | `MAX_ELEMENTS` |
 | 描く節の数（pattern などの描き直しを含む） | 2²² | 描く前 | `MAX_RENDER_NODES` |
 | キャンバスの 1 辺 | 32,768 画素 | 描く前 | Kura の `max_dim` |
 | キャンバスの画素の数 | 2²⁸ | 描く前 | Kura の `max_pixels` |

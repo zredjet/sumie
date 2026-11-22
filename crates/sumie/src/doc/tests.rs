@@ -175,3 +175,28 @@ fn style_media_attribute() {
     assert!(!applied("(min-width: 200px)"));
     assert!(applied(""));
 }
+
+/// 木を作る段の見積もり（M1 の形）：展開の数の上限と、描く木に入りうる画像・文字。
+#[test]
+fn estimate_build_checks_instances_and_needs() {
+    let est = |body: &str| {
+        let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\">{body}</svg>");
+        let doc = parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+        doc.estimate_build(&Never)
+    };
+    assert!(est("<rect/>").is_ok());
+    // use の爆弾（2^25 を超える展開）
+    let mut bomb = String::from("<rect id=\"l0\"/>");
+    for k in 1..=25 {
+        bomb.push_str(&format!("<g id=\"l{k}\"><use href=\"#l{}\"/><use href=\"#l{}\"/></g>", k - 1, k - 1));
+    }
+    assert!(
+        matches!(est(&bomb), Err(Error::Limit(l)) if l.resource == Resource::Instances && l.stage == Stage::EstimateBuild)
+    );
+    assert!(
+        matches!(est("<text>a</text>"), Err(Error::Unsupported(u)) if u.feature == crate::error::Feature::TextWithoutFonts)
+    );
+    assert!(
+        matches!(est("<image href=\"a.png\"/>"), Err(Error::Unsupported(u)) if u.feature == crate::error::Feature::Image)
+    );
+}

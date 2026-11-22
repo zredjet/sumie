@@ -88,6 +88,40 @@ impl<'s> Document<'s> {
         self.needs
     }
 
+    /// 木を作る段の見積もり（M1 の形：展開したあとの要素の数を上限と比べ、描く木に入りうる画像と文字の要るものを確かめる。
+    /// 木を作る段の手間と確保の式は木を作る段（M2）で足し、画像のデコーダとフォントの集まりは M3・M5 で引数に足す）。
+    /// 今は画像のデコーダとフォントの集まりを受けないので、描く木に入りうるラスターの画像があれば `Unsupported`（`Image`）、
+    /// SVG の画像があれば `Unsupported`（`NestedSvg`）、文字があれば `Unsupported`（`TextWithoutFonts`）。展開の数が
+    /// `Limits::instances` を超えれば `Limit`（`Instances`）。返す見積もりは展開の数に比例する仮の値。
+    pub fn estimate_build(&self, cancel: &dyn Cancel) -> Result<Estimate, Error> {
+        let budget = Budget::new(Stage::EstimateBuild, self.limits.estimate_work, self.limits.estimate_bytes, cancel);
+        budget.spend(cost::OP_STEP)?;
+        let n = self.refs.instances;
+        if n > self.limits.instances {
+            return Err(Error::limit(
+                crate::error::Resource::Instances,
+                n,
+                self.limits.instances,
+                Stage::EstimateBuild,
+            ));
+        }
+        let unsupported = |feature| Err(Error::Unsupported(crate::error::Unsupported { feature, position: None }));
+        if self.needs.svg_images {
+            return unsupported(crate::error::Feature::NestedSvg);
+        }
+        if self.needs.raster_images {
+            return unsupported(crate::error::Feature::Image);
+        }
+        if self.needs.text {
+            return unsupported(crate::error::Feature::TextWithoutFonts);
+        }
+        Ok(Estimate {
+            work: n.saturating_mul(cost::BUILD_PER_INSTANCE),
+            peak_bytes: n.saturating_mul(cost::BUILD_BYTES_PER_INSTANCE),
+            result_bytes: n.saturating_mul(cost::BUILD_BYTES_PER_INSTANCE),
+        })
+    }
+
     /// 持ち続ける量（`Estimate::result_bytes` と同じ）。
     pub(crate) fn held_bytes(&self) -> u64 {
         [

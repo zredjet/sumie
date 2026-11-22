@@ -135,7 +135,7 @@ impl<'s> Document<'s> {
     pub fn pixel_size(&self, scale: f64) -> Result<Option<PixelSize>, Error>;
     pub fn needs(&self) -> Needs;                       // 文字があるか・描く木に入りうる <image> の種類（§3.1）
     pub fn report(&self) -> &Report;                    // この段までの警告・読まなかった参照
-    pub fn estimate_build(&self, res: &Resources<'_>, cancel: &dyn Cancel) -> Result<Estimate, Error>;
+    pub fn estimate_build(&self, res: &Resources<'_>, cancel: &dyn Cancel) -> Result<Estimate, Error>;   // M1・M2 は res なし（画像・文字は Unsupported。M3・M5 で足す）
     pub fn build(&self, res: &Resources<'_>, cancel: &dyn Cancel) -> Result<Tree, Error>;
 }
 pub struct Resources<'a> {
