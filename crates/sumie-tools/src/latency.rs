@@ -189,6 +189,17 @@ fn cases(scale: usize) -> Vec<(&'static str, Vec<u8>)> {
             &format!("<filter id=\"f\"/>{}", "<rect/>".repeat(n(10_000))),
         ),
     ));
+    // 文書の段の 3 回目のレビューの形
+    out.push(("輪の鎖 × 多くの節", {
+        let masks: String = (1..=1000)
+            .map(|i| format!("<mask id=\"Y{i}\"><rect fill=\"url(#X)\" mask=\"url(#Y{})\"/></mask>", i - 1))
+            .collect();
+        format!(
+            "{SVG}<pattern id=\"X\"><mask id=\"Y0\"><rect/></mask>{masks}</pattern><rect mask=\"url(#Y1000)\"/>{}</svg>",
+            "<g/>".repeat(n(400_000))
+        )
+        .into_bytes()
+    }));
     out.push(("深い入れ子", format!("{SVG}{}{}</svg>", "<g>".repeat(1000), "</g>".repeat(1000)).into_bytes()));
     out.push(("参照の多い文書（use の鎖）", {
         let mut body = String::from("<defs><rect id=\"r0\"/>");
