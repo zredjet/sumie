@@ -1,0 +1,5 @@
+# ファズだけの nightly（ADR-25 (1)）。fuzz/ の中で cargo fuzz を回すと、これが使われる（scripts/fuzz-seeds.sh・CI も）。
+# 日付は rustup の channel の日付（rustc -vV の commit-date より 1 日あとになることがある）
+[toolchain]
+channel = "nightly-2026-10-16"
+profile = "minimal"

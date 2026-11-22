@@ -63,12 +63,9 @@ fn is_canonical_uint(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (s == "0" || !s.starts_with('0'))
 }
 
-/// 正規の倍率の字句（`1`・`0.5`・`2.25`。符号・指数・末尾の 0・先頭の余計な 0 なし。正の有限）。
+/// 正規の倍率の字句：正の有限の f64 を Rust の `{}` で書いた字句と同じ（`1`・`0.5`・`2.25`。同じ値の字句は 1 つ）。
 fn is_canonical_scale(s: &str) -> bool {
-    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
-    let frac_ok = frac.is_empty() || (frac.bytes().all(|b| b.is_ascii_digit()) && !frac.ends_with('0'));
-    let dot_ok = !s.contains('.') || !frac.is_empty();
-    is_canonical_uint(int) && frac_ok && dot_ok && s.parse::<f64>().is_ok_and(|v| v.is_finite() && v > 0.0)
+    s.parse::<f64>().is_ok_and(|v| v.is_finite() && v > 0.0 && format!("{v}") == s)
 }
 
 /// 入力の場所を引く表（BLAKE3 → 相対の道）。`tests/svg/` と `corpus/` の下の SVG。
@@ -206,20 +203,32 @@ fn check_file(text: &str, render: bool, index: Option<&Index>) -> (Vec<String>, 
     (errs, names)
 }
 
+/// 版をまたいで同じ名前の例が変えてはいけない鍵（入力と設定。描いた結果と道の手がかりは変わってよい）。
+const SAME_ACROSS_VERSIONS: &[&str] = &["input", "fonts", "decoder", "style", "scale", "region"];
+
 #[test]
 fn golden_files_are_well_formed() {
     let root = workspace();
     let current = current_version();
-    let index = Index { inputs: input_index(&root), fonts: font_index(&root) };
     let mut errs = Vec::new();
     let mut by_version: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
-    let mut names: Vec<String> = std::fs::read_dir(goldens())
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.ends_with(".jsonl"))
-        .collect();
+    let mut lines_by_version: BTreeMap<u32, Vec<Line>> = BTreeMap::new();
+    let all: Vec<String> =
+        std::fs::read_dir(goldens()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+    for n in &all {
+        if !n.ends_with(".jsonl") && n != "README.md" {
+            errs.push(format!("{n}：goldens/ には .jsonl と README.md だけを置く（打ち間違いを見逃さない）"));
+        }
+    }
+    let mut names: Vec<String> = all.into_iter().filter(|n| n.ends_with(".jsonl")).collect();
     names.sort();
+    // 入力の索引は、今の版の行があるときだけ作る（集まり全体のダイジェストを取るので）
+    let cur_text = std::fs::read_to_string(goldens().join(format!("render-v{current}.jsonl"))).unwrap_or_default();
+    let index = if cur_text.trim().is_empty() {
+        Index { inputs: BTreeMap::new(), fonts: BTreeSet::new() }
+    } else {
+        Index { inputs: input_index(&root), fonts: font_index(&root) }
+    };
     for name in names {
         let text = std::fs::read_to_string(goldens().join(&name)).unwrap();
         if name == "estimate.jsonl" {
@@ -238,14 +247,36 @@ fn golden_files_are_well_formed() {
         let (e, ns) = check_file(&text, true, ix);
         errs.extend(e.into_iter().map(|e| format!("{name}：{e}")));
         by_version.insert(v, ns);
+        lines_by_version.insert(v, text.lines().filter_map(|l| Line::parse(l).ok()).collect());
     }
     assert!(by_version.contains_key(&current), "今の版のファイル render-v{current}.jsonl がない");
-    // 版を上げたら全部の例を描き直す（古い版の例の名前は次の版にもある。ADR-41 (7)）
+    // 版は 0 から今の版まで切れ目なくある
+    for v in 0..=current {
+        if !by_version.contains_key(&v) {
+            errs.push(format!("render-v{v}.jsonl がない（版は切れ目なく並べる）"));
+        }
+    }
+    // 版を上げたら全部の例を描き直す（古い版の例の名前は次の版にもある。ADR-41 (7)）。同じ名前の例は、入力と設定が同じ
     for (v, ns) in &by_version {
         if let Some(next) = by_version.get(&(v + 1)) {
             let missing: Vec<&String> = ns.difference(next).collect();
             if !missing.is_empty() {
                 errs.push(format!("render-v{v} の例 {missing:?} が render-v{} にない", v + 1));
+            }
+        }
+        if let (Some(a), Some(b)) = (lines_by_version.get(v), lines_by_version.get(&(v + 1))) {
+            for la in a {
+                let name = la.get_str("name");
+                if let Some(lb) = b.iter().find(|l| l.get_str("name") == name) {
+                    for k in SAME_ACROSS_VERSIONS {
+                        if la.get(k) != lb.get(k) {
+                            errs.push(format!(
+                                "例 {name:?} の {k} が render-v{v} と render-v{} で違う（中身を変えるなら新しい名前）",
+                                v + 1
+                            ));
+                        }
+                    }
+                }
             }
         }
     }
@@ -289,7 +320,7 @@ fn checker_rejects_broken_lines() {
     assert_eq!(errs(&set(2, "/tmp/x.svg")), 1, "path が絶対");
     assert_eq!(errs(&set(3, &h)), 1, "fonts の鍵が tests/fonts にない");
     assert_eq!(errs(&set(5, "mine")), 1, "style");
-    for bad in ["0", "1e0", "+1", "1.0", ".5", "01", "1.", "-1"] {
+    for bad in ["0", "1e0", "+1", "1.0", ".5", "01", "1.", "-1", "1.00000000000000001", "0.50"] {
         assert_eq!(errs(&set(6, bad)), 1, "scale {bad}");
     }
     assert_eq!(errs(&set(7, "1,2,3")), 1, "region の数");

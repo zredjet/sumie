@@ -4,10 +4,12 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
-deps="$(cargo tree --locked -q -e normal,build --target all -p sumie --prefix none --format '{p}' | sed 's/ (.*)//' | sort -u)"
-want="$(printf 'libm v0.2.16\nsumie v0.0.0\n')"
-if [[ "$deps" != "$want" ]]; then
-  echo "本番の依存が libm だけでない：" >&2
+# crates.io の依存は「名前 版」だけ、git・path の出どころには「 (…)」が付く。libm は括弧なし（crates.io）でなければならない
+deps="$(cargo tree --locked -q -e normal,build --target all -p sumie --prefix none --format '{p}' | sort -u)"
+libm="$(grep '^libm ' <<< "$deps" || true)"
+others="$(grep -v -e '^libm ' -e '^sumie v0\.0\.0 (' <<< "$deps" || true)"
+if [[ "$libm" != "libm v0.2.16" ]] || [[ -n "$others" ]]; then
+  echo "本番の依存が crates.io の libm v0.2.16 だけでない：" >&2
   echo "$deps" >&2
   exit 1
 fi
@@ -18,14 +20,15 @@ if grep -qE 'libm feature "' <<< "$feats"; then
   echo "$feats" >&2
   exit 1
 fi
-# 差し替え（[patch]・[replace]）がなく、Cargo.lock の libm の出どころが crates.io
-if grep -qE '^\[(patch|replace)' Cargo.toml; then
+# 差し替え（[patch]・[replace]・点つきの patch の鍵・.cargo/config の [patch]・[source]）がない
+if grep -qE '^\s*\[(patch|replace)|^\s*patch\.' Cargo.toml; then
   echo "根の Cargo.toml に [patch]・[replace] がある（本番の依存の出どころが変わる）" >&2
   exit 1
 fi
-src="$(awk '/^name = "libm"$/ { getline; getline; print; exit }' Cargo.lock)"
-if [[ "$src" != 'source = "registry+https://github.com/rust-lang/crates.io-index"' ]]; then
-  echo "Cargo.lock の libm の出どころが crates.io でない：$src" >&2
-  exit 1
-fi
+for c in .cargo/config.toml .cargo/config; do
+  if [[ -f "$c" ]] && grep -qE '^\s*\[(patch|source)|^\s*(patch|source)\.' "$c"; then
+    echo "$c に [patch]・[source] がある（本番の依存の出どころが変わる）" >&2
+    exit 1
+  fi
+done
 echo "本番の依存は crates.io の libm v0.2.16 だけ（feature なし）"

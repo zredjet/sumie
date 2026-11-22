@@ -14,16 +14,16 @@ M1 から `xml`・`dtd`・`css`・`values`・`document` を足す。Kura のフ�
 
 ## 回し方
 
-nightly は CI と同じ `nightly-2026-10-15`（`.github/workflows/ci.yml`）。手元の `+nightly` が違う日付なら
-`+nightly-2026-10-15` を使う。
+nightly は `fuzz/rust-toolchain.toml`（`nightly-2026-10-16`）の 1 か所で決め、`fuzz/` の中で `cargo fuzz` を回すと
+それが使われる（`+nightly` は付けない）。組み立てと種の流し直しは `scripts/fuzz-seeds.sh`（全チェックと CI が呼ぶ）。
 
 ```bash
 cd fuzz
-cargo +nightly fuzz build
+cargo fuzz build
 mkdir -p corpus/mem_ops
-cargo +nightly fuzz run mem_ops corpus/mem_ops seeds/mem_ops -- -max_total_time=3600 -rss_limit_mb=4096 -timeout=20
+cargo fuzz run mem_ops corpus/mem_ops seeds/mem_ops -- -max_total_time=3600 -rss_limit_mb=4096 -timeout=20
 # 種を流し直すだけ（CI と scripts/verify.sh）
-cargo +nightly fuzz run mem_ops seeds/mem_ops -- -runs=0
+cargo fuzz run mem_ops seeds/mem_ops -- -runs=0
 ```
 
 `cargo fuzz` の既定（debug-assertions と overflow-checks が入る）で回し、示しそこなったあふれを panic として見つける

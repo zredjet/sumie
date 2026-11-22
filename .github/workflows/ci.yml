@@ -12,7 +12,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # main の回は取り消さない（どの push の確かめも残す）
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,7 +30,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: ツールチェーン（rust-toolchain.toml の 1.99.0）
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -53,7 +54,7 @@ jobs:
     timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: ツールチェーン
@@ -68,45 +69,34 @@ jobs:
         run: cargo run --locked -q -p sumie-tools -- gen-disallowed --check
       - name: 禁じる口の試し
         run: cargo run --locked -q -p sumie-tools -- check-lint-probe
-      - name: ゴールデンは追記だけ
-        env:
-          BEFORE: ${{ github.event.before }}
+      - name: ゴールデンは追記だけ（履歴の全体）
         run: |
           scripts/check-goldens-append-only.sh --self-test
+          scripts/check-goldens-append-only.sh --history
+      - name: ゴールデンは追記だけ（main の版のスクリプトでも。同じ変更で見張りを弱められないように）
+        run: |
           git fetch -q origin main
-          # 基準：push の前の先頭（新しいブランチなら main との分かれ目）。main への push でも自分と比べない
-          if [[ -n "$BEFORE" && ! "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
-            echo "基準：push の前の先頭 $BEFORE"
-            scripts/check-goldens-append-only.sh --strict "$BEFORE"
-          else
-            base="$(git merge-base HEAD origin/main)"
-            echo "基準：origin/main との分かれ目 $base"
-            if [[ "$base" == "$(git rev-parse HEAD)" ]]; then
-              echo "比べる変更がない（新しいブランチで、main と同じ）"
-            else
-              scripts/check-goldens-append-only.sh "$base"
+          base="$(git merge-base HEAD origin/main)"
+          script=scripts/check-goldens-append-only.sh
+          if git cat-file -e "$base:$script" 2>/dev/null; then
+            if ! git diff --quiet "$base" HEAD -- "$script"; then
+              echo "::warning::追記の見張りのスクリプトが main から変わっている（レビューで見る）"
             fi
+            git show "$base:$script" > scripts/.check-goldens-base.sh
+            bash scripts/.check-goldens-base.sh "$base"
+          else
+            echo "main にはまだ見張りのスクリプトがない"
           fi
 
   fuzz:
     name: fuzz (nightly)
     timeout-minutes: 30
     runs-on: ubuntu-latest
-    env:
-      # 手元と同じ nightly（fuzz/README.md）
-      NIGHTLY: nightly-2026-10-15
     steps:
-      - uses: actions/checkout@v4
-      - name: nightly と cargo-fuzz
+      - uses: actions/checkout@v5
+      - name: 固定した nightly（fuzz/rust-toolchain.toml）と cargo-fuzz
         run: |
-          rustup toolchain install "$NIGHTLY" --profile minimal
-          cargo "+$NIGHTLY" install cargo-fuzz --locked --version 0.13.2
-      - name: 組み立て
-        working-directory: fuzz
-        run: cargo "+$NIGHTLY" fuzz build
-      - name: 種を流し直す（落ちないこと）
-        working-directory: fuzz
-        run: |
-          for t in mem_ops math_ops; do
-            cargo "+$NIGHTLY" fuzz run "$t" "seeds/$t" -- -runs=0
-          done
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"$/\1/p' fuzz/rust-toolchain.toml)" --profile minimal
+          cargo install cargo-fuzz --locked --version 0.13.2
+      - name: 組み立てと種の流し直し
+        run: scripts/fuzz-seeds.sh

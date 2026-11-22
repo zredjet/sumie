@@ -41,13 +41,13 @@ crates/sumie/goldens/      # render-v<N>.jsonl（凍結した版は追記だけ�
 crates/sumie-tools/        # 照合（resvg・Chrome）・計測・重い入力の生成・Unicode の表の生成（本番に入らない）
 fuzz/                      # cargo-fuzz（独立の workspace）
 tests/svg/                 # 自作の試験の SVG
-tests/fonts/               # 試験用のフォント（写しを許すライセンスのものだけ。出どころの一覧つき）
+tests/fonts/               # 試験用のフォント（写しを許すライセンスのものだけ。出どころの一覧つき。M5 で作る）
 corpus/                    # 照合の集まり（取り込んだ試験の SVG。出どころ・版・ライセンスの写しつき。ADR-21）
-scripts/                   # verify.sh・check-goldens-append-only.sh
+scripts/                   # verify.sh・clippy.sh・check-deps.sh・check-goldens-append-only.sh・fuzz-seeds.sh・lint-probe/
 docs/                      # 正本の文書
 ```
 
-（M0 で作った。ほかに `scripts/lint-probe/`（禁じる口の試しのクレート）・`.github/workflows/ci.yml`）
+（M0 で作った。`tests/fonts/` は M5 から。ほかに `.github/workflows/ci.yml`、git の外の `local/`（W3C の試験・重い入力・照合の結果）。`scripts/lint-probe/` は禁じる口の試しのクレート）
 
 ## コマンド
 
@@ -62,7 +62,7 @@ docs/                      # 正本の文書
 | ゴールデンは追記だけ | `scripts/check-goldens-append-only.sh [--strict] [基準のコミット]`（`--self-test` で自己試験） |
 | 本番の依存が libm だけ | `scripts/check-deps.sh`（`cargo tree -e normal,build --target all -p sumie` と libm の feature・出どころ） |
 | x86_64 の命令で | `cargo test -p sumie --target x86_64-apple-darwin`（Rosetta 2。先に `rustup target add x86_64-apple-darwin`） |
-| ファズ | `cd fuzz && cargo +nightly fuzz run <対象> corpus/<対象> seeds/<対象> -- -max_total_time=3600 -rss_limit_mb=4096 -timeout=20`（先に `mkdir -p corpus/<対象>`。nightly は CI と同じ `nightly-2026-10-15`） |
+| ファズ | `cd fuzz && cargo fuzz run <対象> corpus/<対象> seeds/<対象> -- -max_total_time=3600 -rss_limit_mb=4096 -timeout=20`（先に `mkdir -p corpus/<対象>`。nightly は `fuzz/rust-toolchain.toml` の 1 か所）・種の流し直しは `scripts/fuzz-seeds.sh` |
 | 照合 | `cargo run -p sumie-tools --release -- compare <入力> --against resvg\|chrome` |
 | 計測 | `cargo run -p sumie-tools --release -- bench <入力>` |
 

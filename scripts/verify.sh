@@ -4,7 +4,7 @@
 #
 #   scripts/verify.sh                         全部（飛ばした段があれば最後に並べ、終わりの状態を 3 にする）
 #   SUMIE_VERIFY_QUICK=1 scripts/verify.sh    release・native・x86_64・ファズを飛ばす（終わりの状態は 3）
-#   SUMIE_GOLDEN_BASE=<rev> scripts/verify.sh ゴールデンの追記の確かめの基準（既定は main との分かれ目）
+#   SUMIE_GOLDEN_BASE=<rev> scripts/verify.sh ゴールデンの追記の確かめの基準（既定は origin/main との分かれ目。履歴の全体も見る）
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
@@ -32,6 +32,7 @@ cargo test --locked --workspace
 
 step "ゴールデンは追記だけ"
 scripts/check-goldens-append-only.sh --self-test
+scripts/check-goldens-append-only.sh --history
 scripts/check-goldens-append-only.sh ${SUMIE_GOLDEN_BASE:+"$SUMIE_GOLDEN_BASE"}
 
 step "本番の依存"
@@ -46,7 +47,9 @@ else
   step "試験（release・target-cpu=native。値がビルドの設定に依らない。determinism.md §1.2）"
   RUSTFLAGS="-C target-cpu=native" CARGO_TARGET_DIR="$root/target/native" cargo test --locked -p sumie --release
 
-  if ! rustup target list --installed 2>/dev/null | grep -qx "x86_64-apple-darwin"; then
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    : # x86_64-apple-darwin は macOS だけの確かめ（Linux では対象外で、飛ばした段に数えない）
+  elif ! rustup target list --installed 2>/dev/null | grep -qx "x86_64-apple-darwin"; then
     skipped+=("x86_64-apple-darwin（ターゲットがない：rustup target add x86_64-apple-darwin）")
   elif ! arch -x86_64 /usr/bin/true 2>/dev/null; then
     skipped+=("x86_64-apple-darwin（Rosetta 2 がない）")
@@ -55,17 +58,11 @@ else
     cargo test --locked -p sumie --target x86_64-apple-darwin
   fi
 
-  if cargo +nightly fuzz --version >/dev/null 2>&1; then
-    step "ファズの組み立てと種の流し直し（nightly）"
-    (
-      cd fuzz
-      cargo +nightly fuzz build
-      for t in mem_ops math_ops; do
-        cargo +nightly fuzz run "$t" "seeds/$t" -- -runs=0
-      done
-    )
+  if cargo fuzz --version >/dev/null 2>&1; then
+    step "ファズの組み立てと種の流し直し（fuzz/rust-toolchain.toml の nightly）"
+    scripts/fuzz-seeds.sh
   else
-    skipped+=("ファズ（nightly の cargo-fuzz がない）")
+    skipped+=("ファズ（cargo-fuzz がない）")
   fi
 fi
 
