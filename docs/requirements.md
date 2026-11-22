@@ -74,15 +74,15 @@
 | FR-ST-02 | M | `g`・`defs`・`a`（`g` と同じに描く）・`title`・`desc`・`metadata`（描かない）。知らない要素は子ごと描かない（警告） |
 | FR-ST-03 | M | `use`：要素・`symbol`・`svg` への参照、`x`・`y`（平行移動）、`symbol`・`svg` への `width`・`height`。参照先の中身は use の文脈で継承する。輪は FR-CO-05。外の文書への参照は FR-IN-08 |
 | FR-ST-04 | M | `symbol`：`viewBox`・`preserveAspectRatio`・`refX`・`refY`、SVG 2 の `x`・`y`・`width`・`height` |
-| FR-ST-05 | M | `switch`：`systemLanguage`（呼び手が渡す言語の並びで照らす）・`requiredExtensions`・`requiredFeatures` で、通る最初の子だけを描く。`requiredFeatures` の機能の文字列を照らすか無視するか（SVG 2・Chrome は無視）は resvg に合わせる（M1 で照らす） |
+| FR-ST-05 | M | `switch`：`systemLanguage`（呼び手が渡す言語の並びで照らす）・`requiredExtensions`・`requiredFeatures` で、通る最初の子だけを描く。`requiredFeatures` は resvg と同じく照らす：空・知らない機能は偽（SVG 2・Chrome は無視する）。`systemLanguage` は言語の頭で照らす（`en-US` は `en` で通る）。通る機能の文字列の一覧は M1 で resvg と照らして決める（ADR-64 (6)） |
 | FR-ST-06 | M | `style` 要素（`type` がないか `text/css`）と `style` 属性。CDATA の中も読む |
-| FR-ST-07 | M | CSS のセレクタ：型・`*`・`#id`・`.class`・属性（`[a]`・`=`・`~=`・`|=`・`^=`・`$=`・`*=`）・`:first-child`、結合子の子孫・`>`・`+`・`~`。詳細度と出てきた順で決める。ほかの擬似クラス・擬似要素のある規則は当てない（警告）。最終の範囲は M1 で resvg と照らして確定する |
-| FR-ST-08 | M | アットルール（`@media`・`@import`・`@font-face`・`@supports` など）は中身ごと飛ばす（警告）。M1 で resvg が当てるものがあれば合わせる |
-| FR-ST-09 | M | カスケードの順（弱い順）：プレゼンテーション属性 ＜ `style` 要素の規則（詳細度・順） ＜ `style` 属性 ＜ `style` 要素の `!important` ＜ `style` 属性の `!important`。プレゼンテーション属性の一覧は SVG 1.1 と、resvg が読む SVG 2 のもの（`transform`・`transform-origin`・`paint-order`・`mix-blend-mode`・`isolation`・`mask-type` など） |
+| FR-ST-07 | M | CSS のセレクタ（resvg と同じ範囲。ADR-64 (1)）：型（大文字小文字を区別する）・`*`・`#id`・`.class`・属性（`[a]`・`=`・`~=`・`|=`）・`:first-child`、結合子の子孫・`>`・`+`、並び（`,`）。詳細度と出てきた順で決める。`^=`・`$=`・`*=`・`i` の印・`~`・ほかの擬似クラス・擬似要素・名前空間のセレクタは当てない（警告）。並びの中に当てないセレクタがあっても、残りのセレクタは当てる（resvg と同じ。CSS の仕様は規則ごと捨てる） |
+| FR-ST-08 | M | アットルール（`@media`（`screen`・`all` も）・`@import`・`@font-face`・`@supports`・`@layer`・`@charset`・知らないもの）は中身ごと飛ばし（警告）、そのあとの規則は当てる（resvg と同じ。ADR-64 (2)） |
+| FR-ST-09 | M | カスケードの順（弱い順。resvg と同じ。ADR-64 (3)）：プレゼンテーション属性 ＜ `style` 要素の規則（詳細度・順） ＜ `style` 属性 ＜ `style` 要素の `!important`。`style` 属性の `!important` は `style` 属性のふつうの宣言と同じに扱う（規則の `!important` に勝たない）。`<style>` は `type` がないか `text/css` のものだけ、文書のどこにあってもすべての要素に当てる。プレゼンテーション属性の一覧は SVG 1.1 と、resvg が読む SVG 2 のもの（`transform-origin`・`paint-order`・`isolation`・`mask-type`）。`mix-blend-mode` は CSS のプロパティとしてだけ読み、属性としては読まない（resvg・Chrome と同じ）。`marker` のまとめのプロパティを読む。CSS の `transform` プロパティ・`vector-effect`・CSS の幾何のプロパティ（`x`・`width`・`r`・`d` など）は読まない（ADR-64 (4)） |
 | FR-ST-10 | M | 継承・`inherit`・`currentColor`（`color` の継承）。em・ex は計算した `font-size` から |
-| FR-ST-11 | M | `transform`（`matrix`・`translate`・`scale`・`rotate`・`skewX`・`skewY`。区切りのない数 `10-5`・`.5.5` を正しく区切る）と CSS の `transform` プロパティ・`transform-origin`（resvg が受ける範囲） |
+| FR-ST-11 | M | `transform`（`matrix`・`translate`・`scale`・`rotate`・`skewX`・`skewY`。区切りのない数 `10-5`・`.5.5` を正しく区切る）と `transform-origin` 属性。CSS の `transform` プロパティは読まない（resvg と同じ。ADR-64 (4)） |
 | FR-ST-12 | M | `display: none`・`visibility`（`hidden`・`collapse`。子の `visible` は描く）・`opacity` |
-| FR-ST-13 | M | 同じ `id` が複数あれば、文書の順で最初の要素を指す（DOM と Chrome に合わせる。resvg は後のものを使うと見られるので、M1 で照らして差として記録する） |
+| FR-ST-13 | M | 同じ `id` が複数あれば、文書の順で後の要素を指す（resvg と同じ。M1 で照らして確かめた。Chrome・DOM は最初のもの。ADR-64 (5)） |
 | FR-ST-14 | M | `tref`（SVG 1.1。usvg が解くので受ける） |
 | FR-ST-15 | M | 数：字句を自前で切り出し、`f64` に読む。有限でない数（`1e999` など）は壊れた値として、その属性・宣言を無視して警告する（CSS・SVG の誤りの扱い）。数の大きさの上限は持たない（ADR-32。安全は幾何の側で守る。architecture.md §6.1） |
 
@@ -210,7 +210,7 @@
 
 | ID | 優先 | 要件 |
 |---|---|---|
-| FR-OUT-01 | M | 大きさ：外側の svg の `width`・`height`（単位つき、96 dpi）。ない・% なら `viewBox` から。どちらもなければ、usvg と同じく中身の外接矩形の右下を大きさにする（usvg 0.48.1 の振る舞い。100 × 100 ではない。ADR-58 (1)）。その文書の大きさは木を作るまで決まらない（`Document::size` は「中身で決まる」を返し、大きさは `Tree` から読む）。外接矩形の細かい規則（線の太さを含むか・幅か高さの片方だけある文書など）は M1 で resvg と照らして決める。画素は倍率を掛けて切り上げる（10.5 は 11）。0 か負・1 に満たない値（0.3 など）・% が何に対する割合か、の扱いは M1 で resvg と照らして決める |
+| FR-OUT-01 | M | 大きさ：外側の svg の `width`・`height`（単位つき、96 dpi）。ない・% なら `viewBox` から。どちらもなければ、usvg と同じく中身の外接矩形の右下を大きさにする（usvg 0.48.1 の振る舞い。100 × 100 ではない。ADR-58 (1)）。その文書の大きさは木を作るまで決まらない（`Document::size` は `None` を返し、大きさは `Tree` から読む。ADR-63 (3)）。resvg と照らして決めた規則（ADR-64 (8)）：viewBox がなく、幅か高さが欠ける・%・壊れた値なら、幅と高さの両方を中身の外接矩形の右下にする（片方だけある値も使わない）。外接矩形は線の太さを含まず、`visibility: hidden` は含め、`display: none` は含めない。中身がなければ 100 × 100。viewBox があれば、% は viewBox の大きさに対する割合、片方だけなら viewBox の縦横の比で補う。幅か高さが 0 か負なら `Invalid`。壊れた viewBox（幅か高さが 0 以下）は無いものとする。画素は倍率を掛けて切り上げる（10.5 は 11・0.3 は 1） |
 | FR-OUT-02 | M | 大きさは、照合の集まりのすべての入力で resvg 0.48.1 と同じ画素になる（Kura の編集の文書は画素の座標を持つので、大きさが変わると壊れる）。resvg の 32 ビットの丸めに合わせる必要があれば、大きさの計算だけ合わせる（M1 で確かめる） |
 | FR-OUT-03 | M | 倍率（正の有限の数）。描く座標系は「ユーザー単位 × 倍率」。倍率・出力のバッファの大きさと行のバイト数・範囲が正しくなければ `Invalid`（理由は呼び手の誤り。位置なし） |
 | FR-OUT-04 | M | 出力は呼び手が渡す RGBA8 の乗算済みのバッファ（幅・高さ・行のバイト数）。描く前に全体を透明にする。色は sRGB のまま（色の管理をしない。ADR-17） |
