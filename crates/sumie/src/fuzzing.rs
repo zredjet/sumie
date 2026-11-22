@@ -639,6 +639,66 @@ pub const CSS_HEAD: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:x=
 /// [`css_parse`] の文書の終わり（CSS のあと）。
 pub const CSS_TAIL: &[u8] = b"]]></style><g id=\"g\" class=\"a b\" fill=\"red\"><rect id=\"r\" class=\"c\" width=\"5\" height=\"5\" style=\"stroke: blue\"/><x:q id=\"q\"/><circle r=\"1\" lang=\"fr\"/><g><g><path d=\"M0 0\"/></g></g><a xl:href=\"#r\"><text>t</text></a><g/></g></svg>";
 
+/// 値の読みの口（style の値の確かめ・values の読み・`@media`・`@supports`）を通す（ファズの `values` の対象）。頭の 1 バイトで
+/// プロパティ（下の 7 ビット）と、属性か（上の 1 ビット）を選び、残りを値の字句にする（正しい UTF-8 でなければ何もしない）。
+/// 1 回の払いが中止の間隔を超えないこと・同じ入力で同じ結果になること・手間が字句の長さにおおよそ比例することを確かめる。
+pub fn values_parse(data: &[u8]) -> Check {
+    use crate::style::cond::{Env, media, supports};
+    use crate::style::props::PROPS;
+    use crate::style::valid::{Ctx, font_parts, valid, wide};
+    let Some((&head, text)) = data.split_first() else { return Check::Ok };
+    if core::str::from_utf8(text).is_err() {
+        return Check::Ok;
+    }
+    let range = crate::xml::lex::Span::new(0, text.len());
+    let Some(p) = PROPS.get(usize::from(head & 0x7F).checked_rem(PROPS.len()).unwrap_or(0)) else { return Check::Ok };
+    let attr = head & 0x80 != 0;
+    let run = |viewport: bool| -> Result<[bool; 12], Error> {
+        let b = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+        let cx = Ctx { attr, unitless: attr || p.unitless, viewport };
+        let env = Env { color_scheme: crate::style::ColorScheme::Light, size: viewport.then_some((100.0, 50.0)) };
+        let out = [
+            wide(text, range, &b)?.is_some(),
+            valid(p.kind, text, range, cx, &b)?,
+            values_at(text, range, &b).paint()?.is_some(),
+            values_at(text, range, &b).length(attr)?.is_some(),
+            crate::values::transform_attr(text, range, &b)?.is_some(),
+            crate::values::transform_css_valid(text, range, viewport, &b)?,
+            crate::values::view_box(text, range, &b)?.is_some(),
+            crate::values::aspect(text, range, &b)?.is_some(),
+            font_parts(text, range, cx, &b)?.is_some(),
+            media(text, range, &env, &b)?,
+            supports(text, range, crate::css::select::NsTable::EMPTY, &b)?,
+            values_at(text, range, &b).color()?.is_some(),
+        ];
+        if b.max_spend() >= CANCEL_INTERVAL || b.over_released() {
+            return Err(Error::Cancelled);
+        }
+        // 手間は字句の長さにおおよそ比例する（2 乗に伸びない）
+        let bound = (text.len() as u64).saturating_add(16).saturating_mul(4096);
+        if b.work() > bound {
+            return Err(Error::Cancelled);
+        }
+        Ok(out)
+    };
+    for viewport in [false, true] {
+        match (run(viewport), run(viewport)) {
+            (Ok(a), Ok(b)) if a == b => {}
+            (Err(Error::Cancelled), _) | (_, Err(Error::Cancelled)) => {
+                return Check::Violation("値の読みの勘定が崩れたか、手間が長さに比例しない");
+            }
+            _ => return Check::Violation("同じ入力で値の読みの結果が違う"),
+        }
+    }
+    Check::Ok
+}
+
+/// 値の字句を読む口（[`values_parse`] が使う）。
+fn values_at<'a>(text: &'a [u8], range: crate::xml::lex::Span, b: &'a Budget<'_>) -> crate::values::Values<'a, 'a> {
+    let b: &'a Budget<'a> = b;
+    crate::values::Values::new(text, range, b)
+}
+
 /// [`document_parse`] の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DocOutcome {

@@ -1,0 +1,1 @@
+screen and (min-width: 10px) and ((color) or (100px <= width < 300px)), (aspect-ratio: 16/9)

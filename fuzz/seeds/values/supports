@@ -1,0 +1,1 @@
+(fill: red !important) and (not (foo)) or selector(:is(a > b))

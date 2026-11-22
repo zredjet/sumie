@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use sumie::Cancel;
 use sumie::fuzzing::{
     CSS_HEAD, CSS_TAIL, Check, css_parse, document_parse, document_parse_cancel, dtd_parse, math_ops, mem_ops,
-    mem_ops_with, xml_parse,
+    mem_ops_with, values_parse, xml_parse,
 };
 use sumie_testkit::alloc::{assert_heap_within, measure};
 use sumie_testkit::mutate::cases;
@@ -304,6 +304,17 @@ fn css_survives_seeded_mutations() {
     }
     // 読める件も読めない件（壊れた UTF-8・`]]>` など）もある
     assert!(ok > 500 && err > 10, "読めた {ok}・読めない {err}");
+}
+
+#[test]
+fn values_survive_seeded_mutations() {
+    let seeds = fuzz_seeds("values");
+    let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
+    for (n, case) in cases(0x5eed_0008, 4000, &refs, CSS_DICT, 512).iter().enumerate() {
+        let (out, heap) = measure(|| values_parse(case));
+        assert_eq!(out, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
+        assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
+    }
 }
 
 /// 読む段の全体を途中で中止しても（数える段でも本体でも）、勘定が崩れず、確保をすべて返す。
