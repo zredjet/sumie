@@ -25,7 +25,8 @@ pub fn run(_args: &[String]) -> Result<(), String> {
     if !unreachable.is_empty() {
         return Err(format!("clippy が引けない口が crates/sumie/clippy.toml にある：\n{}", unreachable.join("\n")));
     }
-    if text.contains("error[") || text.contains("error:") && !text.contains("warning") {
+    // 組めない（誤りがある）なら照らせない。警告（disallowed の拾い）は誤りでない
+    if !out.status.success() || text.lines().any(|l| l.contains(": error[") || l.starts_with("error[")) {
         return Err(format!("試しのクレートが組めない：\n{text}"));
     }
     // 行 → 拾われた口

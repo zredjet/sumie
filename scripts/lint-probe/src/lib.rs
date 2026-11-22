@@ -73,10 +73,27 @@ pub fn traits(v: &[u32]) -> u32 {
     s + n + c + st.len() as u32 + ow.len() as u32 + e.len() as u32
 }
 
+pub fn added(a: u32, t: &str, v: &[u32], o: Option<&u32>) -> usize {
+    let _ = env!("CARGO_PKG_NAME"); // 期待: core::env
+    let _ = option_env!("X"); // 期待: core::option_env
+    let _ = std::ops::Div::div(a, 2); // 期待: core::ops::arith::Div::div
+    let _ = std::ops::Shl::shl(a, 2u32); // 期待: core::ops::bit::Shl::shl
+    let _: Vec<u32> = v.iter().cloned().take(0).collect(); // 期待: core::iter::traits::iterator::Iterator::cloned core::iter::traits::iterator::Iterator::collect
+    let _ = o.cloned(); // 期待: core::option::Option::cloned
+    let _ = u32::from_str_radix(t, 10); // 期待: u32::from_str_radix
+    let _ = t.to_ascii_lowercase(); // 期待: str::to_ascii_lowercase
+    let _ = std::fmt::format(format_args!("{a}")); // 期待: alloc::fmt::format
+    let _ = 'a'.escape_debug(); // 期待: char::escape_debug
+    0
+}
+
 pub fn types() -> usize {
     let t = std::time::Instant::now(); // 期待: std::time::Instant::now std::time::Instant
     let _ = std::env::var("X"); // 期待: std::env::var
     let _ = std::thread::spawn(|| ()); // 期待: std::thread::spawn
+    if t == t {
+        std::process::abort(); // 期待: std::process::abort
+    }
     let _ = t;
     let m: BTreeMap<u8, u8> = BTreeMap::new(); // 期待: alloc::collections::BTreeMap alloc::collections::btree::map::BTreeMap::new
     let d: VecDeque<u8> = VecDeque::new(); // 期待: alloc::collections::VecDeque alloc::collections::vec_deque::VecDeque::new

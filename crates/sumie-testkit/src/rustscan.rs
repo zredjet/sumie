@@ -91,11 +91,14 @@ pub fn lex(src: &str) -> Vec<Token> {
                     j += 1;
                 }
             }
-            let body = &src[i..j.min(b.len())];
+            let body = src.get(i..j.min(b.len())).unwrap_or("");
             let doc =
                 (body.starts_with("/**") && !body.starts_with("/***") && body != "/**/") || body.starts_with("/*!");
-            if doc && body.len() >= 5 {
-                out.push(Token { kind: Kind::Doc, text: body[3..body.len() - 2].to_string(), line: start_line });
+            // 閉じない注釈（`/** あ`）でも文字の境目で切る
+            let inner = body.strip_prefix("/**").or_else(|| body.strip_prefix("/*!")).unwrap_or("");
+            let inner = inner.strip_suffix("*/").unwrap_or(inner);
+            if doc {
+                out.push(Token { kind: Kind::Doc, text: inner.to_string(), line: start_line });
             }
             i = j;
             continue;
@@ -165,15 +168,20 @@ pub fn lex(src: &str) -> Vec<Token> {
         if c.is_ascii_digit() {
             let mut j = i + 1;
             let hex = c == b'0' && matches!(b.get(i + 1), Some(b'x' | b'X'));
+            // 接尾辞（u8・usize・f64 など）が始まったら、指数の符号と小数点を取らない（`5usize-1` は 3 つの字句）
+            let mut suffix = false;
             while j < b.len() {
                 let d = b[j];
                 if d.is_ascii_alphanumeric() || d == b'_' {
-                    let exp = !hex && (d == b'e' || d == b'E');
+                    let exp = !hex && !suffix && (d == b'e' || d == b'E');
+                    if d.is_ascii_alphabetic() && !exp && !(hex && d.is_ascii_hexdigit()) && !(hex && j == i + 1) {
+                        suffix = true;
+                    }
                     j += 1;
-                    if exp && matches!(b.get(j), Some(b'+' | b'-')) {
+                    if exp && matches!(b.get(j), Some(b'+' | b'-')) && b.get(j + 1).is_some_and(u8::is_ascii_digit) {
                         j += 1;
                     }
-                } else if d == b'.' && b.get(j + 1).is_some_and(u8::is_ascii_digit) {
+                } else if d == b'.' && !suffix && b.get(j + 1).is_some_and(u8::is_ascii_digit) {
                     j += 1;
                 } else {
                     break;
@@ -393,6 +401,22 @@ mod tests {
         assert!(k.contains(&(Kind::Literal, "1.5e-3".to_string())));
         assert!(k.contains(&(Kind::Literal, "0xFFu8".to_string())));
         assert!(k.contains(&(Kind::Literal, "2.0f64".to_string())));
+    }
+
+    #[test]
+    fn suffixes_and_unclosed_comments() {
+        let k = kinds("5usize-1 1e-3 2e5f64 0xFFu8");
+        assert_eq!(k[0], (Kind::Literal, "5usize".to_string()));
+        assert_eq!(k[1], (Kind::Punct, "-".to_string()));
+        assert!(k.contains(&(Kind::Literal, "1e-3".to_string())));
+        assert!(k.contains(&(Kind::Literal, "2e5f64".to_string())));
+        assert!(k.contains(&(Kind::Literal, "0xFFu8".to_string())));
+        // 閉じない文書の注釈・文字列・文字で panic しない
+        assert_eq!(lex("/** あ")[0].kind, Kind::Doc);
+        let _ = lex("/*! い");
+        let _ = lex("\"あ");
+        let _ = lex("'あ");
+        let _ = lex("r#\"う");
     }
 
     #[test]

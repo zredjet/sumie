@@ -2,23 +2,25 @@
 //! ソース（rust-src）から機械的に作る（roadmap M0・ADR-41 (6)）。
 //!
 //! 分類（理由に書く）：
-//! - **落ちうる**：std の文書に `# Panics` の節がある公開の口（core・alloc・std の浮動小数）
-//! - **確保**：alloc の固有の口のうち、本体が確保する口を呼ぶもの（`reserve`・`push`・`Box::new` など）と、alloc で定義した
-//!   トレイトの口（`ToOwned::to_owned`・`ToString::to_string` など）
-//! - **浮動小数**：`f32`・`f64` の固有の口のうち、determinism.md §2.1 の使ってよい口でないもの（超越関数・`mul_add`・
-//!   `powi`・`max`・`min`・`clamp`・`algebraic_*` など）
-//! - **Unicode の表**：`char`・`str` の固有の口のうち、本体が core の Unicode の表（`unicode`）を引くもの
+//! - **落ちうる**：std の文書に `# Panics` の節がある公開の安定な口（core・alloc・std の浮動小数）。写せなかった口が
+//!   あれば、理由を書いた除外の一覧（[`PANICS_UNMAPPED_OK`]）にない限り失敗する（漏れを黙って出さない）
+//! - **確保**：alloc の口のうち、本体が確保する口を呼ぶもの・入れ物の型（`String`・`Vec`・`Box` …）を返すもの、と、それらを
+//!   呼ぶもの（変わらなくなるまで推移させる。公開でない関数も辺に入れる）。alloc で定義したトレイトの口も
+//! - **浮動小数**：`f32`・`f64` の固有の口のうち、determinism.md §2.1 の使ってよい口（と述語）でないもの
+//! - **Unicode の表**：`char`・`str` の口のうち、本体が core の Unicode の表（`unicode`）を引くものと、それを呼ぶもの
+//!   （推移させる）
 //! - **手で書いた分類**：determinism.md・CLAUDE.md の一覧（並べ替え・探索・時刻・環境・スレッド・`Clone::clone`・
-//!   `Iterator::collect` など。std の文書からは決まらないもの）
+//!   `Iterator::collect`・演算子のトレイトの口など。std の文書からは決まらないもの）。core・alloc の口は、走査した口に
+//!   あることを確かめる（打ち間違いを黙って無視しない）
 //!
-//! 生成したものから、理由を付けて許す口（[`ALLOWED`]）を除く。`--check` は今のファイルと照らす。
+//! 生成したものから、理由を付けて許す口（[`ALLOWED`]）を除く（当たらない許す口は誤り）。`--check` は今のファイルと照らす。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sumie_testkit::rustscan::{Kind, Token, lex};
+use sumie_testkit::rustscan::{Kind, Token, lex, matching};
 
 /// 生成したファイルの置き場（workspace の根から）。
 const OUT: &str = "crates/sumie/clippy.toml";
@@ -31,8 +33,8 @@ const PRIMS: [&str; 17] = [
     "bool", "str",
 ];
 
-/// 浮動小数の使ってよい口（determinism.md §2.1：結果が一意に決まるもの・述語・ビットの変換）。
-const FLOAT_OK: [&str; 33] = [
+/// 浮動小数の使ってよい口：determinism.md §2.1 の口（結果が正確に 1 つに決まるもの・ビットの変換）と、値を比べる述語。
+const FLOAT_OK: [&str; 21] = [
     "abs",
     "copysign",
     "signum",
@@ -52,23 +54,11 @@ const FLOAT_OK: [&str; 33] = [
     "is_nan",
     "is_infinite",
     "is_finite",
-    "is_normal",
-    "is_subnormal",
-    "classify",
     "is_sign_positive",
     "is_sign_negative",
-    "to_be_bytes",
-    "to_le_bytes",
-    "to_ne_bytes",
-    "from_be_bytes",
-    "from_le_bytes",
-    "from_ne_bytes",
-    "next_up",
-    "next_down",
-    "to_int_unchecked",
 ];
 
-/// 確保の口を呼ぶとみなす本体の字句（識別子）。alloc の固有の口の本体にこれがあれば「確保」に入れる。
+/// 確保の口を呼ぶとみなす本体の字句（識別子）。
 const ALLOC_IDENTS: [&str; 32] = [
     "Concat",
     "Join",
@@ -104,6 +94,10 @@ const ALLOC_IDENTS: [&str; 32] = [
     "make_mut",
 ];
 
+/// 返すと確保したとみなす入れ物の型。
+const HEAP_TYPES: [&str; 11] =
+    ["String", "Vec", "Box", "Rc", "Arc", "CString", "VecDeque", "BinaryHeap", "BTreeMap", "BTreeSet", "LinkedList"];
+
 /// 手で書いた分類（std の文書からは決まらないもの）。理由つき。
 const HAND: &[(&str, &str)] = &[
     // 確保（std の中で数えずに確保する口。ADR-31）
@@ -112,12 +106,36 @@ const HAND: &[(&str, &str)] = &[
         "確保：入れ物の clone は std の中で数えずに確保する（`Clone::clone` はすべて禁じ、Arc は mem::share。ADR-41 (6)）",
     ),
     ("core::clone::Clone::clone_from", "確保：同上"),
+    ("core::iter::traits::iterator::Iterator::cloned", "確保：要素を clone する（Copy の要素は copied を使う）"),
+    ("core::option::Option::cloned", "確保：同上"),
+    ("core::result::Result::cloned", "確保：同上"),
     (
         "core::iter::traits::iterator::Iterator::collect",
         "確保：std の中で数えずに確保する（mem の入れ物を使う。ADR-31）",
     ),
     ("core::iter::traits::collect::FromIterator::from_iter", "確保：同上"),
     ("core::iter::traits::collect::Extend::extend", "確保：同上"),
+    // 演算子のトレイトの口（arithmetic_side_effects は a / b を拾うが Div::div(a, b) を拾わない）
+    ("core::ops::arith::Add::add", "演算子の口：あふれうる。checked_* を使う（arithmetic_side_effects の抜け道）"),
+    ("core::ops::arith::Sub::sub", "演算子の口：同上"),
+    ("core::ops::arith::Mul::mul", "演算子の口：同上"),
+    ("core::ops::arith::Div::div", "演算子の口：同上（0 で panic する）"),
+    ("core::ops::arith::Rem::rem", "演算子の口：同上（0 で panic する）"),
+    ("core::ops::arith::Neg::neg", "演算子の口：同上"),
+    ("core::ops::arith::AddAssign::add_assign", "演算子の口：同上"),
+    ("core::ops::arith::SubAssign::sub_assign", "演算子の口：同上"),
+    ("core::ops::arith::MulAssign::mul_assign", "演算子の口：同上"),
+    ("core::ops::arith::DivAssign::div_assign", "演算子の口：同上"),
+    ("core::ops::arith::RemAssign::rem_assign", "演算子の口：同上"),
+    ("core::ops::bit::Shl::shl", "演算子の口：桁より大きいずらしで panic する。checked_shl を使う"),
+    ("core::ops::bit::Shr::shr", "演算子の口：同上"),
+    ("core::ops::bit::ShlAssign::shl_assign", "演算子の口：同上"),
+    ("core::ops::bit::ShrAssign::shr_assign", "演算子の口：同上"),
+    // 落ちうる（文書に節がないもの）
+    (
+        "core::char::from_digit",
+        "落ちうる：非推奨の包みで、中で radix が 36 を超えると panic する（char::from_digit と同じ）",
+    ),
     // 並べ替え・探索（determinism.md §4.1・§4.2）
     ("slice::sort", "並べ替え：std の中で確保する。mem::stable_sort を使う（ADR-31）"),
     ("slice::sort_by", "並べ替え：同上"),
@@ -187,7 +205,7 @@ const HAND_INT: &[(&str, &str)] = &[
     ("next_power_of_two", "整数：あふれると debug で panic する。checked_next_power_of_two を使う"),
 ];
 
-/// 生成したものから外す口と、外す理由（使ってよいと確かめたもの）。
+/// 生成したものから外す口と、外す理由（使ってよいと確かめたもの）。当たらない許す口は誤り。
 const ALLOWED: &[(&str, &str)] = &[
     (
         "core::iter::traits::iterator::Iterator::enumerate",
@@ -195,28 +213,47 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
     ("core::iter::traits::iterator::Iterator::count", "同上"),
     ("core::iter::traits::iterator::Iterator::position", "同上"),
-    ("core::iter::traits::iterator::Iterator::rposition", "同上"),
     (
         "core::sync::atomic::Atomic::load",
         "中止の印を Relaxed で読むだけ（Release・AcqRel を渡したときだけ panic する。cancel.rs の 1 か所）",
     ),
 ];
 
-/// std のソースの中の 1 つの口。
+/// 文書に Panics の節があるが、口として写さない（写せない）もの。(ファイル, 関数, 理由)。
+const PANICS_UNMAPPED_OK: &[(&str, &str, &str)] = &[
+    (
+        "core/src/ptr/const_ptr.rs",
+        "align_offset",
+        "生のポインタの口（ライブラリは unsafe を使わず、生のポインタを作らない）。clippy のパスの書き方も決まらない",
+    ),
+    ("core/src/ptr/mut_ptr.rs", "align_offset", "同上"),
+    (
+        "core/src/sync/atomic.rs",
+        "load",
+        "原子の整数の型（atomic_int! が作る）の口。定義のパスは Atomic::load と同じで、そちらで扱う。原子の型は cancel.rs の AtomicBool だけ（tests/rules.rs）",
+    ),
+    ("core/src/sync/atomic.rs", "store", "同上（Atomic::store）"),
+];
+
+/// std のソースの中の 1 つの関数（辺の点。公開でないものも）。
 #[derive(Debug, Clone)]
-struct Item {
-    /// clippy の `disallowed-methods` に書くパス
-    path: String,
-    /// 口の名前
+struct FnInfo {
     name: String,
-    /// 口の持ち主
-    owner: Owner,
-    /// 文書（`///` と `#[doc = "…"]` の中身をつないだもの）
-    docs: String,
-    /// 本体の字句（宣言だけのトレイトの口は空）
-    body: Vec<Token>,
-    /// 定義したクレート（core・alloc・std）
     krate: String,
+    file: String,
+    line: u32,
+    docs: String,
+    body: Vec<Token>,
+    /// 返り値の型の字句の識別子
+    ret: Vec<String>,
+    /// 写した口のパス（写さないものは空）
+    paths: Vec<String>,
+    /// 持ち主（写したもの）
+    owner: Option<Owner>,
+    /// 写すべき口か（公開・安定・unsafe でない・トレイトの実装の中でない・関数の中でない）
+    should_map: bool,
+    /// トレイトの実装の中の口か（推移の辺に入れない）
+    in_trait_impl: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,21 +269,32 @@ enum Owner {
 }
 
 #[derive(Debug, Clone)]
+enum ImplOwner {
+    /// 写せる持ち主
+    Owner(Owner),
+    /// マクロの中の `impl $T`（型はマクロを呼ぶ所から決める）
+    MacroVar,
+    /// トレイトの実装・写せない型
+    None,
+}
+
+#[derive(Debug, Clone)]
 enum Ctx {
-    Impl { owner: Option<Owner>, skip: bool },
+    Impl { owner: ImplOwner, trait_impl: bool, skip: bool },
     Trait { path: String, skip: bool },
     Mod,
     Macro(String),
-    Fn { item: Option<Item>, start: usize },
+    Fn { idx: usize, start: usize },
     Other,
 }
 
-/// `gen-disallowed [--check] [--print]`
+/// `gen-disallowed [--check]`
 pub fn run(args: &[String]) -> Result<(), String> {
     let check = args.iter().any(|a| a == "--check");
     let root = workspace_root()?;
     let (rustc, library) = rust_src()?;
-    let mut items = Vec::new();
+    let mut fns = Vec::new();
+    let mut defined: BTreeSet<String> = BTreeSet::new();
     for (krate, sub) in [("core", "core/src"), ("alloc", "alloc/src"), ("std", "std/src/num")] {
         let dir = library.join(sub);
         let mut files = Vec::new();
@@ -256,11 +304,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
             let rel = f.strip_prefix(library.join(format!("{krate}/src"))).map_err(|e| e.to_string())?;
             let module = module_path(krate, rel);
             let src = std::fs::read_to_string(&f).map_err(|e| format!("{}: {e}", f.display()))?;
-            let file_name = rel.to_string_lossy().to_string();
-            scan_file(krate, &module, &file_name, &src, &mut items);
+            let file_name = format!("{krate}/src/{}", rel.to_string_lossy());
+            defined.extend(type_defs(&module, &lex(&src)));
+            fns.extend(scan_file(krate, &module, &file_name, &src));
         }
     }
-    let text = render(&rustc, &items);
+    drop_undefined_types(&mut fns, &defined);
+    let text = render(&rustc, &fns)?;
     let out = root.join(OUT);
     if check {
         let now = std::fs::read_to_string(&out).map_err(|e| format!("{}: {e}", out.display()))?;
@@ -275,6 +325,33 @@ pub fn run(args: &[String]) -> Result<(), String> {
         println!("{OUT} を書いた");
     }
     Ok(())
+}
+
+/// ファイルで定義した型とトレイトのパス（`core::cell::RefCell` など）。
+fn type_defs(module: &str, t: &[Token]) -> Vec<String> {
+    let mut out = Vec::new();
+    for k in 0..t.len() {
+        if t[k].kind == Kind::Ident
+            && matches!(t[k].text.as_str(), "struct" | "enum" | "union" | "trait")
+            && let Some(n) = t.get(k + 1).filter(|n| n.kind == Kind::Ident)
+        {
+            out.push(format!("{module}::{}", n.text));
+        }
+    }
+    out
+}
+
+/// 持ち主の型の定義がクレートの中に見つからない口（別のクレートの型への口・解けなかった名前）は写さない
+/// （clippy がパスを引けない）。
+fn drop_undefined_types(fns: &mut [FnInfo], defined: &BTreeSet<String>) {
+    for f in fns {
+        if let Some(Owner::Type(p)) = &f.owner
+            && !defined.contains(p)
+        {
+            f.paths.clear();
+            f.owner = None;
+        }
+    }
 }
 
 fn workspace_root() -> Result<PathBuf, String> {
@@ -324,8 +401,7 @@ fn module_path(krate: &str, rel: &Path) -> String {
     let mut parts = vec![krate.to_string()];
     let comps: Vec<String> = rel.iter().map(|c| c.to_string_lossy().to_string()).collect();
     for (k, c) in comps.iter().enumerate() {
-        let last = k + 1 == comps.len();
-        if last {
+        if k + 1 == comps.len() {
             let stem = c.trim_end_matches(".rs");
             if stem != "mod" && stem != "lib" {
                 parts.push(stem.to_string());
@@ -337,10 +413,12 @@ fn module_path(krate: &str, rel: &Path) -> String {
     parts.join("::")
 }
 
-/// 1 つのファイルを走査して、公開の口を `items` に足す。
-fn scan_file(krate: &str, module: &str, file: &str, src: &str, items: &mut Vec<Item>) {
+/// 1 つのファイルを走査して、すべての関数を返す（写せる公開の口には `paths` が入る）。
+fn scan_file(krate: &str, module: &str, file: &str, src: &str) -> Vec<FnInfo> {
     let t = lex(src);
     let names = Names::collect(krate, module, &t);
+    let macro_types = macro_invocation_types(&t);
+    let mut fns: Vec<FnInfo> = Vec::new();
     let mut stack: Vec<Ctx> = Vec::new();
     // かっこの深さ（{} の文脈ごとに 0 から数え直す）
     let mut paren: Vec<i64> = vec![0];
@@ -350,6 +428,16 @@ fn scan_file(krate: &str, module: &str, file: &str, src: &str, items: &mut Vec<I
         let tok = &t[i];
         if tok.kind == Kind::Punct {
             match tok.text.as_str() {
+                // 属性の中（`#[doc = m!{…}]` など）は飛ばす：中の {} を文脈に積まない
+                "#" => {
+                    let open = if t.get(i + 1).is_some_and(|x| x.is_punct('!')) { i + 2 } else { i + 1 };
+                    if t.get(open).is_some_and(|x| x.is_punct('['))
+                        && let Some(close) = matching(&t, open)
+                    {
+                        i = close + 1;
+                        continue;
+                    }
+                }
                 "(" | "[" => {
                     if let Some(p) = paren.last_mut() {
                         *p += 1;
@@ -363,14 +451,14 @@ fn scan_file(krate: &str, module: &str, file: &str, src: &str, items: &mut Vec<I
                 ";" if paren.last() == Some(&0) => {
                     // 本体のない口（トレイトの宣言だけの口）
                     let header = &t[start..i];
-                    if let Some(item) = fn_item(krate, module, file, header, &stack) {
-                        items.push(item);
+                    if let Some(f) = fn_info(krate, module, file, header, &stack, &macro_types) {
+                        fns.push(f);
                     }
                     start = i + 1;
                 }
                 "{" => {
                     let header = &t[start..i];
-                    let ctx = classify(krate, module, file, header, &stack, i, &names);
+                    let ctx = classify(krate, module, file, header, &stack, &names, &macro_types, &mut fns, i + 1);
                     stack.push(ctx);
                     paren.push(0);
                     start = i + 1;
@@ -380,9 +468,10 @@ fn scan_file(krate: &str, module: &str, file: &str, src: &str, items: &mut Vec<I
                     if paren.is_empty() {
                         paren.push(0);
                     }
-                    if let Some(Ctx::Fn { item: Some(mut item), start: s }) = stack.pop() {
-                        item.body = t[s..i].to_vec();
-                        items.push(item);
+                    if let Some(Ctx::Fn { idx, start: body_start }) = stack.pop()
+                        && let Some(f) = fns.get_mut(idx)
+                    {
+                        f.body = t[body_start.min(i)..i].to_vec();
                     }
                     start = i + 1;
                 }
@@ -391,9 +480,44 @@ fn scan_file(krate: &str, module: &str, file: &str, src: &str, items: &mut Vec<I
         }
         i += 1;
     }
+    fns
 }
 
-/// 字句の並びから属性（`#[…]`・`#![…]`）を除き、属性の中身の識別子と、文書の中身を返す。
+/// マクロの名前 → 呼ぶ所に並んだ基本の型（`from_str_int_impl! { signed isize i8 … }` → isize・i8 …）。
+fn macro_invocation_types(t: &[Token]) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for k in 0..t.len() {
+        if t[k].kind != Kind::Ident || !t.get(k + 1).is_some_and(|x| x.is_punct('!')) {
+            continue;
+        }
+        if k >= 1 && t[k - 1].is_ident("macro_rules") {
+            continue;
+        }
+        let Some(open) = t.get(k + 2).filter(|x| x.is_punct('{') || x.is_punct('(') || x.is_punct('[')).map(|_| k + 2)
+        else {
+            continue;
+        };
+        let Some(close) = matching(t, open) else { continue };
+        // 型の並びだけを渡す呼び方（識別子が基本の型と signed・unsigned だけ）に限る。ほかの識別子（型の名前・属性）が
+        // 混ざる呼び方（atomic_int! など）は、どの型の口になるか字句で決まらないので使わない
+        let idents: Vec<&Token> = t[open + 1..close].iter().filter(|x| x.kind == Kind::Ident).collect();
+        let only_types =
+            idents.iter().all(|x| PRIMS.contains(&x.text.as_str()) || x.is_ident("signed") || x.is_ident("unsigned"));
+        let tys: Vec<String> =
+            idents.iter().filter(|x| PRIMS.contains(&x.text.as_str())).map(|x| x.text.clone()).collect();
+        if only_types && !tys.is_empty() {
+            let e = out.entry(t[k].text.clone()).or_default();
+            for ty in tys {
+                if !e.contains(&ty) {
+                    e.push(ty);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 字句の並びから属性（`#[…]`・`#![…]`）を除き、属性の中身と、文書の中身を返す。
 fn split_header(header: &[Token]) -> (Vec<Token>, Vec<String>, String) {
     let mut rest = Vec::new();
     let mut attrs = Vec::new();
@@ -413,21 +537,8 @@ fn split_header(header: &[Token]) -> (Vec<Token>, Vec<String>, String) {
                 j += 1;
             }
             if header.get(j).is_some_and(|t| t.is_punct('[')) {
-                // 対応する ]
-                let mut depth = 0i64;
-                let mut end = j;
-                for (m, t) in header.iter().enumerate().skip(j) {
-                    if t.is_punct('[') {
-                        depth += 1;
-                    } else if t.is_punct(']') {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = m;
-                            break;
-                        }
-                    }
-                }
-                let inner = &header[j + 1..end.max(j + 1)];
+                let end = matching(header, j).unwrap_or(header.len().saturating_sub(1));
+                let inner = &header[(j + 1).min(end)..end];
                 let head = inner.first().map(|t| t.text.clone()).unwrap_or_default();
                 if head == "doc" {
                     for s in inner.iter().filter(|t| t.kind == Kind::Str) {
@@ -448,17 +559,18 @@ fn split_header(header: &[Token]) -> (Vec<Token>, Vec<String>, String) {
         rest.push(tok.clone());
         k += 1;
     }
+    // マクロの繰り返しの印（`$(`・`)*`・`,`）が見出しの頭に混ざるのを除く
+    let lead = rest
+        .iter()
+        .take_while(|t| t.kind == Kind::Punct && matches!(t.text.as_str(), "$" | "(" | ")" | "*" | "+" | ","))
+        .count();
+    rest.drain(..lead);
     (rest, attrs, docs)
 }
 
 /// 安定でない・隠した・試験だけの口か。
 fn is_skipped(attrs: &[String]) -> bool {
-    attrs.iter().any(|a| {
-        a.starts_with("unstable")
-            || a == "doc_hidden"
-            || a.starts_with("cfg ( test")
-            || a.starts_with("rustc_deprecated_safe_2024")
-    })
+    attrs.iter().any(|a| a.starts_with("unstable") || a == "doc_hidden" || a.starts_with("cfg ( test"))
 }
 
 /// 見出しの字句（属性を除いたもの）から、可視性・修飾を除いた残りと、公開かどうか。
@@ -469,24 +581,12 @@ fn strip_vis(rest: &[Token]) -> (bool, Vec<Token>) {
         k = 1;
         if rest.get(1).is_some_and(|t| t.is_punct('(')) {
             // pub(crate) などは公開でない
-            let mut depth = 0i64;
-            for (m, t) in rest.iter().enumerate().skip(1) {
-                if t.is_punct('(') {
-                    depth += 1;
-                } else if t.is_punct(')') {
-                    depth -= 1;
-                    if depth == 0 {
-                        k = m + 1;
-                        break;
-                    }
-                }
-            }
+            k = matching(rest, 1).map_or(rest.len(), |c| c + 1);
         } else {
             public = true;
         }
     }
     let mut out: Vec<Token> = rest[k.min(rest.len())..].to_vec();
-    // 修飾
     while let Some(f) = out.first() {
         if f.kind == Kind::Ident && matches!(f.text.as_str(), "default" | "const" | "async" | "safe") {
             out.remove(0);
@@ -499,48 +599,56 @@ fn strip_vis(rest: &[Token]) -> (bool, Vec<Token>) {
     (public, out)
 }
 
-/// `{` の前の見出しから文脈を決める。
-fn classify(krate: &str, module: &str, file: &str, header: &[Token], stack: &[Ctx], open: usize, names: &Names) -> Ctx {
+/// `{` の前の見出しから文脈を決める（関数なら `fns` に足す）。
+#[allow(clippy::too_many_arguments)]
+fn classify(
+    krate: &str,
+    module: &str,
+    file: &str,
+    header: &[Token],
+    stack: &[Ctx],
+    names: &Names,
+    macro_types: &BTreeMap<String, Vec<String>>,
+    fns: &mut Vec<FnInfo>,
+    body_start: usize,
+) -> Ctx {
     let (rest, attrs, _docs) = split_header(header);
     let skip = is_skipped(&attrs);
     let (public, body) = strip_vis(&rest);
     let Some(first) = body.first() else { return Ctx::Other };
-    if first.is_ident("unsafe") {
-        // unsafe impl・unsafe trait・unsafe fn
-        if body.get(1).is_some_and(|t| t.is_ident("fn")) {
-            return Ctx::Fn { item: None, start: open + 1 };
-        }
-        if body.get(1).is_some_and(|t| t.is_ident("impl")) {
-            return Ctx::Impl { owner: None, skip: true };
-        }
-        if body.get(1).is_some_and(|t| t.is_ident("trait")) {
-            return Ctx::Trait { path: String::new(), skip: true };
-        }
-    }
-    if first.is_ident("impl") {
+    let unsafe_head = first.is_ident("unsafe");
+    let kw = if unsafe_head { body.get(1) } else { Some(first) };
+    let rest_after = if unsafe_head { body.get(2..).unwrap_or(&[]) } else { body.get(1..).unwrap_or(&[]) };
+    let Some(kw) = kw else { return Ctx::Other };
+    if kw.is_ident("impl") {
         let in_fn = stack.iter().any(|c| matches!(c, Ctx::Fn { .. }));
-        let owner = if in_fn { None } else { impl_owner(module, &body[1..], names) };
-        return Ctx::Impl { owner, skip };
+        let (owner, trait_impl) = if in_fn { (ImplOwner::None, false) } else { impl_owner(module, rest_after, names) };
+        return Ctx::Impl { owner, trait_impl, skip: skip || unsafe_head };
     }
-    if first.is_ident("trait") {
-        let name = body.get(1).map(|t| t.text.clone()).unwrap_or_default();
-        return Ctx::Trait { path: format!("{module}::{name}"), skip: skip || !public };
+    if kw.is_ident("trait") {
+        let name = rest_after.first().map(|t| t.text.clone()).unwrap_or_default();
+        return Ctx::Trait { path: format!("{module}::{name}"), skip: skip || !public || unsafe_head };
     }
-    if first.is_ident("mod") {
+    if kw.is_ident("mod") {
         return Ctx::Mod;
     }
-    if first.is_ident("macro_rules") {
+    if kw.is_ident("macro_rules") {
         return Ctx::Macro(body.get(2).map(|t| t.text.clone()).unwrap_or_default());
     }
-    if first.is_ident("fn") {
-        let item = fn_item(krate, module, file, header, stack);
-        return Ctx::Fn { item, start: open + 1 };
+    if kw.is_ident("fn") {
+        if let Some(f) = fn_info(krate, module, file, header, stack, macro_types) {
+            // 本体は閉じたときに body_start から切り出す
+            let idx = fns.len();
+            fns.push(f);
+            return Ctx::Fn { idx, start: body_start };
+        }
+        return Ctx::Other;
     }
     Ctx::Other
 }
 
 /// `impl` の見出し（`impl` のあと）から持ち主を決める。トレイトの実装は None（トレイトの定義の側で見る）。
-fn impl_owner(module: &str, h: &[Token], names: &Names) -> Option<Owner> {
+fn impl_owner(module: &str, h: &[Token], names: &Names) -> (ImplOwner, bool) {
     let mut k = 0usize;
     // 型の引数 <…>
     if h.first().is_some_and(|t| t.is_punct('<')) {
@@ -569,10 +677,13 @@ fn impl_owner(module: &str, h: &[Token], names: &Names) -> Option<Owner> {
             || (t.is_punct('!') && m == 0)
         {
             // トレイトの実装（impl Trait for Type）と否定の実装（impl !Send for Type）
-            return None;
+            return (ImplOwner::None, true);
         }
     }
-    let first = h.first()?;
+    let Some(first) = h.first() else { return (ImplOwner::None, false) };
+    if first.is_punct('$') {
+        return (ImplOwner::MacroVar, false);
+    }
     if first.is_punct('[') {
         let mut d = 0i64;
         for t in h {
@@ -584,16 +695,16 @@ fn impl_owner(module: &str, h: &[Token], names: &Names) -> Option<Owner> {
                     break;
                 }
             } else if d == 1 && t.is_punct(';') {
-                return None; // 配列（[T; N]）は扱わない
+                return (ImplOwner::None, false); // 配列（[T; N]）は扱わない
             }
         }
-        return Some(Owner::Prim("slice".to_string()));
+        return (ImplOwner::Owner(Owner::Prim("slice".to_string())), false);
     }
     if first.kind != Kind::Ident || first.is_ident("dyn") {
-        return None;
+        return (ImplOwner::None, false);
     }
     if PRIMS.contains(&first.text.as_str()) {
-        return Some(Owner::Prim(first.text.clone()));
+        return (ImplOwner::Owner(Owner::Prim(first.text.clone())), false);
     }
     // パス A::B::C<…>
     let mut segs = Vec::new();
@@ -608,16 +719,16 @@ fn impl_owner(module: &str, h: &[Token], names: &Names) -> Option<Owner> {
         }
         break;
     }
-    let name = segs.last()?.clone();
+    let Some(name) = segs.last().cloned() else { return (ImplOwner::None, false) };
     if segs.first().is_some_and(|s| s == "crate") && segs.len() > 1 {
         let krate = module.split("::").next().unwrap_or("core");
         let rest = segs[1..].join("::");
-        return Some(Owner::Type(format!("{krate}::{rest}")));
+        return (ImplOwner::Owner(Owner::Type(format!("{krate}::{rest}"))), false);
     }
     if segs.len() > 1 {
-        return None; // 外のパス（self::・super:: など）は扱わない
+        return (ImplOwner::None, false); // 外のパス（self::・super:: など）は扱わない
     }
-    Some(Owner::Type(names.resolve(module, &name)))
+    (ImplOwner::Owner(Owner::Type(names.resolve(module, &name))), false)
 }
 
 /// ファイルの中の名前の表：定義した型・型の別名・`use` で入れた名前（impl の型の定義の場所を解くため）。
@@ -640,21 +751,16 @@ impl Names {
                     defined.push(n.text.clone());
                 }
             } else if tok.is_ident("type") {
-                // type A = B<…>;
-                if let (Some(a), Some(eq), Some(b)) = (t.get(k + 1), t.get(k + 2), t.get(k + 3)) {
-                    if a.kind == Kind::Ident && eq.is_punct('=') && b.kind == Kind::Ident {
+                // type A = B<…>; と type A<T> = B<…>;
+                if let Some(a) = t.get(k + 1).filter(|a| a.kind == Kind::Ident) {
+                    let mut m = k + 2;
+                    while m < t.len() && !t[m].is_punct('=') && !t[m].is_punct(';') {
+                        m += 1;
+                    }
+                    if t.get(m).is_some_and(|e| e.is_punct('='))
+                        && let Some(b) = t.get(m + 1).filter(|b| b.kind == Kind::Ident)
+                    {
                         aliases.push((a.text.clone(), b.text.clone()));
-                    } else if a.kind == Kind::Ident && eq.is_punct('<') {
-                        // type A<T> = B<…>;
-                        let mut m = k + 2;
-                        while m < t.len() && !t[m].is_punct('=') && !t[m].is_punct(';') {
-                            m += 1;
-                        }
-                        if let Some(b) = t.get(m + 1).filter(|b| b.kind == Kind::Ident)
-                            && t[m].is_punct('=')
-                        {
-                            aliases.push((a.text.clone(), b.text.clone()));
-                        }
                     }
                 }
             } else if tok.is_ident("use") {
@@ -731,95 +837,137 @@ impl Names {
     }
 }
 
-/// `fn` の見出しから口を作る（持ち主が決まり、公開で安定なものだけ）。
-fn fn_item(krate: &str, module: &str, _file: &str, header: &[Token], stack: &[Ctx]) -> Option<Item> {
+/// `fn` の見出しから関数の情報を作る（写せる公開の口なら `paths` を入れる）。
+fn fn_info(
+    krate: &str,
+    module: &str,
+    file: &str,
+    header: &[Token],
+    stack: &[Ctx],
+    macro_types: &BTreeMap<String, Vec<String>>,
+) -> Option<FnInfo> {
     let (rest, attrs, docs) = split_header(header);
-    if is_skipped(&attrs) {
-        return None;
-    }
     let (public, body) = strip_vis(&rest);
-    if body.first().is_some_and(|t| t.is_ident("unsafe")) {
-        return None;
-    }
+    let is_unsafe = body.first().is_some_and(|t| t.is_ident("unsafe"));
+    let body: &[Token] = if is_unsafe { body.get(1..).unwrap_or(&[]) } else { &body };
     if !body.first().is_some_and(|t| t.is_ident("fn")) {
         return None;
     }
-    let name = body.get(1).filter(|t| t.kind == Kind::Ident)?.text.clone();
+    let name_tok = body.get(1).filter(|t| t.kind == Kind::Ident)?;
+    let name = name_tok.text.clone();
+    let line = name_tok.line;
+    // 返り値の型の識別子
+    let ret = return_idents(body);
+    let skipped = is_skipped(&attrs);
     // いちばん近い文脈（Other を飛ばす）
-    let mut owners = Vec::new();
-    let mut inside_macro: Option<String> = None;
-    let mut skip_ctx = false;
+    let mut owner: Option<Owner> = None;
+    let mut ctx_skip = false;
+    let mut in_trait_impl = false;
+    let mut nested = false;
+    let mut macro_name: Option<String> = None;
+    let mut macro_var = false;
+    let mut decided = false;
     for c in stack.iter().rev() {
         match c {
             Ctx::Other => continue,
-            Ctx::Fn { .. } => return None, // 関数の中の関数
-            Ctx::Impl { owner, skip } => {
-                if *skip || !public {
-                    return None;
+            Ctx::Fn { .. } => {
+                nested = true;
+                decided = true;
+            }
+            Ctx::Impl { owner: o, trait_impl, skip } => {
+                ctx_skip = *skip;
+                in_trait_impl = *trait_impl;
+                match o {
+                    ImplOwner::Owner(o) if public => owner = Some(o.clone()),
+                    ImplOwner::MacroVar => macro_var = true,
+                    _ => {}
                 }
-                owners.push(owner.clone()?);
-                break;
+                decided = true;
             }
             Ctx::Trait { path, skip } => {
-                skip_ctx = *skip;
-                owners.push(Owner::Trait(path.clone()));
-                break;
+                ctx_skip = *skip;
+                owner = Some(Owner::Trait(path.clone()));
+                decided = true;
             }
             Ctx::Macro(m) => {
-                inside_macro = Some(m.clone());
+                if macro_name.is_none() {
+                    macro_name = Some(m.clone());
+                }
                 continue;
             }
             Ctx::Mod => {
-                if !public {
-                    return None;
+                if public {
+                    owner = Some(Owner::Free);
                 }
-                owners.push(Owner::Free);
-                break;
+                decided = true;
+            }
+        }
+        if decided {
+            break;
+        }
+    }
+    // マクロの中の impl $T：impl の外のマクロの名前を探す
+    if macro_var && macro_name.is_none() {
+        macro_name = stack.iter().rev().find_map(|c| if let Ctx::Macro(m) = c { Some(m.clone()) } else { None });
+    }
+    if !decided && public {
+        // ファイルの頭の関数か、int_impl!・uint_impl! の中の口（core/src/num/{int,uint}_macros.rs）
+        owner = match macro_name.as_deref() {
+            Some("int_impl") | Some("uint_impl") => Some(Owner::Prim(String::new())),
+            Some(_) => None,
+            None => Some(Owner::Free),
+        };
+    }
+    let mappable = !skipped && !ctx_skip && !is_unsafe && !nested && !in_trait_impl;
+    let should_map = mappable && (public || matches!(owner, Some(Owner::Trait(_))));
+    let mut paths = Vec::new();
+    if mappable {
+        let types: Vec<String> = match (macro_name.as_deref(), macro_var, &owner) {
+            (Some("int_impl"), _, Some(Owner::Prim(_))) => SIGNED.iter().map(|s| s.to_string()).collect(),
+            (Some("uint_impl"), _, Some(Owner::Prim(_))) => UNSIGNED.iter().map(|s| s.to_string()).collect(),
+            (Some(m), true, _) if public => macro_types.get(m).cloned().unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if !types.is_empty() {
+            for ty in &types {
+                paths.push(format!("{ty}::{name}"));
+            }
+            owner = Some(Owner::Prim(types.join(",")));
+        } else {
+            match &owner {
+                // 別のクレートの型に付けた固有の口（alloc が core の型に付けたものなど）は、clippy がパスを引けない
+                Some(Owner::Type(p)) if p.split("::").next() != Some(krate) => owner = None,
+                Some(Owner::Prim(p)) if !p.is_empty() => paths.push(format!("{p}::{name}")),
+                Some(Owner::Type(p)) | Some(Owner::Trait(p)) => paths.push(format!("{p}::{name}")),
+                Some(Owner::Free) => paths.push(format!("{module}::{name}")),
+                _ => {}
             }
         }
     }
-    if skip_ctx {
-        return None;
-    }
-    if owners.is_empty() {
-        if let Some(m) = &inside_macro {
-            // int_impl!・uint_impl! の中の口は整数の型すべてに当たる（core/src/num/{int,uint}_macros.rs）
-            if !public {
-                return None;
-            }
-            let types: &[&str] = match m.as_str() {
-                "int_impl" => &SIGNED,
-                "uint_impl" => &UNSIGNED,
-                _ => return None,
-            };
-            // 1 つ目を返し、残りは呼び手が写す（render で展開する）
-            return Some(Item {
-                path: format!("{{ints:{}}}::{name}", types.join(",")),
-                name,
-                owner: Owner::Prim(types.join(",")),
-                docs,
-                body: Vec::new(),
-                krate: krate.to_string(),
-            });
-        }
-        if !public {
-            return None;
-        }
-        owners.push(Owner::Free);
-    }
-    let owner = owners.pop()?;
-    // 別のクレートの型に付けた固有の口（alloc が core の型に付けたものなど）は、clippy がパスを引けないので扱わない
-    if let Owner::Type(p) = &owner
-        && p.split("::").next() != Some(krate)
-    {
-        return None;
-    }
-    let path = match &owner {
-        Owner::Prim(p) => format!("{p}::{name}"),
-        Owner::Type(p) | Owner::Trait(p) => format!("{p}::{name}"),
-        Owner::Free => format!("{module}::{name}"),
-    };
-    Some(Item { path, name, owner, docs, body: Vec::new(), krate: krate.to_string() })
+    Some(FnInfo {
+        name,
+        krate: krate.to_string(),
+        file: file.to_string(),
+        line,
+        docs,
+        body: Vec::new(),
+        ret,
+        paths,
+        owner,
+        should_map,
+        in_trait_impl,
+    })
+}
+
+/// 見出しの `->` のあとの識別子。
+fn return_idents(h: &[Token]) -> Vec<String> {
+    let Some(arrow) = h.windows(2).position(|w| w[0].is_punct('-') && w[1].is_punct('>')) else { return Vec::new() };
+    h[arrow + 2..]
+        .iter()
+        .take_while(|t| !t.is_ident("where"))
+        .filter(|t| t.kind == Kind::Ident)
+        .map(|t| t.text.clone())
+        .collect()
 }
 
 fn has_panics(docs: &str) -> bool {
@@ -829,32 +977,46 @@ fn has_panics(docs: &str) -> bool {
     })
 }
 
-fn body_has(item: &Item, names: &[&str]) -> bool {
-    item.body.iter().any(|t| t.kind == Kind::Ident && names.contains(&t.text.as_str()))
+/// 本体が `names` のどれかを関数として呼ぶか（`名前(` か `名前::<`）。
+fn calls_any(body: &[Token], names: &BTreeSet<String>) -> bool {
+    body.iter().enumerate().any(|(k, t)| {
+        t.kind == Kind::Ident
+            && names.contains(&t.text)
+            && body.get(k + 1).is_some_and(|n| n.is_punct('(') || n.is_punct(':'))
+    })
 }
 
-/// 整数のマクロの口を型ごとに広げる。
-fn expand(items: &[Item]) -> Vec<Item> {
-    let mut out = Vec::new();
-    for it in items {
-        if let Some(rest) = it.path.strip_prefix("{ints:") {
-            let (types, name) = rest.split_once("}::").unwrap_or(("", ""));
-            for ty in types.split(',') {
-                let mut c = it.clone();
-                c.path = format!("{ty}::{name}");
-                c.owner = Owner::Prim(ty.to_string());
-                out.push(c);
+/// 種から始めて、本体が印のついた関数を呼ぶ関数に、変わらなくなるまで印を広げる。印は関数ごと。辺は名前で張るが、
+/// その名前の関数が 1 つしかないときだけにする（`new`・`get` のような多くの型が持つ名前を通って、確保しない口にまで
+/// 印が広がらないように）。戻り値は `fns` と同じ並びの印。
+fn propagate(fns: &[&FnInfo], seed: impl Fn(&FnInfo) -> bool) -> Vec<bool> {
+    let mut count: BTreeMap<&str, usize> = BTreeMap::new();
+    for f in fns {
+        *count.entry(f.name.as_str()).or_default() += 1;
+    }
+    let mut marked: Vec<bool> = fns.iter().map(|f| seed(f)).collect();
+    loop {
+        let names: BTreeSet<String> = fns
+            .iter()
+            .zip(&marked)
+            .filter(|(f, m)| **m && count.get(f.name.as_str()) == Some(&1))
+            .map(|(f, _)| f.name.clone())
+            .collect();
+        let mut changed = false;
+        for (f, m) in fns.iter().zip(marked.iter_mut()) {
+            if !*m && calls_any(&f.body, &names) {
+                *m = true;
+                changed = true;
             }
-        } else {
-            out.push(it.clone());
+        }
+        if !changed {
+            return marked;
         }
     }
-    out
 }
 
 /// 分類して clippy.toml の中身を作る。
-fn render(rustc: &str, raw: &[Item]) -> String {
-    let items = expand(raw);
+fn render(rustc: &str, fns: &[FnInfo]) -> Result<String, String> {
     let mut reasons: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut add = |path: &str, why: &str| {
         let e = reasons.entry(path.to_string()).or_default();
@@ -862,84 +1024,106 @@ fn render(rustc: &str, raw: &[Item]) -> String {
             e.push(why.to_string());
         }
     };
-    // 1. 落ちうる
-    for it in &items {
-        if has_panics(&it.docs) {
-            add(&it.path, "落ちうる：std の文書に Panics の節がある。範囲を確かめた包みか checked_* を使う");
+    let mapped: Vec<&FnInfo> = fns.iter().filter(|f| !f.paths.is_empty()).collect();
+    let all_paths: BTreeSet<&str> = mapped.iter().flat_map(|f| f.paths.iter().map(String::as_str)).collect();
+    // 1. 落ちうる（写せなかった口は除外の一覧にない限り誤り）
+    let mut unmapped = Vec::new();
+    for f in fns.iter().filter(|f| has_panics(&f.docs)) {
+        if !f.paths.is_empty() {
+            for p in &f.paths {
+                add(p, "落ちうる：std の文書に Panics の節がある。範囲を確かめた包みか checked_* を使う");
+            }
+        } else if f.should_map && !PANICS_UNMAPPED_OK.iter().any(|(file, n, _)| *file == f.file && *n == f.name) {
+            unmapped.push(format!("{}:{} {}", f.file, f.line, f.name));
         }
     }
-    // 2. 確保（alloc の固有の口で本体が確保する口を呼ぶもの・alloc で定義したトレイトの口）
-    for it in &items {
-        if it.krate != "alloc" || it.name.starts_with("try_") {
+    if !unmapped.is_empty() {
+        return Err(format!(
+            "Panics の節がある公開の口のうち、clippy のパスに写せなかったもの（走査を直すか、PANICS_UNMAPPED_OK に理由を書く）：\n{}",
+            unmapped.join("\n")
+        ));
+    }
+    // 2. 確保（alloc の関数の辺で推移させる。トレイトの実装の中の口は辺に入れない）
+    let alloc_fns: Vec<&FnInfo> = fns.iter().filter(|f| f.krate == "alloc" && !f.in_trait_impl).collect();
+    let alloc_marked = propagate(&alloc_fns, |f| {
+        f.body.iter().any(|t| t.kind == Kind::Ident && ALLOC_IDENTS.contains(&t.text.as_str()))
+            || f.ret.iter().any(|r| HEAP_TYPES.contains(&r.as_str()))
+    });
+    for (f, m) in alloc_fns.iter().zip(&alloc_marked) {
+        if f.paths.is_empty() || f.name.starts_with("try_") {
             continue;
         }
-        let alloc_owner = matches!(&it.owner, Owner::Type(_) | Owner::Prim(_));
-        let alloc_trait = matches!(&it.owner, Owner::Trait(_));
-        if (alloc_owner && (body_has(it, &ALLOC_IDENTS) || returns_owned_new(it))) || alloc_trait {
-            add(&it.path, "確保：std の中で数えずに確保する。mem の入れ物を使う（ADR-31）");
-        }
-    }
-    // 3. 浮動小数
-    for it in &items {
-        if let Owner::Prim(p) = &it.owner
-            && (p == "f32" || p == "f64")
-            && !FLOAT_OK.contains(&it.name.as_str())
-        {
-            add(
-                &it.path,
-                "浮動小数：値が環境・版で変わりうるか、決めた規則と違う。crate::math を使う（determinism.md §2.2・§2.3）",
-            );
-        }
-    }
-    // 4. Unicode の表（char・str の口で本体が unicode を引くもの。char の禁じた口を呼ぶ str の口も）
-    let mut uni: Vec<String> = Vec::new();
-    for _round in 0..4 {
-        for it in &items {
-            if let Owner::Prim(p) = &it.owner {
-                if p != "char" && p != "str" {
-                    continue;
-                }
-                if it.name.contains("ascii") || uni.contains(&it.path) {
-                    continue;
-                }
-                let calls_uni = it.body.iter().any(|t| {
-                    t.kind == Kind::Ident
-                        && (t.text == "unicode" || uni.iter().any(|u| u.rsplit("::").next() == Some(t.text.as_str())))
-                });
-                if calls_uni {
-                    uni.push(it.path.clone());
-                }
+        let trait_in_alloc = matches!(&f.owner, Some(Owner::Trait(_)));
+        if trait_in_alloc || *m {
+            for p in &f.paths {
+                add(p, "確保：std の中で数えずに確保する。mem の入れ物を使う（ADR-31）");
             }
         }
     }
-    for p in &uni {
-        add(p, "Unicode の表：std の表は Rust の版で上がる。自前の表と関数を使う（determinism.md §4.3）");
+    // 3. 浮動小数
+    for f in &mapped {
+        if let Some(Owner::Prim(p)) = &f.owner
+            && (p == "f32" || p == "f64")
+            && !FLOAT_OK.contains(&f.name.as_str())
+        {
+            for path in &f.paths {
+                add(
+                    path,
+                    "浮動小数：値が環境・版で変わりうるか、決めた規則と違う。crate::math を使う（determinism.md §2.2・§2.3）",
+                );
+            }
+        }
     }
-    // 5. 手で書いた分類
+    // 4. Unicode の表（core の関数の辺で推移させる。ASCII の口は除く）
+    let core_fns: Vec<&FnInfo> = fns.iter().filter(|f| f.krate == "core" && !f.in_trait_impl).collect();
+    let uni = propagate(&core_fns, |f| f.body.iter().any(|t| t.is_ident("unicode")));
+    for (f, m) in core_fns.iter().zip(&uni) {
+        if let Some(Owner::Prim(p)) = &f.owner
+            && (p == "char" || p == "str")
+            && !f.name.contains("ascii")
+            && *m
+        {
+            for path in &f.paths {
+                add(path, "Unicode の表：std の表は Rust の版で上がる。自前の表と関数を使う（determinism.md §4.3）");
+            }
+        }
+    }
+    // 5. 手で書いた分類（core・alloc・基本の型の口は、走査した口にあることを確かめる）
+    let mut typos = Vec::new();
     for (p, why) in HAND {
+        if !p.starts_with("std::") && !all_paths.contains(p) {
+            typos.push(*p);
+        }
         add(p, why);
     }
-    let int_names: Vec<&str> =
-        items.iter().filter(|i| matches!(&i.owner, Owner::Prim(_))).map(|i| i.path.as_str()).collect();
     for ty in SIGNED.iter().chain(UNSIGNED.iter()) {
         for (name, why) in HAND_INT {
             let p = format!("{ty}::{name}");
-            if int_names.contains(&p.as_str()) {
+            if all_paths.contains(p.as_str()) {
                 add(&p, why);
             }
         }
     }
-    // 許す口を除く
+    if !typos.is_empty() {
+        return Err(format!("手で書いた口が走査した口にない（打ち間違いか、版で消えた）：{typos:?}"));
+    }
+    // 許す口を除く（当たらないものは誤り）
     let mut allowed_note = String::new();
+    let mut unused = Vec::new();
     for (p, why) in ALLOWED {
         if reasons.remove(*p).is_some() {
             let _ = writeln!(allowed_note, "#   {p}：{why}");
+        } else {
+            unused.push(*p);
         }
+    }
+    if !unused.is_empty() {
+        return Err(format!("許す口が一覧に当たらない（ALLOWED から消す）：{unused:?}"));
     }
     let mut s = String::new();
     let _ = writeln!(s, "# ライブラリ（crates/sumie）の厳しい規則。手で書き換えない：");
     let _ = writeln!(s, "#   cargo run -p sumie-tools -- gen-disallowed        （作り直す）");
-    let _ = writeln!(s, "#   cargo run -p sumie-tools -- gen-disallowed --check（照らす。scripts/verify.sh）");
+    let _ = writeln!(s, "#   cargo run -p sumie-tools -- gen-disallowed --check（照らす。scripts/verify.sh・CI）");
     let _ = writeln!(
         s,
         "# 元：{rustc} の rust-src（core・alloc・std/src/num）。分類は crates/sumie-tools/src/gen_disallowed.rs"
@@ -970,31 +1154,7 @@ fn render(rustc: &str, raw: &[Item]) -> String {
     let _ = writeln!(s, "]");
     let _ = writeln!(s);
     s.push_str(TYPES_AND_MACROS);
-    s
-}
-
-/// alloc の型の、新しい入れ物を作って返す関連の関数（`Box::new`・`Arc::new`・`String::from_utf8_lossy` など）か。
-fn returns_owned_new(it: &Item) -> bool {
-    let Owner::Type(p) = &it.owner else { return false };
-    let heap = [
-        "Box",
-        "Rc",
-        "Arc",
-        "Vec",
-        "String",
-        "VecDeque",
-        "BinaryHeap",
-        "BTreeMap",
-        "BTreeSet",
-        "LinkedList",
-        "CString",
-    ];
-    let ty = p.rsplit("::").next().unwrap_or("");
-    if !heap.contains(&ty) {
-        return false;
-    }
-    // new 系で、本体が Box・RawVec・内部の確保に触れるもの
-    it.name.starts_with("new") || it.name.starts_with("from") || it.name == "pin"
+    Ok(s)
 }
 
 /// 手で書いた型とマクロ（determinism.md §4・CLAUDE.md）。
@@ -1021,6 +1181,9 @@ disallowed-macros = [
     { path = "core::debug_assert_ne", reason = "同上" },
     { path = "alloc::vec", reason = "確保：std の中で数えずに確保する（ADR-31）" },
     { path = "alloc::format", reason = "確保：同上" },
+    { path = "core::env", reason = "組むときの環境変数を読む（determinism.md §5）" },
+    { path = "core::option_env", reason = "組むときの環境変数を読む（determinism.md §5）" },
+    # include! は組み込みのマクロで clippy が拾えないので、tests/rules.rs の走査が拾う
     { path = "std::println", reason = "出力しない" },
     { path = "std::eprintln", reason = "出力しない" },
     { path = "std::print", reason = "出力しない" },
@@ -1028,3 +1191,97 @@ disallowed-macros = [
     { path = "std::dbg", reason = "出力しない" },
 ]
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan(file: &str, src: &str) -> Vec<FnInfo> {
+        let krate = file.split('/').next().unwrap_or("core");
+        let rel = file.split_once("/src/").map(|(_, r)| r).unwrap_or(file);
+        scan_file(krate, &module_path(krate, Path::new(rel)), file, src)
+    }
+
+    fn paths(fns: &[FnInfo]) -> Vec<String> {
+        let mut p: Vec<String> = fns.iter().flat_map(|f| f.paths.clone()).collect();
+        p.sort();
+        p
+    }
+
+    #[test]
+    fn inherent_slice_and_trait_impls() {
+        let src = "impl<T> [T] {\n/// # Panics\npub fn split_at(&self) {}\nfn private(&self) {}\n}\n\
+                   impl Foo for Bar { pub fn x(&self) {} }\npub trait Tr { fn need(&self); fn given(&self) {} }";
+        let fns = scan("core/src/slice/mod.rs", src);
+        assert_eq!(paths(&fns), ["core::slice::Tr::given", "core::slice::Tr::need", "slice::split_at"]);
+        assert!(has_panics(&fns.iter().find(|f| f.name == "split_at").unwrap().docs));
+        assert!(fns.iter().any(|f| f.name == "x" && f.in_trait_impl && f.paths.is_empty()));
+        assert!(fns.iter().any(|f| f.name == "private" && f.paths.is_empty() && !f.should_map));
+    }
+
+    #[test]
+    fn macro_impl_with_var_type() {
+        let src = "macro_rules! from_str_int_impl {\n ($s:ident $($int_ty:ty)+) => {$(\n impl $int_ty {\n\
+                   /// # Panics\n pub const fn from_str_radix(s: &str) -> u8 { 0 }\n }\n )*}\n}\n\
+                   from_str_int_impl! { signed isize i8 }\nfrom_str_int_impl! { unsigned u8 }";
+        let fns = scan("core/src/num/mod.rs", src);
+        assert_eq!(paths(&fns), ["i8::from_str_radix", "isize::from_str_radix", "u8::from_str_radix"]);
+    }
+
+    #[test]
+    fn int_impl_macro_fns() {
+        let src = "macro_rules! uint_impl {\n () => {\n /// # Panics\n pub const fn ilog2(self) -> u32 { 0 }\n }\n}";
+        let fns = scan("core/src/num/uint_macros.rs", src);
+        assert_eq!(paths(&fns).len(), 6);
+        assert!(paths(&fns).contains(&"u32::ilog2".to_string()));
+    }
+
+    #[test]
+    fn braces_inside_attributes_do_not_open_contexts() {
+        let src = "impl str {\n#[doc = m!{ a ? b : c }]\n/// # Panics\npub fn after(&self) {}\n}";
+        let fns = scan("core/src/str/mod.rs", src);
+        assert_eq!(paths(&fns), ["str::after"]);
+    }
+
+    #[test]
+    fn use_and_alias_resolution() {
+        let src = "use crate::sync::atomic::Atomic;\npub type AtomicBool = Atomic<bool>;\n\
+                   impl AtomicBool { pub fn load(&self) -> bool { true } }\n\
+                   use core::wtf8::Wtf8;\nimpl Wtf8 { pub fn to_owned(&self) {} }";
+        let fns = scan("alloc/src/x.rs", src);
+        assert_eq!(paths(&fns), ["alloc::sync::atomic::Atomic::load"]);
+        // core の型に alloc が付けた口は写さない
+        assert!(fns.iter().any(|f| f.name == "to_owned" && f.paths.is_empty()));
+    }
+
+    #[test]
+    fn unstable_hidden_and_unsafe_are_skipped() {
+        let src = "impl Foo {\n#[unstable(feature = \"x\")]\npub fn u(&self) {}\n#[doc(hidden)]\npub fn h(&self) {}\n\
+                   pub unsafe fn s(&self) {}\npub fn ok(&self) {}\n}\nstruct Foo;";
+        let fns = scan("core/src/foo.rs", src);
+        assert_eq!(paths(&fns), ["core::foo::Foo::ok"]);
+    }
+
+    #[test]
+    fn propagation_marks_callers() {
+        let a = "impl [u8] { pub fn to_ascii_lowercase(&self) -> Vec<u8> { let mut v = self.to_vec(); v } }\n\
+                 impl str { pub fn to_ascii_lowercase(&self) -> String { let b = self.as_bytes().to_ascii_lowercase(); x(b) } }\n\
+                 fn helper() { inner_alloc() }\nfn inner_alloc() { let v = RawVec::new(); }\npub fn uses() { helper() }";
+        let fns = scan("alloc/src/str.rs", a);
+        let refs: Vec<&FnInfo> = fns.iter().collect();
+        let marked = propagate(&refs, |f| f.body.iter().any(|t| t.is_ident("to_vec") || t.is_ident("RawVec")));
+        let is = |n: &str| refs.iter().zip(&marked).filter(|(f, _)| f.name == n).all(|(_, m)| *m);
+        // slice の to_ascii_lowercase は種。str の同じ名前の口へは辺を張らない（名前が 2 つある）
+        assert!(refs.iter().zip(&marked).any(|(f, m)| f.name == "to_ascii_lowercase" && *m));
+        assert!(!refs.iter().zip(&marked).all(|(f, m)| f.name != "to_ascii_lowercase" || *m));
+        assert!(is("inner_alloc") && is("helper") && is("uses"));
+        assert_eq!(return_idents(&lex("fn f(&self) -> Result<String, E> where T: X")), ["Result", "String", "E"]);
+    }
+
+    #[test]
+    fn module_paths() {
+        assert_eq!(module_path("core", Path::new("num/f64.rs")), "core::num::f64");
+        assert_eq!(module_path("core", Path::new("slice/mod.rs")), "core::slice");
+        assert_eq!(module_path("alloc", Path::new("lib.rs")), "alloc");
+    }
+}
