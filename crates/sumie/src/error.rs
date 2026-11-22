@@ -40,6 +40,14 @@ pub enum Resource {
     /// 確保器が断った（上限の内でも環境で失敗しうる。D1・D2 の約束の外。`needed` は頼んだバイト数、`allowed` は 0。
     /// determinism.md §1.2）
     Allocator,
+    /// 入力のバイト数（`Limits::input_bytes`）
+    Input,
+    /// 実体を展開したあとのバイト数（`Limits::expanded_bytes`）
+    Expanded,
+    /// XML の節の数（`Limits::nodes`）
+    Nodes,
+    /// 入れ子の深さ（`Limits::depth`）
+    Depth,
 }
 
 /// 段（どこで断ったか）。
@@ -104,6 +112,8 @@ pub enum InvalidReason {
     Utf8,
     /// XML の整形式でない
     Xml,
+    /// 外側の svg の幅か高さが 0 か負（ADR-64 (8)）
+    Size,
 }
 
 impl Error {

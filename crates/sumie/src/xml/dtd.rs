@@ -1,0 +1,212 @@
+//! DTD の内部のサブセット（requirements.md FR-IN-07）。一般の実体の宣言だけを読む。
+//!
+//! - パラメタ実体（宣言・`%名前;` の参照）・外部の実体（`SYSTEM`・`PUBLIC`）・値に `<`・`&`・`%` を含む実体は
+//!   `Unsupported`（今の Kura の前段と同じ。値に参照を含まないので、展開は 1 段で、大きさは「参照の数 × 値の長さ」で決まる）
+//! - ELEMENT・ATTLIST・NOTATION の宣言は引用符を見ながら読み飛ばす（ATTLIST の既定の属性値は当てない。ADR-64 (7)）。
+//!   宣言の中の文字は確かめない（roxmltree と同じ）
+//! - 注釈・処理命令・空白は飛ばす。宣言の外のそのほかの文字と、知らない宣言（`<!FOO`）は誤り（roxmltree と同じ）
+//! - `<!ENTITY` のあと・名前のあとには空白が要る（XML 1.0 §4.2）
+//! - 同じ名前の実体は最初の宣言を使う（XML 1.0 §4.2）
+//!
+//! サブセットは字句（[`crate::xml::lex`]）で一度読んだが、ここで読み直すバイトも 1 バイト 1 単位で、読む前に塊ずつ払う
+//! （[`ScanMeter`]）。ほかに実体 1 つあたりの手間と、名前で引くための並べ替えの手間を払う。
+
+use crate::budget::Budget;
+use crate::cost;
+use crate::error::{Error, Feature, Unsupported};
+use crate::mem::{MVec, Plain, lower_bound, stable_sort};
+use crate::xml::chars::{decode, is_name_char, is_name_start, is_space};
+use crate::xml::lex::{ScanMeter, Span};
+
+/// 一般の実体（名前と値の範囲。どちらも入力の中）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Entity {
+    pub(crate) name: Span,
+    pub(crate) value: Span,
+    /// 宣言の順（同じ名前は最初のものを使う）
+    pub(crate) order: u32,
+}
+
+impl Plain for Entity {}
+
+fn unsupported(feature: Feature, pos: usize) -> Error {
+    Error::Unsupported(Unsupported { feature, position: Some(pos as u64) })
+}
+
+fn invalid(pos: usize) -> Error {
+    Error::Invalid(crate::error::Invalid { reason: crate::error::InvalidReason::Xml, position: Some(pos as u64) })
+}
+
+/// サブセットを読む口（`end` より前だけを読み、読む前に払う）。
+struct Cur<'a, 'b> {
+    b: &'a [u8],
+    end: usize,
+    meter: ScanMeter,
+    budget: &'b Budget<'b>,
+}
+
+impl Cur<'_, '_> {
+    fn at(&mut self, i: usize) -> Result<Option<u8>, Error> {
+        if i >= self.end {
+            return Ok(None);
+        }
+        self.meter.pay(self.budget, i)?;
+        Ok(self.b.get(i).copied())
+    }
+
+    fn starts(&mut self, i: usize, pat: &[u8]) -> Result<bool, Error> {
+        for (k, &p) in pat.iter().enumerate() {
+            if self.at(i.saturating_add(k))? != Some(p) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn skip_space(&mut self, mut i: usize) -> Result<usize, Error> {
+        while self.at(i)?.is_some_and(is_space) {
+            i = i.saturating_add(1);
+        }
+        Ok(i)
+    }
+
+    /// `from` から `pat` を探す（見つかった位置）。
+    fn find(&mut self, mut i: usize, pat: &[u8]) -> Result<Option<usize>, Error> {
+        while self.at(i)?.is_some() {
+            if self.starts(i, pat)? {
+                return Ok(Some(i));
+            }
+            i = i.saturating_add(1);
+        }
+        Ok(None)
+    }
+
+    /// `i` の 1 文字（多バイトの文字は最後のバイトまで払う）。
+    fn char_at(&mut self, i: usize) -> Result<Option<(u32, usize)>, Error> {
+        if self.at(i)?.is_none() {
+            return Ok(None);
+        }
+        self.at(i.saturating_add(3).min(self.end.saturating_sub(1)))?;
+        Ok(decode(self.b, i).filter(|&(_, n)| i.saturating_add(n) <= self.end))
+    }
+
+    /// 名前の終わり（名前でなければ None）。
+    fn name_end(&mut self, i: usize) -> Result<Option<usize>, Error> {
+        let Some((c, n)) = self.char_at(i)? else { return Ok(None) };
+        if !is_name_start(c) {
+            return Ok(None);
+        }
+        let mut j = i.saturating_add(n);
+        while let Some((c, n)) = self.char_at(j)? {
+            if !is_name_char(c) {
+                break;
+            }
+            j = j.saturating_add(n);
+        }
+        Ok(Some(j))
+    }
+}
+
+/// 内部のサブセット `subset` を読み、名前で並べた実体の表を返す（並びは名前のバイトの順、同じ名前は宣言の順）。
+pub(crate) fn entities<'b>(b: &[u8], subset: Span, budget: &'b Budget<'b>) -> Result<MVec<'b, Entity>, Error> {
+    let end = (subset.end as usize).min(b.len());
+    let start = subset.start as usize;
+    let mut c = Cur { b, end, meter: ScanMeter::new(start, end), budget };
+    let mut out: MVec<'b, Entity> = MVec::new(budget);
+    let mut k = start;
+    let mut order = 0u32;
+    while let Some(ch) = c.at(k)? {
+        if is_space(ch) {
+            k = k.saturating_add(1);
+        } else if c.starts(k, b"<!--")? {
+            k = c.find(k.saturating_add(4), b"-->")?.ok_or_else(|| invalid(k))?.saturating_add(3);
+        } else if c.starts(k, b"<?")? {
+            k = c.find(k.saturating_add(2), b"?>")?.ok_or_else(|| invalid(k))?.saturating_add(2);
+        } else if c.starts(k, b"<!ENTITY")? {
+            let (e, next) = entity(&mut c, k, order)?;
+            budget.spend(cost::OP_STEP)?;
+            out.push(e)?;
+            order = order.saturating_add(1);
+            k = next;
+        } else if c.starts(k, b"<!ELEMENT")? || c.starts(k, b"<!ATTLIST")? || c.starts(k, b"<!NOTATION")? {
+            // 引用符を見ながら '>' まで
+            let mut e = k.saturating_add(2);
+            let mut quote: Option<u8> = None;
+            loop {
+                let Some(x) = c.at(e)? else { return Err(invalid(k)) };
+                match (quote, x) {
+                    (Some(q), x) if x == q => quote = None,
+                    (Some(_), _) => {}
+                    (None, b'"' | b'\'') => quote = Some(x),
+                    (None, b'>') => break,
+                    _ => {}
+                }
+                e = e.saturating_add(1);
+            }
+            k = e.saturating_add(1);
+        } else if ch == b'%' {
+            return Err(unsupported(Feature::ParameterEntity, k));
+        } else {
+            return Err(invalid(k));
+        }
+    }
+    // 名前で引けるように並べる（名前のバイトを比べる分は、要素ごとに名前の長さ × 段の数を前払いする）
+    let n = out.len() as u64;
+    let name_bytes: u64 =
+        out.as_slice().iter().fold(0u64, |a, e| a.saturating_add((e.name.len() as u64).saturating_add(1)));
+    budget.spend_large(cost::scan(name_bytes).saturating_mul(cost::ceil_log2(n)))?;
+    stable_sort(budget, out.as_mut_slice(), |x, y| (x.name.of(b), x.order) < (y.name.of(b), y.order))?;
+    Ok(out)
+}
+
+/// `<!ENTITY`（`k` の位置）の宣言を読む。実体と、宣言の終わりのあとの位置。
+fn entity(c: &mut Cur<'_, '_>, k: usize, order: u32) -> Result<(Entity, usize), Error> {
+    let mut t = c.skip_space(k.saturating_add(8))?;
+    if t == k.saturating_add(8) {
+        return Err(invalid(t));
+    }
+    if c.at(t)? == Some(b'%') {
+        return Err(unsupported(Feature::ParameterEntity, k));
+    }
+    let ne = c.name_end(t)?.ok_or_else(|| invalid(t))?;
+    let name = Span::new(t, ne);
+    t = c.skip_space(ne)?;
+    if t == ne {
+        return Err(invalid(t));
+    }
+    let q = c.at(t)?.ok_or_else(|| invalid(t))?;
+    if q != b'"' && q != b'\'' {
+        if c.starts(t, b"SYSTEM")? || c.starts(t, b"PUBLIC")? {
+            return Err(unsupported(Feature::ExternalEntity, k));
+        }
+        return Err(invalid(t));
+    }
+    // 値（`<`・`&`・`%` を含めば Unsupported）
+    let vs = t.saturating_add(1);
+    let mut ve = vs;
+    loop {
+        match c.at(ve)? {
+            None => return Err(invalid(t)),
+            Some(x) if x == q => break,
+            Some(b'<' | b'&' | b'%') => return Err(unsupported(Feature::MarkupEntity, k)),
+            Some(_) => ve = ve.saturating_add(1),
+        }
+    }
+    let close = c.skip_space(ve.saturating_add(1))?;
+    if c.at(close)? != Some(b'>') {
+        return Err(invalid(close));
+    }
+    Ok((Entity { name, value: Span::new(vs, ve), order }, close.saturating_add(1)))
+}
+
+/// 名前で引く（並べた表。同じ名前は最初の宣言）。名前のバイトを比べる分（名前の長さ × 歩数）を払う。
+pub(crate) fn lookup(b: &[u8], table: &[Entity], name: &[u8], budget: &Budget<'_>) -> Result<Option<Entity>, Error> {
+    let steps = cost::search(table.len() as u64);
+    budget.spend(steps.saturating_mul(cost::copy(name.len() as u64).saturating_add(1)))?;
+    let i = lower_bound(table, |e| e.name.of(b) < name);
+    Ok(table.get(i).copied().filter(|e| e.name.of(b) == name))
+}
+
+#[cfg(test)]
+mod tests;

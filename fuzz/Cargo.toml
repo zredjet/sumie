@@ -29,3 +29,17 @@ path = "fuzz_targets/math_ops.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "xml"
+path = "fuzz_targets/xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dtd"
+path = "fuzz_targets/dtd.rs"
+test = false
+doc = false
+bench = false

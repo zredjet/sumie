@@ -1,6 +1,6 @@
 //! 種つきの変異の試験（CLAUDE.md・architecture.md §9）。種と回数を固定し、`sumie-testkit` の ChaCha8 で作った入力を
 //! ファズの入り口（`sumie::fuzzing`）に通して、不変の条件・panic しないこと・ヒープの山 ≤ 数えた山を確かめる。
-//! 段ごとのパーサーができたら、ここに対象を足す（M1 から）。
+//! 段ごとのパーサーの対象：XML（M1 の xml・dtd）。
 
 #![allow(
     clippy::unwrap_used,
@@ -13,7 +13,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use sumie::Cancel;
-use sumie::fuzzing::{Check, math_ops, mem_ops, mem_ops_with};
+use sumie::fuzzing::{Check, dtd_parse, math_ops, mem_ops, mem_ops_with, xml_parse};
 use sumie_testkit::alloc::{assert_heap_within, measure};
 use sumie_testkit::mutate::cases;
 
@@ -122,5 +122,75 @@ fn math_ops_survive_seeded_mutations() {
     let dict: &[&[u8]] = &[&[0, 0, 0, 0, 0, 0, 0xf0, 0x7f], &[0, 0, 0, 0, 0, 0, 0, 0x80], &[1, 0, 0, 0, 0, 0, 0, 0]];
     for (n, case) in cases(0x5eed_0002, 4000, seeds, dict, 240).iter().enumerate() {
         assert_eq!(math_ops(case), Check::Ok, "{n} 件目 {case:?}");
+    }
+}
+
+/// fuzz/seeds/<対象> の種を読む（道の名前の順）。
+fn fuzz_seeds(target: &str) -> Vec<Vec<u8>> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds").join(target);
+    let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
+    files.sort();
+    files.iter().map(|p| std::fs::read(p).unwrap()).collect()
+}
+
+/// XML の目印の字句（変異で差し込む）。
+const XML_DICT: &[&[u8]] = &[
+    b"<",
+    b">",
+    b"/>",
+    b"</",
+    b"=",
+    b"\"",
+    b"'",
+    b"&",
+    b";",
+    b"&amp;",
+    b"&#x41;",
+    b"&#9;",
+    b"<!--",
+    b"-->",
+    b"<![CDATA[",
+    b"]]>",
+    b"<?",
+    b"?>",
+    b"<!DOCTYPE svg [",
+    b"]>",
+    b"<!ENTITY a \"x\">",
+    b"&a;",
+    b"%",
+    b"xmlns:p=\"urn:p\"",
+    b"p:",
+    b"xml:space=\"preserve\"",
+    b"\r\n",
+    b"\t",
+    "鞍".as_bytes(),
+    b"\xff",
+];
+
+#[test]
+fn xml_survives_seeded_mutations() {
+    let seeds = fuzz_seeds("xml");
+    let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
+    let (mut ok, mut err) = (0usize, 0usize);
+    for (n, case) in cases(0x5eed_0004, 3000, &refs, XML_DICT, 4096).iter().enumerate() {
+        let (out, heap) = measure(|| xml_parse(case));
+        assert_eq!(out.check, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
+        // ヒープの山 ≤ 数えた山（数える段と作る段の大きい方）
+        assert_heap_within(&heap, out.count_peak.max(out.build_peak), 0, &format!("{n} 件目"));
+        assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
+        if out.error.is_some() { err += 1 } else { ok += 1 }
+    }
+    // 読める件も読めない件もある（試験が両方の道を通る）
+    assert!(ok > 30 && err > 100, "読めた {ok}・読めない {err}");
+}
+
+#[test]
+fn dtd_survives_seeded_mutations() {
+    let seeds = fuzz_seeds("dtd");
+    let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
+    for (n, case) in cases(0x5eed_0005, 3000, &refs, XML_DICT, 1024).iter().enumerate() {
+        let (out, heap) = measure(|| dtd_parse(case));
+        assert_eq!(out.check, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
+        assert_heap_within(&heap, out.count_peak.max(out.build_peak).saturating_add(4096), 0, &format!("{n} 件目"));
     }
 }

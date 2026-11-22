@@ -88,6 +88,17 @@ impl<'c> Budget<'c> {
         Ok(())
     }
 
+    /// 大きな手間を、`CANCEL_INTERVAL` 未満の塊に分けて順に払う（前払いの式の量をまとめて払うとき）。
+    pub(crate) fn spend_large(&self, mut units: u64) -> Result<(), Error> {
+        let most = CANCEL_INTERVAL.saturating_sub(1);
+        while units > 0 {
+            let n = units.min(most);
+            self.spend(n)?;
+            units = units.saturating_sub(n);
+        }
+        Ok(())
+    }
+
     /// 確保の量を数える（確保の前に呼ぶ）。上限を超えたら `Limit`。
     pub(crate) fn charge(&self, bytes: u64) -> Result<(), Error> {
         let Some(b) = self.bytes.get().checked_add(bytes) else {

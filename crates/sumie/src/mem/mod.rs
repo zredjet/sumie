@@ -147,6 +147,10 @@ impl<'b, T: Plain> MVec<'b, T> {
         self.v.last()
     }
 
+    pub(crate) fn last_mut(&mut self) -> Option<&mut T> {
+        self.v.last_mut()
+    }
+
     pub(crate) fn pop(&mut self) -> Option<T> {
         self.v.pop()
     }

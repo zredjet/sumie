@@ -10,7 +10,8 @@
     clippy::arithmetic_side_effects
 )]
 
-use sumie::fuzzing::{Check, mem_ops};
+use sumie::Limits;
+use sumie::fuzzing::{Check, mem_ops, xml_parse_with};
 use sumie_testkit::stack::on_small_stack;
 
 #[test]
@@ -25,4 +26,22 @@ fn mem_ops_on_a_small_stack() {
     assert_eq!(out.check, Check::Ok);
     assert!(!out.limited, "上限で止まった：{out:?}");
     assert!(out.work > 100_000);
+}
+
+/// 10 万段の入れ子の XML を、上限を広げて 128 KiB のスタックで読む（歩きは再帰しない）。
+#[test]
+fn xml_deep_nesting_on_a_small_stack() {
+    let n = 100_000;
+    let mut src = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\">");
+    for _ in 0..n {
+        src.push_str("<g a=\"1\">");
+    }
+    for _ in 0..n {
+        src.push_str("</g>");
+    }
+    src.push_str("</svg>");
+    let limits = Limits { depth: 200_000, nodes: 400_000, ..Limits::DEFAULT };
+    let out = on_small_stack(move || xml_parse_with(src.as_bytes(), &limits));
+    assert_eq!(out.check, Check::Ok, "{out:?}");
+    assert_eq!(out.nodes, Some(n + 1), "{out:?}");
 }

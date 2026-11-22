@@ -73,6 +73,11 @@ pub(crate) const fn shift(moved: u64, size: u64) -> u64 {
     copy(moved.saturating_mul(size)).saturating_add(1)
 }
 
+/// 入力のバイトを読む手間（XML の字句・展開。1 バイト 1 単位。architecture.md §5.2）。
+pub(crate) const fn scan(bytes: u64) -> u64 {
+    bytes
+}
+
 /// 1 回の確保の決まった手間（確保器を呼ぶ分。取った領域に触れる分は fill・copy で数える）。
 pub(crate) const ALLOC_STEP: u64 = 64;
 

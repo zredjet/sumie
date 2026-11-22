@@ -48,6 +48,7 @@ const LAYERS: &[(&str, u32, u32)] = &[
     ("cost", 0, 0),
     ("error", 0, 0),
     ("cancel", 0, 0),
+    ("limits", 0, 0),
     ("report", 0, 0),
     ("unicode", 0, 0),
     ("geom", 1, 0),

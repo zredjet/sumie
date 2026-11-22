@@ -411,3 +411,129 @@ pub fn math_ops(data: &[u8]) -> Check {
     }
     Check::Ok
 }
+
+/// [`xml_parse`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XmlOutcome {
+    pub check: Check,
+    /// 読めたか（誤りなら None）
+    pub nodes: Option<u64>,
+    /// 誤り（読めなかったとき）
+    pub error: Option<Error>,
+    /// 数える段と作る段の手間・確保の山（作る段は数える段の見積もり以下のはず）
+    pub count_work: u64,
+    pub count_peak: u64,
+    pub build_work: u64,
+    pub build_estimate: u64,
+    pub build_peak: u64,
+    pub build_peak_estimate: u64,
+}
+
+/// XML の段（数える段と作る段）を通し、作る段が見積もり（数える段の結果）を超えないこと・節の鎖が正しいことを確かめる。
+pub fn xml_parse(data: &[u8]) -> XmlOutcome {
+    xml_parse_with(data, &crate::limits::Limits::DEFAULT)
+}
+
+/// [`xml_parse`] の上限を変えたもの（試験で深さ・節の数の上限を広げる）。
+pub fn xml_parse_with(data: &[u8], limits: &crate::limits::Limits) -> XmlOutcome {
+    let mut out = XmlOutcome {
+        check: Check::Ok,
+        nodes: None,
+        error: None,
+        count_work: 0,
+        count_peak: 0,
+        build_work: 0,
+        build_estimate: 0,
+        build_peak: 0,
+        build_peak_estimate: 0,
+    };
+    let est_budget = Budget::new(Stage::EstimateParse, limits.estimate_work, limits.estimate_bytes, &Never);
+    let counts = match crate::xml::count(data, limits, &est_budget, Stage::EstimateParse) {
+        Ok(c) => c,
+        Err(e) => {
+            out.error = Some(e);
+            out.count_work = est_budget.work();
+            out.count_peak = est_budget.peak();
+            return out;
+        }
+    };
+    out.count_work = est_budget.work();
+    out.count_peak = est_budget.peak();
+    if est_budget.over_released() || est_budget.max_spend() >= CANCEL_INTERVAL {
+        out.check = Check::Violation("数える段の勘定が崩れた");
+        return out;
+    }
+    let (work, peak) = (counts.build_work(), counts.build_peak());
+    out.build_estimate = work;
+    out.build_peak_estimate = peak;
+    let budget = Budget::new(Stage::Parse, work, peak, &Never);
+    let doc = match crate::xml::build(data, &counts, limits, &budget, Stage::Parse) {
+        Ok(d) => d,
+        Err(e) => {
+            out.error = Some(e);
+            // 数える段が通ったのに作る段が上限で止まるのは見積もりの不具合
+            if matches!(e, Error::Limit(l) if l.resource == Resource::Work || l.resource == Resource::Memory) {
+                out.check = Check::Violation("作る段が数える段の見積もりを超えた");
+            } else {
+                out.check = Check::Violation("数える段が通ったのに作る段が誤りになった");
+            }
+            return out;
+        }
+    };
+    out.build_work = budget.work();
+    out.build_peak = budget.peak();
+    out.nodes = Some(doc.nodes.len() as u64);
+    if doc.nodes.len() as u64 != counts.nodes
+        || doc.attrs.len() as u64 != counts.attrs
+        || doc.store.len() as u64 != counts.store
+    {
+        out.check = Check::Violation("作った量が数えた量と違う");
+        return out;
+    }
+    if budget.over_released() || budget.max_spend() >= CANCEL_INTERVAL {
+        out.check = Check::Violation("作る段の勘定が崩れた");
+        return out;
+    }
+    // 節の鎖：子の親は自分、兄弟の親は同じ、番号は行きがけの順（子と兄弟は自分より後ろ）
+    let nodes = doc.nodes.as_slice();
+    for (i, n) in nodes.iter().enumerate() {
+        let i = i as u32;
+        for (next, want_parent) in [(n.first_child, i), (n.next_sibling, n.parent)] {
+            if next == crate::xml::NONE {
+                continue;
+            }
+            match nodes.get(next as usize) {
+                Some(c) if next > i && c.parent == want_parent => {}
+                _ => {
+                    out.check = Check::Violation("節の鎖が崩れた");
+                    return out;
+                }
+            }
+        }
+        if n.kind == crate::xml::KIND_ELEMENT && doc.attrs_of(n).len() != n.attrs.len() {
+            out.check = Check::Violation("属性の範囲が外れた");
+            return out;
+        }
+    }
+    out
+}
+
+/// DTD の内部のサブセットを `data` にして、実体を本文と属性から参照する文書を [`xml_parse`] に通す（ファズの `dtd` の対象）。
+pub fn dtd_parse(data: &[u8]) -> XmlOutcome {
+    // 先頭の 1 バイトで、参照する実体の名前（a〜p）を選ぶ
+    let name = b"abcdefghijklmnop".get(usize::from(data.first().copied().unwrap_or(0) % 16)).copied().unwrap_or(b'a');
+    let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let mut doc: MVec<'_, u8> = MVec::new(&budget);
+    let parts: [&[u8]; 3] =
+        [b"<!DOCTYPE svg [", data.get(1..).unwrap_or(&[]), b"]><svg xmlns=\"http://www.w3.org/2000/svg\" a=\"&"];
+    for p in parts {
+        if doc.append_slice(p).is_err() {
+            return xml_parse(&[]);
+        }
+    }
+    let tail = [name, b';', b'"', b'>', b'&', name, b';', b'<', b'/', b's', b'v', b'g', b'>'];
+    if doc.append_slice(&tail).is_err() {
+        return xml_parse(&[]);
+    }
+    xml_parse(doc.as_slice())
+}

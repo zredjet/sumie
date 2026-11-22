@@ -1,0 +1,3 @@
+<?xml version="1.0"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "x.dtd" [<!ENTITY ns_svg "http://www.w3.org/2000/svg"><!-- c --><?pi ?>]>
+<svg xmlns="&ns_svg;" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve"><use xlink:href="#a" a="x	y&#10;"/>a&amp;b<![CDATA[c]]></svg>
