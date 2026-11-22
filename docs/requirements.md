@@ -80,7 +80,7 @@
 | FR-ST-08 | M | アットルール（ADR-66 (2)）：`@media` は照らす（`screen`・`all` は真、`print` などは偽。`prefers-color-scheme` は呼び手の設定で既定は light。大きさの条件は文書の大きさ（FR-OUT-01 で width・height・viewBox から決まるもの）で照らし、中身で大きさが決まる文書では偽）。`@supports` は読めるプロパティと値か・`selector()` で照らす。`@layer` は層の順でカスケードする。`@namespace` を読む。`@import`（外を読まない）・`@font-face`・`@charset`・`@keyframes`・`@page`・知らないものは飛ばし（警告）、そのあとの規則は当てる。`<!--`・`-->` は飛ばす |
 | FR-ST-09 | M | カスケードの順（弱い順。CSS Cascade のとおり。ADR-66 (3)）：プレゼンテーション属性 ＜ `style` 要素の規則（層・詳細度・順） ＜ `style` 属性 ＜ 規則の `!important`（層は逆の順） ＜ `style` 属性の `!important`。プロパティの名前と `!important` は大文字小文字を区別しない。`<style>` は文書のどこにあってもすべての要素に当てる。プレゼンテーション属性の一覧は SVG 2 のもの（SVG 1.1 のものと、`transform-origin`・`paint-order`・`isolation`・`mask-type`・`vector-effect`、幾何の `x`・`y`・`width`・`height`・`r`・`rx`・`ry`・`cx`・`cy`・`d`）。幾何のプロパティは CSS でも読む（効くのは M2 から）。`mix-blend-mode` は CSS のプロパティとしてだけ読み、属性としては読まない（Chrome と同じ）。`marker` のまとめのプロパティを読む（ADR-66 (4)） |
 | FR-ST-10 | M | 継承・`inherit`・`currentColor`（`color` の継承）。em・ex は計算した `font-size` から |
-| FR-ST-11 | M | `transform` 属性（`matrix`・`translate`・`scale`・`rotate`・`skewX`・`skewY`。区切りのない数 `10-5`・`.5.5` を正しく区切る）と `transform-origin` 属性。CSS の `transform` プロパティ（CSS Transforms の単位つきの書き方）と `transform-box` も読む（ADR-66 (4)） |
+| FR-ST-11 | M | `transform` 属性（SVG 1.1 の書き方だけ：`matrix`・`translate`・`scale`・`rotate`・`skewX`・`skewY`、名前は大文字小文字を区別、単位のない数、区切りのない数 `10-5`・`.5.5` を正しく区切る、名前と `(` の間の空白を受ける。CSS Transforms 1 §7.2・Chrome と同じ。ADR-74）と `transform-origin` 属性。CSS の `transform` プロパティ（CSS Transforms の単位つきの 2 次元の関数。長さはどの単位も受ける。3 次元の関数は読まない）と `transform-box` も読む（ADR-66 (4)） |
 | FR-ST-12 | M | `display: none`・`visibility`（`hidden`・`collapse`。子の `visible` は描く）・`opacity` |
 | FR-ST-13 | M | 同じ `id` が複数あれば、文書の順で最初の要素を指す（DOM・Chrome と同じ。ADR-66 (5)） |
 | FR-ST-14 | M | `tref`（SVG 1.1。usvg が解くので受ける） |
@@ -93,7 +93,7 @@
 | FR-SH-01 | M | `path`：パスのデータの文法すべて（暗黙の命令の繰り返し・区切りのない数・弧の旗の詰め書き）。途中で壊れていれば、そこまでを描く（SVG の誤りの扱い）。弧は SVG 1.1 の付録 F の式で中心の形に直し、半径が足りなければ広げる |
 | FR-SH-02 | M | `rect`（`rx`・`ry` の `auto` と半分への切り詰め）・`circle`・`ellipse`（SVG 2 の `auto`）・`line`・`polyline`・`polygon`（数が奇数なら最後を捨てる）。大きさが 0 か負なら描かない |
 | FR-SH-03 | S | `pathLength`（破線と textPath の `startOffset` の割合に効く。resvg が受けるなら M） |
-| FR-SH-04 | M | 長さの単位：数・px・in・cm・mm・pt・pc・em・ex（em の半分）・rem・%（向きに応じた表示の領域の幅・高さ・対角の √2 で割ったもの）・vw・vh・vmin・vmax（`@media` と同じ文書の大きさから。中身で大きさが決まる文書では壊れた値）。単位の大文字小文字は区別しない（ADR-66 (4)） |
+| FR-SH-04 | M | 長さの単位：数・px・in・cm・mm・Q・pt・pc・em・ex（em の半分）・ch（em の半分）・ic（1em）・cap（0.7em）・lh（`line-height` の計算した値）・rlh（根の要素の `line-height`）・rem・%（向きに応じた表示の領域の幅・高さ・対角の √2 で割ったもの）・vw・vh・vmin・vmax・vi・vb（横書きなので vi は vw、vb は vh。`@media` と同じ文書の大きさから。中身で大きさが決まる文書では壊れた値）。ch・ic・cap は読む段にフォントがないので CSS Values 4 の代わりの値（ADR-74）。単位の大文字小文字は区別しない（ADR-66 (4)）。CSS の宣言では、単位のない長さは SVG のプロパティ（x・y・r・rx・ry・cx・cy・stroke-width・stroke-dashoffset・baseline-shift・stroke-dasharray）だけが受ける（属性はどれも受ける。Chrome と同じ。ADR-74）。`calc()`・`var()` は M1 では読まずに壊れた値として警告する |
 
 ### 2.4 塗りと線（FR-PT）
 
@@ -187,7 +187,7 @@
 | 項目 | 既定 | 見る段 | 由来・注 |
 |---|---|---|---|
 | 入力のバイト数 | 16 MiB | 読む前 | Kura の `MAX_SOURCE` |
-| 実体を展開したあとのバイト数 | 64 MiB | 読む前（字句の数から）・読む | `MAX_EXPANDED` |
+| 実体を展開したあとのバイト数 | 64 MiB | 読む前（読む段の道を走らせて測る。ADR-70）・読む | `MAX_EXPANDED` |
 | XML の節の数 | 2²¹ | 読む前・読む | `MAX_ELEMENTS`（roxmltree の `nodes_limit`） |
 | 入れ子の深さ | 1,024 | 読む前・読む | Kura は 64（usvg の再帰のため）。再帰しないので広げる。深さに比べた手間は数える |
 | 展開したあとの要素の数（use・marker・複製） | 2²¹ | 木を作る前 | `MAX_ELEMENTS` |
