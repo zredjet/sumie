@@ -24,7 +24,7 @@ use crate::budget::{Budget, chunk_len};
 use crate::cost;
 use crate::error::{Error, Feature, Invalid, InvalidReason, Resource, Stage, Unsupported};
 use crate::limits::Limits;
-use crate::mem::{Frozen, MVec, Plain, stable_sort};
+use crate::mem::{Frozen, MVec, Plain, bytes_cmp, bytes_eq, stable_sort, stable_sort_try};
 use crate::xml::dtd::{AttDecl, Entity};
 use crate::xml::lex::{Event, Lexer, ScanMeter, Span};
 
@@ -347,6 +347,10 @@ trait Out {
     fn write(&mut self, s: &[u8]) -> Result<(), Error>;
     /// 実体の値を書く（数える側は前に求めた量を足すだけで、値を走査しない）。
     fn entity(&mut self, w: &Walk<'_, '_>, e: &Entity, mode: Mode) -> Result<(), Error>;
+    /// 数える側なら、書いたものとして量を足す（真を返す）。書く側は何もしない（偽）。
+    fn add(&mut self, _bytes: u64, _work: u64) -> Result<bool, Error> {
+        Ok(false)
+    }
 }
 
 /// 数える側：バイト数と、作る段で置き場に書く手間（`cost::append` の伸ばさない形）。`limit` があれば、書く量が展開の
@@ -386,6 +390,13 @@ impl Out for CountOut {
         // 作る段は値を読みながら書く（読む手間も作る段の手間に入れる）
         self.work = self.work.saturating_add(work).saturating_add(cost::scan(e.value.len() as u64));
         self.check()
+    }
+
+    fn add(&mut self, bytes: u64, work: u64) -> Result<bool, Error> {
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.work = self.work.saturating_add(work);
+        self.check()?;
+        Ok(true)
     }
 }
 
@@ -432,6 +443,27 @@ impl Out for Collapse<'_, '_> {
     }
 
     fn entity(&mut self, w: &Walk<'_, '_>, e: &Entity, mode: Mode) -> Result<(), Error> {
+        // 数える側は、DOCTYPE で求めた形から量を足す（作る段が値を読んで揃える手間も入れる）。書く側は値を読んで揃える
+        if e.tok_flags & 8 == 0 {
+            return Ok(());
+        }
+        if e.tok_flags & 1 == 0 {
+            // 空白だけ：空白を読んだのと同じ
+            if self.inner.add(0, cost::scan(e.value.len() as u64).saturating_add(cost::scan(e.attr_bytes)))? {
+                self.pending = self.started;
+                return Ok(());
+            }
+            return normalize(w.b, w.budget, e.value, mode, self).map(|_| ());
+        }
+        let pend = if e.tok_flags & 2 != 0 { self.started } else { self.pending };
+        let lead_work = if pend { cost::append(0, u64::MAX, 1, 1).0 } else { 0 };
+        let scan_work = cost::scan(e.value.len() as u64).saturating_add(cost::scan(e.attr_bytes));
+        let bytes = e.tok_bytes.saturating_add(u64::from(pend));
+        if self.inner.add(bytes, e.tok_work.saturating_add(lead_work).saturating_add(scan_work))? {
+            self.started = true;
+            self.pending = e.tok_flags & 4 != 0;
+            return Ok(());
+        }
         normalize(w.b, w.budget, e.value, mode, self).map(|_| ())
     }
 }
@@ -688,12 +720,30 @@ fn shape_entities(b: &[u8], budget: &Budget<'_>, table: &mut MVec<'_, Entity>) -
         normalize(b, budget, e.value, Mode::Attr, &mut attr)?;
         let mut text = CountOut::new();
         let ok = normalize(b, budget, e.value, Mode::Text, &mut text)?;
+        // CDATA でない型の属性の中の形：頭の空白を無視する状態（始まっていない）で揃えた中身
+        let mut core = CountOut::new();
+        let trail = {
+            let mut c = Collapse { inner: &mut core, budget, pending: false, started: false };
+            normalize(b, budget, e.value, Mode::Attr, &mut c)?;
+            c.pending
+        };
+        let lead = e.value.of(b).first().is_some_and(|f| matches!(f, b' ' | b'\t' | b'\n' | b'\r'));
+        let has = core.bytes > 0;
+        // 終わりの空白：中身のあとに空白があるか（始まっていない状態では、中身がなければ空白は残らない）
+        let trail = trail || (has && e.value.of(b).last().is_some_and(|f| matches!(f, b' ' | b'\t' | b'\n' | b'\r')));
+        let flags = u32::from(has)
+            | (u32::from(lead && has) << 1)
+            | (u32::from(trail) << 2)
+            | (u32::from(!e.value.of(b).is_empty()) << 3);
         if let Some(x) = table.get_mut(k) {
             x.attr_bytes = attr.bytes;
             x.attr_work = attr.work;
             x.text_bytes = text.bytes;
             x.text_work = text.work;
             x.text_ok = u32::from(ok);
+            x.tok_bytes = core.bytes;
+            x.tok_work = core.work;
+            x.tok_flags = flags;
         }
     }
     Ok(())
@@ -893,6 +943,50 @@ fn walk<'b>(
                     }
                     default_bound |= pb.is_empty();
                 }
+                // 局所名が xmlns で接頭辞を束ねていない属性（`b:xmlns`）は、roxmltree と同じに既定の名前空間の宣言として
+                // 読む（名前空間 1.0 では束ねていない接頭辞の誤りだが、断らない。束ねた接頭辞なら仕様のとおりふつうの属性）
+                for k in 0..raw.len() {
+                    budget.spend(cost::OP_STEP)?;
+                    let Some(&a) = raw.get(k) else { continue };
+                    if a.ns == NS_XMLNS || a.dropped != 0 {
+                        continue;
+                    }
+                    let (prefix, local) = split_qname(b, a.name, budget)?;
+                    let Some(p) = prefix else { continue };
+                    let pb = p.of(b);
+                    if local.of(b) != b"xmlns" || pb == b"xml" || pb == b"xmlns" {
+                        continue;
+                    }
+                    let mut bound = false;
+                    for j in (0..bindings.len()).rev() {
+                        budget.spend(cost::OP_STEP)?;
+                        if let Some(bd) = bindings.get(j)
+                            && bytes_eq(budget, bd.prefix.of(b), pb)?
+                        {
+                            bound = true;
+                            break;
+                        }
+                    }
+                    if bound {
+                        continue;
+                    }
+                    let u = w.attr_value(&a, &mut uri, true)?;
+                    if u == URI_XMLNS || u == URI_XML {
+                        return Err(xml_err(a.pos as usize));
+                    }
+                    if !default_bound {
+                        bindings.push(Binding {
+                            prefix: Span::new(a.name.end as usize, a.name.end as usize),
+                            ns: ns_of_uri(u),
+                            pad: [0; 3],
+                        })?;
+                        default_bound = true;
+                    }
+                    if let Some(r) = raw.get_mut(k) {
+                        r.ns = NS_XMLNS;
+                        r.local = Span::new(a.name.end as usize, a.name.end as usize);
+                    }
+                }
                 let resolve = |prefix: Option<Span>,
                                default_ns: bool,
                                bindings: &MVec<'b, Binding>|
@@ -905,9 +999,9 @@ fn walk<'b>(
                         return Ok(Some(NS_XML));
                     }
                     for k in (0..bindings.len()).rev() {
-                        budget.spend_large(cost::copy(pb.len() as u64).saturating_add(1))?;
+                        budget.spend(cost::OP_STEP)?;
                         if let Some(bd) = bindings.get(k)
-                            && bd.prefix.of(b) == pb
+                            && bytes_eq(budget, bd.prefix.of(b), pb)?
                         {
                             return Ok(Some(bd.ns));
                         }
@@ -981,12 +1075,11 @@ fn walk<'b>(
             }
             Event::End { pos, name } => {
                 let Some(o) = open.pop() else { return Err(xml_err(pos as usize)) };
-                budget.spend_large(cost::copy(name.len() as u64).saturating_add(1))?;
-                // 接頭辞と局所名で比べる（`</:svg>` は `<svg>` を閉じる。roxmltree と同じ）
+                // 接頭辞と局所名で比べる（`</:svg>` は `<svg>` を閉じる。roxmltree と同じ。比べるバイトは塊ずつ払う）
                 let (op, ol) = split_qname(b, o.name, budget)?;
                 let (ep, el) = split_qname(b, name, budget)?;
                 let pre = |p: Option<Span>| p.map_or(&[][..], |p| p.of(b));
-                if pre(op) != pre(ep) || ol.of(b) != el.of(b) {
+                if !bytes_eq(budget, pre(op), pre(ep))? || !bytes_eq(budget, ol.of(b), el.of(b))? {
                     return Err(xml_err(pos as usize));
                 }
                 bindings.truncate(o.bindings as usize);
@@ -1029,17 +1122,21 @@ fn apply_attlists(w: &Walk<'_, '_>, qname: Span, raw: &mut MVec<'_, RawAttr>) ->
             continue;
         }
         let name = d.name.of(b);
-        w.budget.spend_large(cost::copy(name.len() as u64).saturating_add(1))?;
-        if last.is_some_and(|l| l.of(b) == name) {
+        w.budget.spend(cost::OP_STEP)?;
+        if let Some(l) = last
+            && bytes_eq(w.budget, l.of(b), name)?
+        {
             continue;
         }
         last = Some(d.name);
         let mut found = false;
         for j in 0..written {
-            w.budget.spend_large(cost::copy(name.len() as u64).saturating_add(1))?;
-            if let Some(r) = raw.get_mut(j)
-                && r.name.of(b) == name
-            {
+            w.budget.spend(cost::OP_STEP)?;
+            let same = match raw.get(j) {
+                Some(r) => bytes_eq(w.budget, r.name.of(b), name)?,
+                None => false,
+            };
+            if same && let Some(r) = raw.get_mut(j) {
                 r.tokens = u8::from(d.tokens != 0);
                 found = true;
                 break;
@@ -1071,11 +1168,20 @@ fn check_duplicates(b: &[u8], raw: &mut MVec<'_, RawAttr>, budget: &Budget<'_>) 
     }
     // そのほかの名前空間は URI を持たないので、修飾つきの名前で比べる（同じ接頭辞の重なりを拾う）
     let key = |a: &RawAttr| -> (u8, &[u8]) { (a.ns, if a.ns == NS_OTHER { a.name.of(b) } else { a.local.of(b) }) };
-    // 比べる名前のバイトの分（要素ごとに鍵の長さ × 段の数）を前払いする
-    let names: u64 =
-        raw.as_slice().iter().fold(0u64, |s, a| s.saturating_add((key(a).1.len() as u64).saturating_add(1)));
-    budget.spend_large(cost::scan(names).saturating_mul(cost::ceil_log2(n).saturating_add(1)))?;
-    stable_sort(budget, raw.as_mut_slice(), |x, y| key(x) < key(y))?;
+    // 比べる名前のバイトは比べる中で塊ずつ払う
+    let less = |x: &RawAttr, y: &RawAttr| -> Result<bool, Error> {
+        let (kx, ky) = (key(x), key(y));
+        if kx.0 != ky.0 {
+            return Ok(kx.0 < ky.0);
+        }
+        Ok(bytes_cmp(budget, kx.1, ky.1)? == core::cmp::Ordering::Less)
+    };
+    let _ = n;
+    stable_sort_try(budget, raw.as_mut_slice(), less)?;
+    let same = |x: &RawAttr, y: &RawAttr| -> Result<bool, Error> {
+        let (kx, ky) = (key(x), key(y));
+        Ok(kx.0 == ky.0 && bytes_eq(budget, kx.1, ky.1)?)
+    };
     // 同じ鍵の並びごとに：書いた属性が 2 つあれば誤り。既定の値で足した属性は、書いた属性があれば捨て、なければ最初の
     // ものだけを残す（並べ替えは安定なので、並びの中は書いた順）。既定の名前空間の宣言（`xmlns`）の重なりは受ける
     // （束ねるのは最初のもの）。捨てた属性は比べない
@@ -1085,11 +1191,17 @@ fn check_duplicates(b: &[u8], raw: &mut MVec<'_, RawAttr>, budget: &Budget<'_>) 
         budget.spend(cost::OP_STEP)?;
         let Some(&first) = raw.get(i) else { break };
         let mut j = i.saturating_add(1);
-        while j < len && raw.get(j).is_some_and(|y| key(y) == key(&first)) {
+        while j < len {
             budget.spend(cost::OP_STEP)?;
+            let Some(y) = raw.get(j) else { break };
+            if !same(y, &first)? {
+                break;
+            }
             j = j.saturating_add(1);
         }
-        if first.ns != NS_XMLNS || first.local.len() != 0 {
+        // 既定の名前空間の宣言（`xmlns`）と `xmlns:xml` の重なりは受ける（どちらも束ねるのは最初のもの。roxmltree と同じ）
+        let lenient = first.ns == NS_XMLNS && (first.local.len() == 0 || first.local.of(b) == b"xml");
+        if !lenient {
             let mut written = 0u32;
             let mut kept_default = false;
             for k in i..j {

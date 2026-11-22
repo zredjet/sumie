@@ -289,6 +289,24 @@ impl<'a, 'b> Lexer<'a, 'b> {
         }
     }
 
+    /// 宣言（`i` は `<!`）を `>` まで飛ばし、`>` のあとの位置（`quotes` なら引用の中の `>` は終わりにしない。文字を
+    /// 確かめない）。
+    fn raw_to_gt(&mut self, i: usize, quotes: bool) -> Result<usize, Error> {
+        let mut k = i.saturating_add(2);
+        let mut q: Option<u8> = None;
+        loop {
+            match (self.at(k)?, q) {
+                (None, _) => return Err(invalid(i)),
+                (Some(c), Some(open)) if c == open => q = None,
+                (Some(_), Some(_)) => {}
+                (Some(c @ (b'"' | b'\'')), None) if quotes => q = Some(c),
+                (Some(b'>'), None) => return Ok(k.saturating_add(1)),
+                _ => {}
+            }
+            k = k.saturating_add(1);
+        }
+    }
+
     /// `i` から 1 つ以上の空白を飛ばした位置（空白がなければ誤り）。
     fn space_then(&mut self, i: usize) -> Result<usize, Error> {
         let j = self.skip_space(i)?;
@@ -330,6 +348,12 @@ impl<'a, 'b> Lexer<'a, 'b> {
                     Some(b'"' | b'\'') => k = self.quoted_raw(k)?,
                     Some(b'<') if self.starts(k, b"<!--")? => k = self.comment(k)?,
                     Some(b'<') if self.starts(k, b"<?")? => k = self.pi(k)?,
+                    // 宣言は宣言の単位で読む（中の `]`・`<!--`・`<?` は特別でない。roxmltree と同じ）。ELEMENT と NOTATION は
+                    // 最初の `>` まで、ATTLIST・ENTITY と知らない宣言は引用符を見ながら `>` まで
+                    Some(b'<') if self.starts(k, b"<!ELEMENT")? || self.starts(k, b"<!NOTATION")? => {
+                        k = self.raw_to_gt(k, false)?;
+                    }
+                    Some(b'<') if self.starts(k, b"<!")? => k = self.raw_to_gt(k, true)?,
                     // 宣言の中の文字は確かめない（roxmltree と同じ。宣言の外の文字は DTD の段で誤りにする）
                     Some(_) => k = k.saturating_add(1),
                 }

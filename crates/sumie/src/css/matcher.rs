@@ -24,7 +24,8 @@ use crate::css::select::{
 };
 use crate::css::sheet::Sheet;
 use crate::error::Error;
-use crate::mem::{MVec, Plain, stable_sort};
+use crate::mem::{MVec, Plain, bytes_cmp, bytes_eq, bytes_eq_ignore_case, stable_sort_try};
+use crate::xml::lex::ScanMeter;
 use crate::xml::{KIND_ELEMENT, NS_NONE, NS_SVG, NS_XLINK, NS_XML, Node, XmlDoc};
 
 /// 照合の結果を受ける側（要素ごとに `element` のあと、当たった規則を規則の順に `rule`）。
@@ -96,16 +97,25 @@ fn siblings<'b>(doc: &XmlDoc, input: &[u8], with_type: bool, budget: &'b Budget<
                 let n = nodes.get(*id as usize);
                 (n.map_or(0, |n| n.ns), n.map_or(&[][..], |n| n.local.of(input)))
             };
-            let bytes: u64 =
-                kids.as_slice().iter().fold(0u64, |a, id| a.saturating_add((key(id).1.len() as u64).saturating_add(1)));
-            budget.spend_large(cost::scan(bytes).saturating_mul(cost::ceil_log2(kids.len() as u64)))?;
-            stable_sort(budget, kids.as_mut_slice(), |x, y| key(x) < key(y))?;
+            // 名前のバイトは比べる中で塊ずつ払う
+            stable_sort_try(budget, kids.as_mut_slice(), |x, y| {
+                let (kx, ky) = (key(x), key(y));
+                if kx.0 != ky.0 {
+                    return Ok(kx.0 < ky.0);
+                }
+                Ok(bytes_cmp(budget, kx.1, ky.1)? == core::cmp::Ordering::Less)
+            })?;
             let ks = kids.as_slice();
             let mut i = 0usize;
             while i < ks.len() {
                 let mut j = i;
-                while j < ks.len() && ks.get(j).map(key) == ks.get(i).map(key) {
+                while j < ks.len() {
                     budget.spend(cost::OP_STEP)?;
+                    let (Some(x), Some(y)) = (ks.get(j), ks.get(i)) else { break };
+                    let (kx, ky) = (key(x), key(y));
+                    if kx.0 != ky.0 || !bytes_eq(budget, kx.1, ky.1)? {
+                        break;
+                    }
                     j = j.saturating_add(1);
                 }
                 let run = (j.saturating_sub(i)) as u32;
@@ -354,22 +364,19 @@ impl Ctx<'_, '_> {
         let ns_ok = |ns: u8| s.ns == NS_ANY || s.ns == ns;
         let sib = || self.sib.and_then(|v| v.get(e as usize)).copied().unwrap_or_default();
         Ok(match s.kind {
-            S_TYPE => {
-                let a = self.name(s);
-                self.pay(a.len())?;
-                ns_ok(n.ns) && n.local.of(input) == a
-            }
+            S_TYPE => ns_ok(n.ns) && bytes_eq(self.budget, n.local.of(input), self.name(s))?,
             S_UNIVERSAL => ns_ok(n.ns),
             S_ID => {
-                let a = self.name(s);
-                self.pay(a.len().saturating_add(doc.attrs_of(n).len()))?;
-                doc.attr(input, n, NS_NONE, b"id") == Some(a)
+                self.pay(doc.attrs_of(n).len())?;
+                match doc.attr(input, n, NS_NONE, b"id") {
+                    Some(v) => bytes_eq(self.budget, v, self.name(s))?,
+                    None => false,
+                }
             }
             S_CLASS => {
-                let a = self.name(s);
+                self.pay(doc.attrs_of(n).len())?;
                 let v = doc.attr(input, n, NS_NONE, b"class").unwrap_or(&[]);
-                self.pay(v.len().saturating_add(doc.attrs_of(n).len()))?;
-                has_token(v, a, false)
+                has_token(self.budget, v, self.name(s), false)?
             }
             S_ATTR => self.attr(n, s)?,
             S_FIRST_CHILD => sib().index == 1,
@@ -433,34 +440,42 @@ impl Ctx<'_, '_> {
         let a = self.name(s);
         let want = s.b.of(self.sheet.names.as_slice());
         let ci = s.flags & FLAG_CASE_I != 0;
+        let budget = self.budget;
+        // 比べるバイトは塊ずつ払う
+        let eq = |x: &[u8], y: &[u8]| if ci { bytes_eq_ignore_case(budget, x, y) } else { bytes_eq(budget, x, y) };
         for at in doc.attrs_of(n) {
-            self.pay(a.len())?;
-            if !(s.ns == NS_ANY || s.ns == at.ns) || at.local.of(input) != a {
+            budget.spend(cost::OP_STEP)?;
+            if !(s.ns == NS_ANY || s.ns == at.ns) || !bytes_eq(budget, at.local.of(input), a)? {
                 continue;
             }
             let v = doc.value(input, at);
-            self.pay(v.len().saturating_add(want.len()))?;
-            let eq = |x: &[u8], y: &[u8]| if ci { x.eq_ignore_ascii_case(y) } else { x == y };
             let ok = match s.op {
                 OP_EXISTS => true,
-                OP_EQ => eq(v, want),
-                OP_INCLUDES => has_token(v, want, ci),
+                OP_EQ => eq(v, want)?,
+                OP_INCLUDES => has_token(budget, v, want, ci)?,
                 OP_DASH => {
-                    eq(v, want)
+                    eq(v, want)?
                         || (v.len() > want.len()
                             && v.get(want.len()) == Some(&b'-')
-                            && eq(v.get(..want.len()).unwrap_or(&[]), want))
+                            && eq(v.get(..want.len()).unwrap_or(&[]), want)?)
                 }
-                OP_PREFIX => !want.is_empty() && v.len() >= want.len() && eq(v.get(..want.len()).unwrap_or(&[]), want),
+                OP_PREFIX => !want.is_empty() && v.len() >= want.len() && eq(v.get(..want.len()).unwrap_or(&[]), want)?,
                 OP_SUFFIX => {
                     !want.is_empty()
                         && v.len() >= want.len()
-                        && eq(v.get(v.len().saturating_sub(want.len())..).unwrap_or(&[]), want)
+                        && eq(v.get(v.len().saturating_sub(want.len())..).unwrap_or(&[]), want)?
                 }
                 OP_SUBSTR => {
-                    !want.is_empty()
-                        && (0..=v.len().saturating_sub(want.len()))
-                            .any(|k| v.get(k..k.saturating_add(want.len())).is_some_and(|w| eq(w, want)))
+                    let mut found = false;
+                    if !want.is_empty() && v.len() >= want.len() {
+                        for k in 0..=v.len().saturating_sub(want.len()) {
+                            if eq(v.get(k..k.saturating_add(want.len())).unwrap_or(&[]), want)? {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    found
                 }
                 _ => false,
             };
@@ -472,13 +487,26 @@ impl Ctx<'_, '_> {
     }
 }
 
-/// 空白で区切った語に `want` があるか（空白は CSS の空白。`want` が空か空白を含めば当たらない）。
-fn has_token(v: &[u8], want: &[u8], ci: bool) -> bool {
-    if want.is_empty() || want.iter().any(|&c| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0C)) {
-        return false;
+/// 空白で区切った語に `want` があるか（空白は CSS の空白。`want` が空か空白を含めば当たらない）。読むバイトは塊ずつ払う。
+fn has_token(budget: &Budget<'_>, v: &[u8], want: &[u8], ci: bool) -> Result<bool, Error> {
+    let ws = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0C);
+    if want.is_empty() || want.iter().any(|&c| ws(c)) {
+        return Ok(false);
     }
-    v.split(|&c| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0C))
-        .any(|w| if ci { w.eq_ignore_ascii_case(want) } else { w == want })
+    let mut meter = ScanMeter::new(0, v.len());
+    let mut start = 0usize;
+    for i in 0..=v.len() {
+        meter.pay(budget, i)?;
+        if v.get(i).is_none_or(|&c| ws(c)) {
+            let w = v.get(start..i).unwrap_or(&[]);
+            let hit = if ci { bytes_eq_ignore_case(budget, w, want)? } else { bytes_eq(budget, w, want)? };
+            if hit {
+                return Ok(true);
+            }
+            start = i.saturating_add(1);
+        }
+    }
+    Ok(false)
 }
 
 /// An+B に 1 から数えた位置 `i` が当たるか（ある n ≥ 0 で a·n + b = i）。

@@ -9,11 +9,22 @@ use crate::budget::{Budget, chunk_len};
 use crate::cost;
 use crate::error::Error;
 
-/// `s` を `is_less` の順に安定に並べる（等しいものは元の順）。
+/// `s` を `is_less` の順に安定に並べる（等しいものは元の順）。`is_less` は O(1) で軽いこと（重い比べ方は
+/// [`stable_sort_try`] で、比べる関数の中で払う）。
 pub(crate) fn stable_sort<T: Plain>(
     budget: &Budget<'_>,
     s: &mut [T],
     mut is_less: impl FnMut(&T, &T) -> bool,
+) -> Result<(), Error> {
+    stable_sort_try(budget, s, |a, b| Ok(is_less(a, b)))
+}
+
+/// [`stable_sort`] の、比べる関数が誤りを返せるもの（比べる関数の中で長さに比例する手間を塊ずつ払う。長い名前の比べで
+/// 中止を見る間が延びない）。比べる関数が誤りを返せば、並びは途中のまま誤りを返す。
+pub(crate) fn stable_sort_try<T: Plain>(
+    budget: &Budget<'_>,
+    s: &mut [T],
+    mut is_less: impl FnMut(&T, &T) -> Result<bool, Error>,
 ) -> Result<(), Error> {
     let n = s.len();
     if n < 2 {
@@ -70,7 +81,7 @@ fn merge_pass<T: Plain>(
     width: usize,
     chunk: usize,
     step: u64,
-    is_less: &mut impl FnMut(&T, &T) -> bool,
+    is_less: &mut impl FnMut(&T, &T) -> Result<bool, Error>,
 ) -> Result<(), Error> {
     let n = src.len().min(dst.len());
     let mut lo = 0usize;
@@ -88,7 +99,7 @@ fn merge_pass<T: Plain>(
             }
             // 右が左より小さいときだけ右を取る（安定）
             let take_right = match (src.get(i).filter(|_| i < mid), src.get(j).filter(|_| j < hi)) {
-                (Some(a), Some(b)) => is_less(b, a),
+                (Some(a), Some(b)) => is_less(b, a)?,
                 (None, Some(_)) => true,
                 _ => false,
             };

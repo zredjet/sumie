@@ -26,8 +26,8 @@ use crate::budget::{Budget, chunk_len};
 use crate::cost;
 use crate::error::Error;
 
-pub(crate) use sort::stable_sort;
-pub(crate) use sorted::{SortedMap, SortedVec, lower_bound};
+pub(crate) use sort::{stable_sort, stable_sort_try};
+pub(crate) use sorted::{SortedMap, SortedVec, lower_bound, lower_bound_try};
 
 /// `MVec`・`Frozen` に入れてよい型：`#[repr(C)]` か基本の型で、写して捨てても何も起きないもの（ADR-39 (3)）。
 /// 大きさが Rust の版で変わらないので、数える量（D2）がツールチェーンに依らない。
@@ -309,6 +309,57 @@ impl<T: Plain> Frozen<T> {
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
+}
+
+/// 一度に比べるバイトの数（1 回の払いの `cost::copy` が `CANCEL_INTERVAL` よりずっと小さい）。
+const CMP_CHUNK: usize = 1 << 18;
+
+/// 2 つのバイト列を辞書の順に比べる。比べるバイトの手間は塊ずつ、比べる前に払う（長い名前の比べで中止を見る間が延びない）。
+pub(crate) fn bytes_cmp(budget: &Budget<'_>, a: &[u8], b: &[u8]) -> Result<core::cmp::Ordering, Error> {
+    let n = a.len().min(b.len());
+    let mut k = 0usize;
+    loop {
+        let e = k.saturating_add(CMP_CHUNK).min(n);
+        budget.spend(cost::copy(e.saturating_sub(k) as u64).saturating_add(1))?;
+        let (x, y) = (a.get(k..e).unwrap_or(&[]), b.get(k..e).unwrap_or(&[]));
+        let o = x.cmp(y);
+        if o != core::cmp::Ordering::Equal {
+            return Ok(o);
+        }
+        if e >= n {
+            return Ok(a.len().cmp(&b.len()));
+        }
+        k = e;
+    }
+}
+
+/// 2 つのバイト列が ASCII の大文字小文字を問わずに同じか（塊ずつ払う）。
+pub(crate) fn bytes_eq_ignore_case(budget: &Budget<'_>, a: &[u8], b: &[u8]) -> Result<bool, Error> {
+    if a.len() != b.len() {
+        budget.spend(1)?;
+        return Ok(false);
+    }
+    let mut k = 0usize;
+    loop {
+        let e = k.saturating_add(CMP_CHUNK).min(a.len());
+        budget.spend(cost::copy(e.saturating_sub(k) as u64).saturating_add(1))?;
+        if !a.get(k..e).unwrap_or(&[]).eq_ignore_ascii_case(b.get(k..e).unwrap_or(&[])) {
+            return Ok(false);
+        }
+        if e >= a.len() {
+            return Ok(true);
+        }
+        k = e;
+    }
+}
+
+/// 2 つのバイト列が同じか（長さが違えば払わずに偽。同じ長さなら [`bytes_cmp`] と同じに払う）。
+pub(crate) fn bytes_eq(budget: &Budget<'_>, a: &[u8], b: &[u8]) -> Result<bool, Error> {
+    if a.len() != b.len() {
+        budget.spend(1)?;
+        return Ok(false);
+    }
+    Ok(bytes_cmp(budget, a, b)? == core::cmp::Ordering::Equal)
 }
 
 /// `Arc` を共有する（`Clone::clone` を mem の外で使わないための包み。ADR-41 (6)）。

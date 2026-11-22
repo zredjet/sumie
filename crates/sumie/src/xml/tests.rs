@@ -465,9 +465,9 @@ fn expansion_limit_is_checked_before_expanding() {
             Some(Error::Limit(l)) => assert_eq!(l.resource, Resource::Expanded, "{place}"),
             e => panic!("{place}: {e:?}"),
         }
-        // 前置き・字句・DTD の読み直し・実体の値の 2 回（属性用・文字用）で入力の約 5 倍。参照ごとには走査しない
-        // （走査すれば 300 × 1 MiB）
-        assert!(o.count_work < 6 * (src.len() as u64), "{place}: {}", o.count_work);
+        // 前置き・字句・DTD の読み直し・実体の値の 3 回（属性用・文字用・CDATA でない型の形）で入力の約 7 倍。参照ごとには
+        // 走査しない（走査すれば 300 × 1 MiB）
+        assert!(o.count_work < 8 * (src.len() as u64), "{place}: {}", o.count_work);
     }
     // 上限の内なら読め、xmlns の展開も展開の量に数える
     let small = "x".repeat(100);
@@ -643,4 +643,83 @@ fn predefined_entities_and_declared_encoding() {
         Some(Error::Unsupported(u)) => assert_eq!(u.feature, Feature::Encoding),
         e => panic!("{e:?}"),
     }
+}
+
+/// CDATA でない型の属性の中の実体も、参照ごとに値を走査しない（DOCTYPE で求めた形を使う）。値は作る段と同じ。
+#[test]
+fn token_attributes_with_entities() {
+    let sp = " ".repeat(1 << 16);
+    let src = format!(
+        "<!DOCTYPE svg [<!ATTLIST g v NMTOKENS #IMPLIED><!ENTITY e \"{sp}\">]><svg {SVG}><g v=\"{}\"/></svg>",
+        "&e;x".repeat(1000)
+    );
+    let (doc, counts) = parse_with(src.as_bytes(), &Limits::DEFAULT).unwrap();
+    let want = vec!["x"; 1000].join(" ");
+    assert_eq!(doc.attr(src.as_bytes(), doc.node(1).unwrap(), NS_NONE, b"v"), Some(want.as_bytes()));
+    assert!(counts.walk_work < 10 * src.len() as u64, "{}", counts.walk_work);
+    // 空白の並びと実体の頭・終わりの空白の組み合わせ
+    for (v, want) in [
+        (" &e; a &e; ", "b c a b c"),
+        ("&e;&e;", "b c b c"),
+        ("a&s;b", "a b"),
+        ("&s;&s;a&s;", "a"),
+        ("a&n;b", "ab"),
+        ("&s;", ""),
+    ] {
+        let src = format!(
+            "<!DOCTYPE svg [<!ATTLIST g v NMTOKENS #IMPLIED><!ENTITY e \"  b  c  \"><!ENTITY s \"   \"><!ENTITY n \"\">]><svg {SVG}><g v=\"{v}\"/></svg>"
+        );
+        let doc = parse(&src).unwrap();
+        assert_eq!(doc.attr(src.as_bytes(), doc.node(1).unwrap(), NS_NONE, b"v"), Some(want.as_bytes()), "{v}");
+    }
+}
+
+/// DTD の宣言は宣言の単位で読む（中の `]`・`<!--`・`<?`・閉じない引用符で、サブセットの終わりを見誤らない。roxmltree と同じに
+/// 受ける）。
+#[test]
+fn dtd_declarations_are_read_as_units() {
+    for decl in [
+        "<!ELEMENT svg A]NY>",
+        "<!NOTATION n]SYSTEM \"x\">",
+        "<!ATTLIST svg a CDATA #IMPLIED]>",
+        "<!ELEMENT svg<!-- ANY>",
+        "<!ATTLIST g b CDATA #IMPLIED<?xml >",
+        "<!ELEMENT svg it's>",
+        "<!NOTATION n SYSTEM' \"x\">",
+    ] {
+        let src = format!("<!DOCTYPE svg [{decl}]><svg {SVG}/>");
+        assert!(parse(&src).is_ok(), "{decl}");
+    }
+}
+
+/// 局所名が xmlns で接頭辞を束ねていない属性は既定の名前空間の宣言（roxmltree と同じ）。束ねた接頭辞ならふつうの属性。
+/// `xmlns:xml` の重なりは受ける。
+#[test]
+fn prefixed_xmlns_and_repeated_xml_declarations() {
+    let b = |s: &str| parse(s).map(|d| d.nodes.as_slice().iter().map(|n| n.ns).collect::<Vec<_>>());
+    assert_eq!(b("<svg b:xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>").unwrap(), [NS_SVG, NS_SVG]);
+    let src = "<svg xmlns:a=\"urn:a\" a:xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>";
+    let doc = parse(src).unwrap();
+    assert_eq!(doc.nodes.as_slice().iter().map(|n| n.ns).collect::<Vec<_>>(), [NS_NONE, NS_NONE]);
+    assert_eq!(doc.attrs_of(doc.node(0).unwrap()).len(), 1);
+    let x = "xmlns:xml=\"http://www.w3.org/XML/1998/namespace\"";
+    assert!(parse(&format!("<svg {x} {x}/>")).is_ok());
+}
+
+/// 長い名前の並べ替えも比べる中で払う（前払いしてから払わずに比べない）。
+#[test]
+fn long_names_in_sorts_are_paid_as_compared() {
+    let e = "e".repeat(70_000);
+    let atts: String = (0..400).map(|i| format!(" a{i:05} CDATA #IMPLIED")).collect();
+    let src = format!("<!DOCTYPE svg [<!ATTLIST {e}{atts}>]><svg {SVG}/>");
+    let o = xml_parse_with(src.as_bytes(), &Limits::DEFAULT);
+    assert_eq!(o.check, Check::Ok);
+    assert!(o.error.is_none(), "{:?}", o.error);
+    // 長い名前の属性が多い要素の重なりの確かめ
+    let n = "n".repeat(17_000);
+    let attrs: String = (0..200).map(|i| format!(" {n}{i:03}=\"1\"")).collect();
+    let src = format!("<svg {SVG}{attrs}/>");
+    let o = xml_parse_with(src.as_bytes(), &Limits::DEFAULT);
+    assert_eq!(o.check, Check::Ok);
+    assert!(o.error.is_none(), "{:?}", o.error);
 }

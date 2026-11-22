@@ -102,6 +102,16 @@ fn edge_cases() -> Vec<(&'static str, String)> {
         ("element-xml-prefix", "<xml:svg/>".to_string()),
         ("element-decl-quote", format!("<!DOCTYPE svg [<!ELEMENT svg \"]>\">]><svg {svg}/>")),
         ("entity-predefined-redeclared", format!("<!DOCTYPE svg [<!ENTITY lt \"&#38;#60;\">]><svg {svg}>&lt;</svg>")),
+        ("dtd-element-bracket", format!("<!DOCTYPE svg [<!ELEMENT svg A]NY>]><svg {svg}/>")),
+        ("dtd-notation-bracket", format!("<!DOCTYPE svg [<!NOTATION n]SYSTEM \"x\">]><svg {svg}/>")),
+        ("dtd-attlist-bracket", format!("<!DOCTYPE svg [<!ATTLIST svg a CDATA #IMPLIED]>]><svg {svg}/>")),
+        ("dtd-element-comment", format!("<!DOCTYPE svg [<!ELEMENT svg<!-- ANY>]><svg {svg}/>")),
+        ("dtd-element-apostrophe", format!("<!DOCTYPE svg [<!ELEMENT svg it's>]><svg {svg}/>")),
+        ("dtd-notation-quote", format!("<!DOCTYPE svg [<!NOTATION n SYSTEM' \"x\">]><svg {svg}/>")),
+        ("xmlns-unbound-prefix", "<svg b:xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>".to_string()),
+        ("xmlns-bound-prefix", "<svg xmlns:a=\"urn:a\" a:xmlns=\"http://www.w3.org/2000/svg\"/>".to_string()),
+        ("xmlns-xml-twice", format!("<svg {svg} xmlns:xml=\"http://www.w3.org/XML/1998/namespace\" xmlns:xml=\"http://www.w3.org/XML/1998/namespace\"/>")),
+        ("attlist-token-entity", format!("<!DOCTYPE svg [<!ATTLIST svg v NMTOKENS #IMPLIED><!ENTITY e \"  a  \">]><svg {svg} v=\"&e;&e;\"/>")),
     ]);
     v.push(("deep-1000", format!("<svg {svg}>{}{}</svg>", "<g>".repeat(1000), "</g>".repeat(1000))));
     v

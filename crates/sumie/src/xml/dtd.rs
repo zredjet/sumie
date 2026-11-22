@@ -5,7 +5,7 @@
 //! - ATTLIST は XML 1.0 §3.3 のとおりに読む（型・既定の宣言）。既定の値は、要素がその属性を書いていないときに当てる
 //!   （§5.1。非検証の処理器にも求められる。ADR-66）。同じ要素の同じ属性は最初の宣言を使う（§3.3）。読めない ATTLIST は
 //!   最初の `>` まで飛ばして当てない（roxmltree はどの ATTLIST も最初の `>` まで飛ばして受ける。NFR-10）
-//! - ELEMENT・NOTATION の宣言は引用符を見ながら読み飛ばす。宣言の中の文字は確かめない（roxmltree と同じ）
+//! - ELEMENT・NOTATION の宣言は最初の `>` まで読み飛ばす（字句と同じ。roxmltree と同じ）。宣言の中の文字は確かめない
 //! - 注釈・処理命令・空白は飛ばす。宣言の外のそのほかの文字と、知らない宣言（`<!FOO`）は誤り（roxmltree と同じ）
 //! - `<!ENTITY` のあと・名前のあとには空白が要る（XML 1.0 §4.2）
 //! - 同じ名前の実体は最初の宣言を使う（XML 1.0 §4.2）
@@ -16,7 +16,9 @@
 use crate::budget::Budget;
 use crate::cost;
 use crate::error::{Error, Feature, Unsupported};
-use crate::mem::{MVec, Plain, lower_bound, stable_sort};
+use core::cmp::Ordering;
+
+use crate::mem::{MVec, Plain, bytes_cmp, bytes_eq, lower_bound_try, stable_sort_try};
 use crate::xml::chars::{decode, is_name_char, is_name_start, is_space};
 use crate::xml::lex::{ScanMeter, Span};
 
@@ -35,6 +37,12 @@ pub(crate) struct Entity {
     pub(crate) attr_work: u64,
     pub(crate) text_bytes: u64,
     pub(crate) text_work: u64,
+    /// CDATA でない型の属性の中で空白を揃えたときの形（頭と終わりの空白を除いた中身のバイト数と書く手間、印：1 中身が
+    /// ある・2 頭が空白・4 終わりが空白・8 空でない）。参照ごとに値を走査しないため
+    pub(crate) tok_bytes: u64,
+    pub(crate) tok_work: u64,
+    pub(crate) tok_flags: u32,
+    pub(crate) pad: u32,
 }
 
 impl Plain for Entity {}
@@ -181,40 +189,24 @@ pub(crate) fn parse_subset<'b>(b: &[u8], subset: Span, budget: &'b Budget<'b>) -
                 Err(e) => return Err(e),
             };
         } else if c.starts(k, b"<!ELEMENT")? || c.starts(k, b"<!NOTATION")? {
-            // 引用符を見ながら '>' まで
-            let mut e = k.saturating_add(2);
-            let mut quote: Option<u8> = None;
-            loop {
-                let Some(x) = c.at(e)? else { return Err(invalid(k)) };
-                match (quote, x) {
-                    (Some(q), x) if x == q => quote = None,
-                    (Some(_), _) => {}
-                    (None, b'"' | b'\'') => quote = Some(x),
-                    (None, b'>') => break,
-                    _ => {}
-                }
-                e = e.saturating_add(1);
-            }
-            k = e.saturating_add(1);
+            // 最初の '>' まで（字句と同じ。ELEMENT は引用を書けず、NOTATION は roxmltree と同じに引用を見ない）
+            k = c.find(k.saturating_add(2), b">")?.ok_or_else(|| invalid(k))?.saturating_add(1);
         } else if ch == b'%' {
             return Err(unsupported(Feature::ParameterEntity, k));
         } else {
             return Err(invalid(k));
         }
     }
-    // 名前で引けるように並べる（名前のバイトを比べる分は、要素ごとに名前の長さ × 段の数を前払いする）
-    let n = out.len() as u64;
-    let name_bytes: u64 =
-        out.as_slice().iter().fold(0u64, |a, e| a.saturating_add((e.name.len() as u64).saturating_add(1)));
-    budget.spend_large(cost::scan(name_bytes).saturating_mul(cost::ceil_log2(n)))?;
-    stable_sort(budget, out.as_mut_slice(), |x, y| (x.name.of(b), x.order) < (y.name.of(b), y.order))?;
-    let n = atts.len() as u64;
-    let att_bytes: u64 = atts.as_slice().iter().fold(0u64, |a, d| {
-        a.saturating_add((d.element.len() as u64).saturating_add(d.name.len() as u64).saturating_add(1))
-    });
-    budget.spend_large(cost::scan(att_bytes).saturating_mul(cost::ceil_log2(n)))?;
-    let key = |d: &AttDecl| (d.element.of(b), d.name.of(b), d.order);
-    stable_sort(budget, atts.as_mut_slice(), |x, y| key(x) < key(y))?;
+    // 名前で引けるように並べる（名前のバイトは比べる中で塊ずつ払う。同じ名前は宣言の順のまま。並べ替えは安定）
+    stable_sort_try(budget, out.as_mut_slice(), |x, y| {
+        Ok(bytes_cmp(budget, x.name.of(b), y.name.of(b))? == Ordering::Less)
+    })?;
+    stable_sort_try(budget, atts.as_mut_slice(), |x, y| {
+        Ok(match bytes_cmp(budget, x.element.of(b), y.element.of(b))? {
+            Ordering::Equal => bytes_cmp(budget, x.name.of(b), y.name.of(b))? == Ordering::Less,
+            o => o == Ordering::Less,
+        })
+    })?;
     Ok(Subset { entities: out, attlists: atts })
 }
 
@@ -328,10 +320,8 @@ pub(crate) fn att_range(
     if table.is_empty() {
         return Ok((0, 0));
     }
-    let steps = cost::search(table.len() as u64);
-    budget.spend_large(steps.saturating_mul(2).saturating_mul(cost::copy(element.len() as u64).saturating_add(1)))?;
-    let lo = lower_bound(table, |d| d.element.of(b) < element);
-    let hi = lower_bound(table, |d| d.element.of(b) <= element);
+    let lo = lower_bound_try(table, |d| Ok(bytes_cmp(budget, d.element.of(b), element)? == Ordering::Less))?;
+    let hi = lower_bound_try(table, |d| Ok(bytes_cmp(budget, d.element.of(b), element)? != Ordering::Greater))?;
     Ok((lo, hi.max(lo)))
 }
 
@@ -381,10 +371,11 @@ fn entity(c: &mut Cur<'_, '_>, k: usize, order: u32) -> Result<(Option<Entity>, 
 /// 名前で引く（並べた表。同じ名前は最初の宣言）。名前のバイトを比べる分（名前の長さ × 歩数）を払う（長い名前は
 /// 塊に分けて払う）。
 pub(crate) fn lookup(b: &[u8], table: &[Entity], name: &[u8], budget: &Budget<'_>) -> Result<Option<Entity>, Error> {
-    let steps = cost::search(table.len() as u64);
-    budget.spend_large(steps.saturating_mul(cost::copy(name.len() as u64).saturating_add(1)))?;
-    let i = lower_bound(table, |e| e.name.of(b) < name);
-    Ok(table.get(i).copied().filter(|e| e.name.of(b) == name))
+    let i = lower_bound_try(table, |e| Ok(bytes_cmp(budget, e.name.of(b), name)? == Ordering::Less))?;
+    match table.get(i).copied() {
+        Some(e) if bytes_eq(budget, e.name.of(b), name)? => Ok(Some(e)),
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]

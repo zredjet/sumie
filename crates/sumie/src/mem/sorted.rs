@@ -23,6 +23,20 @@ pub(crate) fn lower_bound<T>(s: &[T], mut is_less: impl FnMut(&T) -> bool) -> us
     lo
 }
 
+/// [`lower_bound`] の、比べる関数が誤りを返せるもの（比べる関数の中で長さに比例する手間を払う）。
+#[expect(clippy::arithmetic_side_effects, reason = "lo ≤ mid < hi ≤ len なので、あふれない")]
+pub(crate) fn lower_bound_try<T>(s: &[T], mut is_less: impl FnMut(&T) -> Result<bool, Error>) -> Result<usize, Error> {
+    let (mut lo, mut hi) = (0usize, s.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match s.get(mid) {
+            Some(x) if is_less(x)? => lo = mid + 1,
+            _ => hi = mid,
+        }
+    }
+    Ok(lo)
+}
+
 /// 並べた並び（同じ値は入れた順）。
 pub(crate) struct SortedVec<'b, T: Plain + Ord> {
     v: MVec<'b, T>,
