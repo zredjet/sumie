@@ -42,7 +42,9 @@
 - [x] `sumie-tools`：`oracle resvg`・`oracle chrome`・`compare`・`bench`・`corpus`・`gen-heavy` の骨組み
 - [x] 試験の集まりの取り込み（ライセンスを確かめ、写しを許すものだけを出どころ・版・ライセンスの写しとともに。取り込む前に一覧を見せて承認を得る。ADR-21）
 - [x] CI（GitHub Actions：`ubuntu-latest`・`ubuntu-24.04-arm`・`macos-15`（arm64）。非公開のリポジトリで arm の Linux が使えるかを確かめる。ADR-22）と
-  手元の全チェック `scripts/verify.sh`。→ リポジトリを公開にして 3 つのターゲットで回した（ADR-54）
+  手元の全チェック `scripts/verify.sh`。→ リポジトリを公開にして 3 つのターゲットで回した（ADR-54）。M0 の終わりの
+  ed8c3d6 で、CI の回 45017566008 の 5 つのジョブ（3 つのターゲットの試験・checks・fuzz）が通り、手元の `scripts/verify.sh`
+  の全段（release・native・x86_64・ファズ）も 22b5fbb で通った
 - [x] Kura と同じ resvg（`raster-images` なし）で、sbix の絵文字（Apple Color Emoji）がどう描かれるか（代わりのフォントとして
   選ばれるか・仮の輪郭を描くか）を確かめ、絵文字の書体の数え方をユーザーに決めてもらう（ADR-14 (5)・ADR-40）。→ resvg は
   Apple Color Emoji を選んで何も描かない。(a) 字ごとに数える（ADR-56 (2)）
