@@ -159,6 +159,36 @@ fn cases(scale: usize) -> Vec<(&'static str, Vec<u8>)> {
         )
         .into_bytes(),
     ));
+    // 文書の段の 2 回目のレビューの形
+    out.push(("巻き戻しの多い輪（K = D）", {
+        let k = n(8_000);
+        let uses: String = (0..k).map(|i| format!("<use href=\"#c{i}\"/>")).collect();
+        let inner: String = (0..k).map(|i| format!("<use id=\"c{i}\" href=\"#Q\"/>")).collect();
+        format!("{SVG}{uses}<g id=\"Q\">{}<g id=\"P\">{inner}</g>{}</g></svg>", "<g>".repeat(1000), "</g>".repeat(1000))
+            .into_bytes()
+    }));
+    out.push(("倍々の use 100 段", {
+        let mut body = String::from("<defs><rect id=\"l0\"/>");
+        for k in 1..=100 {
+            body.push_str(&format!("<g id=\"l{k}\"><use href=\"#l{p}\"/><use href=\"#l{p}\"/></g>", p = k - 1));
+        }
+        format!("{SVG}{body}</defs><use href=\"#l100\"/></svg>").into_bytes()
+    }));
+    out.push(("filter の inherit × 長い並び", {
+        let filters: String = (0..40_000).map(|i| format!("<filter id=\"f{i}\"/>")).collect();
+        let urls: String = (0..40_000).map(|i| format!("url(#f{i}) ")).collect();
+        doc(
+            "g g{filter:inherit}",
+            &format!("{filters}<g style=\"filter:{urls}\">{}{}</g>", "<g>".repeat(1000), "</g>".repeat(1000)),
+        )
+    }));
+    out.push((
+        "規則の長い filter × 要素",
+        doc(
+            &format!("rect{{filter:{}}}", "url(#f) ".repeat(10_000)),
+            &format!("<filter id=\"f\"/>{}", "<rect/>".repeat(n(10_000))),
+        ),
+    ));
     out.push(("深い入れ子", format!("{SVG}{}{}</svg>", "<g>".repeat(1000), "</g>".repeat(1000)).into_bytes()));
     out.push(("参照の多い文書（use の鎖）", {
         let mut body = String::from("<defs><rect id=\"r0\"/>");

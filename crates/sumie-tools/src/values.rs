@@ -210,7 +210,8 @@ fn paint_text(p: &Paint, opacity: f64) -> String {
     }
 }
 
-/// 塗りが同じか（色は ±1・不透明度は 1e-3。参照先は種類だけを比べる：usvg は objectBoundingBox の参照先に新しい id を付ける）。
+/// 塗りが同じか（色は ±1・不透明度は 1e-3。参照先は種類と id を比べる。usvg が objectBoundingBox の参照先に付けた新しい id
+/// （`linearGradient1` など）なら種類だけ）。
 fn paint_same(s: &Paint, s_op: f64, u: Option<&(String, f32)>) -> bool {
     match (s, u) {
         (Paint::None | Paint::Cut, None) => true,
@@ -221,13 +222,18 @@ fn paint_same(s: &Paint, s_op: f64, u: Option<&(String, f32)>) -> bool {
             (0..3).all(|k| (f32::from(ch(k)) - c[k]).abs() <= 1.0)
                 && (near(a, b) || (a - b).abs() <= 0.5 / 255.0 + 1e-6)
         }
-        (Paint::Server(local, _), Some((t, op))) => {
+        (Paint::Server(local, id), Some((t, op))) => {
             let kind = match local.as_str() {
                 "linearGradient" => "linear(",
                 "radialGradient" => "radial(",
                 _ => "pattern(",
             };
-            t.starts_with(kind) && near(s_op, f64::from(*op))
+            // usvg が作り直した参照先（`linearGradient1` など）でなければ id も比べる
+            let uid = t.strip_prefix(kind).and_then(|r| r.strip_suffix(')')).unwrap_or("");
+            let generated = ["linearGradient", "radialGradient", "pattern"]
+                .iter()
+                .any(|p| uid.strip_prefix(p).is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())));
+            t.starts_with(kind) && (generated || uid == id) && near(s_op, f64::from(*op))
         }
         _ => false,
     }
