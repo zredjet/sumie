@@ -21,6 +21,7 @@ mod math;
 mod mem;
 mod report;
 mod style;
+mod values;
 mod xml;
 
 #[doc(hidden)]
