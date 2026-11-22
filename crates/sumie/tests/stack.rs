@@ -1,6 +1,7 @@
 //! 小さいスタック（128 KiB）の試験（NFR-03）。debug と release の両方で回す（CI は `cargo test --release` も回す）。
-//! スタックがあふれたらプロセスごと落ちるので、落ちずに終われば通る。段ができたら、10 万段の入れ子・参照の鎖・
-//! セレクタの結合子を、読む・木を作る・描くの最後まで通す例を足す（M1 から）。
+//! スタックがあふれたらプロセスごと落ちるので、落ちずに終われば通る。M1 は 10 万段の入れ子・参照の鎖・セレクタの
+//! 結合子・括弧と規則の入れ子を、読む段の全体と木を作る段の見積もりに通す（Kura の攻撃の例は tests/attacks.rs も
+//! 小さなスタックで回す）。木を作る・描く段ができたら、同じ例を最後まで通す。
 
 #![allow(
     clippy::unwrap_used,
@@ -64,5 +65,98 @@ fn parse_deep_nesting_on_a_small_stack() {
         let p = sumie::parse(src.as_bytes(), &opts, &sumie::Never).map(|_| ());
         (e, p)
     });
+    assert_eq!((e, p), (Ok(()), Ok(())));
+}
+
+/// estimate_parse・parse・estimate_build の結果（読めなければ estimate_build は None）。
+type Stages = (Result<(), sumie::Error>, Result<(), sumie::Error>, Option<Result<(), sumie::Error>>);
+
+/// 読む段の全体（estimate_parse・parse）と木を作る段の見積もりを 128 KiB のスタックで通し、結果を返す。
+fn parse_small(src: String, limits: Limits) -> Stages {
+    let opts = sumie::ParseOptions { limits, ..sumie::ParseOptions::DEFAULT };
+    on_small_stack(move || {
+        let e = sumie::estimate_parse(src.as_bytes(), &opts, &sumie::Never).map(|_| ());
+        let p = sumie::parse(src.as_bytes(), &opts, &sumie::Never);
+        let b = p.as_ref().ok().map(|d| d.estimate_build(&sumie::Never).map(|_| ()));
+        (e, p.map(|_| ()), b)
+    })
+}
+
+/// 参照の鎖（use・pattern の href・gradient の href・受け継ぐ塗り）が 10 万段でも、輪を探す・展開の数を数える歩きは
+/// 再帰しない。
+#[test]
+fn reference_chains_on_a_small_stack() {
+    let n = 100_000;
+    let x = "xmlns=\"http://www.w3.org/2000/svg\" width=\"4\" height=\"4\"";
+    let mut uses = format!("<svg {x}><defs><rect id=\"u0\"/>");
+    let mut pats = format!("<svg {x}><defs><pattern id=\"p0\"/>");
+    let mut grads = format!("<svg {x}><defs><linearGradient id=\"g0\"/>");
+    for i in 1..n {
+        uses.push_str(&format!("<g id=\"u{i}\"><use href=\"#u{}\"/></g>", i - 1));
+        pats.push_str(&format!("<pattern id=\"p{i}\"><rect fill=\"url(#p{})\"/></pattern>", i - 1));
+        grads.push_str(&format!("<linearGradient id=\"g{i}\" href=\"#g{}\"/>", i - 1));
+    }
+    uses.push_str(&format!("</defs><use href=\"#u{}\"/></svg>", n - 1));
+    pats.push_str(&format!("</defs><rect fill=\"url(#p{})\"/></svg>", n - 1));
+    grads.push_str(&format!("</defs><rect fill=\"url(#g{})\"/></svg>", n - 1));
+    // defs の中の鎖は描く参照の分だけ数えるので、展開の数は 2n ほどで上限の内
+    for src in [uses, pats, grads] {
+        assert_eq!(parse_small(src, Limits::DEFAULT), (Ok(()), Ok(()), Some(Ok(()))));
+    }
+    // 輪の鎖（最後が最初を指す）
+    let mut ring = format!("<svg {x}><defs>");
+    for i in 0..n {
+        ring.push_str(&format!("<g id=\"r{i}\"><use href=\"#r{}\"/></g>", (i + 1) % n));
+    }
+    ring.push_str("</defs><use href=\"#r0\"/></svg>");
+    assert_eq!(parse_small(ring, Limits::DEFAULT), (Ok(()), Ok(()), Some(Ok(()))));
+}
+
+/// 長いセレクタ（結合子 10 万・`:is()`・`:not()` の入れ子）・入れ子の括弧・入れ子の規則を、小さなスタックで読む。
+#[test]
+fn long_selectors_on_a_small_stack() {
+    let n = 100_000;
+    let doc = |css: String| {
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"4\" height=\"4\"><style>{css}</style>{}<rect/>{}</svg>",
+            "<g>".repeat(10),
+            "</g>".repeat(10)
+        )
+    };
+    let cases = [
+        format!("{}rect{{fill:red}}", "g ".repeat(n)),
+        format!("{}rect{{fill:red}}", "g>".repeat(n)),
+        format!("{}rect{{fill:red}}", "g~".repeat(n)),
+        format!("{}rect{}{{fill:red}}", ":is(".repeat(10_000), ")".repeat(10_000)),
+        format!("{}rect{}{{fill:red}}", ":not(".repeat(10_000), ")".repeat(10_000)),
+        format!("rect{{fill:{}red{}}}", "(".repeat(n), ")".repeat(n)),
+        format!("rect{{fill:{}red}}", "[".repeat(n)),
+        format!("{}rect{{fill:red}}{}", "g{".repeat(n), "}".repeat(n)),
+        format!("@media {}screen{} {{rect{{fill:red}}}}", "(".repeat(n), ")".repeat(n)),
+        format!("@supports {}(fill:red){} {{rect{{fill:red}}}}", "not (".repeat(10_000), ")".repeat(10_000)),
+    ];
+    for css in cases {
+        let head: String = css.chars().take(40).collect();
+        let (e, p, _) = parse_small(doc(css), Limits::DEFAULT);
+        // 読むか断る。断るなら estimate_parse と parse が同じ誤り
+        match (&e, &p) {
+            (Ok(()), Ok(())) => {}
+            (Err(a), Err(b)) => assert_eq!(a, b, "{head}"),
+            _ => panic!("{head}：{e:?} {p:?}"),
+        }
+    }
+}
+
+/// 実体の参照の鎖（実体の中の参照は断るので、鎖は 1 段だけ）と、深い入れ子の属性の値の参照。
+#[test]
+fn entity_references_on_a_small_stack() {
+    let ents: String = (0..10_000).map(|i| format!("<!ENTITY e{i} \"v{i}\">")).collect();
+    let refs: String = (0..10_000).map(|i| format!("&e{i};")).collect();
+    let src = format!(
+        "<!DOCTYPE svg [{ents}]><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"4\" height=\"4\"><desc>{refs}</desc>{}<rect class=\"{refs}\"/>{}</svg>",
+        "<g>".repeat(1000),
+        "</g>".repeat(1000)
+    );
+    let (e, p, _) = parse_small(src, Limits::DEFAULT);
     assert_eq!((e, p), (Ok(()), Ok(())));
 }
