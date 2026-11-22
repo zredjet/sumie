@@ -59,10 +59,10 @@
 | FR-IN-01 | M | 入力は SVG のバイト列。UTF-8 だけを読む（先頭の BOM は飛ばす）。読めるかは XML の宣言の `encoding` に依らず、UTF-8 として正しいかで決める（ASCII だけの ISO-8859-1 の宣言のものなどは読む） |
 | FR-IN-02 | M | UTF-8 として読めないときだけ、BOM と宣言を見て誤りの種類を分ける：UTF-16 の BOM があるもの・宣言が UTF-8 以外を名乗るものは `Unsupported`（Kura が次の段へ回せる。今の Kura は読み取りの誤り）、それ以外は `Invalid` |
 | FR-IN-03 | M | svgz（gzip。先頭が `1f 8b`）は `Unsupported`（今の Kura と同じ。展開を自作するかは v1 の外） |
-| FR-IN-04 | M | XML 1.0 の整形式でなければ `Invalid`（入力の位置つき）。閉じていない要素・属性の重複・不正な名前・不正な文字の参照など。roxmltree（resvg の中）が受けて描いているものを `Invalid` にしないかを、M1 で照合の集まりと Kura のファズのコーパスで照らし、受けるものは受ける（NFR-10） |
+| FR-IN-04 | M | XML 1.0 の整形式でなければ `Invalid`（入力の位置つき）。閉じていない要素・属性の重複・不正な名前・不正な文字の参照など。roxmltree（resvg の中）が受けて描いているものを `Invalid` にしないかを、M1 で照合の集まりと Kura のファズのコーパスで照らし、受けるものは受ける（NFR-10）。細かい扱いは roxmltree 0.21.1 に合わせる（ADR-65） |
 | FR-IN-05 | M | 名前空間：接頭辞は宣言で URI に解いて見る（接頭辞の文字では見ない）。描くのは SVG の名前空間の要素だけ。`href` と `xlink:href` の両方を読み、両方あれば `href` を使う |
-| FR-IN-06 | M | 文字の参照（`&#…;`・`&#x…;`）と定義済みの 5 つの実体 |
-| FR-IN-07 | M | DTD：内部のサブセットの一般の実体だけを、展開した量に上限を付けて扱う。パラメタ実体・外部の実体・マークアップか参照を含む実体は `Unsupported`（今の Kura と同じ）。外部の DTD の識別子（`SYSTEM`・`PUBLIC`）は読まずに無視する（Illustrator の DOCTYPE を読める）。ELEMENT・ATTLIST・NOTATION の宣言は読み飛ばす。ATTLIST の既定の属性値は当てない（XML 1.0 §5.1 は非検証の処理器にも当てることを求めるが、roxmltree・今の Kura と同じにする。M1 で照らす） |
+| FR-IN-06 | M | 文字の参照（`&#…;`・`&#x…;`）と定義済みの 5 つの実体。値が u32 に入らないもの・文書の文字でないもの（`&#0;`・`&#xFFFE;` など）は `Invalid`、サロゲートと U+10FFFF を超える値は U+FFFD（roxmltree と同じ。ADR-65） |
+| FR-IN-07 | M | DTD：内部のサブセットの一般の実体だけを、展開した量に上限を付けて扱う。パラメタ実体・外部の実体・マークアップか参照を含む実体は `Unsupported`（今の Kura と同じ）。外部の DTD の識別子（`SYSTEM`・`PUBLIC`）は読まずに無視する（Illustrator の DOCTYPE を読める）。ELEMENT・ATTLIST・NOTATION の宣言は読み飛ばす。宣言の外の文字と知らない宣言は `Invalid`（ADR-65）。ATTLIST の既定の属性値は当てない（XML 1.0 §5.1 は非検証の処理器にも当てることを求めるが、roxmltree・今の Kura と同じにする。M1 で照らす） |
 | FR-IN-08 | M | 外部の資源（ファイル・http・相対のパス・`@import`・`@font-face` の `src`）を読まない。外を指す参照（use・塗り・filter など）は描かずに、報告の「読まなかった参照」に載せる。`<image>` は FR-IMG |
 | FR-IN-09 | M | 外から来たバイト列を `&str` の位置で切らない。名前・値の走査はバイト列で行い、文字の節・属性の値は UTF-8 として確かめてから使う |
 

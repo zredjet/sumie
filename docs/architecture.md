@@ -67,7 +67,7 @@ RGBA8（乗算済み）
 
 | 層 | モジュール |
 |---|---|
-| 0 基礎 | `math`・`fixed`・`mem`・`budget`・`cost`・`error`・`cancel`（中止の印）・`report`・`unicode`（生成した表） |
+| 0 基礎 | `math`・`fixed`・`mem`・`budget`・`cost`・`error`・`limits`（上限）・`cancel`（中止の印）・`report`・`unicode`（生成した表） |
 | 1 幾何の型 | `geom`（変形・パス・平坦化・線の外形・破線。字句を知らない） |
 | 2 読み取り | `xml` → `css` → `values`（`geom` の型を作る）→ `style` → `doc` |
 | 3 フォントと文字 | `font` → `text` |
@@ -240,8 +240,10 @@ Kura の「形」（値を描かずに大きさなどを読む。今の Kura は
 - 走査はバイト列の上の位置で進め、どの枝も必ず 1 バイト以上進む（`tests/rules.rs` では見られないので、ファズと
   「すべての 3 バイトの並び」のテストで確かめる）
 - 空白は XML の空白（#x20・#x9・#xD・#xA）だけ。std の `trim`・`is_whitespace` は使わない（determinism.md §4.3）
-- 整形式の厳しさは、roxmltree（resvg の中）が受けて描いているものを `Invalid` にしないかを、M1 で照合の集まりと Kura の
-  ファズのコーパスで照らして決める（NFR-10）
+- 2 つの段で読む：数える段（`estimate_parse` はここまで）が整形式・名前空間・属性の重なり・実体を確かめて、節・属性・
+  文字の置き場の数と作る段の手間を数え、作る段が数えた容量を最初に取って同じ歩きで節を作る（歩きの手間と確保は 2 つの段で
+  同じ）。読むバイトは 1 バイト 1 単位で、読む前に塊ずつ払う（`ScanMeter`）
+- 整形式の厳しさは roxmltree 0.21.1（resvg の中）に合わせる（ADR-65）。照らしは `sumie-tools wellformed`（§10）
 
 ### 4.2 スタイル（段 2）
 
@@ -542,8 +544,8 @@ Unicode の表は、`sumie-tools` の `gen-unicode` が Unicode の文字のデ�
 ## 10. 照合と試験の道具（sumie-tools）
 
 M0 にあるのは `oracle`・`compare`・`bench`（と子の `bench-one`）・`corpus`（`import-resvg`・`resvg-source`・`fetch-w3c`・
-`fetch-real`・`index`）・`gen-heavy`・`kura-compat`・`oracle-lock`・`gen-disallowed`・`check-lint-probe`。「（M2 から）」などの印の
-ものはまだない。
+`fetch-real`・`index`）・`gen-heavy`・`kura-compat`・`oracle-lock`・`gen-disallowed`・`check-lint-probe`。M1 で `probe`・`wellformed`
+を足した。「（M2 から）」などの印のものはまだない。
 
 | 道具 | すること |
 |---|---|
@@ -552,6 +554,8 @@ M0 にあるのは `oracle`・`compare`・`bench`（と子の `bench-one`）・`
 | `oracle chrome` | `/Applications/Google Chrome.app` のヘッドレスで描く（決めた描き方は下の「Chrome の描き方」。Chrome の版を記録）。PNG はストレートなので、決めた式で乗算済みに直す |
 | `compare` | 2 つの描画の差を乗算済みの RGBA8 で測る（ADR-15 の基準）・差の画像・一覧の HTML |
 | `corpus` | 照合の集まりの取り込み（出どころ・版・ライセンス・ダイジェストの一覧。resvg の試験・W3C・実例の SVG。ADR-21・ADR-59）と、使っている機能での分類（マイルストーンごとの範囲を選ぶ） |
+| `probe` | M1 の範囲を決める照らし：CSS のセレクタ・アットルール・カスケード・SVG 2 の属性・値の書き方・大きさの端の小さな SVG を `tests/svg/m1-probe/` に書き、resvg と Chrome で描いて、決めた点の色で「効く・効かない」を表にする（`README.md`。ADR-64） |
+| `wellformed` | XML の整形式の照らし：照合の集まり・Kura のファズのコーパス（`--kura-fuzz <dir>`。読むだけで、名前は BLAKE3 にする）・変異（`--mutate N`）・端の例を、roxmltree（usvg が外に出しているもの）と sumie の XML の段（`sumie::fuzzing::xml_parse`）の両方で読み、受ける・断るの食い違いを `local/wellformed/`（`summary.md`・`result.jsonl`・食い違った入力の `diff/`）に書く（FR-IN-04・ADR-65） |
 | `kura-compat` | Kura の側の「描く／断る」と大きさの一覧（`corpus/kura-request.md`）と照らす（ADR-62 (4)。依頼は取り下げたので、一覧が届いたときに使う。ADR-63 (1)） |
 | `oracle-lock` | 照合の相手の依存の閉包の版と checksum を Kura の Cargo.lock と照らして記録する（ADR-57 (1)・ADR-60 (5)） |
 | `gen-disallowed`・`check-lint-probe` | ライブラリの禁じる口の一覧を std の文書から作る・それが本当に拾われるかを試しのクレートで確かめる（ADR-49） |
