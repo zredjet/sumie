@@ -81,6 +81,33 @@ fn cases(scale: usize) -> Vec<(&'static str, Vec<u8>)> {
         let decls: String = (0..n(20_000)).map(|_| " a CDATA \"&n;\"").collect();
         format!("<!DOCTYPE svg [<!ATTLIST g{decls}>]>{SVG}{}</svg>", "<g/>".repeat(n(5_000))).into_bytes()
     }));
+    // Kura の svg.rs の試験の CSS の形（css_costs_are_bounded・css_and_reference_work_is_bounded）
+    out.push((
+        "Kura：隣接の結合子の鎖 g+ × 要素",
+        doc(&format!("{}g{{fill:red}}", "g+".repeat(n(11_000))), &"<g/>".repeat(n(11_000))),
+    ));
+    out.push((
+        "Kura：子孫の後戻り（61 段 × 6 つの g）",
+        doc("y g g g g g g rect{fill:red}", &format!("{}<rect/>{}", "<g>".repeat(61), "</g>".repeat(61))),
+    ));
+    out.push(("Kura：1 つの規則の 8 万の宣言", doc(&format!("g{{{}}}", "opacity:1;".repeat(n(80_000))), "<g/>")));
+    out.push((
+        "Kura：style 属性の 30 万の宣言",
+        format!("{SVG}<g style=\"{}\"/></svg>", "opacity:1;".repeat(n(300_000))).into_bytes(),
+    ));
+    out.push(("Kura：規則 12,000 × 要素 12,000", {
+        let css: String = (0..12_000).map(|i| format!(".c{i}{{fill:red}}")).collect();
+        let body: String = (0..n(12_000)).map(|i| format!("<g class=\"c{}\"/>", i % 12_000)).collect();
+        doc(&css, &body)
+    }));
+    out.push(("Kura：受け継ぐ参照の規則 4,000 × 深い入れ子", {
+        let css: String = (0..4_000).map(|i| format!("g{{fill:url(#p{i})}}")).collect();
+        let pats: String = (0..4_000).map(|i| format!("<pattern id=\"p{i}\"/>")).collect();
+        doc(
+            &css,
+            &format!("<defs>{pats}</defs>{}{}{}", "<g>".repeat(60), "<rect/>".repeat(n(5_000)), "</g>".repeat(60)),
+        )
+    }));
     out.push(("深い入れ子", format!("{SVG}{}{}</svg>", "<g>".repeat(1000), "</g>".repeat(1000)).into_bytes()));
     out.push(("参照の多い文書（use の鎖）", {
         let mut body = String::from("<defs><rect id=\"r0\"/>");
