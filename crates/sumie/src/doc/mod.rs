@@ -15,12 +15,22 @@ use crate::style::ParseOptions;
 use crate::xml::{self, XmlCounts, XmlDoc};
 
 /// 読んだ文書（入力を借りる。名前と値は写さない）。
-#[derive(Debug)]
 pub struct Document<'s> {
     input: &'s [u8],
     xml: XmlDoc,
     limits: Limits,
     report: Report,
+}
+
+impl core::fmt::Debug for Document<'_> {
+    /// 大きさだけを出す（入力と節を全部出すと、大きな文書で記録が膨らむ）。
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Document")
+            .field("input_bytes", &self.input.len())
+            .field("nodes", &self.xml.nodes.len())
+            .field("held_bytes", &self.held_bytes())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'s> Document<'s> {
@@ -126,7 +136,8 @@ pub(crate) fn parse_watch<'s>(
     watch: &mut Watch,
 ) -> Result<Document<'s>, Error> {
     let c = count(svg, opts, cancel, watch)?;
-    // 本体の Budget は最初の払いまで中止を見ないので、段の間で 1 度見る（印が立ってからの手間を 2 × CANCEL_INTERVAL の内に）
+    // 本体の Budget は払った手間が CANCEL_INTERVAL に届くまで中止を見ないので、段の間で 1 度見る（印が立ってからの手間を
+    // 2 × CANCEL_INTERVAL の内に）
     if cancel.cancelled() {
         return Err(Error::Cancelled);
     }

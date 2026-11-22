@@ -61,3 +61,38 @@ fn cancel_is_seen() {
     assert_eq!(parse(big.as_bytes(), &ParseOptions::DEFAULT, &stop).unwrap_err(), Error::Cancelled);
     assert_eq!(estimate_parse(big.as_bytes(), &ParseOptions::DEFAULT, &stop).unwrap_err(), Error::Cancelled);
 }
+
+/// 見積もりは parse の全体（数える段 ＋ 本体）を上から押さえ（ADR-68 (1)）、印がどこで立っても（段の間でも）、立ってから
+/// 止まるまでの手間は 2 × CANCEL_INTERVAL の内（ADR-68 (2)・NFR-06）。
+#[test]
+fn whole_parse_is_estimated_and_cancel_is_prompt() {
+    use crate::budget::CANCEL_INTERVAL as CI;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    struct After(AtomicU32);
+    impl Cancel for After {
+        fn cancelled(&self) -> bool {
+            self.0.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_err()
+        }
+    }
+    let big = format!("<svg xmlns=\"http://www.w3.org/2000/svg\">{}</svg>", "<g a=\"1\"/>".repeat(25_000));
+    let big = big.as_bytes();
+    let opts = ParseOptions::DEFAULT;
+    let e = estimate_parse(big, &opts, &Never).unwrap();
+    let mut w = Watch::default();
+    parse_watch(big, &opts, &Never, &mut w).unwrap();
+    assert!(w.count_work + w.body_work <= e.work);
+    assert!(w.count_peak.max(w.body_peak) <= e.peak_bytes);
+    let k = w.count_work / CI;
+    let mut cancelled = 0;
+    for calls in 0..=(k + 2 + w.body_work / CI) {
+        let c = After(AtomicU32::new(calls as u32));
+        let mut w2 = Watch::default();
+        if parse_watch(big, &opts, &c, &mut w2).err() == Some(Error::Cancelled) {
+            cancelled += 1;
+            // 印が立った時点の手間（数える段の中なら calls 回目の確かめ、段の間なら数える段の終わり、本体なら本体の確かめ）
+            let flag_at = if calls <= k { calls * CI } else { w.count_work + (calls - k - 1) * CI };
+            assert!(w2.count_work + w2.body_work - flag_at < 2 * CI, "{calls} 回目");
+        }
+    }
+    assert!(cancelled > k);
+}

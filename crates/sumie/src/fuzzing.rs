@@ -599,6 +599,13 @@ pub fn document_parse_cancel(data: &[u8], cancel: &dyn Cancel) -> DocOutcome {
                 out.check = Check::Violation("持ち続ける量が見積もりと違う");
                 return out;
             }
+            // 見積もりは parse の全体（数える段 ＋ 本体。ADR-68 (1)）
+            if watch.count_work.saturating_add(watch.body_work) > e.work
+                || watch.count_peak.max(watch.body_peak) > e.peak_bytes
+            {
+                out.check = Check::Violation("parse の全体の手間か山が見積もりを超えた");
+                return out;
+            }
             e
         }
         (_, Err(Error::Cancelled)) | (Err(Error::Cancelled), _) => return out,

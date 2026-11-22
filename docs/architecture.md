@@ -117,6 +117,18 @@ pub struct StyleDefaults<'a> {         // 既定は const の StyleDefaults::USV
     pub fallback: &'a [&'a str],       // 代わりの書体の並び（FR-FO-05）
     pub color_scheme: ColorScheme,     // @media の prefers-color-scheme（既定 Light。ADR-66 (2)）
 }
+pub struct GenericFamilies<'a> { pub serif: &'a str, pub sans_serif: &'a str, pub cursive: &'a str,
+                                 pub fantasy: &'a str, pub monospace: &'a str }   // 既定 GenericFamilies::USVG（FR-FO-04）
+pub enum ColorScheme { Light, Dark }
+
+// ---- 報告（FR-REP-03・04）----
+impl Report {
+    pub fn warnings(&self) -> impl ExactSizeIterator<Item = Warning> + '_;      // 位置の順（同じ位置は足した順、位置なしは最後。D2）
+    pub fn unread_refs(&self) -> impl ExactSizeIterator<Item = UnreadRef<'_>> + '_;   // 位置の順
+}
+pub struct Warning { pub kind: WarningKind, pub position: Option<u64> }        // #[non_exhaustive]
+pub struct UnreadRef<'a> { pub href: &'a [u8], pub position: u64 }            // #[non_exhaustive]
+pub enum WarningKind { UnknownElement, InvalidValue, AtRule, ReferenceCycle, InvalidSelector, … }
 
 impl<'s> Document<'s> {
     pub fn size(&self) -> Option<Size>;                 // ユーザー単位の幅・高さ（None は中身で決まる＝木が要る。ADR-63 (3)）
@@ -195,14 +207,19 @@ pub enum Error {
   渡す代わりに、段ごとに見積もりを読んで予算を確保してから次の段を呼ぶ（待つのは呼び手の側。ライブラリは待たない）
 - 見積もりの関数は、値を変えない決定的な関数。中で要る小さな確保と手間は、上限の「見積もりの手間」の中で数え、中止の印も見る
 - `estimate_parse` の `work` は `parse` を呼んだときの全体の手間（`parse` が中で走らせる数える段 ＋ 本体）。`parse_work` とは
-  その和で比べる（ADR-68 (1)）
+  その和で比べる（ADR-68 (1)）。`estimate_parse` が通れば、同じ入力・同じ設定の `parse` は `Limit` にならない（確保器の失敗と
+  中止を除く）。断られる `parse` も数える段では `estimate_work`・`estimate_bytes` まで使うので、`parse` の最大は
+  max(`estimate_*`, `parse_*`)。ほかの見積もりの口（`estimate_build`・`Tree::estimate`）も「その口に当たる段を呼んだときの全体」
+  を返す
 - 段に入るときは「見積もり ≤ 上限」を欄ごとに確かめ、`Budget` の上限には見積もりの値を入れる（§5.1。ADR-39）。Kura は
   `RenderEstimate.plan` を共有の分（`shared`）、`Plan::estimate_region` を範囲ごとの作業領域（`per_task`）として予算にできる
 - `Document<'s>` は入力を借りる（名前・値を写さない）。`Tree`・`Plan`・`FontSet` は何も借りない（字形の輪郭は木に写す。
   フォントのバイト列は `Arc` で共有する）ので、Kura は木と計画とフォントの集まりを持っておいて、タイルを何度でも、
   複数のスレッドで同時に描ける
 - 出力は乗算済み。Kura はストレートに戻す式を自分の側で凍結する（determinism.md §1.4）
-- 列挙の型（`Resource`・`Feature`・`InvalidReason`・`WarningKind`・`ImageError`）は `#[non_exhaustive]` にする
+- 列挙の型（`Resource`・`Feature`・`InvalidReason`・`Stage`・`WarningKind`・`ColorScheme`・`ImageError`）と、返すだけの
+  構造体（`Warning`・`UnreadRef`）は `#[non_exhaustive]` にする。呼び手が作る設定の構造体（`ParseOptions`・`StyleDefaults`・
+  `Limits`）は `..DEFAULT` で書けるように付けない
 
 ### 3.1 形と、誤りを決める段（ADR-37）
 
@@ -269,6 +286,8 @@ Kura の「形」（値を描かずに大きさなどを読む。今の Kura は
 - 実体から来る CSS（`<style>&css;</style>`・`style="&s;"`）は、`estimate_parse` が展開せずに「実体ごとの CSS の字句の数 ×
   参照の数 ＋ 参照の数（実体の境をまたいで字句がつながる・分かれる分）」で上から見積もる
 - 宣言を要素に当てる手間は「当たった規則の宣言の数の和 ＋ 並べ替え（m log m。m は当たった宣言の数）」で、§5.2 の表に入れる
+- `@media`・`@supports`・`<style media>` の条件は css が読むだけで、style の段が照らす（設定 `ParseOptions` とプロパティの表が
+  そこにある。ADR-68 (4)）
 - 要素ごとの指定の値は `(PropertyId, 値)` の並べた `MVec`。計算した値は全要素には持たず、木を作る段で行きがけの順に
   たどりながら「深さごとの計算した値」の積み上げで求める
 - 継承の文脈：use の中身だけは use の文脈で継承する。pattern・marker・clipPath・mask・symbol（use から参照されたときを除く）・

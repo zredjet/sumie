@@ -218,7 +218,7 @@ fn document_survives_seeded_mutations() {
 fn document_survives_cancellation() {
     let big = format!("<svg xmlns=\"http://www.w3.org/2000/svg\">{}</svg>", "<g a=\"1\"/>".repeat(100_000));
     let mut cancelled = 0usize;
-    for calls in [0u32, 1, 20, 40, 41, 42, 43, 44, 60, 103, 104] {
+    for calls in [0u32, 1, 20, 40, 41, 42, 43, 44, 60, 83, 84, 85, 103, 104] {
         let c = AfterCalls { left: AtomicU32::new(calls) };
         let (out, heap) = measure(|| document_parse_cancel(big.as_bytes(), &c));
         assert_eq!(out.check, Check::Ok, "{calls} 回で中止");

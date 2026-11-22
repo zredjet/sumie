@@ -9,7 +9,7 @@ architecture.md §9）。種は `seeds/<対象>/`（コミットする）、育�
 | `math_ops` | math の max・min・clamp・powi の性質と、超越関数が panic しないこと | `sumie::fuzzing::math_ops` |
 | `xml` | XML の段（数える段と作る段）。作る段が数える段の見積もりを超えないこと・1 回の払いが中止の間隔を超えないこと・節の鎖と属性の範囲 | `sumie::fuzzing::xml_parse` |
 | `dtd` | 入力を DTD の内部のサブセットにして、実体を本文と属性から参照する文書を `xml` と同じに確かめる | `sumie::fuzzing::dtd_parse` |
-| `document` | 読む段の全体（公開の `estimate_parse`・`parse`）。2 つの誤りが同じ（D2）・見積もりが通れば読める・持ち続ける量が見積もりと同じ | `sumie::fuzzing::document_parse` |
+| `document` | 読む段の全体（公開の `estimate_parse`・`parse`）。2 つの誤りが同じ（D2）・見積もりが通れば読める・持ち続ける量が見積もりと同じ・数える段と本体の勘定（1 回の払い・返しすぎ）・全体の手間と山 ≤ 見積もり・上限を見積もりのちょうどにすれば読め、1 少なければ同じ `Limit` | `sumie::fuzzing::document_parse` |
 
 種は `crates/sumie/tests/mutate.rs` の `MEM_SEEDS` と同じにする（試験 `fuzz_seeds_match_mem_seeds` が照らす）。
 `xml`・`dtd`・`document` の種は `crates/sumie/tests/mutate.rs` の種つきの変異の試験も使う。libFuzzer の既定の長さ（4096 バイト）

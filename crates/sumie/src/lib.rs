@@ -38,9 +38,10 @@ pub use crate::style::{ColorScheme, GenericFamilies, ParseOptions, StyleDefaults
 /// 描画器の識別子。値を変える変更で数を上げる（determinism.md §8）。開発中は 0、M7 で 1 に凍結する。
 pub const RENDERER: &str = "sumie-render/0";
 
-/// 読む段の見積もり（architecture.md §3）。本文を 1 度だけ字句に分けて数え、`parse` の手間・確保の山・持ち続ける量を
-/// 返す。見積もり自身は `Limits::estimate_work`・`estimate_bytes` の内で払う。見積もりが `Limits::parse_work`・
-/// `parse_bytes` を超えれば `Limit`。誤り（整形式・符号化・上限）は `parse` と同じ（D2）。
+/// 読む段の見積もり（architecture.md §3）。本文を 1 度だけ字句に分けて数え、`parse` の手間（中で走らせる数える段を含む
+/// 全体）・確保の山・持ち続ける量を返す。見積もり自身は `Limits::estimate_work`・`estimate_bytes` の内で払う。見積もりが
+/// `Limits::parse_work`・`parse_bytes` を超えれば `Limit`。誤り（整形式・符号化・上限）は `parse` と同じ（D2）。これが通れば、
+/// 同じ入力・同じ設定の `parse` は `Limit` にならない（確保器の失敗と中止を除く）。
 pub fn estimate_parse(svg: &[u8], opts: &ParseOptions<'_>, cancel: &dyn Cancel) -> Result<Estimate, Error> {
     doc::estimate_parse(svg, opts, cancel)
 }

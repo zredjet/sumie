@@ -1,7 +1,8 @@
 //! 報告（requirements.md FR-REP-03・04）：警告（種類と位置）と、読まなかった参照（href と要素の位置）。使ったフォント・
 //! 見つからなかった文字・使った画像のデコーダは、それを作る段（M3・M5）で足す。
 //!
-//! - 並びは入力の位置の順（同じ位置は足した順。D2。determinism.md §1.1）。段は足す順を気にしなくてよい（終わりに並べる）
+//! - 並びは入力の位置の順（同じ位置は足した順、位置のない警告は最後。D2。determinism.md §1.1）。段は足す順を気にしなくて
+//!   よい（終わりに並べる）
 //! - 文言は持たない（種類の列挙を返し、呼び手が訳す。FR-REP-04）
 //! - 報告は何も借りない（`Tree` が持ち続ける。href は写して持つ）
 
@@ -29,6 +30,7 @@ pub enum WarningKind {
 impl Plain for WarningKind {}
 
 /// 警告。
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Warning {
     pub kind: WarningKind,
@@ -37,6 +39,7 @@ pub struct Warning {
 }
 
 /// 読まなかった参照（外を指す `href`・`url()` など。FR-IN-08）。
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnreadRef<'a> {
     /// 参照の中身（展開したあとのバイト列）

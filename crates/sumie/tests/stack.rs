@@ -59,10 +59,10 @@ fn parse_deep_nesting_on_a_small_stack() {
         limits: Limits { depth: 200_000, nodes: 400_000, ..Limits::DEFAULT },
         ..sumie::ParseOptions::DEFAULT
     };
-    let ok = on_small_stack(move || {
-        let e = sumie::estimate_parse(src.as_bytes(), &opts, &sumie::Never).is_ok();
-        let p = sumie::parse(src.as_bytes(), &opts, &sumie::Never).is_ok();
-        e && p
+    let (e, p) = on_small_stack(move || {
+        let e = sumie::estimate_parse(src.as_bytes(), &opts, &sumie::Never).map(|_| ());
+        let p = sumie::parse(src.as_bytes(), &opts, &sumie::Never).map(|_| ());
+        (e, p)
     });
-    assert!(ok);
+    assert_eq!((e, p), (Ok(()), Ok(())));
 }
