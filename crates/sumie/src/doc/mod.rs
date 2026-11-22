@@ -44,6 +44,8 @@ pub struct Document<'s> {
     limits: Limits,
     /// 既定の文字の大きさ（`StyleDefaults::font_size`。計算した値の `medium` と根の要素の親の文字の大きさ）
     font_size: f64,
+    /// `@media` と表示の領域の単位（vw など）に使う文書の大きさ（ADR-74 (7)。既定の文字の大きさで解いたもの）
+    media_size: Option<(f64, f64)>,
     report: Report,
 }
 
@@ -213,6 +215,7 @@ fn pipeline<'s>(svg: &'s [u8], opts: &ParseOptions<'_>, budget: &Budget<'_>) -> 
         size,
         limits: opts.limits,
         font_size: opts.style.font_size,
+        media_size: env.size,
         report,
     })
 }

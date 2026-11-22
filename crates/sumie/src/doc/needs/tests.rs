@@ -67,3 +67,31 @@ fn referenced_images_regardless_of_order_and_context() {
         assert!(!raster(&doc), "{doc}");
     }
 }
+
+/// 参照の辺で入った描かない入れ物には display と自分の条件が効かない（SVG 1.1・2・resvg。文書の 2 回目のレビュー）。
+/// 結果は文書の順に依らず、filter の中の fe… でない要素と、根が svg でない文書の画像は数えない。
+#[test]
+fn referenced_containers_ignore_display_and_conditions() {
+    let raster = |b: &str| needs_of(b).raster_images;
+    let img = format!("<image href=\"{PNG}\"/>");
+    for attr in ["display=\"none\"", "style=\"display:none\"", "systemLanguage=\"xx\"", "requiredExtensions=\"\""] {
+        for doc in [
+            format!("<pattern id=\"p\" {attr}>{img}</pattern><rect fill=\"url(#p)\"/>"),
+            format!("<marker id=\"k\" {attr}>{img}</marker><path d=\"M0 0L1 1\" marker-end=\"url(#k)\"/>"),
+            format!("<mask id=\"m\" {attr}>{img}</mask><rect mask=\"url(#m)\"/>"),
+            format!("<symbol id=\"s\" {attr}>{img}</symbol><use href=\"#s\"/>"),
+            format!("<filter id=\"f\" {attr}><feImage href=\"{PNG}\"/></filter><rect filter=\"url(#f)\"/>"),
+        ] {
+            assert!(raster(&doc), "{doc}");
+        }
+    }
+    // 文書の順に依らない（use から文字の中の a を参照する）
+    let a = needs_of(&format!("<use href=\"#a\"/><text><a id=\"a\">{img}</a></text>")).raster_images;
+    let b = needs_of(&format!("<text><a id=\"a\">{img}</a></text><use href=\"#a\"/>")).raster_images;
+    assert_eq!(a, b);
+    // filter の中に直に置いた image は描かない
+    assert!(!raster(&format!("<filter id=\"f\">{img}</filter><rect filter=\"url(#f)\"/>")));
+    let svg = format!("<g xmlns=\"http://www.w3.org/2000/svg\">{img}</g>");
+    let d = crate::doc::parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+    assert!(!d.needs().raster_images);
+}

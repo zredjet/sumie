@@ -139,6 +139,9 @@ pub(crate) struct Computed {
     pub(crate) transform: Transform,
     /// `transform` の計算した値の行列（原点を掛ける前。`transform: inherit` が受け継ぐ）
     pub(crate) transform_raw: Transform,
+    /// `transform-origin` の点（ユーザー単位。受け継がない。`transform-origin: inherit` が受け継ぐ）
+    pub(crate) origin_x: f64,
+    pub(crate) origin_y: f64,
     pub(crate) visibility: u8,
     pub(crate) display_none: u8,
     /// 変形が解けた（0 なら外接矩形が要る：木を作る段で解く）
@@ -172,6 +175,8 @@ impl Computed {
             sw_pct: 0.0,
             transform: Transform::IDENTITY,
             transform_raw: Transform::IDENTITY,
+            origin_x: 0.0,
+            origin_y: 0.0,
             visibility: VISIBLE,
             display_none: 0,
             transform_known: 1,
@@ -380,6 +385,8 @@ pub(crate) fn compute(
         display_none: initial.display_none,
         transform: initial.transform,
         transform_raw: initial.transform_raw,
+        origin_x: 0.0,
+        origin_y: 0.0,
         transform_known: initial.transform_known,
         box_vb: initial.box_vb,
         ..*parent
@@ -669,10 +676,28 @@ fn transform(
         };
     }
     let view_box = c.box_vb != 0;
-    let Some(s) = p.transform.as_ref() else { return Ok(()) };
-    budget.spend(cost::OP_STEP)?;
     let font = c.font_size;
     let line = c.line_height;
+    // 変形の原点（受け継がない。inherit は親の点。解けなければ (0, 0) で、変形があれば「解けない」印）
+    let mut origin_known = true;
+    if let Some(o) = p.transform_origin.as_ref() {
+        budget.spend(cost::OP_STEP)?;
+        let (x, y) = match o.wide {
+            WIDE_INHERIT => (parent.origin_x, parent.origin_y),
+            WIDE_NONE => match origin(o, bufs, font, line, base, budget)? {
+                Some(pt) => pt,
+                None => {
+                    origin_known = false;
+                    (0.0, 0.0)
+                }
+            },
+            _ => (0.0, 0.0),
+        };
+        c.origin_x = x;
+        c.origin_y = y;
+    }
+    let Some(s) = p.transform.as_ref() else { return Ok(()) };
+    budget.spend(cost::OP_STEP)?;
     let (m, mut known) = match s.wide {
         WIDE_INHERIT => (parent.transform_raw, parent.transform_known != 0),
         WIDE_INITIAL | WIDE_UNSET => (Transform::IDENTITY, true),
@@ -710,16 +735,10 @@ fn transform(
         known = false;
     }
     // 変形の原点
-    let (ox, oy) = match p.transform_origin.as_ref() {
-        Some(o) if o.wide == WIDE_NONE => match origin(o, bufs, font, line, base, budget)? {
-            Some(pt) => pt,
-            None => {
-                known = false;
-                (0.0, 0.0)
-            }
-        },
-        _ => (0.0, 0.0),
-    };
+    if !origin_known {
+        known = false;
+    }
+    let (ox, oy) = (c.origin_x, c.origin_y);
     let to = Transform { e: ox, f: oy, ..Transform::IDENTITY };
     let back = Transform { e: -ox, f: -oy, ..Transform::IDENTITY };
     let t = to.then(&m).then(&back);

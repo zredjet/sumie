@@ -88,7 +88,8 @@ pub(crate) fn walk(
         root_font: d.font_size,
         root_line: initial.line_height,
         viewport: size,
-        doc: size,
+        // vw などは `@media` と同じ文書の大きさ（既定の文字の大きさで解いたもの。ADR-74 (7)）
+        doc: d.media_size,
     };
     budget.spend(cost::OP_STEP)?;
     let c0 = compute(&initial, d.styles.of(0), &ids, &bufs, &base, budget)?;

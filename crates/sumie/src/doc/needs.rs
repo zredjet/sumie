@@ -11,7 +11,7 @@
 use crate::budget::Budget;
 use crate::cost;
 use crate::css::sheet::Sheet;
-use crate::doc::refs::{EDGE_CLIP, EDGE_HREF, HIDDEN_SELF, Refs, fits, not_rendered, renders_children};
+use crate::doc::refs::{EDGE_CLIP, EDGE_HREF, EDGE_TEXT, HIDDEN_SELF, Refs, fits, not_rendered, renders_children};
 use crate::error::Error;
 use crate::mem::MVec;
 use crate::style::cascade::{SRC_SHEET, SRC_STORE, Styles, WIDE_NONE};
@@ -78,14 +78,17 @@ pub(crate) fn needs(
             break;
         }
     }
-    if !nodes.first().is_some_and(|n| n.kind == KIND_ELEMENT && n.ns == NS_SVG) {
+    // 根が svg の要素でなければ何も描かない
+    if !nodes.first().is_some_and(|n| n.kind == KIND_ELEMENT && n.ns == NS_SVG && n.local.of(input) == b"svg") {
         return Ok(out);
     }
     let display = lookup(b"display", false);
-    // 中をたどった印：1 子の辺で入った・2 参照の辺で入った（描かない入れ物は、子の辺で先に来ても参照の辺で来たら中を
-    // たどる。印は確かめを通ったときだけ付ける：子の辺で隠れた要素も参照の辺で来たら見る）
-    let mut seen: MVec<'_, u8> = MVec::with_capacity(budget, nodes.len())?;
-    seen.resize_to(nodes.len(), 0)?;
+    // 節（XML の節と、受け継がない参照の並びの節）
+    let total = refs.start.len().saturating_sub(1);
+    // 中をたどった印（文脈ごと）：1 子の辺で文字の外・4 子の辺で文字の中・2 参照の辺。印は確かめを通ったときだけ付ける
+    // （子の辺で隠れた要素も参照の辺で来たら見る。結果が文書の順に依らない。文書の 2 回目のレビュー）
+    let mut seen: MVec<'_, u8> = MVec::with_capacity(budget, total)?;
+    seen.resize_to(total, 0)?;
     // 行く節の積み上げ（節の番号 << 3 ＋ filter の中・文字の中・参照の辺で入ったかの印）
     let mut stack: MVec<'_, u64> = MVec::new(budget);
     stack.push(0)?;
@@ -93,39 +96,70 @@ pub(crate) fn needs(
         let (i, via_ref) = ((item >> 3) as u32, item & 1 != 0);
         let (in_text, in_filter) = (item & 2 != 0, item & 4 != 0);
         budget.spend(cost::OP_STEP)?;
-        let Some(n) = nodes.get(i as usize) else { continue };
-        let bit = if via_ref { 2 } else { 1 };
+        let bit = if via_ref {
+            2
+        } else if in_text {
+            4
+        } else {
+            1
+        };
         let prev = seen.get(i as usize).copied().unwrap_or(0);
-        if n.kind != KIND_ELEMENT || prev & bit != 0 {
+        if prev & bit != 0 {
+            continue;
+        }
+        let Some(n) = nodes.get(i as usize) else {
+            // 並びの節：参照先へ（参照の辺で入ったものとして）
+            if let Some(x) = seen.get_mut(i as usize) {
+                *x = prev | bit;
+            }
+            for e in refs.of(i) {
+                budget.spend(cost::OP_STEP)?;
+                if e.removed == 0 {
+                    stack.push((u64::from(e.target) << 3) | 1)?;
+                }
+            }
+            continue;
+        };
+        if n.kind != KIND_ELEMENT {
             continue;
         }
         let local = n.local.of(input);
+        // 参照の辺で入った描かない入れ物（pattern・marker・mask・symbol・filter など）には、display と自分の条件が効かない
+        // （SVG 1.1・2。resvg と同じ。文書の 2 回目のレビュー）
+        let referenced_container = via_ref && not_rendered(local);
         // 自分の条件が偽ならどの文脈でも描かない。switch が選ばないのは、参照の辺で入れば効かない
         let hidden = refs.hidden.as_slice().get(i as usize).copied().unwrap_or(0);
-        let hidden = if via_ref { hidden & HIDDEN_SELF } else { hidden };
+        let hidden = if referenced_container {
+            0
+        } else if via_ref {
+            hidden & HIDDEN_SELF
+        } else {
+            hidden
+        };
         if n.ns != NS_SVG || hidden != 0 || !known(local) {
             continue;
         }
-        // 親の文脈で描かれうるか（参照の辺で入った要素と filter の中の要素は、その種類の中身として見る）
+        // 親の文脈で描かれうるか（参照の辺で入った要素は、その種類の中身として見る。filter の中は fe… だけ）
+        if !via_ref && in_filter && !local.starts_with(b"fe") {
+            continue;
+        }
         if !via_ref && !in_filter && !fits(local, in_text) {
             continue;
         }
-        // 描く入れ物（描かない入れ物でないもの）は、どちらの辺で来ても中をたどるので 1 度だけ
-        if !not_rendered(local) && prev != 0 {
-            continue;
-        }
         // display: none の部分木は描かない（値は walk と同じ読み方：escape を解いて大文字小文字を問わない）
-        let spec = styles.of(i).iter().find(|s| Some(s.prop) == display).copied();
-        if let Some(s) = spec
-            && s.wide == WIDE_NONE
-        {
-            let buf = match s.src {
-                SRC_SHEET => sheet.text.as_slice(),
-                SRC_STORE => doc.store.as_slice(),
-                _ => input,
-            };
-            if Values::new(buf, s.value, budget).eat_ident(b"none")? {
-                continue;
+        if !referenced_container {
+            let spec = styles.of(i).iter().find(|s| Some(s.prop) == display).copied();
+            if let Some(s) = spec
+                && s.wide == WIDE_NONE
+            {
+                let buf = match s.src {
+                    SRC_SHEET => sheet.text.as_slice(),
+                    SRC_STORE => doc.store.as_slice(),
+                    _ => input,
+                };
+                if Values::new(buf, s.value, budget).eat_ident(b"none")? {
+                    continue;
+                }
             }
         }
         if let Some(x) = seen.get_mut(i as usize) {
@@ -150,7 +184,7 @@ pub(crate) fn needs(
         // 中身を作る参照の辺（clip-path の中身は画像を描かない）
         for e in refs.of(i) {
             budget.spend(cost::OP_STEP)?;
-            if e.removed != 0 || e.kind == EDGE_HREF || e.kind == EDGE_CLIP {
+            if e.removed != 0 || e.kind == EDGE_HREF || e.kind == EDGE_TEXT || e.kind == EDGE_CLIP {
                 continue;
             }
             stack.push((u64::from(e.target) << 3) | 1)?;
@@ -173,7 +207,7 @@ fn classify(
         None => doc.attr(input, n, NS_XLINK, b"href", budget)?,
     };
     let Some(v) = a else { return Ok(()) };
-    let v = trim(v);
+    let v = trim(v, budget)?;
     if v.is_empty() || (local == b"feImage" && v.starts_with(b"#")) {
         return Ok(());
     }
@@ -206,18 +240,28 @@ fn classify(
     Ok(())
 }
 
-fn trim(mut s: &[u8]) -> &[u8] {
-    while let [first, rest @ ..] = s
-        && matches!(first, b' ' | b'\t' | b'\n' | b'\r' | 0x0C)
-    {
-        s = rest;
+/// 前後の空白を除く（読むバイトを塊ずつ払う。文書の 2 回目のレビュー）。
+fn trim<'a>(s: &'a [u8], budget: &Budget<'_>) -> Result<&'a [u8], Error> {
+    let ws = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0C);
+    let mut meter = crate::xml::lex::ScanMeter::new(0, s.len());
+    let mut a = s.len();
+    for (k, &c) in s.iter().enumerate() {
+        meter.pay(budget, k)?;
+        if !ws(c) {
+            a = k;
+            break;
+        }
     }
-    while let [rest @ .., last] = s
-        && matches!(last, b' ' | b'\t' | b'\n' | b'\r' | 0x0C)
-    {
-        s = rest;
+    let mut b = a;
+    let mut back = crate::xml::lex::ScanMeter::new(0, s.len().saturating_sub(a));
+    for (k, &c) in s.iter().enumerate().skip(a).rev() {
+        back.pay(budget, s.len().saturating_sub(k).saturating_sub(1))?;
+        if !ws(c) {
+            b = k.saturating_add(1);
+            break;
+        }
     }
-    s
+    Ok(s.get(a..b).unwrap_or(&[]))
 }
 
 fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {

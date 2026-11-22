@@ -29,7 +29,17 @@ fn run(body: &str) -> (EdgeRows, Vec<String>, u64, usize) {
         if n.kind != KIND_ELEMENT {
             continue;
         }
-        let es: Vec<_> = refs.of(i as u32).iter().map(|e| (id_of(e.target), e.kind, e.removed != 0)).collect();
+        // 並びの節（XML の節の数から後ろ）への辺は、並びの参照先に開いて見る（取り除いた印はどちらかの辺）
+        let mut es: Vec<(String, u8, bool)> = Vec::new();
+        for e in refs.of(i as u32) {
+            if (e.target as usize) < doc.nodes.len() {
+                es.push((id_of(e.target), e.kind, e.removed != 0));
+            } else {
+                for f in refs.of(e.target) {
+                    es.push((id_of(f.target), e.kind, e.removed != 0 || f.removed != 0));
+                }
+            }
+        }
         if !es.is_empty() {
             edges.push((id_of(i as u32), es));
         }
@@ -193,4 +203,111 @@ fn many_child_edge_cycles_in_one_pass() {
     let (b, cb) = work(4_000);
     assert_eq!((ca, cb), (2_000, 4_000));
     assert!(b < a * 3, "{a} → {b}");
+}
+
+/// use の中身は use から塗りと marker を受け継ぐので、use の塗りの参照先は中身の塗る要素の数の倍で数える（文書の 2 回目の
+/// レビュー：数え漏らすと展開の爆弾が estimate_build を抜ける）。
+#[test]
+fn use_inherited_paints_multiply() {
+    let rects: String = (0..10).map(|_| "<rect/>").collect();
+    let mut body = format!("<defs><g id=\"g\">{rects}</g><pattern id=\"p0\"><rect/></pattern>");
+    for k in 1..=8 {
+        body.push_str(&format!("<pattern id=\"p{k}\"><use href=\"#g\" fill=\"url(#p{})\"/></pattern>", k - 1));
+    }
+    body.push_str("</defs><rect fill=\"url(#p8)\"/>");
+    let (_, _, with_use, _) = run(&body);
+    // use を書かずに同じ形（g の中の rect が受け継ぐ）
+    let mut body = "<defs><pattern id=\"p0\"><rect/></pattern>".to_string();
+    for k in 1..=8 {
+        body.push_str(&format!("<pattern id=\"p{k}\"><g fill=\"url(#p{})\">{rects}</g></pattern>", k - 1));
+    }
+    body.push_str("</defs><rect fill=\"url(#p8)\"/>");
+    let (_, _, direct, _) = run(&body);
+    assert!(with_use >= direct / 2 && direct > 100_000_000, "{with_use} {direct}");
+    // marker も中身の marker を付ける要素の数の倍
+    let paths: String = (0..100).map(|_| "<path d=\"M0 0L1 1\"/>").collect();
+    let mk: String = (0..100).map(|_| "<rect/>").collect();
+    let (_, _, m, _) = run(&format!(
+        "<defs><g id=\"g\">{paths}</g><marker id=\"k\">{mk}</marker></defs><use href=\"#g\" marker-end=\"url(#k)\"/>"
+    ));
+    assert!(m > 100 * 100, "{m}");
+}
+
+/// 展開の数は u64 の手前で止め（数え終えていない印と重ならない）、倍々の 100 段でも読む段は手間を使い切らない（文書の
+/// 2 回目のレビュー）。
+#[test]
+fn saturated_counts_are_not_recounted() {
+    let mut body = String::from("<defs><rect id=\"l0\"/>");
+    for k in 1..=100 {
+        body.push_str(&format!("<g id=\"l{k}\"><use href=\"#l{p}\"/><use href=\"#l{p}\"/></g>", p = k - 1));
+    }
+    body.push_str("</defs><use href=\"#l100\"/>");
+    let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\">{body}</svg>");
+    let e = crate::doc::estimate_parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+    assert!(e.work < 10_000_000, "{}", e.work);
+    let d = crate::doc::parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+    assert!(
+        matches!(d.estimate_build(&Never), Err(crate::error::Error::Limit(l)) if l.resource == crate::error::Resource::Instances)
+    );
+}
+
+/// 取り除いた辺より上の段は取り残しにして歩きを続け、入り直すときは途中だった行き先だけを見直す（P の子が多く、Q が深い形
+/// でも手間が節と辺の数に比例する。文書の 2 回目のレビュー）。
+#[test]
+fn orphaned_frames_are_revisited_cheaply() {
+    let work = |k: usize, d: usize| {
+        let uses: String = (0..k).map(|i| format!("<use href=\"#c{i}\"/>")).collect();
+        let inner: String = (0..k).map(|i| format!("<use id=\"c{i}\" href=\"#Q\"/>")).collect();
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\">{uses}<g id=\"Q\">{}<g id=\"P\">{inner}</g>{}</g></svg>",
+            "<g>".repeat(d),
+            "</g>".repeat(d)
+        );
+        crate::doc::estimate_parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap().work
+    };
+    let (a, b) = (work(1_000, 500), work(2_000, 500));
+    assert!(b < a * 3, "{a} → {b}");
+    // 深さを倍にしても手間は倍ほど（K × D に伸びない）
+    let c = work(2_000, 1_000);
+    assert!(c < b * 3 && c < 20_000_000, "{b} → {c}");
+}
+
+/// 受け継がない参照の並びは値ごとに 1 つの節で共有する（inherit は親の並びを指す。辺と確保が要素の数と値の長さの和に
+/// 比例する。文書の 2 回目のレビュー）。
+#[test]
+fn reference_lists_are_shared() {
+    let peak = |svg: String| crate::doc::estimate_parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+    let filters: String = (0..2_000).map(|i| format!("<filter id=\"f{i}\"/>")).collect();
+    let urls: String = (0..2_000).map(|i| format!("url(#f{i}) ")).collect();
+    let e = peak(format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><style>g g{{filter:inherit}}</style>{filters}<g style=\"filter:{urls}\">{}{}</g></svg>",
+        "<g>".repeat(500),
+        "</g>".repeat(500)
+    ));
+    assert!(e.peak_bytes < 8 << 20, "{}", e.peak_bytes);
+    let e = peak(format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><style>rect{{filter:{}}}</style><filter id=\"f\"/>{}</svg>",
+        "url(#f) ".repeat(5_000),
+        "<rect/>".repeat(5_000)
+    ));
+    assert!(e.work < 100_000_000, "{}", e.work);
+    // 並びの輪も見つける（要素の辺を取り除く）
+    let (edges, _, _, cycles) = run(
+        r##"<style>.a{filter:url(#f)}</style><filter id="f"><feImage id="i" class="a"/></filter><rect id="r" class="a"/>"##,
+    );
+    assert_eq!(cycles, 1);
+    let get = |id: &str| edges.iter().find(|(i, _)| i == id).map(|(_, e)| e.clone()).unwrap_or_default();
+    assert_eq!(get("r"), [("f".into(), EDGE_FILTER, false)]);
+}
+
+/// textPath・tref の href は描き直さないので輪にしない（文書の 2 回目のレビュー）。
+#[test]
+fn text_hrefs_are_not_cycles() {
+    for body in [
+        r##"<text id="t">ab<tref xlink:href="#t"/></text>"##,
+        r##"<g id="g"><text><textPath href="#g">x</textPath></text></g>"##,
+    ] {
+        let (_, _, _, cycles) = run(body);
+        assert_eq!(cycles, 0, "{body}");
+    }
 }
