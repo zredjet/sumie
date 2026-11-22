@@ -215,11 +215,16 @@ fn dtd_survives_seeded_mutations() {
     let seeds = fuzz_seeds("dtd");
     let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
     let dict: Vec<&[u8]> = XML_DICT.iter().chain(DTD_DICT).copied().collect();
+    let (mut ok, mut err) = (0usize, 0usize);
     for (n, case) in cases(0x5eed_0005, 3000, &refs, &dict, 1024).iter().enumerate() {
         let (out, heap) = measure(|| dtd_parse(case));
         assert_eq!(out.check, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
         assert_heap_within(&heap, out.count_peak.max(out.build_peak).saturating_add(4096), 0, &format!("{n} 件目"));
+        assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
+        if out.error.is_some() { err += 1 } else { ok += 1 }
     }
+    // 読める件も読めない件もある（試験が両方の道を通る）
+    assert!(ok > 30 && err > 100, "読めた {ok}・読めない {err}");
 }
 
 #[test]

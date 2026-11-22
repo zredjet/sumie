@@ -218,6 +218,10 @@ pub(crate) fn prelude(b: &[u8], limits: &Limits, budget: &Budget<'_>, stage: Sta
     if len > most {
         return Err(Error::limit(Resource::Input, len, most, stage));
     }
+    // 展開したあとの量は入力の長さから数えるので、上限が入力より小さければ値の有無によらず断る
+    if len > limits.expanded_bytes {
+        return Err(Error::limit(Resource::Expanded, len, limits.expanded_bytes, stage));
+    }
     if b.starts_with(&[0x1f, 0x8b]) {
         return Err(Error::Unsupported(Unsupported { feature: Feature::Svgz, position: Some(0) }));
     }
@@ -878,11 +882,12 @@ fn walk<'b>(
                             Err(e) => return Err(e),
                         };
                         let value_ok = d.has_default == 0
-                            || match w.expand(d.value, Mode::Attr, &mut CountOut::new()) {
-                                Ok(()) => true,
-                                Err(Error::Invalid(_)) => false,
-                                Err(e) => return Err(e),
-                            };
+                            || (chars_ok(b, d.value, budget)?
+                                && match w.expand(d.value, Mode::Attr, &mut CountOut::new()) {
+                                    Ok(()) => true,
+                                    Err(Error::Invalid(_)) => false,
+                                    Err(e) => return Err(e),
+                                });
                         if !(name_ok && value_ok)
                             && let Some(x) = w.attlists.get_mut(k)
                         {
@@ -1148,6 +1153,22 @@ fn walk<'b>(
             Event::Eof => return Ok(w.grown.get()),
         }
     }
+}
+
+/// 値の生のバイトが文書の文字だけか（ATTLIST の既定の値。字そのものとして書いた文書の文字でない文字の宣言は、文字の参照で
+/// 書いたものと同じに壊れた宣言とする）。読むバイトを払う。
+fn chars_ok(b: &[u8], raw: Span, budget: &Budget<'_>) -> Result<bool, Error> {
+    let mut meter = ScanMeter::new(raw.start as usize, raw.end as usize);
+    let mut i = raw.start as usize;
+    while i < raw.end as usize {
+        meter.pay(budget, i.saturating_add(3))?;
+        let Some((c, n)) = chars::decode(b, i) else { return Ok(false) };
+        if !chars::is_char(c) {
+            return Ok(false);
+        }
+        i = i.saturating_add(n.max(1));
+    }
+    Ok(true)
 }
 
 /// ATTLIST の宣言を開きのタグに当てる：書いた属性は CDATA でない型なら印を付け、書いていない属性で既定の値のあるものを

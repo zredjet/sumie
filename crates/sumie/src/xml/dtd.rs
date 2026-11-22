@@ -320,8 +320,8 @@ pub(crate) fn att_range(
     if table.is_empty() {
         return Ok((0, 0));
     }
-    let lo = lower_bound_try(table, |d| Ok(bytes_cmp(budget, d.element.of(b), element)? == Ordering::Less))?;
-    let hi = lower_bound_try(table, |d| Ok(bytes_cmp(budget, d.element.of(b), element)? != Ordering::Greater))?;
+    let lo = lower_bound_try(budget, table, |d| Ok(bytes_cmp(budget, d.element.of(b), element)? == Ordering::Less))?;
+    let hi = lower_bound_try(budget, table, |d| Ok(bytes_cmp(budget, d.element.of(b), element)? != Ordering::Greater))?;
     Ok((lo, hi.max(lo)))
 }
 
@@ -371,7 +371,7 @@ fn entity(c: &mut Cur<'_, '_>, k: usize, order: u32) -> Result<(Option<Entity>, 
 /// 名前で引く（並べた表。同じ名前は最初の宣言）。名前のバイトを比べる分（名前の長さ × 歩数）を払う（長い名前は
 /// 塊に分けて払う）。
 pub(crate) fn lookup(b: &[u8], table: &[Entity], name: &[u8], budget: &Budget<'_>) -> Result<Option<Entity>, Error> {
-    let i = lower_bound_try(table, |e| Ok(bytes_cmp(budget, e.name.of(b), name)? == Ordering::Less))?;
+    let i = lower_bound_try(budget, table, |e| Ok(bytes_cmp(budget, e.name.of(b), name)? == Ordering::Less))?;
     match table.get(i).copied() {
         Some(e) if bytes_eq(budget, e.name.of(b), name)? => Ok(Some(e)),
         _ => Ok(None),

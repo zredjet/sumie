@@ -889,3 +889,21 @@ fn broken_attlists_are_not_walked_per_element() {
     // 宣言 2 万 × 要素 5 千（1 億）よりずっと小さい
     assert!(o.build_work < 20_000_000, "{}", o.build_work);
 }
+
+/// ATTLIST の既定の値に字そのものとして書いた文書の文字でない文字は、文字の参照と同じに壊れた宣言（当てない）。展開の
+/// 上限が入力より小さければ、値の有無によらず断る。
+#[test]
+fn attlist_literal_chars_and_small_expansion_limit() {
+    let src = format!("<!DOCTYPE svg [<!ATTLIST svg a CDATA \"\u{1}\" b CDATA \"ok\">]><svg {SVG}/>");
+    let doc = parse(&src).unwrap();
+    let b = src.as_bytes();
+    let names: Vec<_> = doc.attrs_of(doc.node(0).unwrap()).iter().map(|a| a.local.of(b).to_vec()).collect();
+    assert!(names.contains(&b"b".to_vec()) && !names.contains(&b"a".to_vec()));
+    let limits = Limits { expanded_bytes: 8, ..Limits::DEFAULT };
+    for src in ["<svg a=\"1\"/>", "<svg/><!---->"] {
+        assert!(
+            matches!(parse_with(src.as_bytes(), &limits), Err(Error::Limit(l)) if l.resource == Resource::Expanded),
+            "{src}"
+        );
+    }
+}
