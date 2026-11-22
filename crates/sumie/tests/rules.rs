@@ -474,7 +474,8 @@ fn check_plain(all: &[Src]) -> Vec<Finding> {
 }
 
 fn check_plain_type(s: &Src, x: &Token, defs: &[(String, bool, String, u32)], out: &mut Vec<Finding>) {
-    if PRIMS.contains(&x.text.as_str()) {
+    // マクロの定義の中（impl Plain for $t）は飛ばす（マクロを呼ぶ所で見る）
+    if x.kind != Kind::Ident || PRIMS.contains(&x.text.as_str()) {
         return;
     }
     match defs.iter().find(|d| d.0 == x.text) {
@@ -716,6 +717,7 @@ fn rule_plain() {
     let en = "#[repr(u8)]\n#[derive(Clone, Copy)]\nenum E { A, B }\nplain!(E);";
     assert_eq!(hits("mem/mod.rs", en), 0);
     assert_eq!(hits("mem/mod.rs", "plain!(Missing);"), 1);
+    assert_eq!(hits("mem/mod.rs", "macro_rules! plain { ($($t:ty),*) => { $(impl Plain for $t {})* }; }"), 0);
 }
 
 #[test]

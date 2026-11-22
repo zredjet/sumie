@@ -10,5 +10,19 @@
 
 #![forbid(unsafe_code)]
 
+mod budget;
+mod cancel;
+mod cost;
+mod error;
+mod math;
+mod mem;
+
+#[doc(hidden)]
+pub mod fuzzing;
+
+pub use crate::budget::Estimate;
+pub use crate::cancel::{Cancel, Never};
+pub use crate::error::{Error, Feature, Invalid, InvalidReason, LimitError, Resource, Stage, Unsupported};
+
 /// 描画器の識別子。値を変える変更で数を上げる（determinism.md §8）。開発中は 0、M7 で 1 に凍結する。
 pub const RENDERER: &str = "sumie-render/0";
