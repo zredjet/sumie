@@ -20,6 +20,8 @@ pub const RECORD: &str = "crates/sumie-tools/oracle-lock.txt";
 struct Pkg {
     name: String,
     version: String,
+    /// crates.io の checksum（path・git の出どころにはない。差し替えを見分ける）
+    checksum: String,
     deps: Vec<String>,
 }
 
@@ -28,7 +30,7 @@ fn parse(lock: &str) -> Vec<Pkg> {
     let mut in_deps = false;
     for line in lock.lines() {
         if line == "[[package]]" {
-            out.push(Pkg { name: String::new(), version: String::new(), deps: Vec::new() });
+            out.push(Pkg { name: String::new(), version: String::new(), checksum: String::new(), deps: Vec::new() });
             in_deps = false;
             continue;
         }
@@ -45,6 +47,8 @@ fn parse(lock: &str) -> Vec<Pkg> {
             p.name = v.to_string();
         } else if let Some(v) = line.strip_prefix("version = \"").and_then(|v| v.strip_suffix('"')) {
             p.version = v.to_string();
+        } else if let Some(v) = line.strip_prefix("checksum = \"").and_then(|v| v.strip_suffix('"')) {
+            p.checksum = v.to_string();
         } else if line == "dependencies = [" {
             in_deps = true;
         }
@@ -52,7 +56,8 @@ fn parse(lock: &str) -> Vec<Pkg> {
     out
 }
 
-/// `root` の依存の閉包（名前 → 版。同じ名前の 2 つの版は「名前 版」を鍵にする）。
+/// `root` の依存の閉包（名前 → 「版 checksum」。同じ名前の 2 つの版は「名前 版」を鍵にする）。checksum がない（path・git
+/// の出どころ）ものは `-`。
 pub fn closure(lock: &str, root: &str) -> Result<BTreeMap<String, String>, String> {
     let pkgs = parse(lock);
     let find = |spec: &str| -> Option<&Pkg> {
@@ -61,10 +66,11 @@ pub fn closure(lock: &str, root: &str) -> Result<BTreeMap<String, String>, Strin
         let version = it.next();
         pkgs.iter().find(|p| p.name == name && version.is_none_or(|v| v == p.version))
     };
-    let mut seen: BTreeMap<(String, String), ()> = BTreeMap::new();
+    let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut stack = vec![find(root).ok_or_else(|| format!("{root} が lock にない"))?];
     while let Some(p) = stack.pop() {
-        if seen.insert((p.name.clone(), p.version.clone()), ()).is_some() {
+        let sum = if p.checksum.is_empty() { "-".to_string() } else { p.checksum.clone() };
+        if seen.insert((p.name.clone(), p.version.clone()), sum).is_some() {
             continue;
         }
         for d in &p.deps {
@@ -73,9 +79,9 @@ pub fn closure(lock: &str, root: &str) -> Result<BTreeMap<String, String>, Strin
     }
     let mut out = BTreeMap::new();
     let names: Vec<&String> = seen.keys().map(|(n, _)| n).collect();
-    for (n, v) in seen.keys() {
+    for ((n, v), sum) in &seen {
         let key = if names.iter().filter(|x| **x == n).count() > 1 { format!("{n} {v}") } else { n.clone() };
-        out.insert(key, v.clone());
+        out.insert(key, format!("{v} {sum}"));
     }
     Ok(out)
 }
@@ -86,7 +92,10 @@ pub fn mismatches(ours: &BTreeMap<String, String>, kura: &BTreeMap<String, Strin
     for (n, v) in ours {
         match kura.get(n) {
             Some(k) if k == v => {}
-            Some(k) => out.push(format!("{n}：この workspace {v}・Kura {k}（cargo update -p {n} --precise {k}）")),
+            Some(k) => {
+                let ver = k.split(' ').next().unwrap_or("");
+                out.push(format!("{n}：この workspace {v}・Kura {k}（版が違えば cargo update -p {n} --precise {ver}。checksum が違えば出どころの差し替え）"))
+            }
             None => out.push(format!("{n} {v}：Kura の閉包にない")),
         }
     }
@@ -94,6 +103,7 @@ pub fn mismatches(ours: &BTreeMap<String, String>, kura: &BTreeMap<String, Strin
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
+    crate::corpus::check_args(args, &["--kura", "--rev"], &[], 0)?;
     let kura = arg(args, "--kura").ok_or("--kura <Kura の Cargo.lock>")?;
     let rev = arg(args, "--rev").ok_or("--rev <Kura のコミット>")?;
     let text = std::fs::read_to_string(kura).map_err(|e| format!("{kura}：{e}"))?;
@@ -120,17 +130,20 @@ pub fn run(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// 記録を読む（名前 → 版）と、記録した Kura の rev。
+    /// 記録を読む（名前 → 「版 checksum」）と、記録した Kura の rev。
     fn read_record(text: &str) -> (String, BTreeMap<String, String>) {
         let mut rev = String::new();
         let mut out = BTreeMap::new();
         for l in text.lines() {
             if let Some(r) = l.strip_prefix("# kura-rev: ") {
                 rev = r.trim().to_string();
-            } else if !l.starts_with('#')
-                && let Some((n, v)) = l.rsplit_once(' ')
-            {
-                out.insert(n.to_string(), v.to_string());
+            } else if !l.starts_with('#') {
+                // 「名前 版 checksum」（名前に空白が入るのは「名前 版」の鍵のとき）
+                let parts: Vec<&str> = l.split(' ').collect();
+                if parts.len() >= 3 {
+                    let (name, rest) = parts.split_at(parts.len() - 2);
+                    out.insert(name.join(" "), rest.join(" "));
+                }
             }
         }
         (rev, out)
@@ -153,11 +166,11 @@ mod tests {
                     [[package]]\nname = \"b\"\nversion = \"2.0.0\"\n\n[[package]]\nname = \"b\"\nversion = \"3.0.0\"\n\n\
                     [[package]]\nname = \"c\"\nversion = \"0.1.0\"\ndependencies = [\n \"b 3.0.0\",\n]\n";
         let c = closure(lock, "a").unwrap();
-        assert_eq!(c.get("b 2.0.0").map(String::as_str), Some("2.0.0"));
-        assert_eq!(c.get("b 3.0.0").map(String::as_str), Some("3.0.0"));
-        assert_eq!(c.get("c").map(String::as_str), Some("0.1.0"));
+        assert_eq!(c.get("b 2.0.0").map(String::as_str), Some("2.0.0 -"));
+        assert_eq!(c.get("b 3.0.0").map(String::as_str), Some("3.0.0 -"));
+        assert_eq!(c.get("c").map(String::as_str), Some("0.1.0 -"));
         let mut k = c.clone();
-        k.insert("c".into(), "0.2.0".into());
+        k.insert("c".into(), "0.1.0 abc".into());
         k.insert("only-kura".into(), "1.0.0".into());
         assert_eq!(mismatches(&c, &k).len(), 1);
     }

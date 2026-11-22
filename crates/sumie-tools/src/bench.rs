@@ -18,15 +18,17 @@ use std::time::{Duration, Instant};
 use resvg::tiny_skia;
 use sumie_testkit::jsonl::Line;
 
-use crate::corpus::{arg, workspace_root};
+use crate::corpus::{arg, check_args, num_arg, workspace_root};
 use crate::oracle::{Fonts, Resvg};
 
 pub fn run(args: &[String]) -> Result<(), String> {
+    check_args(args, &["--root", "--repeat", "--timeout", "--fonts", "--out", "--filter"], &["--all"], 0)?;
     let ws = workspace_root();
     let root = arg(args, "--root").map(PathBuf::from).unwrap_or_else(|| ws.join("corpus"));
-    let repeat = arg(args, "--repeat").and_then(|n| n.parse::<u32>().ok()).unwrap_or(3).max(1);
-    let timeout = Duration::from_secs(arg(args, "--timeout").and_then(|n| n.parse::<u64>().ok()).unwrap_or(60));
+    let repeat = num_arg::<u32>(args, "--repeat", 3)?.max(1);
+    let timeout = Duration::from_secs(num_arg::<u64>(args, "--timeout", 60)?);
     let fonts = arg(args, "--fonts").unwrap_or("system");
+    Fonts::parse(fonts)?;
     let out = arg(args, "--out").map(PathBuf::from).unwrap_or_else(|| ws.join("local/bench/resvg.jsonl"));
     let index = std::fs::read_to_string(root.join("index.jsonl"))
         .map_err(|e| format!("{}/index.jsonl：{e}（先に corpus index）", root.display()))?;
@@ -37,7 +39,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
     }
     let mut lines = String::new();
-    let (mut n, mut total_ms, mut timeouts) = (0usize, 0.0f64, 0usize);
+    let (mut n, mut total_ms, mut timeouts, mut errors) = (0usize, 0.0f64, 0usize, 0usize);
     for l in index.lines() {
         let line = Line::parse(l)?;
         let path = line.get_str("path").unwrap_or("");
@@ -51,6 +53,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
         if rl.get_bool("timeout") == Some(true) {
             timeouts += 1;
         }
+        if rl.get_str("error").is_some() {
+            errors += 1;
+        }
         if let (Some(p), Some(rn)) = (rl.get_int("parse_us"), rl.get_int("render_us")) {
             total_ms += (p + rn) as f64 / 1000.0;
         }
@@ -60,7 +65,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
         n += 1;
     }
     std::fs::write(&out, lines).map_err(|e| e.to_string())?;
-    println!("{n} 件（時間切れ {timeouts} 件）・合計 {total_ms:.1} ms → {}", out.display());
+    println!(
+        "{n} 件（時間切れ {timeouts} 件・誤り {errors} 件）・描けた分の合計 {total_ms:.1} ms・CPU {} → {}",
+        crate::corpus::cpu_name(),
+        out.display()
+    );
     Ok(())
 }
 
@@ -97,13 +106,17 @@ fn run_child(exe: &Path, file: &Path, repeat: u32, fonts: &str, timeout: Duratio
 
 /// 子のプロセス：1 件を測って JSON の 1 行を出す。
 pub fn one(args: &[String]) -> Result<(), String> {
+    check_args(args, &["--repeat", "--fonts"], &[], 1)?;
     let file = PathBuf::from(args.first().ok_or("bench-one <file>")?);
-    let repeat = arg(args, "--repeat").and_then(|n| n.parse::<u32>().ok()).unwrap_or(3).max(1);
-    let fonts = Fonts::parse(arg(args, "--fonts").unwrap_or("system"));
+    let repeat = num_arg::<u32>(args, "--repeat", 3)?.max(1);
+    let fonts = Fonts::parse(arg(args, "--fonts").unwrap_or("system"))?;
     let svg = std::fs::read(&file).map_err(|e| e.to_string())?;
     // 文字を含むときだけフォントを読む（Kura もフォントの集まりは文字のある SVG で初めて作る）
     let has_text = crate::corpus::features(&svg).contains(&"text");
     let resvg = Resvg::new(if has_text { &fonts } else { &Fonts::None });
+    if has_text && matches!(fonts, Fonts::Dir(_)) && resvg.faces() == 0 {
+        return Err("--fonts のフォルダに書体がない（文字を書体 0 で描いてしまう）".into());
+    }
     let (mut best_parse, mut best_render) = (u128::MAX, u128::MAX);
     let mut size = (0, 0);
     let mut peak = 0u64;
@@ -147,7 +160,33 @@ pub fn one(args: &[String]) -> Result<(), String> {
             .int("render_us", best_render as u64)
             .int("peak_bytes", peak)
             .bool("text", has_text)
+            .int("faces", resvg.faces() as u64)
             .to_json()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 子が誤りで終わる・時間切れのときに、誤りの行・時間切れの行を返す。
+    #[test]
+    fn child_errors_and_timeouts_are_lines() {
+        let dir = std::env::temp_dir().join(format!("sumie-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let _ = Command::new("chmod").arg("+x").arg(&p).status();
+            p
+        };
+        let fail = script("fail.sh", "exit 3");
+        let r = run_child(&fail, Path::new("x.svg"), 1, "none", Duration::from_secs(5)).unwrap();
+        assert!(Line::parse(&r).unwrap().get_str("error").is_some(), "{r}");
+        let slow = script("slow.sh", "sleep 5");
+        let r = run_child(&slow, Path::new("x.svg"), 1, "none", Duration::from_millis(300)).unwrap();
+        assert_eq!(Line::parse(&r).unwrap().get_bool("timeout"), Some(true), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

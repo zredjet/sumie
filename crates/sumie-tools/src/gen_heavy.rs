@@ -26,7 +26,7 @@ fn inputs() -> Vec<(&'static str, &'static str, String)> {
         ),
         (
             "map-shapes",
-            "4096×4096・閉じた path 45,000 本（1 本 20 頂点・半径 4〜20 画素・8 色の塗り）・種 2",
+            "4096×4096・閉じた path 45,000 本（1 本 20 頂点・半径 4〜20 画素を頂点ごとに 0.6〜1.0 倍に揺らす（2.4〜20 画素）・8 色の塗り）・種 2",
             map_shapes(),
         ),
         (
@@ -77,6 +77,7 @@ fn inputs() -> Vec<(&'static str, &'static str, String)> {
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
+    crate::corpus::check_args(args, &["--out"], &[], 0)?;
     let out = arg(args, "--out").map(PathBuf::from).unwrap_or_else(|| workspace_root().join("local/heavy"));
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     let mut index = String::new();

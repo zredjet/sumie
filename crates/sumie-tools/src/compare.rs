@@ -1,17 +1,23 @@
 //! `compare`：2 つの描画（M0 は resvg と Chrome。M2 から sumie）を乗算済みの RGBA8 で比べ、差の一覧の HTML と分布を出す
 //! （architecture.md §10・ADR-15・ADR-35 (1)・ADR-44 (3)）。
 //!
-//! `compare [--root corpus] [--filter <道の一部>] [--all] [--limit N] [--jobs N] [--fonts system|none|<dir>] [--out <dir>]`
+//! `compare [--root corpus] [--filter <道の一部>] [--all] [--limit N] [--jobs N] [--fonts system|none|<dir>] [--min-side N] [--out <dir>]`
+//!
+//! `--min-side N`：長い辺が N 画素に満たない絵は、整数の倍率（N ÷ 長い辺の切り上げ）で大きくして両方を描く（小さい
+//! アイコンで縁の画素が全体の大半になるのを避けて比べる。既定は ADR-61 (1) の 200。0 で倍率 1）。
 //!
 //! 測るもの（1 件ごと）：
 //! - 大きさ・全画素の数・どちらかの画像で α > 0 の画素の数（ADR-15 の割合の 2 つの分母。ADR-44 (3)）
 //! - 各成分の差の最大が 2・8・16 を超える画素の数
-//! - 形の内側（両方の画像で 3 × 3 の近傍の α がすべて 0 か 255）の画素の数・差の最大・差が 2 を超える数
+//! - 形の内側（平らな所：両方の画像で 3 × 3 の近傍の画素がすべて同じ値。ADR-61 (2)）の画素の数・差の最大
+//! - 参考に、ADR-15 のもとの内側（両方の画像で 3 × 3 の近傍の α がすべて 0 か 255。不透明な色の面どうしの境目も含む）の
+//!   画素の数・差の最大・差が 2 を超える数
 //!
 //! 出力：`<out>/report.jsonl`（1 件 1 行）・`<out>/summary.txt`（群ごとの分布・ADR-56 (1) の基準と目標で通る数・候補の
 //! 値での通る数）・`<out>/index.html`（全画素が分母の割合の大きい順。絵は `<out>/img/`）。
 //!
-//! 群（ADR-56 (1)）：図形と単色（8/255・2%・内側 2/255）・フィルタとグラデーション（16/255・1%）は基準で合否を出す。
+//! 群（ADR-56 (1)・ADR-61）：図形と単色（8/255・2%・平らな所 2/255）・フィルタとグラデーション（16/255・1%）は基準で
+//! 合否を出す。
 //! 文字（M0 は両方がシステムのフォントで描く）・画像（Kura の設定の resvg は画像を読まない）・未定義の振る舞いの例（題に
 //! 「(UB)」）は分布から外して別に数える。
 
@@ -39,6 +45,8 @@ pub struct Metrics {
     pub interior_n: u64,
     pub interior_max: u8,
     pub interior_over2: u64,
+    pub flat_n: u64,
+    pub flat_max: u8,
     pub max_diff: u8,
 }
 
@@ -57,6 +65,14 @@ pub fn measure(a: &Rgba, b: &Rgba) -> Option<(Metrics, Rgba)> {
         }
         let al = img.px[((y as usize) * w as usize + x as usize) * 4 + 3];
         al == 0 || al == 255
+    };
+    // 近傍の画素（外は透明）
+    let px = |img: &Rgba, x: i64, y: i64| -> [u8; 4] {
+        if x < 0 || y < 0 || x >= i64::from(w) || y >= i64::from(h) {
+            return [0; 4];
+        }
+        let i = ((y as usize) * w as usize + x as usize) * 4;
+        [img.px[i], img.px[i + 1], img.px[i + 2], img.px[i + 3]]
     };
     for y in 0..h {
         for x in 0..w {
@@ -78,6 +94,14 @@ pub fn measure(a: &Rgba, b: &Rgba) -> Option<(Metrics, Rgba)> {
                 m.interior_n += 1;
                 m.interior_max = m.interior_max.max(d);
                 m.interior_over2 += u64::from(d > 2);
+            }
+            let (xi, yi) = (i64::from(x), i64::from(y));
+            let (ca, cb) = (px(a, xi, yi), px(b, xi, yi));
+            let flat =
+                (-1..=1).all(|dy| (-1..=1).all(|dx| px(a, xi + dx, yi + dy) == ca && px(b, xi + dx, yi + dy) == cb));
+            if flat {
+                m.flat_n += 1;
+                m.flat_max = m.flat_max.max(d);
             }
             let g = d.saturating_mul(8);
             diff.px[i..i + 4].copy_from_slice(&if d > 8 { [255, 0, 0, 255] } else { [g, g, g, 255] });
@@ -106,6 +130,11 @@ struct Outcome {
     id: usize,
     metrics: Option<Metrics>,
     error: String,
+    /// 描いた倍率（`--min-side`）と、Chrome が撮るのにかかった回数
+    scale: u32,
+    chrome_attempts: u32,
+    /// 大きさが整数でない（Chrome が画素の格子に合わせて引き伸ばすので、縁の値が resvg と食い違う）
+    fractional: bool,
 }
 
 fn load_items(root: &Path, args: &[String]) -> Result<Vec<Item>, String> {
@@ -130,36 +159,58 @@ fn load_items(root: &Path, args: &[String]) -> Result<Vec<Item>, String> {
             features: line.get_str("features").unwrap_or("").to_string(),
         });
     }
-    if let Some(n) = arg(args, "--limit").and_then(|n| n.parse::<usize>().ok()) {
-        out.truncate(n);
+    if arg(args, "--limit").is_some() {
+        out.truncate(crate::corpus::num_arg::<usize>(args, "--limit", 0)?);
     }
     Ok(out)
 }
 
+/// 比べるときの長い辺の下限（ADR-61 (1)。resvg の試験の 200 × 200 は倍率 1 のまま）。
+pub const DEFAULT_MIN_SIDE: u32 = 200;
+
+/// 照合の働き手のスタック（深い入れ子の SVG で resvg がスタックを使い切って、全体ごと落ちないように）。
+const WORKER_STACK: usize = 256 << 20;
+
 pub fn run(args: &[String]) -> Result<(), String> {
+    crate::corpus::check_args(
+        args,
+        &["--root", "--out", "--jobs", "--min-side", "--fonts", "--filter", "--limit"],
+        &["--all"],
+        0,
+    )?;
     let ws = workspace_root();
     let root = arg(args, "--root").map(PathBuf::from).unwrap_or_else(|| ws.join("corpus"));
     let out_dir = arg(args, "--out").map(PathBuf::from).unwrap_or_else(|| ws.join("local/compare/resvg-chrome"));
-    let jobs = arg(args, "--jobs").and_then(|n| n.parse::<usize>().ok()).unwrap_or(8).max(1);
-    let fonts = Fonts::parse(arg(args, "--fonts").unwrap_or("system"));
+    let jobs = crate::corpus::num_arg::<usize>(args, "--jobs", 8)?.max(1);
+    let min_side = crate::corpus::num_arg::<u32>(args, "--min-side", DEFAULT_MIN_SIDE)?;
+    let fonts = Fonts::parse(arg(args, "--fonts").unwrap_or("system"))?;
     let items = load_items(&root, args)?;
+    // 前の回の出力を残さない（新しい結果と見誤らない）
+    for f in ["report.jsonl", "summary.txt", "index.html"] {
+        let _ = std::fs::remove_file(out_dir.join(f));
+    }
+    let _ = std::fs::remove_dir_all(out_dir.join("img"));
     std::fs::create_dir_all(out_dir.join("img")).map_err(|e| e.to_string())?;
     let chrome = Chrome::find()?;
     eprintln!("フォントを読む…");
     let resvg = Resvg::new(&fonts);
-    eprintln!("{} 件を {} 並びで描く（resvg：書体 {}、{}）", items.len(), jobs, resvg.faces(), chrome.version);
+    let faces = resvg.faces();
+    if matches!(fonts, Fonts::Dir(_)) && faces == 0 {
+        return Err("--fonts のフォルダに書体がない（文字を書体 0 で描いてしまう）".into());
+    }
+    eprintln!("{} 件を {} 並びで描く（resvg：書体 {faces}、{}）", items.len(), jobs, chrome.version);
     let next = AtomicUsize::new(0);
     let results: Mutex<Vec<Outcome>> = Mutex::new(Vec::new());
-    std::thread::scope(|s| {
+    std::thread::scope(|s| -> Result<(), String> {
         for t in 0..jobs {
             let (items, next, results, resvg, chrome, root, out_dir) =
                 (&items, &next, &results, &resvg, &chrome, &root, &out_dir);
-            s.spawn(move || {
+            let spawned = std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(s, move || {
                 let work = out_dir.join(format!("work-{t}"));
                 loop {
                     let k = next.fetch_add(1, Ordering::Relaxed);
                     let Some(item) = items.get(k) else { break };
-                    let o = one(k, item, root, out_dir, &work, resvg, chrome);
+                    let o = one(k, item, root, out_dir, &work, resvg, chrome, min_side);
                     if k % 100 == 0 {
                         eprintln!("{k}/{}", items.len());
                     }
@@ -167,27 +218,72 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 }
                 let _ = std::fs::remove_dir_all(&work);
             });
+            spawned.map_err(|e| format!("働き手を作れない：{e}"))?;
         }
-    });
+        Ok(())
+    })?;
     let mut results = results.into_inner().unwrap_or_else(|e| e.into_inner());
     results.sort_by_key(|o| o.id);
-    write_outputs(&out_dir, &results, &chrome.version)?;
+    let header = format!(
+        "resvg 0.48.1（Kura の設定・書体 {faces}）と {}（--disable-gpu）の差（乗算済み RGBA8）。CPU：{}・倍率：{}\n",
+        chrome.version,
+        crate::corpus::cpu_name(),
+        if min_side == 0 {
+            "1".to_string()
+        } else {
+            format!("長い辺が {min_side} 画素に満たない絵は整数倍")
+        }
+    );
+    write_outputs(&out_dir, &results, &header)?;
     println!("{} に report.jsonl・summary.txt・index.html を書いた", out_dir.display());
     Ok(())
 }
 
-fn one(id: usize, item: &Item, root: &Path, out_dir: &Path, work: &Path, resvg: &Resvg, chrome: &Chrome) -> Outcome {
+/// 長い辺が `min_side` に満たないときの整数の倍率（0 なら 1）。
+fn scale_for(w: u32, h: u32, min_side: u32) -> u32 {
+    let long = w.max(h).max(1);
+    if min_side == 0 || long >= min_side { 1 } else { min_side.div_ceil(long) }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn one(
+    id: usize,
+    item: &Item,
+    root: &Path,
+    out_dir: &Path,
+    work: &Path,
+    resvg: &Resvg,
+    chrome: &Chrome,
+    min_side: u32,
+) -> Outcome {
     let path = root.join(&item.path);
-    let fail = |e: String| Outcome { item: item.clone(), id, metrics: None, error: e };
+    let fail = |e: String| Outcome {
+        item: item.clone(),
+        id,
+        metrics: None,
+        error: e,
+        scale: 1,
+        chrome_attempts: 0,
+        fractional: false,
+    };
     let svg = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) => return fail(e.to_string()),
     };
-    let a = match resvg.render(&svg, 1.0) {
+    let (k, css, fractional) = match resvg.tree(&svg) {
+        Ok(t) => {
+            let (w, h) = Resvg::size(&t);
+            let k = scale_for(w, h, min_side);
+            let (cw, ch) = Resvg::css_size(&t);
+            (k, (cw * k as f32, ch * k as f32), cw.fract() != 0.0 || ch.fract() != 0.0)
+        }
+        Err(e) => return fail(format!("resvg：{e}")),
+    };
+    let a = match resvg.render(&svg, k as f32) {
         Ok(o) => o.img,
         Err(e) => return fail(format!("resvg：{e}")),
     };
-    let b = match chrome.render(&path, a.w, a.h, work) {
+    let (b, attempts) = match chrome.render(&path, a.w, a.h, css, work) {
         Ok(b) => b,
         Err(e) => return fail(format!("chrome：{e}")),
     };
@@ -196,7 +292,15 @@ fn one(id: usize, item: &Item, root: &Path, out_dir: &Path, work: &Path, resvg: 
     let _ = image::write_png(&img.join(format!("{id}-a.png")), &a);
     let _ = image::write_png(&img.join(format!("{id}-b.png")), &b);
     let _ = image::write_png(&img.join(format!("{id}-d.png")), &d);
-    Outcome { item: item.clone(), id, metrics: Some(m), error: String::new() }
+    Outcome {
+        item: item.clone(),
+        id,
+        metrics: Some(m),
+        error: String::new(),
+        scale: k,
+        chrome_attempts: attempts,
+        fractional,
+    }
 }
 
 /// ADR-15・ADR-56 (1) の基準で分ける群。
@@ -221,7 +325,7 @@ impl Group {
 
     fn label(self) -> &'static str {
         match self {
-            Group::Plain => "図形と単色（8/255・2%・内側 2/255。ADR-56 (1)）",
+            Group::Plain => "図形と単色（8/255・2%・平らな所 2/255。ADR-56 (1)・ADR-61）",
             Group::Filter => "フィルタ・グラデーションを含む（16/255・1%。ADR-35 (1)）",
             Group::Text => "文字を含む（M0 は両方がシステムのフォントで描く。分布から外す）",
             Group::Image => "画像を含む（Kura の設定の resvg は画像の参照を読まない。分布から外す）",
@@ -262,9 +366,9 @@ fn over(m: &Metrics, t: u8) -> u64 {
     if t >= 16 { m.over16 } else { m.over8 }
 }
 
-/// 基準で通るか（割合と、決めてあれば形の内側の両方）。
+/// 基準で通るか（割合と、決めてあれば形の内側（平らな所。ADR-61 (2)）の両方）。
 fn passes(m: &Metrics, c: &Criterion) -> bool {
-    ratio(over(m, c.over), m.n_all) <= c.ratio && c.interior.is_none_or(|lim| m.interior_max <= lim)
+    ratio(over(m, c.over), m.n_all) <= c.ratio && c.interior.is_none_or(|lim| m.flat_max <= lim)
 }
 
 fn percentile(v: &mut [f64], p: f64) -> f64 {
@@ -276,7 +380,18 @@ fn percentile(v: &mut [f64], p: f64) -> f64 {
     v[i]
 }
 
-fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<(), String> {
+/// 描けなかった理由の分け方（resvg が断った・Chrome が描けない・ほか）。
+fn error_kind(e: &str) -> &'static str {
+    if e.starts_with("resvg：") {
+        "resvg"
+    } else if e.starts_with("chrome：") {
+        "Chrome"
+    } else {
+        "ほか"
+    }
+}
+
+fn write_outputs(out_dir: &Path, results: &[Outcome], header: &str) -> Result<(), String> {
     // 1 件 1 行
     let mut jsonl = String::new();
     for o in results {
@@ -298,7 +413,12 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
                 .int("interior_n", m.interior_n)
                 .int("interior_max", m.interior_max)
                 .int("interior_over2", m.interior_over2)
-                .int("max_diff", m.max_diff);
+                .int("flat_n", m.flat_n)
+                .int("flat_max", m.flat_max)
+                .int("max_diff", m.max_diff)
+                .int("scale", o.scale)
+                .int("chrome_attempts", o.chrome_attempts)
+                .bool("fractional_size", o.fractional);
             if let Some(c) = g.criterion() {
                 l = l.bool("pass", passes(m, &c));
             }
@@ -311,23 +431,48 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
 
     // 群ごとの分布と、候補の基準で通る数
     let mut summary = String::new();
-    let _ = writeln!(summary, "resvg 0.48.1（Kura の設定）と {chrome} の差（乗算済み RGBA8）\n");
+    let _ = writeln!(summary, "{header}");
+    let retried = results.iter().filter(|o| o.chrome_attempts > 1).count();
+    let fractional = results.iter().filter(|o| o.fractional).count();
+    let _ = writeln!(
+        summary,
+        "Chrome をやり直して撮れたもの：{retried} 件・大きさが整数でないもの（Chrome が引き伸ばす）：{fractional} 件\n"
+    );
     for g in Group::ALL {
         let ms: Vec<&Metrics> =
             results.iter().filter(|o| group(&o.item) == g).filter_map(|o| o.metrics.as_ref()).collect();
-        let errors = results.iter().filter(|o| group(&o.item) == g && o.metrics.is_none()).count();
-        let _ = writeln!(summary, "## {}：{} 件（描けなかった {errors} 件）", g.label(), ms.len());
+        let errs: Vec<&str> = results
+            .iter()
+            .filter(|o| group(&o.item) == g && o.metrics.is_none())
+            .map(|o| error_kind(&o.error))
+            .collect();
+        let by = |k: &str| errs.iter().filter(|e| **e == k).count();
+        let _ = writeln!(
+            summary,
+            "## {}：測れた {} 件（描けない {} 件：resvg {}・Chrome {}・ほか {}）",
+            g.label(),
+            ms.len(),
+            errs.len(),
+            by("resvg"),
+            by("Chrome"),
+            by("ほか")
+        );
         if ms.is_empty() {
             continue;
         }
         let fil = g == Group::Filter;
         if let Some(c) = g.criterion() {
             let n = ms.iter().filter(|m| passes(m, &c)).count();
-            let _ = writeln!(summary, "  ADR-56 (1) の基準で通る（割合と内側の両方）：{n}/{}", ms.len());
+            let what = if c.interior.is_some() { "割合と内側の両方" } else { "割合" };
+            let _ = writeln!(summary, "  基準で通る（{what}）：{n}/{}", ms.len());
             if g == Group::Plain {
                 let goal = Criterion { ratio: PLAIN_GOAL_RATIO, ..c };
                 let n = ms.iter().filter(|m| passes(m, &goal)).count();
-                let _ = writeln!(summary, "  目標（8/255・0.5%・内側 2/255）で通る：{n}/{}", ms.len());
+                let _ = writeln!(summary, "  目標（8/255・0.5%・平らな所 2/255）で通る：{n}/{}", ms.len());
+                // 参考：ADR-15 のもとの内側（α だけで決める）で見たとき
+                let old = |m: &Metrics| ratio(m.over8, m.n_all) <= c.ratio && m.interior_max <= 2;
+                let n = ms.iter().filter(|m| old(m)).count();
+                let _ = writeln!(summary, "  （参考）もとの内側（α だけ）で見たとき：{n}/{}", ms.len());
             }
         }
         let t_over = if fil { 16 } else { 8 };
@@ -369,7 +514,8 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
         if !fil {
             for lim in [2u8, 4, 8, 16] {
                 let n = ms.iter().filter(|m| m.interior_max <= lim).count();
-                let _ = writeln!(summary, "  内側の差 ≤ {lim}/255 で通る：{n}/{}", ms.len());
+                let f = ms.iter().filter(|m| m.flat_max <= lim).count();
+                let _ = writeln!(summary, "  平らな所の差 ≤ {lim}/255 で通る：{f}/{}（もとの内側なら {n}）", ms.len());
             }
         }
         let _ = writeln!(summary);
@@ -455,16 +601,41 @@ mod tests {
         assert_eq!(m.max_diff, 100);
         assert!(m.interior_n >= 1);
         assert_eq!(m.interior_max, 5);
+        // 平らな所は塊の真ん中だけ（ほかは近傍に塊の縁か外がかかる）
+        assert_eq!((m.flat_n, m.flat_max), (1, 5));
+        // 不透明な 2 色の境目は、もとの内側には入るが平らな所には入らない
+        let mut c = Rgba::transparent(4, 3);
+        let mut d = Rgba::transparent(4, 3);
+        for y in 0..3 {
+            for x in 0..4 {
+                let i = (y * 4 + x) * 4;
+                let col = if x < 2 { [255, 0, 0, 255] } else { [0, 0, 255, 255] };
+                c.px[i..i + 4].copy_from_slice(&col);
+                d.px[i..i + 4].copy_from_slice(&col);
+            }
+        }
+        d.px[(4 + 1) * 4..(4 + 1) * 4 + 4].copy_from_slice(&[200, 0, 55, 255]); // 境目の画素だけ違う
+        let (m, _) = measure(&c, &d).unwrap();
+        assert_eq!(m.flat_max, 0);
+        assert_eq!(m.flat_n, 0);
         assert!(measure(&a, &Rgba::transparent(4, 5)).is_none());
     }
 
     #[test]
+    fn scale_for_small_images() {
+        assert_eq!(scale_for(16, 16, 0), 1);
+        assert_eq!(scale_for(16, 16, 256), 16);
+        assert_eq!(scale_for(24, 20, 256), 11);
+        assert_eq!(scale_for(640, 480, 256), 1);
+    }
+
+    #[test]
     fn criteria_and_groups() {
-        let m = Metrics { n_all: 1000, over8: 20, over16: 10, interior_max: 2, ..Metrics::default() };
+        let m = Metrics { n_all: 1000, over8: 20, over16: 10, flat_max: 2, interior_max: 50, ..Metrics::default() };
         let plain = Group::Plain.criterion().unwrap();
-        assert!(passes(&m, &plain));
+        assert!(passes(&m, &plain), "もとの内側（色の境目を含む）の差は見ない");
         assert!(!passes(&Metrics { over8: 21, ..m.clone() }, &plain));
-        assert!(!passes(&Metrics { interior_max: 3, ..m.clone() }, &plain));
+        assert!(!passes(&Metrics { flat_max: 3, ..m.clone() }, &plain));
         let fil = Group::Filter.criterion().unwrap();
         assert!(passes(&m, &fil));
         assert!(!passes(&Metrics { over16: 11, ..m.clone() }, &fil));

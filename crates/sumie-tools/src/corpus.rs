@@ -27,15 +27,83 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let sub = args.first().map(String::as_str).unwrap_or("");
     let rest = args.get(1..).unwrap_or(&[]);
     match sub {
-        "import-resvg" => import_resvg(rest),
-        "fetch-w3c" => fetch_w3c(rest),
-        "index" => index(rest),
-        _ => Err("corpus import-resvg | fetch-w3c | index".into()),
+        "import-resvg" => {
+            check_args(rest, &["--archive"], &[], 0)?;
+            import_resvg(rest)
+        }
+        "resvg-source" => {
+            check_args(rest, &[], &[], 0)?;
+            write_resvg_source()
+        }
+        "fetch-w3c" => {
+            check_args(rest, &["--dest"], &[], 0)?;
+            fetch_w3c(rest)
+        }
+        "fetch-real" => {
+            check_args(rest, &["--only"], &[], 0)?;
+            crate::corpus_real::run(rest)
+        }
+        "index" => {
+            check_args(rest, &["--root", "--out"], &[], 0)?;
+            index(rest)
+        }
+        _ => Err("corpus import-resvg | resvg-source | fetch-w3c | fetch-real | index".into()),
     }
 }
 
 pub fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
+}
+
+/// 引数が知っている名前だけか。`with_value` は値を取る名前（`--名前 値`）、`flags` は値を取らない名前、`positional` は
+/// 位置の引数の数の上限。打ち間違い（`--filtr`）を黙って無視して全体を回さないように。
+pub fn check_args(args: &[String], with_value: &[&str], flags: &[&str], positional: usize) -> Result<(), String> {
+    let mut i = 0;
+    let mut pos = 0;
+    while let Some(a) = args.get(i) {
+        if with_value.contains(&a.as_str()) {
+            if args.get(i + 1).is_none() {
+                return Err(format!("{a} の値がない"));
+            }
+            i += 2;
+        } else if flags.contains(&a.as_str()) {
+            i += 1;
+        } else if a.starts_with("--") {
+            return Err(format!("知らない引数：{a}（使える引数：{}）", [with_value, flags].concat().join(" ")));
+        } else {
+            pos += 1;
+            if pos > positional {
+                return Err(format!("余分な引数：{a}"));
+            }
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+/// 数の引数（なければ `default`。読めなければ誤り。`600s` を黙って既定の値にしない）。
+pub fn num_arg<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> Result<T, String> {
+    match arg(args, name) {
+        None => Ok(default),
+        Some(v) => v.parse::<T>().map_err(|_| format!("{name} の値 {v} を数として読めない")),
+    }
+}
+
+/// 計った機械の CPU の名前（記録に書く。Chrome の CPU のラスタは命令の種類で縁の値が変わりうる）。
+pub fn cpu_name() -> String {
+    if let Ok(o) = Command::new("sysctl").args(["-n", "machdep.cpu.brand_string"]).output()
+        && o.status.success()
+    {
+        return String::from_utf8_lossy(&o.stdout).trim().to_string();
+    }
+    std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find(|l| l.starts_with("model name"))
+                .map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string())
+        })
+        .unwrap_or_else(|| std::env::consts::ARCH.to_string())
 }
 
 pub fn workspace_root() -> PathBuf {
@@ -77,10 +145,29 @@ fn import_resvg(args: &[String]) -> Result<(), String> {
             a
         }
     };
+    // アーカイブの SHA-256 が違うとき（GitHub はその場で作るアーカイブのバイト列を約束しない）は、コミットした
+    // MANIFEST.jsonl の BLAKE3 で写すファイルを 1 件ずつ照らす（どちらも合わなければ誤り）
     let got = sha256_of(&archive)?;
-    if got != sha {
-        return Err(format!("SHA-256 が違う：{got}（期待 {sha}）。{} を消して取り直す", archive.display()));
-    }
+    let expected = if got == sha {
+        None
+    } else {
+        let m = std::fs::read_to_string(root.join("corpus/resvg/MANIFEST.jsonl")).map_err(|_| {
+            format!(
+                "SHA-256 が違い（{got}、期待 {sha}）、照らす MANIFEST.jsonl もない。{} を消して取り直す",
+                archive.display()
+            )
+        })?;
+        let mut map = BTreeSet::new();
+        for l in m.lines() {
+            let line = Line::parse(l)?;
+            map.insert((
+                line.get_str("path").unwrap_or("").to_string(),
+                line.get_str("blake3").unwrap_or("").to_string(),
+            ));
+        }
+        eprintln!("アーカイブの SHA-256 が違う（{got}）。MANIFEST.jsonl の BLAKE3 で 1 件ずつ照らす");
+        Some(map)
+    };
     // 取り出すのは新しい空のフォルダ（取ったものは信用しない）
     let unpack = root.join(format!("local/resvg-src-{}", std::process::id()));
     if unpack.exists() {
@@ -93,25 +180,36 @@ fn import_resvg(args: &[String]) -> Result<(), String> {
         return Err("tar で取り出せない".into());
     }
     let src = unpack.join(format!("resvg-{rev}"));
-    let result = import_resvg_from(&src, rev, sha);
+    let result = import_resvg_from(&src, expected.as_ref());
     let _ = std::fs::remove_dir_all(&unpack);
     result
 }
 
-fn import_resvg_from(src: &Path, rev: &str, sha: &str) -> Result<(), String> {
+fn import_resvg_from(src: &Path, expected: Option<&BTreeSet<(String, String)>>) -> Result<(), String> {
     let tests = src.join("crates/resvg/tests");
     if !tests.is_dir() {
         return Err(format!("{} がない", tests.display()));
-    }
-    let dest = workspace_root().join("corpus/resvg");
-    if dest.exists() {
-        std::fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
     }
     let mut files = Vec::new();
     for sub in ["tests", "extra", "resources"] {
         walk_svgs(&tests.join(sub), &mut files);
     }
     files.sort();
+    if let Some(exp) = expected {
+        let mut got = BTreeSet::new();
+        for f in &files {
+            let rel = f.strip_prefix(&tests).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
+            let bytes = std::fs::read(f).map_err(|e| e.to_string())?;
+            got.insert((rel, blake3::hash(&bytes).to_hex().to_string()));
+        }
+        if &got != exp {
+            return Err("取り出したファイルが MANIFEST.jsonl の道・BLAKE3 と合わない".into());
+        }
+    }
+    let dest = workspace_root().join("corpus/resvg");
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
+    }
     let mut manifest = String::new();
     for f in &files {
         let rel = f.strip_prefix(&tests).map_err(|e| e.to_string())?;
@@ -130,24 +228,35 @@ fn import_resvg_from(src: &Path, rev: &str, sha: &str) -> Result<(), String> {
         std::fs::copy(src.join(l), dest.join(l)).map_err(|e| format!("{l}：{e}"))?;
     }
     std::fs::write(dest.join("MANIFEST.jsonl"), manifest).map_err(|e| e.to_string())?;
-    std::fs::write(
-        dest.join("SOURCE.md"),
-        format!(
-            "# 出どころ：resvg の試験\n\n\
-             | 項目 | 値 |\n|---|---|\n\
-             | リポジトリ | https://github.com/linebender/resvg |\n\
-             | 版 | タグ `v0.48.1`（コミット `{rev}`。Kura が使う resvg と同じ版） |\n\
-             | 取ったもの | `https://codeload.github.com/linebender/resvg/tar.gz/{rev}`（SHA-256 `{sha}`） |\n\
-             | 写したもの | `crates/resvg/tests/` の `tests/`・`extra/`・`resources/` の `.svg`（{} 件。道は `crates/resvg/tests/` からの相対のまま） |\n\
-             | 写さなかったもの | resvg の描いた PNG（照合の相手の絵はゴールデンにしない）・画像・フォント・試験のコード |\n\
-             | ライセンス | MIT OR Apache-2.0（リポジトリの README の License の節。`LICENSE-MIT`・`LICENSE-APACHE` はリポジトリの根の写し。試験の README にほかの定めはない） |\n\
-             | 一覧 | `MANIFEST.jsonl`（道・バイト数・BLAKE3） |\n\n\
-             作り直し：`cargo run -p sumie-tools -- corpus import-resvg`（rev と SHA-256 は道具の定数。取ったアーカイブを照らしてから写す）\n",
-            files.len()
-        ),
-    )
-    .map_err(|e| e.to_string())?;
+    std::fs::write(dest.join("SOURCE.md"), resvg_source_md(files.len())).map_err(|e| e.to_string())?;
     println!("corpus/resvg に {} 件を写した", files.len());
+    Ok(())
+}
+
+/// `corpus/resvg/SOURCE.md` の中身（取り込みと `corpus resvg-source` の両方が書く。試験が今のファイルと照らす）。
+pub fn resvg_source_md(n: usize) -> String {
+    let (rev, sha) = (RESVG_REV, RESVG_SHA256);
+    format!(
+        "# 出どころ：resvg の試験\n\n\
+         | 項目 | 値 |\n|---|---|\n\
+         | リポジトリ | https://github.com/linebender/resvg |\n\
+         | 版 | タグ `v0.48.1`（コミット `{rev}`。Kura が使う resvg と同じ版） |\n\
+         | 取ったもの | `https://codeload.github.com/linebender/resvg/tar.gz/{rev}`（SHA-256 `{sha}`） |\n\
+         | 写したもの | `crates/resvg/tests/` の `tests/`・`extra/`・`resources/` の `.svg`（{n} 件。道は `crates/resvg/tests/` からの相対のまま） |\n\
+         | 写さなかったもの | resvg の描いた PNG（照合の相手の絵はゴールデンにしない）・画像・フォント・試験のコード |\n\
+         | ライセンス | MIT OR Apache-2.0（リポジトリの README の License の節。`LICENSE-MIT`・`LICENSE-APACHE` はリポジトリの根の写し。試験の README にほかの定めはない） |\n\
+         | 一覧 | `MANIFEST.jsonl`（道・バイト数・BLAKE3） |\n\n\
+         作り直し：`cargo run -p sumie-tools -- corpus import-resvg [--archive <取ったアーカイブ>]`（rev と SHA-256 は道具の定数。\
+         アーカイブの SHA-256 が違うときは、この MANIFEST.jsonl の BLAKE3 で 1 件ずつ照らす）\n"
+    )
+}
+
+/// `corpus resvg-source`：取り直さずに SOURCE.md だけを今の雛形で書き直す（件数は MANIFEST.jsonl の行の数）。
+fn write_resvg_source() -> Result<(), String> {
+    let dir = workspace_root().join("corpus/resvg");
+    let n = std::fs::read_to_string(dir.join("MANIFEST.jsonl")).map_err(|e| e.to_string())?.lines().count();
+    std::fs::write(dir.join("SOURCE.md"), resvg_source_md(n)).map_err(|e| e.to_string())?;
+    println!("corpus/resvg/SOURCE.md を書いた（{n} 件）");
     Ok(())
 }
 
@@ -333,11 +442,13 @@ fn index(args: &[String]) -> Result<(), String> {
     let mut files = Vec::new();
     walk_svgs(&root, &mut files);
     files.sort();
+    // W3C の試験かは、fetch-w3c が根に書く SOURCE.md の印で決める（道の名前の一部で決めない）
+    let w3c = std::fs::read_to_string(root.join("SOURCE.md")).is_ok_and(|t| t.starts_with("# W3C SVG 1.1"));
     let mut text = String::new();
     for f in &files {
         let rel = f.strip_prefix(&root).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
         let bytes = std::fs::read(f).map_err(|e| e.to_string())?;
-        let (source, category, scope) = classify(&rel);
+        let (source, category, scope) = classify(&rel, w3c);
         let line = Line::new()
             .str("path", rel.as_str())
             .str("source", source)
@@ -355,7 +466,8 @@ fn index(args: &[String]) -> Result<(), String> {
 }
 
 /// 道から出どころ・分類・範囲を決める。範囲は `in` か `out:<理由>`（アニメーション・スクリプト・操作は v1 の外）。
-fn classify(rel: &str) -> (String, String, String) {
+/// `w3c` は根が W3C の試験（fetch-w3c の置き場）か。
+fn classify(rel: &str, w3c: bool) -> (String, String, String) {
     let parts: Vec<&str> = rel.split('/').collect();
     if parts.first() == Some(&"resvg") {
         let cat = match parts.get(1) {
@@ -365,8 +477,12 @@ fn classify(rel: &str) -> (String, String, String) {
         };
         return ("resvg".into(), cat, "in".into());
     }
+    if parts.first() == Some(&"real") {
+        // 実際の SVG の集まり（corpus/real/<名前>/…。ADR-59）
+        return ("real".into(), parts.get(1).copied().unwrap_or("").to_string(), "in".into());
+    }
     let name = parts.last().copied().unwrap_or("");
-    if parts.contains(&"svg") || name.contains("-t.svg") || name.contains("-f.svg") || name.contains("-b.svg") {
+    if w3c {
         let cat = name.split('-').next().unwrap_or("").to_string();
         let scope = match cat.as_str() {
             "animate" => "out:animation",
@@ -384,6 +500,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resvg_source_md_is_current() {
+        let dir = workspace_root().join("corpus/resvg");
+        let n = std::fs::read_to_string(dir.join("MANIFEST.jsonl")).unwrap().lines().count();
+        let now = std::fs::read_to_string(dir.join("SOURCE.md")).unwrap();
+        assert_eq!(
+            now,
+            resvg_source_md(n),
+            "corpus/resvg/SOURCE.md が今の雛形と違う（corpus resvg-source で書き直す）"
+        );
+    }
+
+    #[test]
+    fn args_are_checked() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(check_args(&a(&["--root", "x", "--all"]), &["--root"], &["--all"], 0).is_ok());
+        assert!(check_args(&a(&["--filtr", "x"]), &["--filter"], &[], 0).is_err());
+        assert!(check_args(&a(&["--root"]), &["--root"], &[], 0).is_err());
+        assert!(check_args(&a(&["in.svg", "out.png", "x"]), &[], &[], 2).is_err());
+        assert_eq!(num_arg::<u64>(&a(&["--timeout", "600"]), "--timeout", 60), Ok(600));
+        assert!(num_arg::<u64>(&a(&["--timeout", "600s"]), "--timeout", 60).is_err());
+        assert_eq!(num_arg::<u64>(&a(&[]), "--timeout", 60), Ok(60));
+    }
+
+    #[test]
     fn features_and_classify() {
         let f = features(
             b"<svg><defs><linearGradient/><filter><feGaussianBlur/></filter></defs><text>a</text><svg:use/></svg>",
@@ -399,11 +539,18 @@ mod tests {
         let el = features(b"<svg><filter><feImage href=\"#r\"/></filter></svg>");
         assert_eq!(el, ["filter"]);
         assert_eq!(features(b"<svg><title>Recursive (UB)</title><rect/></svg>"), ["ub"]);
-        assert_eq!(classify("resvg/tests/painting/stroke-linejoin/miter.svg").1, "painting/stroke-linejoin");
+        assert_eq!(classify("resvg/tests/painting/stroke-linejoin/miter.svg", false).1, "painting/stroke-linejoin");
         assert_eq!(
-            classify("svg/animate-elem-02-t.svg"),
+            classify("svg/animate-elem-02-t.svg", true),
             ("w3c-svg11".into(), "animate".into(), "out:animation".into())
         );
-        assert_eq!(classify("svg/shapes-rect-01-t.svg").2, "in");
+        assert_eq!(classify("svg/shapes-rect-01-t.svg", true).2, "in");
+        assert_eq!(
+            classify("real/twemoji/assets/svg/1f600.svg", false),
+            ("real".into(), "twemoji".into(), "in".into())
+        );
+        // W3C の根でなければ、名前が -t.svg で終わっても W3C にしない
+        assert_eq!(classify("icons/outline/letter-t.svg", false).0, "local");
+        assert_eq!(classify("svg/animate-x-t.svg", false).2, "in");
     }
 }

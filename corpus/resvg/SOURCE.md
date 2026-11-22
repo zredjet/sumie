@@ -10,4 +10,4 @@
 | ライセンス | MIT OR Apache-2.0（リポジトリの README の License の節。`LICENSE-MIT`・`LICENSE-APACHE` はリポジトリの根の写し。試験の README にほかの定めはない） |
 | 一覧 | `MANIFEST.jsonl`（道・バイト数・BLAKE3） |
 
-作り直し：`cargo run -p sumie-tools -- corpus import-resvg --src <取り出した根> --rev 68b14c4c3bccdb60344c777406486b54c36ec1a4 --sha256 41bf46fdb8abc6fc49ec6f83facff0cdab2759a7212734c92f3f6aec12c51820`
+作り直し：`cargo run -p sumie-tools -- corpus import-resvg [--archive <取ったアーカイブ>]`（rev と SHA-256 は道具の定数。アーカイブの SHA-256 が違うときは、この MANIFEST.jsonl の BLAKE3 で 1 件ずつ照らす）

@@ -42,7 +42,7 @@ crates/sumie-tools/        # 照合（resvg・Chrome）・計測・重い入力�
 fuzz/                      # cargo-fuzz（独立の workspace）
 tests/svg/                 # 自作の試験の SVG
 tests/fonts/               # 試験用のフォント（写しを許すライセンスのものだけ。出どころの一覧つき。M5 で作る）
-corpus/                    # 照合の集まり（取り込んだ試験の SVG。出どころ・版・ライセンスの写しつき。ADR-21）
+corpus/                    # 照合の集まり（取り込んだ試験の SVG と実例の SVG。出どころ・版・ライセンスの写しつき。ADR-21・ADR-59）
 scripts/                   # verify.sh・clippy.sh・check-deps.sh・check-goldens-append-only.sh・fuzz-seeds.sh・lint-probe/
 docs/                      # 正本の文書
 ```

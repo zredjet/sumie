@@ -45,11 +45,13 @@ pub enum Fonts {
 }
 
 impl Fonts {
-    pub fn parse(s: &str) -> Fonts {
+    /// `system`・`none`・フォルダ。フォルダがない（`sytem` のような打ち間違い）なら誤り。
+    pub fn parse(s: &str) -> Result<Fonts, String> {
         match s {
-            "system" => Fonts::System,
-            "none" => Fonts::None,
-            d => Fonts::Dir(PathBuf::from(d)),
+            "system" => Ok(Fonts::System),
+            "none" => Ok(Fonts::None),
+            d if Path::new(d).is_dir() => Ok(Fonts::Dir(PathBuf::from(d))),
+            d => Err(format!("--fonts は system・none かフォルダ（{d} がない）")),
         }
     }
 }
@@ -136,6 +138,12 @@ impl Resvg {
     pub fn size(tree: &usvg::Tree) -> (u32, u32) {
         let s = tree.size().to_int_size();
         (s.width(), s.height())
+    }
+
+    /// 小数のままの大きさ（Chrome の `<img>` に CSS の画素で渡す）。Chrome は `<img>` を画素の格子に合わせるので、整数で
+    /// ない大きさの文書は引き伸ばして描く（resvg は右端の列を半分の被覆で描く）。照合はその文書に印を付ける（ADR-60）。
+    pub fn css_size(tree: &usvg::Tree) -> (f32, f32) {
+        (tree.size().width(), tree.size().height())
     }
 
     /// 描く（倍率 `scale`。大きさは幅・高さ × 倍率の切り上げ）。
@@ -242,8 +250,10 @@ impl Chrome {
         Ok(Chrome { exe, version })
     }
 
-    /// `svg` を `w × h` の大きさで描く（`work` は使い捨ての作業のフォルダ。並べて回すときは別々にする）。
-    pub fn render(&self, svg: &Path, w: u32, h: u32, work: &Path) -> Result<Rgba, String> {
+    /// `svg` を CSS の画素で `css_w × css_h`（小数のまま）に置いて撮り、左上の `w × h` を切り出す（`work` は使い捨ての
+    /// 作業のフォルダ。並べて回すときは別々にする）。返すのは絵と、撮るのにかかった回数（撮れない・時間切れは 1 度だけ
+    /// やり直す。並べて回すと、まれに Chrome が絵を書かずに終わるか止まる）。
+    pub fn render(&self, svg: &Path, w: u32, h: u32, css: (f32, f32), work: &Path) -> Result<(Rgba, u32), String> {
         std::fs::create_dir_all(work).map_err(|e| e.to_string())?;
         // Chrome に渡す URL は絶対の道で作る
         let work = work.canonicalize().map_err(|e| format!("{}: {e}", work.display()))?;
@@ -256,9 +266,11 @@ impl Chrome {
             format!(
                 "<!doctype html><html><head><meta charset=\"utf-8\"><style>html,body{{margin:0;padding:0;\
                  background:transparent;overflow:hidden}}img{{display:block;position:absolute;left:0;top:0}}</style>\
-                 </head><body><img src=\"{url}\" width=\"{w}\" height=\"{h}\" \
+                 </head><body><img src=\"{url}\" style=\"width:{cw}px;height:{ch}px\" \
                  onerror=\"this.style.display='none';document.documentElement.style.background='rgb(255,0,255)'\">\
-                 </body></html>"
+                 </body></html>",
+                cw = css.0,
+                ch = css.1
             ),
         )
         .map_err(|e| e.to_string())?;
@@ -266,42 +278,58 @@ impl Chrome {
         let _ = std::fs::remove_file(&shot);
         // 窓は切り出す領域より 1 画素ずつ大きくして、右下の画素を読めなかった印に使う
         let (ww, wh) = (w.saturating_add(1).max(800), h.saturating_add(1).max(600));
-        let mut child = Command::new(&self.exe)
-            .args([
-                "--headless",
-                "--disable-gpu",
-                "--hide-scrollbars",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--default-background-color=00000000",
-                "--force-device-scale-factor=1",
-                "--force-color-profile=srgb",
-                "--allow-file-access-from-files",
-            ])
-            .arg(format!("--user-data-dir={}", work.join("profile").display()))
-            .arg(format!("--window-size={ww},{wh}"))
-            .arg(format!("--screenshot={}", shot.display()))
-            .arg(file_url(&html))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Chrome を起動できない：{e}"))?;
-        let start = std::time::Instant::now();
-        loop {
-            if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+        let mut attempts = 0u32;
+        let mut timed_out = false;
+        for attempt in 0..2 {
+            attempts = attempt + 1;
+            timed_out = false;
+            if attempt > 0 {
+                let _ = std::fs::remove_dir_all(work.join("profile"));
+            }
+            let mut child = Command::new(&self.exe)
+                .args([
+                    "--headless",
+                    "--disable-gpu",
+                    "--hide-scrollbars",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--default-background-color=00000000",
+                    "--force-device-scale-factor=1",
+                    "--force-color-profile=srgb",
+                    "--allow-file-access-from-files",
+                ])
+                .arg(format!("--user-data-dir={}", work.join("profile").display()))
+                .arg(format!("--window-size={ww},{wh}"))
+                .arg(format!("--screenshot={}", shot.display()))
+                .arg(file_url(&html))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| format!("Chrome を起動できない：{e}"))?;
+            let start = std::time::Instant::now();
+            loop {
+                if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+                    break;
+                }
+                if start.elapsed() > CHROME_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if shot.exists() {
                 break;
             }
-            if start.elapsed() > CHROME_TIMEOUT {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("Chrome が {} 秒で終わらない", CHROME_TIMEOUT.as_secs()));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if timed_out {
+            return Err(format!("Chrome が {} 秒で終わらない（{attempts} 回）", CHROME_TIMEOUT.as_secs()));
         }
         if !shot.exists() {
-            return Err("Chrome が撮れなかった".into());
+            return Err(format!("Chrome が撮れなかった（{attempts} 回）"));
         }
         let full = image::read_png(&shot)?;
         if full.w < ww || full.h < wh {
@@ -311,7 +339,7 @@ impl Chrome {
         if full.px.get(corner..corner + 4) == Some(&LOAD_ERROR_MARK[..]) {
             return Err("Chrome が SVG を読めなかった（壊れた画像）".into());
         }
-        Ok(full.crop(w, h))
+        Ok((full.crop(w, h), attempts))
     }
 }
 
@@ -350,6 +378,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn m0_sizes_and_images_are_not_read() {
+        let resvg = Resvg::new(&Fonts::None);
+        let dir = crate::corpus::workspace_root().join("tests/svg/m0");
+        let mut got = Vec::new();
+        for n in ["no-size.svg", "rect.svg", "stroke-circle.svg", "viewbox-only.svg"] {
+            let t = resvg.tree(&std::fs::read(dir.join(n)).unwrap()).unwrap();
+            got.push((n, Resvg::size(&t)));
+        }
+        // 大きさのない文書は中身の外接矩形（ADR-58 (1)）
+        assert_eq!(
+            got,
+            [
+                ("no-size.svg", (50, 50)),
+                ("rect.svg", (64, 48)),
+                ("stroke-circle.svg", (64, 64)),
+                ("viewbox-only.svg", (30, 20))
+            ]
+        );
+        // Kura の設定は画像の参照を読まない（data: の PNG も描かない）
+        let png = {
+            let p = std::env::temp_dir().join(format!("sumie-1px-{}.png", std::process::id()));
+            crate::image::write_png(&p, &Rgba { w: 1, h: 1, px: vec![255, 0, 0, 255] }).unwrap();
+            let b = std::fs::read(&p).unwrap();
+            let _ = std::fs::remove_file(&p);
+            b
+        };
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"4\" height=\"4\"><image width=\"4\" height=\"4\" href=\"data:image/png;base64,{}\"/></svg>",
+            base64(&png)
+        );
+        let out = resvg.render(svg.as_bytes(), 1.0).unwrap();
+        assert!(out.img.px.iter().all(|&b| b == 0), "画像を描いた");
+        assert_eq!(file_url(Path::new("/a b/é.svg")), "file:///a%20b/%C3%A9.svg");
+    }
+
+    fn base64(b: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut s = String::new();
+        for c in b.chunks(3) {
+            let n = (u32::from(c[0]) << 16)
+                | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*c.get(2).unwrap_or(&0));
+            for k in 0..4 {
+                if k <= c.len() {
+                    s.push(T[((n >> (18 - 6 * k)) & 63) as usize] as char);
+                } else {
+                    s.push('=');
+                }
+            }
+        }
+        s
+    }
+
     /// Chrome が読めない SVG を誤りにする（Chrome のある macOS で手で回す：`cargo test -p sumie-tools -- --ignored chrome`）。
     #[test]
     #[ignore]
@@ -359,13 +441,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let bad = dir.join("bad.svg");
         std::fs::write(&bad, b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"40\"><rect").unwrap();
-        let e = chrome.render(&bad, 40, 40, &dir.join("w1")).unwrap_err();
+        let e = chrome.render(&bad, 40, 40, (40.0, 40.0), &dir.join("w1")).unwrap_err();
         assert!(e.contains("読めなかった"), "{e}");
         let good = dir.join("good.svg");
         std::fs::write(&good, b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"40\"><rect width=\"40\" height=\"40\" fill=\"#f0f\"/></svg>").unwrap();
         // 全面が印の色でも、切り出す領域の外の画素は透明なので誤りにしない
-        let img = chrome.render(&good, 40, 40, &dir.join("w2")).unwrap();
+        let (img, _) = chrome.render(&good, 40, 40, (40.0, 40.0), &dir.join("w2")).unwrap();
         assert_eq!(&img.px[0..4], &[255, 0, 255, 255]);
+        // 小数の大きさも撮れる（Chrome は <img> を画素の格子に合わせて引き伸ばすので、値は照合で印を付けて見る）
+        let half = dir.join("half.svg");
+        std::fs::write(&half, b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10.5\" height=\"4\"><rect width=\"10.5\" height=\"4\"/></svg>").unwrap();
+        let (img, _) = chrome.render(&half, 11, 4, (10.5, 4.0), &dir.join("w3")).unwrap();
+        assert_eq!((img.w, img.h), (11, 4));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
