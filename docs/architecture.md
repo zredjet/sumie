@@ -321,7 +321,8 @@ struct Frozen<T> { /* 数え終えた Vec<T>（取り直さない）と、数え
   倍々に伸ばし、新しい領域の大きさを先に `bytes` に足してから古い領域を返す（取り直しの間の両方が `peak` に入る）
 - 数える量は、頼んだ容量 × `size_of::<T>()`（`capacity()` は std の実装に依るので使わない）。`MVec`・`Frozen` に入れる型は
   すべて `#[repr(C)]` か基本の型にし、大きさを `cost` の定数と試験で照らす（D2 がツールチェーンで変わらないように）
-- 捨てるとき（`Drop`）に `bytes` から引く。`peak` は `bytes` の最大。確保に失敗したら `Limit`（resource は memory）
+- 捨てるとき（`Drop`）に `bytes` から引く。`peak` は `bytes` の最大。数えた量が上限を超えたら `Limit`（resource は `Memory`）、
+  確保器が断ったら `Limit`（resource は `Allocator`。環境に依るので約束の外。ADR-55）
 - 段を終えるとき、結果に残す `MVec` は `Frozen` にして `Budget` から切り離し、数えた量を `result_bytes`・`held_bytes` に入れる
   （容量と長さが違っても取り直さない）
 - `mem` の外では、std の中で数えずに確保する口を使わない（一覧は CLAUDE.md。`disallowed-methods`・`disallowed-types`・
