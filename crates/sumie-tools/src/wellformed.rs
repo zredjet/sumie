@@ -92,6 +92,16 @@ fn edge_cases() -> Vec<(&'static str, String)> {
         ("attlist-gt-in-quote", format!("<!DOCTYPE svg [<!ATTLIST svg a CDATA \"x>y\">]><svg {svg}/>")),
         ("entity-cdata-end-text", format!("<!DOCTYPE svg [<!ENTITY e \"]]>\">]><svg {svg}>&e;</svg>")),
         ("entity-cdata-end-attr", format!("<!DOCTYPE svg [<!ENTITY e \"]]>\">]><svg {svg} a=\"&e;\"/>")),
+        ("attlist-unbound-prefix", format!("<!DOCTYPE svg [<!ATTLIST svg foo:bar CDATA \"1\">]><svg {svg}/>")),
+        ("attlist-xlink-unbound", format!("<!DOCTYPE svg [<!ATTLIST svg xlink:type CDATA #FIXED \"simple\">]><svg {svg}/>")),
+        ("attlist-two-colons", format!("<!DOCTYPE svg [<!ATTLIST svg a:b:c CDATA \"1\">]><svg {svg}/>")),
+        ("attlist-xmlns-xml", format!("<!DOCTYPE svg [<!ATTLIST svg xmlns:xml CDATA \"urn:x\">]><svg {svg}/>")),
+        ("attlist-xmlns-xml-uri", "<!DOCTYPE svg [<!ATTLIST svg xmlns CDATA \"http://www.w3.org/XML/1998/namespace\">]><svg/>".to_string()),
+        ("attlist-overlap-uri", format!("<!DOCTYPE svg [<!ATTLIST svg b:x CDATA \"1\">]><svg {svg} xmlns:b=\"urn:x\" xmlns:c=\"urn:x\" c:x=\"2\"/>")),
+        ("attlist-xmlns-default", "<!DOCTYPE svg [<!ATTLIST svg xmlns CDATA #FIXED \"http://www.w3.org/2000/svg\">]><svg/>".to_string()),
+        ("element-xml-prefix", "<xml:svg/>".to_string()),
+        ("element-decl-quote", format!("<!DOCTYPE svg [<!ELEMENT svg \"]>\">]><svg {svg}/>")),
+        ("entity-predefined-redeclared", format!("<!DOCTYPE svg [<!ENTITY lt \"&#38;#60;\">]><svg {svg}>&lt;</svg>")),
     ]);
     v.push(("deep-1000", format!("<svg {svg}>{}{}</svg>", "<g>".repeat(1000), "</g>".repeat(1000))));
     v

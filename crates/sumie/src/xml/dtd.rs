@@ -53,6 +53,8 @@ pub(crate) struct AttDecl {
     pub(crate) has_default: u32,
     /// 宣言の順（同じ要素の同じ属性は最初のものを使う）
     pub(crate) order: u32,
+    /// 壊れた宣言（属性の名前の形・既定の値の参照。XML の段が DOCTYPE で確かめる）。ないものとして扱う
+    pub(crate) broken: u32,
 }
 
 impl Plain for AttDecl {}
@@ -162,8 +164,10 @@ pub(crate) fn parse_subset<'b>(b: &[u8], subset: Span, budget: &'b Budget<'b>) -
         } else if c.starts(k, b"<!ENTITY")? {
             let (e, next) = entity(&mut c, k, order)?;
             budget.spend(cost::OP_STEP)?;
-            out.push(e)?;
-            order = order.saturating_add(1);
+            if let Some(e) = e {
+                out.push(e)?;
+                order = order.saturating_add(1);
+            }
             k = next;
         } else if c.starts(k, b"<!ATTLIST")? {
             let mark = atts.len();
@@ -331,8 +335,9 @@ pub(crate) fn att_range(
     Ok((lo, hi.max(lo)))
 }
 
-/// `<!ENTITY`（`k` の位置）の宣言を読む。実体と、宣言の終わりのあとの位置。
-fn entity(c: &mut Cur<'_, '_>, k: usize, order: u32) -> Result<(Entity, usize), Error> {
+/// `<!ENTITY`（`k` の位置）の宣言を読む。実体と、宣言の終わりのあとの位置。定義済みの 5 つの名前（`lt` など）の宣言は、
+/// 値を見ずに飛ばす（定義済みの値が勝つ。XML 1.0 §4.6 が勧める `<!ENTITY lt "&#38;#60;">` も読める。roxmltree と同じ）。
+fn entity(c: &mut Cur<'_, '_>, k: usize, order: u32) -> Result<(Option<Entity>, usize), Error> {
     let mut t = c.skip_space(k.saturating_add(8))?;
     if t == k.saturating_add(8) {
         return Err(invalid(t));
@@ -342,6 +347,7 @@ fn entity(c: &mut Cur<'_, '_>, k: usize, order: u32) -> Result<(Entity, usize), 
     }
     let ne = c.name_end(t)?.ok_or_else(|| invalid(t))?;
     let name = Span::new(t, ne);
+    let predefined = matches!(name.of(c.b), b"lt" | b"gt" | b"amp" | b"apos" | b"quot");
     t = c.skip_space(ne)?;
     if t == ne {
         return Err(invalid(t));
@@ -360,7 +366,7 @@ fn entity(c: &mut Cur<'_, '_>, k: usize, order: u32) -> Result<(Entity, usize), 
         match c.at(ve)? {
             None => return Err(invalid(t)),
             Some(x) if x == q => break,
-            Some(b'<' | b'&' | b'%') => return Err(unsupported(Feature::MarkupEntity, k)),
+            Some(b'<' | b'&' | b'%') if !predefined => return Err(unsupported(Feature::MarkupEntity, k)),
             Some(_) => ve = ve.saturating_add(1),
         }
     }
@@ -368,7 +374,8 @@ fn entity(c: &mut Cur<'_, '_>, k: usize, order: u32) -> Result<(Entity, usize), 
     if c.at(close)? != Some(b'>') {
         return Err(invalid(close));
     }
-    Ok((Entity { name, value: Span::new(vs, ve), order, ..Entity::default() }, close.saturating_add(1)))
+    let e = (!predefined).then_some(Entity { name, value: Span::new(vs, ve), order, ..Entity::default() });
+    Ok((e, close.saturating_add(1)))
 }
 
 /// 名前で引く（並べた表。同じ名前は最初の宣言）。名前のバイトを比べる分（名前の長さ × 歩数）を払う（長い名前は

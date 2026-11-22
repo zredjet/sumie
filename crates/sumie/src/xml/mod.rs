@@ -224,7 +224,8 @@ pub(crate) fn prelude(b: &[u8], limits: &Limits, budget: &Budget<'_>, stage: Sta
 
 /// UTF-8 でないときの誤り：宣言が UTF-8 以外を名乗れば `Unsupported`、ほかは `Invalid`（FR-IN-02）。
 fn not_utf8(b: &[u8], bad: usize) -> Error {
-    let head = b.get(..b.len().min(200)).unwrap_or(&[]);
+    let body = b.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(b);
+    let head = body.get(..body.len().min(200)).unwrap_or(&[]);
     if head.starts_with(b"<?xml") {
         let end = (0..head.len()).find(|&k| head.get(k..).is_some_and(|r| r.starts_with(b"?>"))).unwrap_or(head.len());
         let decl = head.get(..end).unwrap_or(&[]);
@@ -297,7 +298,10 @@ struct RawAttr {
     ns: u8,
     /// ATTLIST で CDATA でない型と宣言した属性（値の空白を 1 つに揃える）
     tokens: u8,
-    pad: [u8; 2],
+    /// ATTLIST の既定の値で足した属性（値は DTD の中。展開の量は値の全部を数える）
+    from_decl: u8,
+    /// 既定の値で足した属性が名前空間の確かめで通らず、捨てた（roxmltree は ATTLIST を読まないので、断らない。NFR-10）
+    dropped: u8,
 }
 
 impl Plain for RawAttr {}
@@ -306,6 +310,11 @@ impl RawAttr {
     /// 値の揃え方。
     fn mode(&self) -> Mode {
         if self.tokens != 0 { Mode::Tokens } else { Mode::Attr }
+    }
+
+    /// 値のうち入力の量に入っているバイト数（既定の値は要素に書かれていないので 0）。
+    fn in_input(&self) -> u64 {
+        if self.from_decl != 0 { 0 } else { self.value.len() as u64 }
     }
 }
 
@@ -453,21 +462,28 @@ enum Mode {
 }
 
 impl<'a> Walk<'a, '_> {
-    /// `raw` を置き場に書く要るか（参照・改行の揃え・属性の空白の揃えがあるか）。
-    fn needs_store(&self, raw: Span, mode: Mode) -> bool {
+    /// `raw` を置き場に書く要るか（参照・改行の揃え・属性の空白の揃えがあるか）。読むバイトは塊ずつ払う。
+    fn needs_store(&self, raw: Span, mode: Mode) -> Result<bool, Error> {
         let s = raw.of(self.b);
-        if mode == Mode::Tokens
-            && (s.first() == Some(&b' ')
-                || s.last() == Some(&b' ')
-                || (1..s.len()).any(|k| s.get(k.saturating_sub(1)) == Some(&b' ') && s.get(k) == Some(&b' ')))
-        {
-            return true;
+        let mut meter = ScanMeter::new(0, s.len());
+        if mode == Mode::Tokens && (s.first() == Some(&b' ') || s.last() == Some(&b' ')) {
+            return Ok(true);
         }
-        s.iter().any(|&c| match mode {
-            Mode::Attr | Mode::Tokens => c == b'&' || c == b'\t' || c == b'\n' || c == b'\r',
-            Mode::Text => c == b'&' || c == b'\r',
-            Mode::CData => c == b'\r',
-        })
+        let mut prev = 0u8;
+        for (i, &c) in s.iter().enumerate() {
+            meter.pay(self.budget, i)?;
+            let hit = match mode {
+                Mode::Attr => c == b'&' || c == b'\t' || c == b'\n' || c == b'\r',
+                Mode::Tokens => c == b'&' || c == b'\t' || c == b'\n' || c == b'\r' || (c == b' ' && prev == b' '),
+                Mode::Text => c == b'&' || c == b'\r',
+                Mode::CData => c == b'\r',
+            };
+            if hit {
+                return Ok(true);
+            }
+            prev = c;
+        }
+        Ok(false)
     }
 
     /// `raw` を展開して `out` に書く（参照・改行・属性の空白。`Tokens` は空白も揃える）。
@@ -539,7 +555,9 @@ impl<'a> Walk<'a, '_> {
             // 値は u32 に入らなければ誤り。サロゲートと U+10FFFF を超える値は U+FFFD、ほかの文書の文字でない値は誤り
             // （roxmltree と同じ）
             let mut v: u32 = 0;
-            for &d in digits {
+            let mut meter = ScanMeter::new(0, digits.len());
+            for (i, &d) in digits.iter().enumerate() {
+                meter.pay(self.budget, i)?;
                 let x = match d {
                     b'0'..=b'9' => u32::from(d.saturating_sub(b'0')),
                     b'a'..=b'f' if radix == 16 => u32::from(d.saturating_sub(b'a')).saturating_add(10),
@@ -590,25 +608,33 @@ impl<'a> Walk<'a, '_> {
         Ok(())
     }
 
-    /// 属性の値を揃えた形で見る。揃える要がなければ入力のまま、要れば `scratch` に書く（増えた分は先に数えて上限と比べる）。
-    fn attr_value<'x>(&self, a: &RawAttr, scratch: &'x mut MVec<'_, u8>) -> Result<&'x [u8], Error>
+    /// 属性の値を揃えた形で見る。揃える要がなければ入力のまま、要れば `scratch` に書く。`count` なら展開で増えた分を
+    /// 数えて上限と比べる（属性に入れない xmlns の宣言。属性に入れるものは置き場に書くときに数える）。
+    fn attr_value<'x>(&self, a: &RawAttr, scratch: &'x mut MVec<'_, u8>, count: bool) -> Result<&'x [u8], Error>
     where
         'a: 'x,
     {
         let mode = a.mode();
-        if !self.needs_store(a.value, mode) {
+        let in_input = a.in_input();
+        if !self.needs_store(a.value, mode)? {
+            if count && in_input == 0 {
+                self.grow(a.value.len() as u64, 0)?;
+            }
             return Ok(a.value.of(self.b));
         }
-        let c = self.expanded_len(a.value, mode)?;
-        self.grow(c.bytes, a.value.len() as u64)?;
+        let c = self.expanded_len(a.value, mode, in_input)?;
+        if count {
+            self.grow(c.bytes, in_input)?;
+        }
         scratch.clear();
         self.expand(a.value, mode, &mut StoreOut { store: scratch })?;
         Ok(scratch.as_slice())
     }
 
-    /// 書き出す量（数える）。
-    fn expanded_len(&self, raw: Span, mode: Mode) -> Result<CountOut, Error> {
-        let base = (self.b.len() as u64).saturating_add(self.grown.get()).saturating_sub(raw.len() as u64);
+    /// 書き出す量（数える）。`in_input` は、展開する前の値のうち入力の量に入っているバイト数（要素に書いた値は値の
+    /// 長さ、ATTLIST の既定の値は 0）。
+    fn expanded_len(&self, raw: Span, mode: Mode, in_input: u64) -> Result<CountOut, Error> {
+        let base = (self.b.len() as u64).saturating_add(self.grown.get()).saturating_sub(in_input);
         let mut c = CountOut { limit: Some((base, self.expanded_limit, self.stage)), ..CountOut::new() };
         self.expand(raw, mode, &mut c)?;
         c.limit = None;
@@ -688,12 +714,23 @@ fn utf8(c: u32) -> ([u8; 4], usize) {
 }
 
 /// 名前 `q` を接頭辞と局所名に分ける。`:` が 2 つ以上・空の局所名は誤り。頭の `:` だけのもの（`:a`）は接頭辞のない
-/// 名前 `a` として受ける（roxmltree と同じ）。名前の手間は字句で払ってある。
-fn split_qname(b: &[u8], q: Span) -> Result<(Option<Span>, Span), Error> {
+/// 名前 `a` として受ける（roxmltree と同じ）。読むバイトは塊ずつ払う。
+fn split_qname(b: &[u8], q: Span, budget: &Budget<'_>) -> Result<(Option<Span>, Span), Error> {
     let s = q.of(b);
-    let Some(k) = s.iter().position(|&c| c == b':') else { return Ok((None, q)) };
+    let mut meter = ScanMeter::new(0, s.len());
+    let mut colon: Option<usize> = None;
+    for (i, &c) in s.iter().enumerate() {
+        meter.pay(budget, i)?;
+        if c == b':' {
+            if colon.is_some() {
+                return Err(xml_err(q.start as usize));
+            }
+            colon = Some(i);
+        }
+    }
+    let Some(k) = colon else { return Ok((None, q)) };
     let rest = s.get(k.saturating_add(1)..).unwrap_or(&[]);
-    if rest.is_empty() || rest.contains(&b':') {
+    if rest.is_empty() {
         return Err(xml_err(q.start as usize));
     }
     let start = q.start as usize;
@@ -753,21 +790,27 @@ fn walk<'b>(
                     shape_entities(b, budget, &mut table)?;
                     w.entities = table;
                     w.attlists = sub.attlists;
-                    // 既定の値の参照を確かめ、壊れた既定の値（知らない実体・文書の文字でない文字の参照）の宣言は当てない
-                    // （roxmltree は ATTLIST を読まずに受ける。NFR-10・ADR-66）
+                    // 既定の値の参照と名前を確かめ、壊れた宣言（知らない実体・文書の文字でない文字の参照・名前の形）は、
+                    // 宣言がないものとして当てない（同じ属性のあとの宣言が効く。roxmltree は ATTLIST を読まずに受ける。
+                    // NFR-10・ADR-66）。ここでは展開の上限で比べない（量は当てるときに数える）
                     for k in 0..w.attlists.len() {
+                        budget.spend(cost::OP_STEP)?;
                         let Some(&d) = w.attlists.get(k) else { continue };
-                        if d.has_default != 0 {
-                            match w.expanded_len(d.value, Mode::Attr) {
-                                Ok(_) => {}
-                                Err(Error::Invalid(_)) => {
-                                    if let Some(x) = w.attlists.get_mut(k) {
-                                        x.has_default = 0;
-                                        x.tokens = 0;
-                                    }
-                                }
+                        let name_ok = match split_qname(b, d.name, budget) {
+                            Ok(_) => true,
+                            Err(Error::Invalid(_)) => false,
+                            Err(e) => return Err(e),
+                        };
+                        let value_ok = d.has_default == 0
+                            || match w.expand(d.value, Mode::Attr, &mut CountOut::new()) {
+                                Ok(()) => true,
+                                Err(Error::Invalid(_)) => false,
                                 Err(e) => return Err(e),
-                            }
+                            };
+                        if !(name_ok && value_ok)
+                            && let Some(x) = w.attlists.get_mut(k)
+                        {
+                            x.broken = 1;
                         }
                     }
                 }
@@ -778,7 +821,17 @@ fn walk<'b>(
             }
             Event::Attr { pos, name, value } => {
                 let order = raw.len() as u32;
-                raw.push(RawAttr { name, value, pos, order, local: name, ns: NS_NONE, tokens: 0, pad: [0; 2] })?;
+                raw.push(RawAttr {
+                    name,
+                    value,
+                    pos,
+                    order,
+                    local: name,
+                    ns: NS_NONE,
+                    tokens: 0,
+                    from_decl: 0,
+                    dropped: 0,
+                })?;
             }
             Event::StartEnd { empty } => {
                 let Some((qname, pos)) = pending.take() else { return Err(xml_err(lex.pos())) };
@@ -794,10 +847,11 @@ fn walk<'b>(
                 apply_attlists(&w, qname, &mut raw)?;
                 let mark = bindings.len() as u32;
                 let mut default_bound = false;
-                // 名前空間の宣言を束ねる
+                // 名前空間の宣言を束ねる（既定の値で足した属性の名前は、DOCTYPE で確かめてある）
                 for k in 0..raw.len() {
+                    budget.spend(cost::OP_STEP)?;
                     let Some(&a) = raw.get(k) else { continue };
-                    let (prefix, local) = split_qname(b, a.name)?;
+                    let (prefix, local) = split_qname(b, a.name, budget)?;
                     // `xmlns`（頭の `:` だけの `:xmlns` も。roxmltree と同じ）は既定の名前空間の宣言
                     let decl_prefix = if prefix.is_none() && local.of(b) == b"xmlns" {
                         Some(Span::new(a.name.end as usize, a.name.end as usize))
@@ -807,11 +861,19 @@ fn walk<'b>(
                         None
                     };
                     let Some(p) = decl_prefix else { continue };
-                    let u = w.attr_value(&a, &mut uri)?;
+                    let u = w.attr_value(&a, &mut uri, true)?;
                     let pb = p.of(b);
-                    // XMLNS の名前空間は宣言できない。xml は XML の名前空間にだけ、XML の名前空間は xml にだけ束ねる
+                    // XMLNS の名前空間は宣言できない。xml は XML の名前空間にだけ、XML の名前空間は xml にだけ束ねる。
+                    // 既定の値で足した宣言なら、その宣言だけを捨てる
                     if u == URI_XMLNS || ((pb == b"xml") != (u == URI_XML)) {
-                        return Err(xml_err(a.pos as usize));
+                        if a.from_decl == 0 {
+                            return Err(xml_err(a.pos as usize));
+                        }
+                        if let Some(r) = raw.get_mut(k) {
+                            r.dropped = 1;
+                            r.ns = NS_XMLNS;
+                        }
+                        continue;
                     }
                     // 宣言の局所名は接頭辞（既定の名前空間なら空）
                     if let Some(r) = raw.get_mut(k) {
@@ -853,30 +915,42 @@ fn walk<'b>(
                     Ok(if prefix.is_none() { Some(NS_NONE) } else { None })
                 };
                 // 要素の名前空間
-                let (eprefix, elocal) = split_qname(b, qname)?;
+                let (eprefix, elocal) = split_qname(b, qname, budget)?;
                 let Some(ens) = resolve(eprefix, true, &bindings)? else { return Err(xml_err(pos as usize)) };
-                // 属性の名前空間
+                // 属性の名前空間（既定の値で足した属性の接頭辞が束ねていなければ、その属性だけを捨てる）
                 for k in 0..raw.len() {
+                    budget.spend(cost::OP_STEP)?;
                     let Some(&a) = raw.get(k) else { continue };
                     if a.ns == NS_XMLNS {
                         continue;
                     }
-                    let (prefix, local) = split_qname(b, a.name)?;
-                    let Some(ns) = resolve(prefix, false, &bindings)? else { return Err(xml_err(a.pos as usize)) };
+                    let (prefix, local) = split_qname(b, a.name, budget)?;
+                    let ns = resolve(prefix, false, &bindings)?;
                     if let Some(r) = raw.get_mut(k) {
-                        r.ns = ns;
-                        r.local = local;
+                        match ns {
+                            Some(ns) => {
+                                r.ns = ns;
+                                r.local = local;
+                            }
+                            None if a.from_decl != 0 => {
+                                r.dropped = 1;
+                                r.ns = NS_XMLNS;
+                            }
+                            None => return Err(xml_err(a.pos as usize)),
+                        }
                     }
                 }
-                // 属性の重なり（名前空間と局所名で並べて隣を比べる。名前を比べる分を前払いする）
+                // 属性の重なり（名前空間と局所名で並べて隣を比べる。名前を比べる分を前払いする。既定の値で足した属性が
+                // 重なれば、その属性を捨てる）
                 check_duplicates(b, &mut raw, budget)?;
                 // xml:space（揃えたあとの値で見る。`preserve`・`default` のほかの値は無いものとして親から受け継ぐ）
                 let parent = open.last().copied();
                 let mut preserve = parent.is_some_and(|p| p.preserve);
                 for k in 0..raw.len() {
+                    budget.spend(cost::OP_STEP)?;
                     let Some(&a) = raw.get(k) else { continue };
-                    if a.ns == NS_XML && a.local.of(b) == b"space" {
-                        match w.attr_value(&a, &mut uri)? {
+                    if a.dropped == 0 && a.ns == NS_XML && a.local.of(b) == b"space" {
+                        match w.attr_value(&a, &mut uri, false)? {
                             b"preserve" => preserve = true,
                             b"default" => preserve = false,
                             _ => {}
@@ -891,8 +965,9 @@ fn walk<'b>(
                 }
                 let attrs_start = sink.attrs_len();
                 for k in 0..raw.len() {
+                    budget.spend(cost::OP_STEP)?;
                     let Some(&a) = raw.get(k) else { continue };
-                    if a.ns == NS_XMLNS {
+                    if a.ns == NS_XMLNS || a.dropped != 0 {
                         continue;
                     }
                     sink.attr(&w, &a)?;
@@ -908,8 +983,8 @@ fn walk<'b>(
                 let Some(o) = open.pop() else { return Err(xml_err(pos as usize)) };
                 budget.spend_large(cost::copy(name.len() as u64).saturating_add(1))?;
                 // 接頭辞と局所名で比べる（`</:svg>` は `<svg>` を閉じる。roxmltree と同じ）
-                let (op, ol) = split_qname(b, o.name)?;
-                let (ep, el) = split_qname(b, name)?;
+                let (op, ol) = split_qname(b, o.name, budget)?;
+                let (ep, el) = split_qname(b, name, budget)?;
                 let pre = |p: Option<Span>| p.map_or(&[][..], |p| p.of(b));
                 if pre(op) != pre(ep) || ol.of(b) != el.of(b) {
                     return Err(xml_err(pos as usize));
@@ -950,6 +1025,9 @@ fn apply_attlists(w: &Walk<'_, '_>, qname: Span, raw: &mut MVec<'_, RawAttr>) ->
     let mut last: Option<Span> = None;
     for k in lo..hi {
         let Some(&d) = w.attlists.get(k) else { continue };
+        if d.broken != 0 {
+            continue;
+        }
         let name = d.name.of(b);
         w.budget.spend_large(cost::copy(name.len() as u64).saturating_add(1))?;
         if last.is_some_and(|l| l.of(b) == name) {
@@ -977,7 +1055,8 @@ fn apply_attlists(w: &Walk<'_, '_>, qname: Span, raw: &mut MVec<'_, RawAttr>) ->
                 local: d.name,
                 ns: NS_NONE,
                 tokens: u8::from(d.tokens != 0),
-                pad: [0; 2],
+                from_decl: 1,
+                dropped: 0,
             })?;
         }
     }
@@ -997,15 +1076,47 @@ fn check_duplicates(b: &[u8], raw: &mut MVec<'_, RawAttr>, budget: &Budget<'_>) 
         raw.as_slice().iter().fold(0u64, |s, a| s.saturating_add((key(a).1.len() as u64).saturating_add(1)));
     budget.spend_large(cost::scan(names).saturating_mul(cost::ceil_log2(n).saturating_add(1)))?;
     stable_sort(budget, raw.as_mut_slice(), |x, y| key(x) < key(y))?;
-    let s = raw.as_slice();
-    for k in 1..s.len() {
-        // 既定の名前空間の宣言（`xmlns`）の重なりは受ける（最初のものを使う）
-        if let (Some(x), Some(y)) = (s.get(k.saturating_sub(1)), s.get(k))
-            && key(x) == key(y)
-            && !(x.ns == NS_XMLNS && x.local.len() == 0)
-        {
-            return Err(xml_err(y.pos as usize));
+    // 同じ鍵の並びごとに：書いた属性が 2 つあれば誤り。既定の値で足した属性は、書いた属性があれば捨て、なければ最初の
+    // ものだけを残す（並べ替えは安定なので、並びの中は書いた順）。既定の名前空間の宣言（`xmlns`）の重なりは受ける
+    // （束ねるのは最初のもの）。捨てた属性は比べない
+    let len = raw.len();
+    let mut i = 0usize;
+    while i < len {
+        budget.spend(cost::OP_STEP)?;
+        let Some(&first) = raw.get(i) else { break };
+        let mut j = i.saturating_add(1);
+        while j < len && raw.get(j).is_some_and(|y| key(y) == key(&first)) {
+            budget.spend(cost::OP_STEP)?;
+            j = j.saturating_add(1);
         }
+        if first.ns != NS_XMLNS || first.local.len() != 0 {
+            let mut written = 0u32;
+            let mut kept_default = false;
+            for k in i..j {
+                let Some(&a) = raw.get(k) else { continue };
+                if a.dropped != 0 {
+                    continue;
+                }
+                if a.from_decl == 0 {
+                    written = written.saturating_add(1);
+                    if written > 1 {
+                        return Err(xml_err(a.pos as usize));
+                    }
+                }
+            }
+            for k in i..j {
+                let Some(a) = raw.get_mut(k) else { continue };
+                if a.dropped != 0 || a.from_decl == 0 {
+                    continue;
+                }
+                if written > 0 || kept_default {
+                    a.dropped = 1;
+                } else {
+                    kept_default = true;
+                }
+            }
+        }
+        i = j;
     }
     // 元の順に戻す（作る段は属性を書いた順に持つ）
     stable_sort(budget, raw.as_mut_slice(), |x, y| x.order < y.order)?;
@@ -1025,12 +1136,15 @@ struct CountSink {
 }
 
 impl CountSink {
-    fn store_value(&mut self, w: &Walk<'_, '_>, raw: Span, mode: Mode) -> Result<(), Error> {
-        if w.needs_store(raw, mode) {
-            let c = w.expanded_len(raw, mode)?;
-            w.grow(c.bytes, raw.len() as u64)?;
+    /// 値を数える。`in_input` は値のうち入力の量に入っているバイト数（既定の値は 0 で、借りる値も展開の量に数える）。
+    fn store_value(&mut self, w: &Walk<'_, '_>, raw: Span, mode: Mode, in_input: u64) -> Result<(), Error> {
+        if w.needs_store(raw, mode)? {
+            let c = w.expanded_len(raw, mode, in_input)?;
+            w.grow(c.bytes, in_input)?;
             self.store = self.store.saturating_add(c.bytes);
             self.write_work = self.write_work.saturating_add(c.work);
+        } else {
+            w.grow(raw.len() as u64, in_input)?;
         }
         Ok(())
     }
@@ -1048,7 +1162,7 @@ impl Sink for CountSink {
     fn attr(&mut self, w: &Walk<'_, '_>, a: &RawAttr) -> Result<(), Error> {
         self.attrs = self.attrs.saturating_add(1);
         self.write_work = self.write_work.saturating_add(cost::append(0, u64::MAX, 1, size_of::<Attr>() as u64).0);
-        self.store_value(w, a.value, a.mode())
+        self.store_value(w, a.value, a.mode(), a.in_input())
     }
 
     fn element_done(&mut self, _node: u32, _attrs_start: u64) -> Result<(), Error> {
@@ -1059,7 +1173,7 @@ impl Sink for CountSink {
         let id = self.nodes;
         self.nodes = self.nodes.saturating_add(1);
         self.write_work = self.write_work.saturating_add(cost::append(0, u64::MAX, 1, size_of::<Node>() as u64).0);
-        self.store_value(w, raw, if cdata { Mode::CData } else { Mode::Text })?;
+        self.store_value(w, raw, if cdata { Mode::CData } else { Mode::Text }, raw.len() as u64)?;
         Ok(u32::try_from(id).unwrap_or(NONE))
     }
 
@@ -1078,16 +1192,16 @@ struct BuildSink<'b> {
 }
 
 impl BuildSink<'_> {
-    /// 値を置き場に書くか借りるか。範囲と印。
-    fn value(&mut self, w: &Walk<'_, '_>, raw: Span, mode: Mode) -> Result<(Span, u8), Error> {
-        if !w.needs_store(raw, mode) {
+    /// 値を置き場に書くか借りるか。範囲と印。増えた分は数える段と同じに足す（数える段で上限の内と確かめてある）。
+    fn value(&mut self, w: &Walk<'_, '_>, raw: Span, mode: Mode, in_input: u64) -> Result<(Span, u8), Error> {
+        if !w.needs_store(raw, mode)? {
+            w.grow(raw.len() as u64, in_input)?;
             return Ok((raw, 0));
         }
         let start = self.store.len();
         w.expand(raw, mode, &mut StoreOut { store: &mut self.store })?;
         let end = self.store.len();
-        // 数える段と同じに増えた分を足す（数える段で上限の内と確かめてある）
-        w.grow(end.saturating_sub(start) as u64, raw.len() as u64)?;
+        w.grow(end.saturating_sub(start) as u64, in_input)?;
         Ok((Span::new(start, end), FLAG_IN_STORE))
     }
 }
@@ -1112,7 +1226,7 @@ impl Sink for BuildSink<'_> {
     }
 
     fn attr(&mut self, w: &Walk<'_, '_>, a: &RawAttr) -> Result<(), Error> {
-        let (v, flags) = self.value(w, a.value, a.mode())?;
+        let (v, flags) = self.value(w, a.value, a.mode(), a.in_input())?;
         self.attrs.push(Attr { ns: a.ns, flags, pad: [0; 2], local: a.local, value: v, pos: a.pos })
     }
 
@@ -1125,7 +1239,7 @@ impl Sink for BuildSink<'_> {
     }
 
     fn text(&mut self, w: &Walk<'_, '_>, raw: Span, cdata: bool, parent: u32, preserve: bool) -> Result<u32, Error> {
-        let (t, mut flags) = self.value(w, raw, if cdata { Mode::CData } else { Mode::Text })?;
+        let (t, mut flags) = self.value(w, raw, if cdata { Mode::CData } else { Mode::Text }, raw.len() as u64)?;
         if preserve {
             flags |= FLAG_PRESERVE;
         }
@@ -1174,6 +1288,14 @@ pub(crate) fn count(b: &[u8], limits: &Limits, budget: &Budget<'_>, stage: Stage
     let mut sink = CountSink::default();
     let grown = walk(b, start, limits, budget_ref(budget), &mut sink, stage)?;
     let expanded = (b.len() as u64).saturating_add(grown);
+    // 節・属性の番号は u32 で持つ（置き場は展開の上限で u32 の内）
+    let most = u64::from(u32::MAX).saturating_sub(1);
+    if sink.nodes > most {
+        return Err(Error::limit(Resource::Nodes, sink.nodes, most, stage));
+    }
+    if sink.attrs > most {
+        return Err(Error::limit(Resource::Memory, sink.attrs, most, stage));
+    }
     Ok(XmlCounts {
         nodes: sink.nodes,
         attrs: sink.attrs,

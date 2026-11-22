@@ -551,9 +551,11 @@ fn attlist_defaults_are_applied() {
     ] {
         assert_eq!(attr(broken, 1, b"fill"), None, "{broken}");
     }
-    // 既定の値で足した属性も重なりを確かめる（同じ URI の別の接頭辞）
+    // 既定の値で足した属性が、書いた属性と同じ URI の別の接頭辞で重なれば、既定の値を捨てる（断らない）
     let src = "<!DOCTYPE svg [<!ATTLIST svg b:x CDATA \"1\">]><svg xmlns:a=\"urn:x\" xmlns:b=\"http://www.w3.org/1999/xlink\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" xlink:x=\"2\"/>";
-    assert_eq!(reason(parse(src)), Some(InvalidReason::Xml));
+    let doc = parse(src).unwrap();
+    let vals: Vec<&[u8]> = doc.attrs_of(doc.node(0).unwrap()).iter().map(|a| doc.value(src.as_bytes(), a)).collect();
+    assert_eq!(vals, [b"2".as_slice()]);
     // 既定の値の展開も展開の上限で数える
     let a = "x".repeat(1 << 20);
     let src = format!(
@@ -562,6 +564,83 @@ fn attlist_defaults_are_applied() {
     );
     match xml_parse_with(src.as_bytes(), &Limits::DEFAULT).error {
         Some(Error::Limit(l)) => assert_eq!(l.resource, Resource::Expanded),
+        e => panic!("{e:?}"),
+    }
+}
+
+/// 既定の値で足した属性が名前空間の確かめで通らなければ、その属性だけを捨てる（roxmltree は読む。NFR-10）。
+/// 壊れた宣言はないものとして、同じ属性のあとの宣言が効く。
+#[test]
+fn attlist_defaults_never_reject() {
+    let names = |src: &str| -> Vec<String> {
+        let doc = parse(src).unwrap();
+        let b = src.as_bytes();
+        doc.attrs_of(doc.node(0).unwrap()).iter().map(|a| String::from_utf8_lossy(a.local.of(b)).to_string()).collect()
+    };
+    for (decl, want) in [
+        ("<!ATTLIST svg foo:bar CDATA \"1\">", vec![]),
+        ("<!ATTLIST svg xlink:type CDATA #FIXED \"simple\">", vec![]),
+        ("<!ATTLIST svg a:b:c CDATA \"1\">", vec![]),
+        ("<!ATTLIST svg xmlns:xml CDATA \"urn:x\">", vec![]),
+        ("<!ATTLIST svg xmlns CDATA \"http://www.w3.org/XML/1998/namespace\">", vec![]),
+        ("<!ATTLIST svg a CDATA \"&nope;\"><!ATTLIST svg a CDATA \"x\">", vec!["a".to_string()]),
+    ] {
+        let src = format!("<!DOCTYPE svg [{decl}]><svg/>");
+        assert_eq!(names(&src), want, "{decl}");
+    }
+    let src = "<!DOCTYPE svg [<!ATTLIST svg a CDATA \"&nope;\"><!ATTLIST svg a CDATA \"x\">]><svg/>";
+    let doc = parse(src).unwrap();
+    assert_eq!(doc.attr(src.as_bytes(), doc.node(0).unwrap(), NS_NONE, b"a"), Some(b"x".as_slice()));
+}
+
+/// 既定の値は要素に書かれていないので、値の全部を展開の量に数える（借りる値も）。1 つの大きな既定の値は、当てる要素が
+/// なければ断らない。
+#[test]
+fn attlist_defaults_count_toward_expansion() {
+    let big = "x".repeat(1 << 20);
+    for tail in ["\t", ""] {
+        let src =
+            format!("<!DOCTYPE svg [<!ATTLIST g v CDATA \"{big}{tail}\">]><svg {SVG}>{}</svg>", "<g/>".repeat(200));
+        match xml_parse_with(src.as_bytes(), &Limits::DEFAULT).error {
+            Some(Error::Limit(l)) => assert_eq!(l.resource, Resource::Expanded, "{tail:?}"),
+            e => panic!("{tail:?}: {e:?}"),
+        }
+    }
+    let huge = "y".repeat(40 << 20);
+    let src = format!("<!DOCTYPE svg [<!ATTLIST g v CDATA \"{huge}\">]><svg {SVG}/>");
+    let limits = Limits { input_bytes: 64 << 20, expanded_bytes: 48 << 20, ..Limits::DEFAULT };
+    assert!(xml_parse_with(src.as_bytes(), &limits).error.is_none());
+    // xml:space の展開は 1 回だけ数える
+    let src = format!("<!DOCTYPE svg [<!ENTITY p \"preserve\">]><svg {SVG} xml:space=\"&p;\"/>");
+    let (_, counts) = parse_with(src.as_bytes(), &Limits::DEFAULT).unwrap();
+    assert_eq!(counts.expanded, src.len() as u64 + 5);
+}
+
+/// 長い値・名前を読み直す所（置き場に書く要るか・名前の分け・文字の参照の桁）も払う。
+#[test]
+fn rescans_are_paid() {
+    let v = "a".repeat(1 << 20);
+    let src = format!("<svg {SVG} v=\"{v}\"/>");
+    let o = xml_parse_with(src.as_bytes(), &Limits::DEFAULT);
+    // 前置き・字句・置き場に書く要るかの 3 回
+    assert!(o.count_work >= 3 * (1 << 20), "{}", o.count_work);
+    let zeros = "0".repeat(1 << 20);
+    let src = format!("<svg {SVG}>&#{zeros}65;</svg>");
+    let o = xml_parse_with(src.as_bytes(), &Limits::DEFAULT);
+    assert!(o.error.is_none());
+    assert!(o.count_work >= 3 * (1 << 20), "{}", o.count_work);
+}
+
+/// 定義済みの実体の宣言し直しは値を見ずに飛ばす・BOM と UTF-8 でない符号化の宣言は Unsupported。
+#[test]
+fn predefined_entities_and_declared_encoding() {
+    let src = format!("<!DOCTYPE svg [<!ENTITY lt \"&#38;#60;\"><!ENTITY amp \"x\">]><svg {SVG}>&lt;&amp;</svg>");
+    let doc = parse(&src).unwrap();
+    assert_eq!(doc.text(src.as_bytes(), doc.node(1).unwrap()), b"<&");
+    let mut bad = b"\xEF\xBB\xBF<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><svg>\xE9</svg>".to_vec();
+    bad.push(b' ');
+    match xml_parse_with(&bad, &Limits::DEFAULT).error {
+        Some(Error::Unsupported(u)) => assert_eq!(u.feature, Feature::Encoding),
         e => panic!("{e:?}"),
     }
 }
