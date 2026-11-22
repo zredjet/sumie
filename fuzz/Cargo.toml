@@ -1,0 +1,31 @@
+# sumie のファズの対象（cargo-fuzz。nightly で回す。fuzz/README.md）。
+# 根の workspace には入れない（nightly の依存を通常のビルドに混ぜない）。
+[package]
+name = "sumie-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+sumie = { path = "../crates/sumie" }
+
+[workspace]
+
+[[bin]]
+name = "mem_ops"
+path = "fuzz_targets/mem_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "math_ops"
+path = "fuzz_targets/math_ops.rs"
+test = false
+doc = false
+bench = false
