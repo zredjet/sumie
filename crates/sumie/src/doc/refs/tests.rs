@@ -123,7 +123,8 @@ fn switch_and_conditions() {
         r##"<switch><desc id="d"/><rect id="fr" systemLanguage="fr"/><rect id="en" systemLanguage="de, en-US"/><rect id="late"/></switch>
         <rect id="ext" requiredExtensions=""/><g id="g" systemLanguage="ja"><rect id="inner"/></g><rect id="feat" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Shape"/>"##,
     );
-    assert_eq!(hidden, ["fr", "late", "ext", "g", "inner"]);
+    // 印は自分のものだけ（g の中の inner は、たどる側が g から受け継ぐ）
+    assert_eq!(hidden, ["fr", "late", "ext", "g"]);
 }
 
 /// switch は foreignObject を選ばない（draw.io の書き出しの代わりの中身。ADR-78 (6)）。
@@ -134,4 +135,62 @@ fn switch_skips_foreign_object() {
     );
     assert!(!hidden.contains(&"t".to_string()), "{hidden:?}");
     assert!(hidden.contains(&"r".to_string()), "{hidden:?}");
+}
+
+/// 受け継がない参照（clip-path・mask・filter）の `inherit` は親の辺を写す（輪を見落とさず、展開を数え漏らさない。文書の
+/// 1 回目のレビュー）。
+#[test]
+fn inherit_of_non_inherited_references() {
+    let (edges, _, _, cycles) =
+        run(r##"<g id="g" clip-path="url(#c)"><clipPath id="c" clip-path="inherit"><rect/></clipPath></g>"##);
+    let get = |id: &str| edges.iter().find(|(i, _)| i == id).map(|(_, e)| e.clone()).unwrap_or_default();
+    assert_eq!(get("c"), [("c".into(), EDGE_CLIP, true)]);
+    assert_eq!(cycles, 1);
+    let (_, _, _, cycles) = run(r##"<g filter="url(#f)"><filter id="f" filter="inherit"/></g>"##);
+    assert_eq!(cycles, 1);
+    let rects: String = (0..100).map(|_| "<rect/>").collect();
+    let mask = format!("<defs><mask id=\"m\">{rects}</mask></defs>");
+    let (_, _, plain, _) = run(&format!("{mask}<g mask=\"url(#m)\"><g><g/></g></g>"));
+    let (_, _, inherited, _) =
+        run(&format!("{mask}<g mask=\"url(#m)\"><g mask=\"inherit\"><g mask=\"inherit\"/></g></g>"));
+    assert!(inherited >= plain + 200, "{plain} → {inherited}");
+}
+
+/// 種類の合わない参照先（塗りに g、clip-path に rect、グラデーションの href に pattern など）は辺にせず、輪にしない
+/// （文書の 1 回目のレビュー。ADR-78 (8)）。
+#[test]
+fn wrong_kind_targets_make_no_edges() {
+    for body in [
+        r##"<g id="x"><use id="u1" href="#top"/></g><g id="top"><rect fill="url(#x) red"/></g>"##,
+        r##"<g id="g"><rect fill="url(#g)"/></g>"##,
+        r##"<g id="g"><rect clip-path="url(#g)" mask="url(#g)" filter="url(#g)"/></g>"##,
+        r##"<g id="g"><path d="M0 0" marker-start="url(#g)"/></g>"##,
+        r##"<pattern id="p"><linearGradient id="l" href="#p"/><rect fill="url(#l)"/></pattern>"##,
+    ] {
+        let (_, _, _, cycles) = run(body);
+        assert_eq!(cycles, 0, "{body}");
+    }
+    // 種類が合えば今までどおり輪
+    let (_, _, _, cycles) = run(r##"<pattern id="p"><rect fill="url(#p)"/></pattern>"##);
+    assert_eq!(cycles, 1);
+}
+
+/// 子の辺で戻る輪を 1 度の歩きでまとめて取り除く（参照の辺を取り除いたら、その段から上を巻き戻す）。手間は輪の数に
+/// おおよそ比例する（直す前は 4,000 個で 2.4 億単位・12,000 個で手間の上限。文書の 1 回目のレビュー）。
+#[test]
+fn many_child_edge_cycles_in_one_pass() {
+    let work = |k: usize| {
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><use href=\"#c\"/><g id=\"top\"><g id=\"c\">{}</g></g></svg>",
+            "<use href=\"#top\"/>".repeat(k)
+        );
+        let e = crate::doc::estimate_parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+        let d = crate::doc::parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+        let cycles = d.report().warnings().filter(|w| w.kind == crate::report::WarningKind::ReferenceCycle).count();
+        (e.work, cycles)
+    };
+    let (a, ca) = work(2_000);
+    let (b, cb) = work(4_000);
+    assert_eq!((ca, cb), (2_000, 4_000));
+    assert!(b < a * 3, "{a} → {b}");
 }

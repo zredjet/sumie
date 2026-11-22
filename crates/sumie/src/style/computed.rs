@@ -133,14 +133,21 @@ pub(crate) struct Computed {
     /// 行の高さ（px。`lh_number` なら `lh_factor` × 文字の大きさで、子は子の文字の大きさで求め直す）
     pub(crate) line_height: f64,
     pub(crate) lh_factor: f64,
+    /// `stroke-width` の割合（`sw_is_pct` のとき。計算した値は割合のまま受け継ぎ、使う要素の表示の領域で解く）
+    pub(crate) sw_pct: f64,
     /// 要素の変形（`transform-origin` を含む。受け継がない）
     pub(crate) transform: Transform,
+    /// `transform` の計算した値の行列（原点を掛ける前。`transform: inherit` が受け継ぐ）
+    pub(crate) transform_raw: Transform,
     pub(crate) visibility: u8,
     pub(crate) display_none: u8,
     /// 変形が解けた（0 なら外接矩形が要る：木を作る段で解く）
     pub(crate) transform_known: u8,
     pub(crate) lh_number: u8,
-    pub(crate) pad: [u8; 4],
+    pub(crate) sw_is_pct: u8,
+    /// `transform-box` が view-box（初期の値。ほかは外接矩形が要る）
+    pub(crate) box_vb: u8,
+    pub(crate) pad: [u8; 2],
 }
 
 impl Plain for Computed {}
@@ -162,12 +169,16 @@ impl Computed {
             font_size,
             line_height: NORMAL_LINE * font_size,
             lh_factor: NORMAL_LINE,
+            sw_pct: 0.0,
             transform: Transform::IDENTITY,
+            transform_raw: Transform::IDENTITY,
             visibility: VISIBLE,
             display_none: 0,
             transform_known: 1,
             lh_number: 1,
-            pad: [0; 4],
+            sw_is_pct: 0,
+            box_vb: 1,
+            pad: [0; 2],
         }
     }
 }
@@ -210,6 +221,66 @@ impl PropIds {
             visibility: lookup(b"visibility", false),
         }
     }
+}
+
+/// 要素の指定の値のうち、計算に使うもの（並びを 1 度だけ流して拾う。払いながら。文書の 1 回目のレビュー）。
+#[derive(Debug, Clone, Copy, Default)]
+struct Picked {
+    color: Option<Specified>,
+    display: Option<Specified>,
+    fill: Option<Specified>,
+    fill_opacity: Option<Specified>,
+    font_size: Option<Specified>,
+    line_height: Option<Specified>,
+    opacity: Option<Specified>,
+    stroke: Option<Specified>,
+    stroke_opacity: Option<Specified>,
+    stroke_width: Option<Specified>,
+    transform: Option<Specified>,
+    transform_box: Option<Specified>,
+    transform_origin: Option<Specified>,
+    visibility: Option<Specified>,
+}
+
+fn pick(specs: &[Specified], ids: &PropIds, budget: &Budget<'_>) -> Result<Picked, Error> {
+    let mut p = Picked::default();
+    for &sp in specs {
+        budget.spend(cost::OP_STEP)?;
+        let id = Some(sp.prop);
+        let slot = if id == ids.color {
+            &mut p.color
+        } else if id == ids.display {
+            &mut p.display
+        } else if id == ids.fill {
+            &mut p.fill
+        } else if id == ids.fill_opacity {
+            &mut p.fill_opacity
+        } else if id == ids.font_size {
+            &mut p.font_size
+        } else if id == ids.line_height {
+            &mut p.line_height
+        } else if id == ids.opacity {
+            &mut p.opacity
+        } else if id == ids.stroke {
+            &mut p.stroke
+        } else if id == ids.stroke_opacity {
+            &mut p.stroke_opacity
+        } else if id == ids.stroke_width {
+            &mut p.stroke_width
+        } else if id == ids.transform {
+            &mut p.transform
+        } else if id == ids.transform_box {
+            &mut p.transform_box
+        } else if id == ids.transform_origin {
+            &mut p.transform_origin
+        } else if id == ids.visibility {
+            &mut p.visibility
+        } else {
+            continue;
+        };
+        *slot = Some(sp);
+    }
+    Ok(p)
 }
 
 /// 指定の値の置き場（入力・XML の置き場・CSS の置き場）。
@@ -308,10 +379,12 @@ pub(crate) fn compute(
         opacity: initial.opacity,
         display_none: initial.display_none,
         transform: initial.transform,
+        transform_raw: initial.transform_raw,
         transform_known: initial.transform_known,
+        box_vb: initial.box_vb,
         ..*parent
     };
-    let find = |id: Option<PropertyId>| id.and_then(|id| specs.iter().find(|s| s.prop == id));
+    let p = pick(specs, ids, budget)?;
     // 全体の言葉：Some(true) は親の値、Some(false) は初期の値、None は値を読む
     let wide = |s: &Specified| -> Option<bool> {
         let inherited = PROPS.get(usize::from(s.prop)).is_some_and(|p| p.inherited);
@@ -324,7 +397,7 @@ pub(crate) fn compute(
         }
     };
     // 文字の大きさと行の高さ（ほかの長さが使うので先に）
-    if let Some(s) = find(ids.font_size) {
+    if let Some(s) = p.font_size.as_ref() {
         budget.spend(cost::OP_STEP)?;
         c.font_size = match wide(s) {
             Some(true) => parent.font_size,
@@ -332,7 +405,7 @@ pub(crate) fn compute(
             None => font_size(s, parent, bufs, base, budget)?.unwrap_or(parent.font_size),
         };
     }
-    if let Some(s) = find(ids.line_height) {
+    if let Some(s) = p.line_height.as_ref() {
         budget.spend(cost::OP_STEP)?;
         match wide(s) {
             Some(true) => {
@@ -361,7 +434,7 @@ pub(crate) fn compute(
     }
     let font = c.font_size;
     let line = c.line_height;
-    if let Some(s) = find(ids.color) {
+    if let Some(s) = p.color.as_ref() {
         budget.spend(cost::OP_STEP)?;
         c.color = match wide(s) {
             Some(true) => parent.color,
@@ -373,8 +446,8 @@ pub(crate) fn compute(
             },
         };
     }
-    for (id, is_fill) in [(ids.fill, true), (ids.stroke, false)] {
-        let Some(s) = find(id) else { continue };
+    for (sp, is_fill) in [(p.fill, true), (p.stroke, false)] {
+        let Some(s) = sp.as_ref() else { continue };
         budget.spend(cost::OP_STEP)?;
         let init = if is_fill { CPaint::BLACK } else { CPaint::NONE };
         let from_parent = if is_fill { parent.fill } else { parent.stroke };
@@ -392,8 +465,8 @@ pub(crate) fn compute(
             c.stroke = p;
         }
     }
-    for (id, which) in [(ids.fill_opacity, 0u8), (ids.stroke_opacity, 1), (ids.opacity, 2)] {
-        let Some(s) = find(id) else { continue };
+    for (sp, which) in [(p.fill_opacity, 0u8), (p.stroke_opacity, 1), (p.opacity, 2)] {
+        let Some(s) = sp.as_ref() else { continue };
         budget.spend(cost::OP_STEP)?;
         let from_parent = match which {
             0 => parent.fill_opacity,
@@ -412,24 +485,47 @@ pub(crate) fn compute(
             _ => c.opacity = v,
         }
     }
-    if let Some(s) = find(ids.stroke_width) {
+    // stroke-width：割合は計算した値で割合のまま受け継ぎ、この要素の表示の領域で解く（文書の 1 回目のレビュー）
+    let pct_width = |v: f64| resolve(Length::new(v, Unit::Percent), font, line, base, Axis::Diag);
+    let mut from_parent = true;
+    if let Some(s) = p.stroke_width.as_ref() {
         budget.spend(cost::OP_STEP)?;
-        let v = match wide(s) {
-            Some(true) => Some(parent.stroke_width),
-            Some(false) => Some(1.0),
+        match wide(s) {
+            Some(true) => {}
+            Some(false) => {
+                from_parent = false;
+                c.stroke_width = 1.0;
+                c.sw_is_pct = 0;
+            }
             None => {
                 let unitless = PROPS.get(usize::from(s.prop)).is_some_and(|p| p.unitless) || s.origin == ORIGIN_ATTR;
-                Values::new(bufs.of(s.src), s.value, budget)
-                    .length(unitless)?
-                    .and_then(|l| resolve(l, font, line, base, Axis::Diag))
-                    .filter(|&x| x >= 0.0)
+                let l = Values::new(bufs.of(s.src), s.value, budget).length(unitless)?.filter(|l| l.value >= 0.0);
+                match l {
+                    Some(l) if l.unit == Unit::Percent => {
+                        if let Some(v) = pct_width(l.value) {
+                            from_parent = false;
+                            c.stroke_width = v;
+                            c.sw_is_pct = 1;
+                            c.sw_pct = l.value;
+                        }
+                    }
+                    Some(l) => {
+                        if let Some(v) = resolve(l, font, line, base, Axis::Diag) {
+                            from_parent = false;
+                            c.stroke_width = v;
+                            c.sw_is_pct = 0;
+                        }
+                    }
+                    None => {}
+                }
             }
-        };
-        if let Some(v) = v {
-            c.stroke_width = v;
         }
     }
-    if let Some(s) = find(ids.visibility) {
+    if from_parent && parent.sw_is_pct != 0 {
+        // 受け継いだ割合をこの要素の表示の領域で解き直す（解けなければ親の使った値）
+        c.stroke_width = pct_width(parent.sw_pct).unwrap_or(parent.stroke_width);
+    }
+    if let Some(s) = p.visibility.as_ref() {
         budget.spend(cost::OP_STEP)?;
         c.visibility = match wide(s) {
             Some(true) => parent.visibility,
@@ -450,7 +546,7 @@ pub(crate) fn compute(
             }
         };
     }
-    if let Some(s) = find(ids.display) {
+    if let Some(s) = p.display.as_ref() {
         budget.spend(cost::OP_STEP)?;
         c.display_none = match wide(s) {
             Some(true) => parent.display_none,
@@ -458,7 +554,7 @@ pub(crate) fn compute(
             None => u8::from(Values::new(bufs.of(s.src), s.value, budget).eat_ident(b"none")?),
         };
     }
-    transform(&mut c, parent, specs, ids, bufs, base, budget)?;
+    transform(&mut c, parent, &p, bufs, base, budget)?;
     Ok(c)
 }
 
@@ -548,34 +644,37 @@ fn opacity(s: &Specified, bufs: &Bufs<'_>, budget: &Budget<'_>) -> Result<Option
     Ok(Some(math::clamp(v, 0.0, 1.0)))
 }
 
-/// `transform`・`transform-origin`・`transform-box` から要素の変形を求める。
+/// `transform`・`transform-origin`・`transform-box` から要素の変形を求める。`transform: inherit` は親の原点を掛ける前の
+/// 行列を受け継ぎ、この要素の原点を掛ける。`transform-box: inherit` は親の箱（文書の 1 回目のレビュー）。
 fn transform(
     c: &mut Computed,
     parent: &Computed,
-    specs: &[Specified],
-    ids: &PropIds,
+    p: &Picked,
     bufs: &Bufs<'_>,
     base: &Base,
     budget: &Budget<'_>,
 ) -> Result<(), Error> {
     let budget = budget_ref(budget);
-    let find = |id: Option<PropertyId>| id.and_then(|id| specs.iter().find(|s| s.prop == id));
-    let Some(s) = find(ids.transform) else { return Ok(()) };
+    // 参照の箱（view-box のときだけ解ける。受け継がない）
+    if let Some(b) = p.transform_box.as_ref() {
+        budget.spend(cost::OP_STEP)?;
+        c.box_vb = match b.wide {
+            WIDE_INHERIT => parent.box_vb,
+            WIDE_NONE => {
+                let buf = bufs.of(b.src);
+                let t = Values::new(buf, b.value, budget).next()?;
+                u8::from(t.kind == Tk::Ident && ident_is(buf, t.inner, t.escaped, b"view-box"))
+            }
+            _ => 1,
+        };
+    }
+    let view_box = c.box_vb != 0;
+    let Some(s) = p.transform.as_ref() else { return Ok(()) };
     budget.spend(cost::OP_STEP)?;
     let font = c.font_size;
     let line = c.line_height;
-    // 参照の箱（view-box のときだけ解ける）
-    let view_box = match find(ids.transform_box) {
-        Some(b) if b.wide == WIDE_NONE => {
-            let buf = bufs.of(b.src);
-            let t = Values::new(buf, b.value, budget).next()?;
-            t.kind == Tk::Ident && ident_is(buf, t.inner, t.escaped, b"view-box")
-        }
-        // 初期の値（受け継がないので inherit も親の箱。SVG の要素の箱は view-box か外接矩形）
-        _ => true,
-    };
     let (m, mut known) = match s.wide {
-        WIDE_INHERIT => (parent.transform, parent.transform_known != 0),
+        WIDE_INHERIT => (parent.transform_raw, parent.transform_known != 0),
         WIDE_INITIAL | WIDE_UNSET => (Transform::IDENTITY, true),
         _ if s.origin == ORIGIN_ATTR => match values::transform_attr(bufs.of(s.src), s.value, budget)? {
             Some(m) => (m, true),
@@ -597,9 +696,11 @@ fn transform(
     };
     if !m.finite() {
         c.transform = Transform::IDENTITY;
+        c.transform_raw = Transform::IDENTITY;
         c.transform_known = 0;
         return Ok(());
     }
+    c.transform_raw = m;
     if m == Transform::IDENTITY {
         c.transform = m;
         c.transform_known = u8::from(known);
@@ -609,9 +710,9 @@ fn transform(
         known = false;
     }
     // 変形の原点
-    let (ox, oy) = match find(ids.transform_origin) {
+    let (ox, oy) = match p.transform_origin.as_ref() {
         Some(o) if o.wide == WIDE_NONE => match origin(o, bufs, font, line, base, budget)? {
-            Some(p) => p,
+            Some(pt) => pt,
             None => {
                 known = false;
                 (0.0, 0.0)

@@ -11,11 +11,12 @@
 use crate::budget::Budget;
 use crate::cost;
 use crate::css::sheet::Sheet;
-use crate::doc::refs::{EDGE_CLIP, EDGE_HREF, Refs, not_rendered};
+use crate::doc::refs::{EDGE_CLIP, EDGE_HREF, HIDDEN_SELF, Refs, fits, not_rendered, renders_children};
 use crate::error::Error;
 use crate::mem::MVec;
 use crate::style::cascade::{SRC_SHEET, SRC_STORE, Styles, WIDE_NONE};
 use crate::style::props::lookup;
+use crate::values::Values;
 use crate::xml::{self, KIND_ELEMENT, NONE, NS_NONE, NS_SVG, NS_XLINK, XmlDoc};
 
 /// 描く木を作るのに要るもの。
@@ -81,29 +82,39 @@ pub(crate) fn needs(
         return Ok(out);
     }
     let display = lookup(b"display", false);
+    // 中をたどった印：1 子の辺で入った・2 参照の辺で入った（描かない入れ物は、子の辺で先に来ても参照の辺で来たら中を
+    // たどる。印は確かめを通ったときだけ付ける：子の辺で隠れた要素も参照の辺で来たら見る）
     let mut seen: MVec<'_, u8> = MVec::with_capacity(budget, nodes.len())?;
     seen.resize_to(nodes.len(), 0)?;
-    // 行く節の積み上げ（節の番号 × 2 ＋ 参照の辺で入ったかの印）
+    // 行く節の積み上げ（節の番号 << 3 ＋ filter の中・文字の中・参照の辺で入ったかの印）
     let mut stack: MVec<'_, u64> = MVec::new(budget);
     stack.push(0)?;
     while let Some(item) = stack.pop() {
-        let (i, via_ref) = ((item >> 1) as u32, (item & 1) as u8);
+        let (i, via_ref) = ((item >> 3) as u32, item & 1 != 0);
+        let (in_text, in_filter) = (item & 2 != 0, item & 4 != 0);
         budget.spend(cost::OP_STEP)?;
         let Some(n) = nodes.get(i as usize) else { continue };
-        if n.kind != KIND_ELEMENT || seen.get(i as usize).copied() != Some(0) {
-            continue;
-        }
-        if let Some(x) = seen.get_mut(i as usize) {
-            *x = 1;
-        }
-        if n.ns != NS_SVG || refs.hidden.as_slice().get(i as usize).copied() == Some(1) {
+        let bit = if via_ref { 2 } else { 1 };
+        let prev = seen.get(i as usize).copied().unwrap_or(0);
+        if n.kind != KIND_ELEMENT || prev & bit != 0 {
             continue;
         }
         let local = n.local.of(input);
-        if !known(local) {
+        // 自分の条件が偽ならどの文脈でも描かない。switch が選ばないのは、参照の辺で入れば効かない
+        let hidden = refs.hidden.as_slice().get(i as usize).copied().unwrap_or(0);
+        let hidden = if via_ref { hidden & HIDDEN_SELF } else { hidden };
+        if n.ns != NS_SVG || hidden != 0 || !known(local) {
             continue;
         }
-        // display: none の部分木は描かない
+        // 親の文脈で描かれうるか（参照の辺で入った要素と filter の中の要素は、その種類の中身として見る）
+        if !via_ref && !in_filter && !fits(local, in_text) {
+            continue;
+        }
+        // 描く入れ物（描かない入れ物でないもの）は、どちらの辺で来ても中をたどるので 1 度だけ
+        if !not_rendered(local) && prev != 0 {
+            continue;
+        }
+        // display: none の部分木は描かない（値は walk と同じ読み方：escape を解いて大文字小文字を問わない）
         let spec = styles.of(i).iter().find(|s| Some(s.prop) == display).copied();
         if let Some(s) = spec
             && s.wide == WIDE_NONE
@@ -113,19 +124,26 @@ pub(crate) fn needs(
                 SRC_STORE => doc.store.as_slice(),
                 _ => input,
             };
-            if trim(s.value.of(buf)).eq_ignore_ascii_case(b"none") {
+            if Values::new(buf, s.value, budget).eat_ident(b"none")? {
                 continue;
             }
+        }
+        if let Some(x) = seen.get_mut(i as usize) {
+            *x = prev | bit;
         }
         if matches!(local, b"image" | b"feImage") {
             classify(doc, input, n, local, &mut out, budget)?;
         }
-        // 子（描かない入れ物は参照の辺で入ったときだけ。clipPath の中の画像は描かないので入らない）
-        if (!not_rendered(local) || via_ref != 0) && local != b"clipPath" {
+        // 子（描かない入れ物は参照の辺で入ったときだけ。clipPath の中の画像は描かないので入らない。図形などの子は描かない）
+        let into = if not_rendered(local) { via_ref && local != b"clipPath" } else { renders_children(local) };
+        if into {
+            let child_text = in_text || local == b"text";
+            let child_filter = local == b"filter";
+            let flags = (u64::from(child_filter) << 2) | (u64::from(child_text) << 1);
             let mut c = n.first_child;
             while c != NONE {
                 budget.spend(cost::OP_STEP)?;
-                stack.push(u64::from(c) << 1)?;
+                stack.push((u64::from(c) << 3) | flags)?;
                 c = nodes.get(c as usize).map_or(NONE, |x| x.next_sibling);
             }
         }
@@ -135,7 +153,7 @@ pub(crate) fn needs(
             if e.removed != 0 || e.kind == EDGE_HREF || e.kind == EDGE_CLIP {
                 continue;
             }
-            stack.push((u64::from(e.target) << 1) | 1)?;
+            stack.push((u64::from(e.target) << 3) | 1)?;
         }
     }
     Ok(out)

@@ -217,3 +217,50 @@ fn zero_view_box_is_not_drawn() {
     let d = crate::doc::parse(src.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
     assert_eq!(d.size().map(|s| (s.width, s.height)), Some((10.0, 10.0)));
 }
+
+/// 内容のモデル：文字の外の tspan・stop・fe…、文字の中の rect は描かない（Chrome・usvg と同じ。文書の 1 回目のレビュー）。
+#[test]
+fn content_model() {
+    let rows = run(&format!(
+        r##"<svg {X} width="10" height="10"><tspan id="ts"/><stop id="st"/><feFlood id="fe"/><text id="t"><tspan id="in"/><a id="ta"><tspan id="ats"/></a><rect id="r"/></text><a id="oa"><rect id="ar"/></a></svg>"##
+    ));
+    for id in ["ts", "st", "fe", "r"] {
+        assert!(!get(&rows, id).1.rendered, "{id}");
+    }
+    for id in ["t", "in", "ta", "ats", "oa", "ar"] {
+        assert!(get(&rows, id).1.rendered, "{id}");
+    }
+}
+
+/// 根の svg の変形は viewBox の変形の外側に掛ける（usvg・Chrome と同じ。文書の 1 回目のレビュー）。
+#[test]
+fn root_transform_applies() {
+    let rows = run(&format!(
+        r##"<svg {X} width="100" height="100" viewBox="0 0 50 50" transform="translate(30 30)"><rect id="r"/></svg>"##
+    ));
+    ctm_is(get(&rows, "r"), [2.0, 0.0, 0.0, 2.0, 30.0, 30.0]);
+}
+
+/// 計算した値の受け継ぎの細部（文書の 1 回目のレビュー）：stroke-width の % は割合のまま受け継いで使う要素の表示の領域で
+/// 解き、`transform: inherit` は原点を掛ける前の行列を受け継いで自分の原点を掛け、`transform-box: inherit` は親の箱。
+#[test]
+fn inherited_details() {
+    let rows = run(&format!(
+        r##"<svg {X} width="200" height="200"><g stroke-width="10%" stroke="black"><svg width="20" height="20"><rect id="sw" width="10" height="10"/></svg></g>
+        <g style="transform: rotate(90deg); transform-origin: 50px 50px"><rect id="ti" style="transform: inherit"/></g>
+        <g style="transform-box: fill-box"><rect id="tb" style="transform-box: inherit; transform: rotate(90deg)"/></g></svg>"##
+    ));
+    assert!(close(get(&rows, "sw").1.computed.stroke_width, 2.0), "{}", get(&rows, "sw").1.computed.stroke_width);
+    // (0, -20)〜(10, -10) の矩形は x 90〜100・y 10〜20 に（Chrome と同じ）
+    let t = get(&rows, "ti").1.ctm;
+    let at = |x: f64, y: f64| (t.a * x + t.c * y + t.e, t.b * x + t.d * y + t.f);
+    let (p, q) = (at(0.0, -20.0), at(10.0, -10.0));
+    assert!(close(p.0, 100.0) && close(p.1, 20.0) && close(q.0, 90.0) && close(q.1, 10.0), "{p:?} {q:?}");
+    assert!(!get(&rows, "tb").1.ctm_known);
+    // 表示の領域のない文書の入れ子の svg・use の x・y の % は解けない
+    let rows = run(&format!(
+        r##"<svg {X}><svg id="s" x="10%" width="50" height="50"><rect id="r"/></svg><use id="u" href="#r" x="20%"/><rect id="ok"/></svg>"##
+    ));
+    assert!(!get(&rows, "s").1.ctm_known && !get(&rows, "r").1.ctm_known && !get(&rows, "u").1.ctm_known);
+    assert!(get(&rows, "ok").1.ctm_known);
+}

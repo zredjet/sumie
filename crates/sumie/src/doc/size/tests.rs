@@ -67,3 +67,15 @@ fn pixel_sizes_round_like_resvg() {
     assert_eq!(doc.pixel_size(1.0).unwrap(), None);
     assert!(doc.pixel_size(0.0).is_err());
 }
+
+/// 根の文字の大きさの言葉も、文書の大きさの em に効く（計算した値と同じ求め方。resvg と同じ。文書の 1 回目のレビュー）。
+#[test]
+fn root_font_size_keywords_resolve_em() {
+    for (fs, want) in [("large", 144.0), ("smaller", 100.0), ("20px", 200.0), ("150%", 180.0)] {
+        let svg =
+            format!("<svg xmlns=\"http://www.w3.org/2000/svg\" font-size=\"{fs}\" width=\"10em\" height=\"10em\"/>");
+        let d = crate::doc::parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+        let s = d.size().unwrap();
+        assert!((s.width - want).abs() < 1e-9 && (s.height - want).abs() < 1e-9, "{fs}：{s:?}");
+    }
+}

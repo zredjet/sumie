@@ -232,7 +232,9 @@ fn document_survives_seeded_mutations() {
     let seeds = fuzz_seeds("document");
     let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
     let (mut ok, mut err) = (0usize, 0usize);
-    for (n, case) in cases(0x5eed_0006, 2000, &refs, XML_DICT, 4096).iter().enumerate() {
+    // 文書の構造の目印（use・pattern・switch・条件・入れ子の svg・変形。文書の 1 回目のレビュー）も混ぜる
+    let dict: Vec<&[u8]> = XML_DICT.iter().chain(DOC_DICT).copied().collect();
+    for (n, case) in cases(0x5eed_0006, 2000, &refs, &dict, 4096).iter().enumerate() {
         let (out, heap) = measure(|| document_parse(case));
         assert_eq!(out.check, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
         let peak = out.peak;
@@ -242,6 +244,31 @@ fn document_survives_seeded_mutations() {
     }
     assert!(ok > 30 && err > 100, "読めた {ok}・読めない {err}");
 }
+
+/// 文書の構造の目印（変異で差し込む）。
+const DOC_DICT: &[&[u8]] = &[
+    b"<use href=\"#r\"/>",
+    b"<use xlink:href=\"#g\" x=\"10%\"/>",
+    b" fill=\"url(#p)\"",
+    b" stroke=\"url(#lg) none\"",
+    b" mask=\"inherit\"",
+    b" clip-path=\"url(#m)\"",
+    b" filter=\"url(#f)\"",
+    b"<pattern id=\"p\">",
+    b"</pattern>",
+    b"<switch>",
+    b"</switch>",
+    b" systemLanguage=\"en\"",
+    b" requiredExtensions=\"\"",
+    b"<svg x=\"1\" viewBox=\"0 0 1 1\">",
+    b" transform=\"rotate(30 1 2)\"",
+    b" style=\"transform:scale(2);transform-box:fill-box\"",
+    b" display=\"none\"",
+    b" id=\"r\"",
+    b" id=\"g\"",
+    b"<text>",
+    b"<tspan>",
+];
 
 /// CSS の目印の字句（変異で差し込む）。
 const CSS_DICT: &[&[u8]] = &[

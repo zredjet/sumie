@@ -160,3 +160,25 @@ fn entity_references_on_a_small_stack() {
     let (e, p, _) = parse_small(src, Limits::DEFAULT);
     assert_eq!((e, p), (Ok(()), Ok(())));
 }
+
+/// 計算した値のたどり（`doc::walk`）も 10 万段の入れ子を 128 KiB のスタックで回る（文書の 1 回目のレビュー）。
+#[test]
+fn computed_walk_deep_nesting_on_a_small_stack() {
+    let n = 100_000;
+    let src = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><style>g {{ fill: red }}</style>{}<rect/>{}</svg>",
+        "<g transform=\"translate(1 0)\" stroke-width=\"10%\">".repeat(n),
+        "</g>".repeat(n)
+    );
+    let opts = sumie::ParseOptions {
+        limits: Limits { depth: 200_000, nodes: 400_000, ..Limits::DEFAULT },
+        ..sumie::ParseOptions::DEFAULT
+    };
+    let count = on_small_stack(move || {
+        let d = sumie::parse(src.as_bytes(), &opts, &sumie::Never).unwrap();
+        let mut count = 0usize;
+        sumie::fuzzing::computed_values(&d, &mut |_| count += 1).unwrap();
+        count
+    });
+    assert_eq!(count, n + 3);
+}

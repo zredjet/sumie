@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="120" height="80" viewBox="0 0 60 40" transform="translate(1 2)">
+<style>.a{fill:url(#p) red;transform:rotate(10deg);transform-origin:center}#u{stroke:currentColor;color:#00f}</style>
+<defs><pattern id="p" width="4" height="4" patternUnits="userSpaceOnUse"><use href="#r" transform="scale(.1)"/></pattern>
+<linearGradient id="lg" xlink:href="#lg2"/><linearGradient id="lg2"><stop offset="0" stop-color="red"/></linearGradient>
+<mask id="m"><rect width="10" height="10" fill="white" mask="inherit"/></mask><filter id="f"><feImage href="#r"/></filter>
+<marker id="k"><path d="M0 0L1 1" marker-end="url(#k)"/></marker><symbol id="s" viewBox="0 0 2 2"><circle r="1"/></symbol></defs>
+<g id="g" fill="url(#lg)" stroke-width="10%" font-size="larger"><rect id="r" class="a" width="5" height="5" style="stroke-width:1em"/>
+<switch><foreignObject width="5" height="5"/><text systemLanguage="xx">x</text><g systemLanguage="en"><use id="u" xlink:href="#s" x="1" y="2" width="3" height="3"/></g><rect/></switch>
+<svg x="10%" y="1" width="20" height="10" viewBox="0 0 0 5"><rect/></svg><svg x="2" width="20" height="10" preserveAspectRatio="xMaxYMin slice" viewBox="0 0 4 2"><rect mask="url(#m)" filter="url(#f)"/></svg>
+<path d="M0 0L5 5" marker-start="url(#k)" transform="matrix(0 0 0 0 0 0)"/><g display="none"><use href="#g"/></g><text><tspan>t</tspan><rect/></text></g>
+</svg>

@@ -810,7 +810,13 @@ pub fn document_parse_cancel(data: &[u8], cancel: &dyn Cancel) -> DocOutcome {
             }
             // 計算した値のたどり（木を作る段の前の部分。払いを確かめ、確保をヒープの山と照らす山に入れる）
             let wb = Budget::new(Stage::Build, u64::MAX, u64::MAX, cancel);
-            match crate::doc::walk::walk(&d, &wb, &mut |_| Ok(())) {
+            let paint = |v: &crate::doc::walk::WalkItem| -> Result<(), Error> {
+                use crate::doc::walk::used_paint;
+                used_paint(&d, v.node, &v.computed.fill, true, v.computed.color, &wb)?;
+                used_paint(&d, v.node, &v.computed.stroke, false, v.computed.color, &wb)?;
+                Ok(())
+            };
+            match crate::doc::walk::walk(&d, &wb, &mut |v| paint(v)) {
                 Ok(()) | Err(Error::Cancelled) => {}
                 Err(_) => {
                     out.check = Check::Violation("計算した値のたどりが誤りを返した");

@@ -200,3 +200,14 @@ fn estimate_build_checks_instances_and_needs() {
         matches!(est("<image href=\"a.png\"/>"), Err(Error::Unsupported(u)) if u.feature == crate::error::Feature::Image)
     );
 }
+
+/// 読まなかった参照：CSS の url は escape を解いた形で載せ、feImage の外の画像は <image> と同じに要るものにする（文書の
+/// 1 回目のレビュー）。
+#[test]
+fn unread_refs_are_decoded_and_feimage_is_an_image() {
+    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect style="fill: url(a\29 .svg#p)"/><filter id="f"><feImage href="x.png"/></filter><rect filter="url(#f)"/></svg>"##;
+    let d = crate::doc::parse(svg, &crate::style::ParseOptions::DEFAULT, &Never).unwrap();
+    let unread: Vec<String> = d.report().unread_refs().map(|u| String::from_utf8_lossy(u.href).to_string()).collect();
+    assert_eq!(unread, ["a).svg#p"]);
+    assert!(d.needs().raster_images);
+}

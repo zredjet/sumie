@@ -21,11 +21,9 @@ use crate::limits::Limits;
 use crate::mem::MVec;
 use crate::report::{Report, ReportBuilder};
 use crate::style::ParseOptions;
-use crate::style::cascade::{SRC_SHEET, SRC_STORE, WIDE_NONE};
+use crate::style::cascade::{SRC_SHEET, SRC_STORE};
 use crate::style::cascade::{Styles, cascade};
 use crate::style::cond::Env;
-use crate::style::props::lookup;
-use crate::values::{Unit, Values};
 use crate::xml::{self, KIND_ELEMENT, KIND_TEXT, NS_NONE, NS_SVG, XmlDoc};
 use ids::Ids;
 pub use needs::Needs;
@@ -198,7 +196,7 @@ fn pipeline<'s>(svg: &'s [u8], opts: &ParseOptions<'_>, budget: &Budget<'_>) -> 
     };
     let styles = cascade(&doc, svg, &sheet, &env, budget)?;
     // 文書の大きさの em などは根の要素の文字の大きさで解く（usvg と同じ）
-    let root_font = root_font_size(&doc, svg, &sheet, &styles, opts.style.font_size, budget)?;
+    let root_font = root_font_size(&doc, svg, &sheet, &styles, opts.style.font_size, env.size, budget)?;
     let size = if root_font == opts.style.font_size { media_size } else { size_rule(&doc, svg, root_font, budget)? };
     let ids = Ids::build(&doc, svg, budget)?;
     let refs = refs::build(&doc, svg, &sheet, &styles, &ids, opts.style.languages, budget)?;
@@ -219,37 +217,24 @@ fn pipeline<'s>(svg: &'s [u8], opts: &ParseOptions<'_>, budget: &Budget<'_>) -> 
     })
 }
 
-/// 根の要素の文字の大きさ（px）。指定の値が長さか割合ならそれ（em・ex・% は既定の文字の大きさに対して）、ほか（言葉・
-/// 全体の言葉・指定なし）は既定の文字の大きさ。
+/// 根の要素の文字の大きさ（px）。計算した値と同じ求め方（`style::computed::compute`。言葉・em・%・rem は既定の文字の大きさ、
+/// vw などは `@media` と同じ文書の大きさで解く。文書の 1 回目のレビュー）。
 fn root_font_size(
     doc: &XmlDoc,
     input: &[u8],
     sheet: &Sheet,
     styles: &Styles,
     default: f64,
+    media: Option<(f64, f64)>,
     budget: &Budget<'_>,
 ) -> Result<f64, Error> {
-    let budget = budget_ref(budget);
-    let Some(id) = lookup(b"font-size", false) else { return Ok(default) };
-    let Some(spec) = styles.of(0).iter().find(|s| s.prop == id) else { return Ok(default) };
-    if spec.wide != WIDE_NONE {
-        return Ok(default);
-    }
-    let buf = match spec.src {
-        SRC_SHEET => sheet.text.as_slice(),
-        SRC_STORE => doc.store.as_slice(),
-        _ => input,
-    };
-    let mut v = Values::new(buf, spec.value, budget);
-    let Some(l) = v.length(true)? else { return Ok(default) };
-    let px = match l.unit {
-        Unit::Em | Unit::Rem | Unit::Ic => Some(l.value * default),
-        Unit::Ex | Unit::Ch => Some(l.value * default * 0.5),
-        Unit::Cap => Some(l.value * default * 0.7),
-        Unit::Percent => Some(l.value * default / 100.0),
-        _ => l.absolute_px(),
-    };
-    Ok(px.filter(|x| x.is_finite() && *x >= 0.0).unwrap_or(default))
+    use crate::style::computed::{Base, Bufs, Computed, PropIds, compute};
+    let initial = Computed::initial(default);
+    let base =
+        Base { default_font: default, root_font: default, root_line: initial.line_height, viewport: media, doc: media };
+    let bufs = Bufs { input, store: doc.store.as_slice(), sheet: sheet.text.as_slice() };
+    let c = compute(&initial, styles.of(0), &PropIds::new(), &bufs, &base, budget)?;
+    Ok(c.font_size)
 }
 
 fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {
@@ -355,6 +340,7 @@ fn report(
             r.warn(n.kind, Some(u64::from(n.pos)))?;
         }
     }
+    let mut scratch: MVec<'_, u8> = MVec::new(budget);
     for n in ref_notes {
         budget.spend(cost::OP_STEP)?;
         if n.unread != 0 {
@@ -363,6 +349,16 @@ fn report(
                 SRC_STORE => doc.store.as_slice(),
                 _ => input,
             };
+            if n.escaped != 0 {
+                // CSS の url の escape を解いた形で報告する（`@import` と同じ。文書の 1 回目のレビュー）
+                scratch.clear();
+                for c in crate::css::lex::decode_string(buf, n.href, budget) {
+                    let (b, k) = crate::css::select::utf8_pub(c?);
+                    scratch.append_slice(b.get(..k).unwrap_or(&[]))?;
+                }
+                r.unread(scratch.as_slice(), u64::from(n.pos))?;
+                continue;
+            }
             r.unread(n.href.of(buf), u64::from(n.pos))?;
         } else {
             r.warn(crate::report::WarningKind::ReferenceCycle, Some(u64::from(n.pos)))?;

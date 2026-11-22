@@ -25,6 +25,11 @@ use crate::style::props::lookup;
 use crate::xml::lex::Span;
 use crate::xml::{self, KIND_ELEMENT, NONE, NS_NONE, NS_SVG, NS_XLINK, Node, XmlDoc};
 
+/// 自分の条件（`requiredExtensions`・`systemLanguage`）が偽。
+pub(crate) const HIDDEN_SELF: u8 = 1;
+/// 親の `switch` が選ばない（参照の辺で入れば描く。Chrome・usvg と同じ）。
+pub(crate) const HIDDEN_SWITCH: u8 = 2;
+
 /// 辺の種類。
 /// 中身を作らない `href`（グラデーション・textPath・tref）
 pub(crate) const EDGE_HREF: u8 = 0;
@@ -57,11 +62,12 @@ impl Plain for Edge {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RefNote {
     pub(crate) pos: u32,
-    /// 読まなかった参照なら href の範囲（`src` の置き場の中）
+    /// 読まなかった参照なら href の範囲（`src` の置き場の中。`escaped` なら CSS の escape を解いて報告する）
     pub(crate) href: Span,
     pub(crate) src: u8,
     pub(crate) unread: u8,
-    pub(crate) pad: [u8; 2],
+    pub(crate) escaped: u8,
+    pub(crate) pad: u8,
 }
 
 impl Plain for RefNote {}
@@ -73,7 +79,9 @@ pub(crate) struct Refs {
     /// 節ごとの辺の始まり（節の数 ＋ 1）
     pub(crate) start: Frozen<u32>,
     pub(crate) edges: Frozen<Edge>,
-    /// 節ごとの印：描かない（条件が偽・switch で選ばれない。祖先からも受け継ぐ）
+    /// 節ごとの、自分の印（祖先からは受け継がない。たどる側が道に沿って受け継ぐ）：`HIDDEN_SELF`（自分の条件が偽。
+    /// どの文脈でも描かない）・`HIDDEN_SWITCH`（親の switch が選ばない。参照の辺で入ったときは効かない。文書の 1 回目の
+    /// レビュー）
     pub(crate) hidden: Frozen<u8>,
     /// 根から展開したあとの要素の数（飽和する）
     pub(crate) instances: u64,
@@ -182,7 +190,7 @@ impl Cx<'_, '_> {
             return Ok(None);
         }
         // 外の文書：読まない（範囲は置き場の中の生のもの。報告は解いた形にする）
-        notes.push(RefNote { pos, href: raw, src, unread: 1, pad: [0; 2] })?;
+        notes.push(RefNote { pos, href: raw, src, unread: 1, escaped: u8::from(escaped), pad: 0 })?;
         Ok(None)
     }
 
@@ -263,35 +271,36 @@ pub(crate) fn build(
         } else {
             inh.get(parent as usize).copied().unwrap_or(Inherited { t: [NONE; 5] })
         };
-        let parent_hidden = if parent == NONE { 0 } else { hidden.get(parent as usize).copied().unwrap_or(0) };
         if node.kind != KIND_ELEMENT {
             inh.push(parent_inh)?;
-            hidden.push(parent_hidden)?;
+            hidden.push(0)?;
             continue;
         }
         let pos = node.pos;
         let svg = node.ns == NS_SVG;
         let local = node.local.of(input);
         // 条件と switch
-        let mut hide = parent_hidden != 0 || (svg && !conditions_pass(doc, input, node, languages, budget)?);
+        // 条件と switch（自分の印。switch の選び方は switch が描かれるかに依らない：use から参照されても同じ子を選ぶ）
+        let own_false = svg && !conditions_pass(doc, input, node, languages, budget)?;
+        let mut bits = if own_false { HIDDEN_SELF } else { 0 };
         if parent != NONE
             && let Some(p) = nodes.get(parent as usize)
             && p.ns == NS_SVG
             && p.local.of(input) == b"switch"
             && svg
             && switch_candidate(local)
+            && !own_false
         {
             // 通る最初の子の要素だけを描く
-            let chosen = switch_chosen.get(parent as usize).copied().unwrap_or(0) != 0;
-            if !hide && !chosen {
+            if switch_chosen.get(parent as usize).copied().unwrap_or(0) == 0 {
                 if let Some(c) = switch_chosen.get_mut(parent as usize) {
                     *c = 1;
                 }
             } else {
-                hide = true;
+                bits |= HIDDEN_SWITCH;
             }
         }
-        hidden.push(u8::from(hide))?;
+        hidden.push(bits)?;
         if !svg {
             inh.push(parent_inh)?;
             continue;
@@ -302,9 +311,22 @@ pub(crate) fn build(
                 Some(a) => Some(a),
                 None => doc.find_attr(input, node, NS_XLINK, b"href", budget)?,
             };
+            // feImage の外の画像は、<image> と同じに読まなかった参照でなく要るもの（呼び手の画像のデコーダ）にする
+            // （文書の 1 回目のレビュー）
+            let a = match a {
+                Some(a)
+                    if local == b"feImage"
+                        && !starts_with_hash(attr_buf(doc, input, a).1.of(attr_buf(doc, input, a).0), budget)? =>
+                {
+                    None
+                }
+                x => x,
+            };
             if let Some(a) = a {
                 let (buf, span, src) = attr_buf(doc, input, a);
-                if let Some(t) = cx.resolve(buf, span, false, src, pos, &mut notes)? {
+                if let Some(t) = cx.resolve(buf, span, false, src, pos, &mut notes)?
+                    && target_kind_ok(nodes, input, t, href_targets(local))
+                {
                     let kind = if matches!(local, b"use" | b"feImage" | b"pattern" | b"filter") {
                         EDGE_USE
                     } else {
@@ -333,8 +355,12 @@ pub(crate) fn build(
                             }
                             Ok(())
                         })?;
+                        let want: &[&[u8]] = if k < 2 { PAINT_SERVERS } else { &[b"marker"] };
                         match found {
-                            Some((sp, esc)) => cx.resolve(buf, sp, esc, s.src, pos, &mut notes)?.unwrap_or(NONE),
+                            Some((sp, esc)) => cx
+                                .resolve(buf, sp, esc, s.src, pos, &mut notes)?
+                                .filter(|&t| target_kind_ok(nodes, input, t, want))
+                                .unwrap_or(NONE),
                             None => NONE,
                         }
                     }
@@ -353,6 +379,21 @@ pub(crate) fn build(
             } else {
                 continue;
             };
+            if s.wide == WIDE_INHERIT && parent != NONE {
+                // 受け継がない参照の `inherit` は親の計算した値：親の同じ種類の辺を写す（親は文書の順に先に終えている。
+                // 輪を見落とさず、展開を数え漏らさない。文書の 1 回目のレビュー）
+                let a = start.get(parent as usize).copied().unwrap_or(0) as usize;
+                let b = start.get((parent as usize).saturating_add(1)).copied().unwrap_or(0) as usize;
+                for k in a..b {
+                    budget.spend(cost::OP_STEP)?;
+                    if let Some(e) = edges.get(k).copied()
+                        && e.kind == kind
+                    {
+                        edges.push(Edge { removed: 0, ..e })?;
+                    }
+                }
+                continue;
+            }
             if s.wide != WIDE_NONE {
                 continue;
             }
@@ -365,7 +406,14 @@ pub(crate) fn build(
             for (k, &sp) in found.as_slice().iter().enumerate() {
                 budget.spend(cost::OP_STEP)?;
                 let esc = escaped.get(k).copied().unwrap_or(0) != 0;
-                if let Some(t) = cx.resolve(buf, sp, esc, s.src, pos, &mut notes)? {
+                let want: &[&[u8]] = match kind {
+                    EDGE_CLIP => &[b"clipPath"],
+                    EDGE_MASK => &[b"mask"],
+                    _ => &[b"filter"],
+                };
+                if let Some(t) = cx.resolve(buf, sp, esc, s.src, pos, &mut notes)?
+                    && target_kind_ok(nodes, input, t, want)
+                {
                     edges.push(Edge { target: t, kind, removed: 0, pad: [0; 2] })?;
                 }
             }
@@ -528,7 +576,9 @@ fn remove_cycles(
             // 次の行き先：子（要素だけ）、次に参照の辺
             let mut next: Option<(u32, u32)> = None;
             let mut frame = top;
+            // 飛ばす子（文字の節）と辺（取り除いた辺）も 1 つずつ払う（文書の 1 回目のレビュー）
             while frame.child != NONE {
+                budget.spend(cost::OP_STEP)?;
                 let c = frame.child;
                 frame.child = nodes.get(c as usize).map_or(NONE, |x| x.next_sibling);
                 if nodes.get(c as usize).is_some_and(|x| x.kind == KIND_ELEMENT) {
@@ -539,6 +589,7 @@ fn remove_cycles(
             if next.is_none() {
                 let end = edge_start(top.node.saturating_add(1));
                 while frame.edge < end {
+                    budget.spend(cost::OP_STEP)?;
                     let k = frame.edge;
                     frame.edge = frame.edge.saturating_add(1);
                     if let Some(e) = edges.get(k as usize)
@@ -568,18 +619,22 @@ fn remove_cycles(
                 }
                 Some(GRAY) => {
                     // 輪：戻りの辺が参照の辺ならそれを、子の辺なら積み上げの上でいちばん近い参照の辺を取り除く
-                    let cut = if via != NONE {
-                        Some(via)
+                    // （積み上げの中の辺を取り除いたら、その辺で入った段から上を巻き戻して白に戻す：その段から上はもう
+                    // 祖先でない。巻き戻さないと古い印が残り、1 度の歩きで 1 本ずつしか取り除けない。文書の 1 回目の
+                    // レビュー）
+                    let (cut, unwind_to) = if via != NONE {
+                        (Some(via), None)
                     } else {
-                        let mut found = None;
-                        for f in stack.as_slice().iter().rev() {
+                        let mut found = (None, None);
+                        let frames = stack.as_slice();
+                        for (j, f) in frames.iter().enumerate().rev() {
                             budget.spend(cost::OP_STEP)?;
                             // 行き先の段に入った辺は輪の外
                             if f.node == target {
                                 break;
                             }
                             if f.via != NONE {
-                                found = Some(f.via);
+                                found = (Some(f.via), Some(j));
                                 break;
                             }
                         }
@@ -594,7 +649,16 @@ fn remove_cycles(
                         // 警告の位置は辺の元の要素
                         let src_node = source_of(start, k);
                         let pos = nodes.get(src_node as usize).map_or(0, |x| x.pos);
-                        notes.push(RefNote { pos, href: Span::default(), src: 0, unread: 0, pad: [0; 2] })?;
+                        notes.push(RefNote { pos, href: Span::default(), src: 0, unread: 0, escaped: 0, pad: 0 })?;
+                        if let Some(j) = unwind_to {
+                            while stack.len() > j {
+                                budget.spend(cost::OP_STEP)?;
+                                let Some(f) = stack.pop() else { break };
+                                if let Some(c) = color.get_mut(f.node as usize) {
+                                    *c = WHITE;
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -666,6 +730,7 @@ fn count_instances(
         if next.is_none() {
             let end = edge_start(top.node.saturating_add(1));
             while frame.edge < end {
+                budget.spend(cost::OP_STEP)?;
                 let k = frame.edge;
                 frame.edge = frame.edge.saturating_add(1);
                 if let Some(e) = edges.get(k as usize)
@@ -711,6 +776,53 @@ fn count_instances(
         }
     }
     Ok(count.get(0).copied().unwrap_or(0))
+}
+
+/// 値の前の空白を除いた頭が `#` か（読むバイトを塊ずつ払う）。
+fn starts_with_hash(v: &[u8], budget: &Budget<'_>) -> Result<bool, Error> {
+    let mut meter = crate::xml::lex::ScanMeter::new(0, v.len());
+    for (k, &c) in v.iter().enumerate() {
+        meter.pay(budget, k)?;
+        if !matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0C) {
+            return Ok(c == b'#');
+        }
+    }
+    Ok(false)
+}
+
+/// 塗りの参照先になる要素。
+const PAINT_SERVERS: &[&[u8]] = &[b"linearGradient", b"radialGradient", b"pattern"];
+const GRADIENTS: &[&[u8]] = &[b"linearGradient", b"radialGradient"];
+
+/// 要素 `local` の `href` が指せる要素（空ならどれでも）。グラデーションはグラデーション、pattern は pattern、filter は
+/// filter から属性と中身を受け継ぐ（SVG 2 §14.2・§14.3・FE 1 §5）。
+fn href_targets(local: &[u8]) -> &'static [&'static [u8]] {
+    match local {
+        b"linearGradient" | b"radialGradient" => GRADIENTS,
+        b"pattern" => &[b"pattern"],
+        b"filter" => &[b"filter"],
+        _ => &[],
+    }
+}
+
+/// 参照先 `t` が使える種類の要素か（`want` が空ならどれでも）。種類の合わない参照は辺にしない（使わない参照で輪を作らない。
+/// 文書の 1 回目のレビュー。ADR-78 (8)）。
+fn target_kind_ok(nodes: &[Node], input: &[u8], t: u32, want: &[&[u8]]) -> bool {
+    want.is_empty()
+        || nodes.get(t as usize).is_some_and(|x| x.ns == NS_SVG && want.iter().any(|w| x.local.of(input) == *w))
+}
+
+/// 子を描く入れ物か（図形・use・image の子は描かない。文字の要素の子は文字の中身）。
+pub(crate) fn renders_children(local: &[u8]) -> bool {
+    matches!(local, b"svg" | b"g" | b"a" | b"switch" | b"text" | b"tspan" | b"textPath")
+}
+
+/// 要素が親の文脈で描かれうるか（SVG 2 の内容のモデルの近いもの）：文字の中（`in_text`）では文字の中身の要素（tspan・
+/// textPath・tref）と `a` だけ、文字の外では文字の中身の要素と `stop`・フィルタの要素（fe…）を描かない（文書の 1 回目の
+/// レビュー。Chrome・usvg と同じ）。
+pub(crate) fn fits(local: &[u8], in_text: bool) -> bool {
+    let text_content = matches!(local, b"tspan" | b"textPath" | b"tref");
+    if in_text { text_content || local == b"a" } else { !text_content && local != b"stop" && !local.starts_with(b"fe") }
 }
 
 /// 子を描かない入れ物（参照の辺で入ったときだけ中をたどる）。

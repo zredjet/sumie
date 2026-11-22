@@ -3,10 +3,12 @@
 //!
 //! - 行きがけの順に、明示の積み上げで（深さごとの計算した値と、子に掛ける変形・表示の領域を積む）
 //! - 根からの変形：根の viewBox の変形 × 祖先の変形 × 要素の変形。use は自分の変形のあとに x・y の平行移動を掛け、入れ子の
-//!   svg は子に x・y の平行移動と viewBox の変形を掛ける（svg 自身の変形には含めない）。根の svg 自身の変形は読まない
+//!   svg は子に x・y の平行移動と viewBox の変形を掛ける（svg 自身の変形には含めない）。根の svg 自身の変形は viewBox の
+//!   変形の外側に掛ける
 //! - 表示の領域（% の基準）：根は文書の大きさ（viewBox があればその幅・高さ）。入れ子の svg は `width`・`height`（既定
 //!   100%。属性だけを読む）と viewBox
-//! - 描く木に入るか：SVG の名前空間の知っている要素で、子を描く入れ物（svg・g・a・switch と文字の要素）の子であり、描かない
+//! - 描く木に入るか：SVG の名前空間の知っている要素で、子を描く入れ物（svg・g・a・switch と文字の要素）の子であり、内容の
+//!   モデルに合い（文字の中は文字の中身の要素と a だけ、文字の外では tspan・stop・fe… を描かない。`refs::fits`）、描かない
 //!   入れ物（defs など）の中でなく、条件が偽・switch で選ばれない要素の部分木（refs の `hidden`）でなく、`display: none` の
 //!   部分木の中でない。変形が逆にできない（行列式が 0）要素と、幅か高さが 0 以下の入れ子の svg と、幅か高さが 0 の viewBox
 //!   の svg（根なら文書の全体）は、部分木ごと描かない（CSS Transforms 1 §6・SVG 2 §8.2。ADR-78 (7)）
@@ -16,7 +18,7 @@ use crate::cost;
 use crate::css::lex::decode_string;
 use crate::doc::Document;
 use crate::doc::needs::known;
-use crate::doc::refs::{EDGE_FILL, EDGE_STROKE, not_rendered};
+use crate::doc::refs::{EDGE_FILL, EDGE_STROKE, fits, not_rendered, renders_children};
 use crate::error::Error;
 use crate::mem::{MVec, Plain};
 use crate::style::computed::{
@@ -59,7 +61,9 @@ struct Frame {
     /// 子が描く木に入りうる
     children_rendered: u8,
     known: u8,
-    pad: [u8; 5],
+    /// 子が文字の中（text の部分木）
+    in_text: u8,
+    pad: [u8; 4],
 }
 
 impl Plain for Frame {}
@@ -108,10 +112,18 @@ pub(crate) fn walk(
         _ => (Transform::IDENTITY, size),
     };
     let hidden = d.refs.hidden.as_slice();
-    let is_hidden = |i: u32| hidden.get(i as usize).copied() == Some(1);
+    // 自分の印（条件が偽・switch が選ばない）。祖先の印は描く木に入るかで受け継ぐ
+    let is_hidden = |i: u32| hidden.get(i as usize).copied().unwrap_or(0) != 0;
     let root_ok =
         root.ns == NS_SVG && root.local.of(input) == b"svg" && c0.display_none == 0 && !is_hidden(0) && root_drawn;
-    f(&WalkItem { node: 0, parent: NONE, computed: c0, ctm: Transform::IDENTITY, ctm_known: true, rendered: root_ok })?;
+    // 根の svg の変形は viewBox の変形の外側に掛ける（usvg・Chrome と同じ。文書の 1 回目のレビュー）
+    let root_own = c0.transform;
+    let root_known = c0.transform_known != 0;
+    let root_ok = root_ok && {
+        let det = root_own.a * root_own.d - root_own.b * root_own.c;
+        det != 0.0 && det.is_finite()
+    };
+    f(&WalkItem { node: 0, parent: NONE, computed: c0, ctm: root_own, ctm_known: root_known, rendered: root_ok })?;
     let mut stack: MVec<'_, Frame> = MVec::new(budget);
     let (vp_w, vp_h, has_vp) = match root_vp {
         Some((w, h)) => (w, h, 1),
@@ -119,15 +131,16 @@ pub(crate) fn walk(
     };
     stack.push(Frame {
         computed: c0,
-        ctm_children: root_ctm,
+        ctm_children: root_own.then(&root_ctm),
         vp_w,
         vp_h,
         node: 0,
         child: root.first_child,
         has_vp,
         children_rendered: u8::from(root_ok),
-        known: 1,
-        pad: [0; 5],
+        known: u8::from(root_known),
+        in_text: 0,
+        pad: [0; 4],
     })?;
     while let Some(top) = stack.last().copied() {
         budget.spend(cost::OP_STEP)?;
@@ -164,6 +177,7 @@ pub(crate) fn walk(
             && svg_ns
             && known(local)
             && !not_rendered(local)
+            && fits(local, top.in_text != 0)
             && !is_hidden(next)
             && comp.display_none == 0
             && det != 0.0
@@ -172,23 +186,34 @@ pub(crate) fn walk(
         let mut known_ctm = top.known != 0 && comp.transform_known != 0;
         let mut child_ctm = ctm;
         let mut child_vp = vp;
+        // 属性の長さ（書いていない・壊れた値は 0。基準がなく解けない % は 0 にして「解けない」印を付ける）
+        let mut len0 = |name: &[u8], axis: Axis| -> Result<f64, Error> {
+            Ok(match attr_len(doc, input, n, name, &comp, &b, axis, budget)? {
+                Some(Some(v)) => v,
+                Some(None) => {
+                    known_ctm = false;
+                    0.0
+                }
+                None => 0.0,
+            })
+        };
         if svg_ns && local == b"use" {
-            let x = attr_len(doc, input, n, b"x", &comp, &b, Axis::X, budget)?.unwrap_or(0.0);
-            let y = attr_len(doc, input, n, b"y", &comp, &b, Axis::Y, budget)?.unwrap_or(0.0);
+            let x = len0(b"x", Axis::X)?;
+            let y = len0(b"y", Axis::Y)?;
             ctm = ctm.then(&Transform { e: x, f: y, ..Transform::IDENTITY });
             child_ctm = ctm;
         } else if svg_ns && local == b"svg" {
             // 入れ子の svg：x・y・width・height（既定 100%）と viewBox
-            let x = attr_len(doc, input, n, b"x", &comp, &b, Axis::X, budget)?.unwrap_or(0.0);
-            let y = attr_len(doc, input, n, b"y", &comp, &b, Axis::Y, budget)?.unwrap_or(0.0);
+            let x = len0(b"x", Axis::X)?;
+            let y = len0(b"y", Axis::Y)?;
             let full =
                 |axis: Axis| resolve(Length::new(100.0, Unit::Percent), comp.font_size, comp.line_height, &b, axis);
             let w = match attr_len(doc, input, n, b"width", &comp, &b, Axis::X, budget)? {
-                Some(w) => Some(w),
+                Some(w) => w,
                 None => full(Axis::X),
             };
             let h = match attr_len(doc, input, n, b"height", &comp, &b, Axis::Y, budget)? {
-                Some(h) => Some(h),
+                Some(h) => h,
                 None => full(Axis::Y),
             };
             let to = ctm.then(&Transform { e: x, f: y, ..Transform::IDENTITY });
@@ -230,18 +255,15 @@ pub(crate) fn walk(
             has_vp,
             children_rendered: u8::from(rendered && renders_children(local)),
             known: u8::from(known_ctm),
-            pad: [0; 5],
+            in_text: u8::from(top.in_text != 0 || (svg_ns && local == b"text")),
+            pad: [0; 4],
         })?;
     }
     Ok(())
 }
 
-/// 子を描く入れ物（図形・use・image の子は描かない。文字の要素の子は文字の中身）。
-fn renders_children(local: &[u8]) -> bool {
-    matches!(local, b"svg" | b"g" | b"a" | b"switch" | b"text" | b"tspan" | b"textPath")
-}
-
-/// 属性の長さ（単位のない数も受ける。`auto` と壊れた値は None）をユーザー単位に解く。
+/// 属性の長さ（単位のない数も受ける）をユーザー単位に解く。書いていない・`auto`・壊れた値は None、基準がなく解けない
+/// （表示の領域のない % など）なら `Some(None)`。
 #[allow(clippy::too_many_arguments, reason = "長さの文脈をまとめて渡す")]
 fn attr_len(
     doc: &XmlDoc,
@@ -252,7 +274,7 @@ fn attr_len(
     base: &Base,
     axis: Axis,
     budget: &Budget<'_>,
-) -> Result<Option<f64>, Error> {
+) -> Result<Option<Option<f64>>, Error> {
     let budget = budget_ref(budget);
     let Some(v) = doc.attr(input, n, NS_NONE, name, budget)? else { return Ok(None) };
     let mut vals = Values::new(v, Span::new(0, v.len()), budget);
@@ -260,7 +282,7 @@ fn attr_len(
     if !vals.at_end()? {
         return Ok(None);
     }
-    Ok(resolve(l, c.font_size, c.line_height, base, axis))
+    Ok(Some(resolve(l, c.font_size, c.line_height, base, axis)))
 }
 
 /// 要素の `viewBox`（負の幅・高さの壊れたものは None。幅か高さが 0 のものは返し、呼び手が描かない）と
@@ -334,7 +356,14 @@ pub(crate) fn used_paint(
         return Ok(fallback(p));
     }
     let kind = if is_fill { EDGE_FILL } else { EDGE_STROKE };
-    let cut = d.refs.of(node).iter().any(|e| e.kind == kind && e.target == t && e.removed != 0);
+    let mut cut = false;
+    for e in d.refs.of(node) {
+        budget.spend(cost::OP_STEP)?;
+        if e.kind == kind && e.target == t && e.removed != 0 {
+            cut = true;
+            break;
+        }
+    }
     Ok(if cut { Used::Cut } else { Used::Server(t) })
 }
 

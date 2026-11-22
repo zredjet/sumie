@@ -38,3 +38,32 @@ fn images_on_the_drawn_paths() {
     assert!(needs_of("<defs><text>a</text></defs>").text);
     assert!(!needs_of("<rect/>").text);
 }
+
+/// 描かない入れ物が参照より前に子の辺で来ても、参照の辺で来たら中をたどる。switch が選ばない子・条件が偽の祖先の中の
+/// 要素も、参照の辺で入れば描く（Chrome・usvg と同じ。文書の 1 回目のレビュー）。
+#[test]
+fn referenced_images_regardless_of_order_and_context() {
+    let raster = |b: &str| needs_of(b).raster_images;
+    let img = format!("<image href=\"{PNG}\"/>");
+    for doc in [
+        format!("<rect fill=\"url(#p)\"/><pattern id=\"p\">{img}</pattern>"),
+        format!("<pattern id=\"p\">{img}</pattern><rect fill=\"url(#p)\"/>"),
+        format!("<use href=\"#s\"/><symbol id=\"s\">{img}</symbol>"),
+        format!("<rect filter=\"url(#f)\"/><filter id=\"f\"><feImage href=\"{PNG}\"/></filter>"),
+        format!("<rect mask=\"url(#m)\"/><mask id=\"m\">{img}</mask>"),
+        format!("<path d=\"M0 0L1 1\" marker-end=\"url(#k)\"/><marker id=\"k\">{img}</marker>"),
+        format!("<switch><rect/><image id=\"b\" href=\"{PNG}\"/></switch><use href=\"#b\"/>"),
+        format!("<g systemLanguage=\"xx\"><image id=\"c\" href=\"{PNG}\"/></g><use href=\"#c\"/>"),
+    ] {
+        assert!(raster(&doc), "{doc}");
+    }
+    // 自分の条件が偽なら参照しても描かない。図形・文字の中の画像は描かない
+    for doc in [
+        format!("<image id=\"d\" systemLanguage=\"xx\" href=\"{PNG}\"/><use href=\"#d\"/>"),
+        format!("<rect>{img}</rect>"),
+        format!("<text>{img}</text>"),
+        format!("<g style=\"display: n\\6f ne\">{img}</g>"),
+    ] {
+        assert!(!raster(&doc), "{doc}");
+    }
+}
