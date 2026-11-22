@@ -149,8 +149,7 @@ fn cases(scale: usize) -> Vec<(&'static str, Vec<u8>)> {
     ));
     out.push((
         "1 つの要素の多くの filter の url",
-        format!("{SVG}<g id=\"a\"><rect style=\"filter:{}\"/></g></svg>", "url(#a) ".repeat(n(1_500_000)))
-            .into_bytes(),
+        format!("{SVG}<g id=\"a\"><rect style=\"filter:{}\"/></g></svg>", "url(#a) ".repeat(n(1_500_000))).into_bytes(),
     ));
     out.push((
         "子の辺で戻る輪 × 12,000",
