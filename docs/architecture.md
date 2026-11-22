@@ -1,7 +1,7 @@
 # 設計
 
 段の分け方・型・公開の口。要件は `requirements.md`、値の規則は `determinism.md`。
-ここに書いた方式は承認済み（ADR-26 ほか）。AAT は ADR-29・ADR-36・ADR-42、レビューで直した所は ADR-30〜44。変えるときは
+ここに書いた方式は承認済み（ADR-26 ほか）。AAT は ADR-29・ADR-36・ADR-42、レビューで直した所は ADR-30〜44、M0 の詰めは ADR-45〜。変えるときは
 `decisions.md` に追記してから変える。
 
 この文書の言葉：**節**は XML と木の節（node）。文書の区切りは「§」で書く。**文字**は符号位置、**字形**はフォントの
@@ -21,7 +21,7 @@ crates/sumie/                 # ライブラリ。本番の依存は libm だけ
   goldens/                    # render-v<N>.jsonl（凍結した版は追記だけ）・estimate.jsonl（D2）
 crates/sumie-testkit/         # 試験の共通の道具（自前の ChaCha8・種つきの変異・照合の集まりの読み込み・確保を数える確保器の包み）。dev だけ
 crates/sumie-tools/           # 照合・計測・生成の道具（本番に入らない。resvg =0.48.1 などに依存してよい）。clippy.toml は別のゆるいもの
-fuzz/                         # cargo-fuzz（nightly。独立の workspace。sumie-testkit を使う）
+fuzz/                         # cargo-fuzz（nightly。独立の workspace。段ができるまではライブラリの doc(hidden) の fuzzing の入り口を使う。ADR-50）
 tests/svg/                    # 自作の試験の SVG（コミットする）
 tests/fonts/                  # 試験用のフォント（写しを許すライセンスのもの・それに表を足して作ったもの。出どころと作り方の一覧つき）
 corpus/                       # 照合の集まり（取り込んだ試験の SVG。ADR-21）

@@ -47,23 +47,22 @@ scripts/                   # verify.sh・check-goldens-append-only.sh
 docs/                      # 正本の文書
 ```
 
-（M0 で作る。今あるのは docs と、この CLAUDE.md だけ）
+（M0 で作った。ほかに `scripts/lint-probe/`（禁じる口の試しのクレート）・`.github/workflows/ci.yml`）
 
 ## コマンド
 
-M0 で用意する。用意したらこの表を実際のものに合わせる。
-
 | 目的 | コマンド |
 |---|---|
-| 全チェック | `scripts/verify.sh`（整形・clippy・テスト・ゴールデンの追記だけの検査・依存の検査） |
+| 全チェック | `scripts/verify.sh`（整形・clippy・禁じる口の照らしと試し・テスト（debug・release・target-cpu=native・x86_64）・ゴールデンの追記だけの検査・依存の検査・ファズの組み立てと種の流し直し。飛ばした段があれば並べて終わりの状態 3。`SUMIE_VERIFY_QUICK=1` で速い方、`SUMIE_GOLDEN_BASE=<rev>` で基準） |
 | 整形 | `cargo fmt --all -- --check` |
-| lint | `cargo clippy --workspace --all-targets -- -D warnings` |
+| lint | `scripts/clippy.sh`（`cargo clippy --workspace --all-targets -- -D warnings` に、clippy.toml の引けない口の検出を足したもの） |
+| 禁じる口の一覧 | `cargo run -p sumie-tools -- gen-disallowed [--check]`（std の文書から作る）・`cargo run -p sumie-tools -- check-lint-probe`（本当に拾われるか） |
 | テスト | `cargo test --workspace` |
 | ゴールデン | `cargo test -p sumie --test golden` |
-| ゴールデンは追記だけ | `scripts/check-goldens-append-only.sh [基準のコミット]` |
-| 本番の依存が libm だけ | `cargo tree -e normal,build -p sumie`（libm の feature は `cargo tree -e features -i libm`） |
+| ゴールデンは追記だけ | `scripts/check-goldens-append-only.sh [--strict] [基準のコミット]`（`--self-test` で自己試験） |
+| 本番の依存が libm だけ | `scripts/check-deps.sh`（`cargo tree -e normal,build --target all -p sumie` と libm の feature・出どころ） |
 | x86_64 の命令で | `cargo test -p sumie --target x86_64-apple-darwin`（Rosetta 2。先に `rustup target add x86_64-apple-darwin`） |
-| ファズ | `cd fuzz && cargo +nightly fuzz run <対象> -- -max_total_time=3600 -rss_limit_mb=4096 -timeout=20` |
+| ファズ | `cd fuzz && cargo +nightly fuzz run <対象> corpus/<対象> seeds/<対象> -- -max_total_time=3600 -rss_limit_mb=4096 -timeout=20`（先に `mkdir -p corpus/<対象>`。nightly は CI と同じ `nightly-2026-10-15`） |
 | 照合 | `cargo run -p sumie-tools --release -- compare <入力> --against resvg\|chrome` |
 | 計測 | `cargo run -p sumie-tools --release -- bench <入力>` |
 
