@@ -4,7 +4,8 @@
 //! `wellformed [--root corpus] [--kura-fuzz <Kura の fuzz/corpus/decode_svg>] [--mutate N] [--out local/wellformed]`
 //!
 //! 分け方：両方読む・両方断る・roxmltree だけ読む（sumie が断りすぎ。Kura が描くものを断ると NFR-10 に反しうる）・
-//! sumie だけ読む（sumie がゆるい）・sumie が `Unsupported`（DTD の実体など。今の Kura の前段と同じ断り）。
+//! sumie だけ読む（sumie がゆるい）・sumie が `Unsupported`（DTD の実体など。今の Kura の前段と同じ断り）・sumie が上限で
+//! 止まる（`Limit`。整形式の違いでない）・sumie の不変の条件が崩れた（`Violation`。sumie の不具合）。
 //! Kura のファズのコーパスは読むだけで、結果の一覧に道を書かず BLAKE3 で指す（写さない）。
 
 use std::fmt::Write as _;
@@ -78,6 +79,20 @@ fn edge_cases() -> Vec<(&'static str, String)> {
         ("standalone-yes", format!("<?xml version=\"1.0\" standalone=\"yes\"?><svg {svg}/>")),
         ("encoding-latin1-ascii", format!("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><svg {svg}/>")),
     ];
+    v.extend([
+        ("pi-xml-in-content", format!("<svg {svg}><?xml?></svg>")),
+        ("pi-xml-tab", format!("<svg {svg}><?xml\tx?></svg>")),
+        ("pi-xml-after-root", format!("<svg {svg}/><?xml\nx?>")),
+        ("pi-xml-in-subset", format!("<!DOCTYPE svg [<?xml?>]><svg {svg}/>")),
+        ("decl-newline", format!("<?xml\n version=\"1.0\"\n standalone=\"no\" encoding=\"UTF-8\"?><svg {svg}/>")),
+        ("decl-space-in-content", format!("<svg {svg}><?xml x?></svg>")),
+        ("xmlns-xmlns", format!("<svg {svg} xmlns:xmlns=\"urn:a\"/>")),
+        ("xmlns-xmlns-used", format!("<svg {svg} xmlns:xmlns=\"urn:a\"><xmlns:g/></svg>")),
+        ("attlist-unclosed-quote", format!("<!DOCTYPE svg [<!ATTLIST svg a CDATA \"x>]><svg {svg}/>")),
+        ("attlist-gt-in-quote", format!("<!DOCTYPE svg [<!ATTLIST svg a CDATA \"x>y\">]><svg {svg}/>")),
+        ("entity-cdata-end-text", format!("<!DOCTYPE svg [<!ENTITY e \"]]>\">]><svg {svg}>&e;</svg>")),
+        ("entity-cdata-end-attr", format!("<!DOCTYPE svg [<!ENTITY e \"]]>\">]><svg {svg} a=\"&e;\"/>")),
+    ]);
     v.push(("deep-1000", format!("<svg {svg}>{}{}</svg>", "<g>".repeat(1000), "</g>".repeat(1000))));
     v
 }
@@ -89,6 +104,8 @@ enum Verdict {
     RoxOnly,
     SumieOnly,
     SumieUnsupported,
+    SumieLimit,
+    SumieViolation,
 }
 
 fn judge(data: &[u8]) -> (Verdict, String, String) {
@@ -103,6 +120,10 @@ fn judge(data: &[u8]) -> (Verdict, String, String) {
         Err(_) => Err("UTF-8 でない".to_string()),
     };
     let out = sumie::fuzzing::xml_parse(data);
+    let violation = match out.check {
+        sumie::fuzzing::Check::Ok => None,
+        sumie::fuzzing::Check::Violation(what) => Some(what),
+    };
     let s = match out.error {
         None => Ok(()),
         Some(e) => Err(e),
@@ -111,11 +132,16 @@ fn judge(data: &[u8]) -> (Verdict, String, String) {
         Ok(()) => "読む".to_string(),
         Err(e) => e.clone(),
     };
-    let sumie_text = match &s {
-        Ok(()) => "読む".to_string(),
-        Err(e) => format!("{e:?}"),
+    let sumie_text = match (&s, violation) {
+        (_, Some(what)) => format!("不変の条件が崩れた：{what}"),
+        (Ok(()), None) => "読む".to_string(),
+        (Err(e), None) => format!("{e:?}"),
     };
+    if violation.is_some() {
+        return (Verdict::SumieViolation, rox_text, sumie_text);
+    }
     let v = match (&rox, &s) {
+        (_, Err(Error::Limit(_))) => Verdict::SumieLimit,
         (Ok(()), Ok(())) => Verdict::Both,
         (Err(_), Err(_)) => Verdict::Neither,
         (Ok(()), Err(Error::Unsupported(_))) => Verdict::SumieUnsupported,
@@ -195,11 +221,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .str("sumie", sumie.as_str());
         lines.push_str(&l.to_json());
         lines.push('\n');
-        if matches!(v, Verdict::RoxOnly | Verdict::SumieOnly) || src == "端の例" {
+        if matches!(v, Verdict::RoxOnly | Verdict::SumieOnly | Verdict::SumieLimit | Verdict::SumieViolation)
+            || src == "端の例"
+        {
             let _ = writeln!(diffs, "| {src} | `{name}` | {key} | {rox} | {sumie} |");
         }
         // 食い違った入力は diff/ に写す（手元の調べのため。local/ の中だけ）
-        if matches!(v, Verdict::RoxOnly | Verdict::SumieOnly) {
+        if matches!(v, Verdict::RoxOnly | Verdict::SumieOnly | Verdict::SumieViolation) {
             let dir = out_dir.join("diff");
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let file = name.replace(['/', '\\'], "_");

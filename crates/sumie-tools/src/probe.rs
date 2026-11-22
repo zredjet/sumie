@@ -489,7 +489,154 @@ fn probes() -> Vec<Probe> {
         GREEN,
         BLACK,
     ));
+    v.extend(css_details());
     v
+}
+
+/// CSS の細部（css の単位で決める字句・名前・照合の細かい扱い）。効けば緑、効かなければ赤。
+fn css_details() -> Vec<Probe> {
+    let c = |name: &'static str, what: &'static str, body: &str| Probe {
+        group: "CSS の細部",
+        name,
+        what,
+        body: svg(body),
+        yes: GREEN,
+        no: RED,
+        point: (50, 50),
+    };
+    let r = "<rect id=\"r\" class=\"a\" width=\"100\" height=\"100\" fill=\"red\"/>";
+    let st = |css: &str, content: &str| format!("<style>{css}</style>{content}");
+    vec![
+        c("prop-upper", "プロパティの名前の大文字 `FILL`（CSS は区別しない）", &st("rect { FILL: green }", r)),
+        c(
+            "prop-upper-attr",
+            "style 属性のプロパティの名前の大文字",
+            "<rect width=\"100\" height=\"100\" fill=\"red\" style=\"FILL: green\"/>",
+        ),
+        c("value-upper", "色の名前の大文字 `GREEN`", &st("rect { fill: GREEN }", r)),
+        c("escape-class", "クラスの名前の escape `.\\61`", &st(".\\61 { fill: green }", r)),
+        c("escape-type", "型の名前の escape `r\\65 ct`", &st("r\\65 ct { fill: green }", r)),
+        c("escape-hex-space", "escape のあとの空白 `#\\72 `", &st("#\\72  { fill: green }", r)),
+        c("id-upper", "`#R`（id は区別する。当たらないのが正しい）", &st("#R { fill: green }", r)),
+        c("class-upper", "`.A`（class は区別する。当たらないのが正しい）", &st(".A { fill: green }", r)),
+        c(
+            "attr-name-upper",
+            "`[DATA-X]`（XML の属性の名前は区別する。当たらないのが正しい）",
+            &st("[DATA-X] { fill: green }", "<rect data-x=\"1\" width=\"100\" height=\"100\" fill=\"red\"/>"),
+        ),
+        c(
+            "attr-unquoted",
+            "`[data-x=foo]`（引用符なしの値）",
+            &st("[data-x=foo] { fill: green }", "<rect data-x=\"foo\" width=\"100\" height=\"100\" fill=\"red\"/>"),
+        ),
+        c(
+            "attr-xlink-href",
+            "`[href]` が `xlink:href` に当たるか",
+            &st("[href] { fill: green }", "<rect xlink:href=\"#x\" width=\"100\" height=\"100\" fill=\"red\"/>"),
+        ),
+        c(
+            "first-child-foreign",
+            "`:first-child` の前に別の名前空間の要素",
+            &st(
+                "rect:first-child { fill: green }",
+                "<g><foo:x xmlns:foo=\"urn:x\"/><rect width=\"100\" height=\"100\" fill=\"red\"/></g>",
+            ),
+        ),
+        c(
+            "adjacent-foreign",
+            "`desc + rect` の間に別の名前空間の要素",
+            &st(
+                "desc + rect { fill: green }",
+                "<g><desc/><foo:x xmlns:foo=\"urn:x\"/><rect width=\"100\" height=\"100\" fill=\"red\"/></g>",
+            ),
+        ),
+        c(
+            "child-foreign",
+            "`g > rect` の間に別の名前空間の要素（子でないので当たらないのが CSS）",
+            &st(
+                "g > rect { fill: green }",
+                "<g><foo:x xmlns:foo=\"urn:x\"><rect width=\"100\" height=\"100\" fill=\"red\"/></foo:x></g>",
+            ),
+        ),
+        c(
+            "first-child-text",
+            "`:first-child` の前に文字（文字は数えない）",
+            &st("rect:first-child { fill: green }", "<g>text<rect width=\"100\" height=\"100\" fill=\"red\"/></g>"),
+        ),
+        c(
+            "first-child-root",
+            "根の要素の `:first-child`",
+            "<style>svg:first-child rect { fill: green }</style><rect width=\"100\" height=\"100\" fill=\"red\"/>",
+        ),
+        c(
+            "type-foreign",
+            "別の名前空間の要素の型 `x rect`（`foo:x` に当たるか）",
+            &st(
+                "x rect { fill: green }",
+                "<foo:x xmlns:foo=\"urn:x\"><rect width=\"100\" height=\"100\" fill=\"red\"/></foo:x>",
+            ),
+        ),
+        c(
+            "important-space",
+            "`! important`（間に空白）",
+            &st("rect { fill: green ! important }", "<rect width=\"100\" height=\"100\" style=\"fill: red\"/>"),
+        ),
+        c(
+            "important-upper",
+            "`!IMPORTANT`",
+            &st("rect { fill: green !IMPORTANT }", "<rect width=\"100\" height=\"100\" style=\"fill: red\"/>"),
+        ),
+        c("decl-later-wins", "同じ規則の後の宣言が勝つ", &st("rect { fill: red; fill: green }", r)),
+        c(
+            "decl-invalid-later",
+            "後の宣言が壊れた値（前の宣言が残るのが CSS）",
+            &st("rect { fill: green; fill: nonsense }", r),
+        ),
+        c(
+            "attr-invalid-value",
+            "プレゼンテーション属性の壊れた値（受け継いだ値が残るか）",
+            "<g fill=\"green\"><rect width=\"100\" height=\"100\" fill=\"nonsense\"/></g>",
+        ),
+        c(
+            "cdo-cdc",
+            "`<!--`・`-->` を CSS の中に書く",
+            "<style>&lt;!-- rect { fill: green } --&gt;</style><rect width=\"100\" height=\"100\" fill=\"red\"/>",
+        ),
+        c("comment-in-selector", "セレクタの中の注釈 `rect/**/.a`", &st("rect/**/.a { fill: green }", r)),
+        c("combinator-tight", "空白のない結合子 `g>rect`", &st("g>rect { fill: green }", &format!("<g>{r}</g>"))),
+        c("unclosed-block", "閉じていない規則（文書の終わりで閉じる）", &st("rect { fill: green", r)),
+        c("string-in-value", "宣言の値の中の `;` を含む文字列", &st("rect { font-family: \"a;b\"; fill: green }", r)),
+        c(
+            "bad-selector-block",
+            "読めないセレクタの規則のあとの規則",
+            &st("rect[ { fill: red } rect { fill: green }", r),
+        ),
+        c(
+            "style-two",
+            "2 つの `<style>`（後が勝つ）",
+            "<style>rect { fill: red }</style><style>rect { fill: green }</style><rect width=\"100\" height=\"100\"/>",
+        ),
+        c(
+            "style-media-attr",
+            "`<style media=\"print\">`（media 属性を見るか。見なければ当たる）",
+            "<style media=\"print\">rect { fill: green }</style><rect width=\"100\" height=\"100\" fill=\"red\"/>",
+        ),
+        c(
+            "style-cdata-split",
+            "文字と CDATA に分かれた `<style>`",
+            "<style>rect { fill:<![CDATA[ green }]]></style><rect width=\"100\" height=\"100\" fill=\"red\"/>",
+        ),
+        c(
+            "style-in-foreign",
+            "別の名前空間の要素の中の `<style>`",
+            "<foo:x xmlns:foo=\"urn:x\"><style>rect { fill: green }</style></foo:x><rect width=\"100\" height=\"100\" fill=\"red\"/>",
+        ),
+        c(
+            "style-foreign-ns",
+            "別の名前空間の `style` 要素（当たらないのが正しい）",
+            "<foo:style xmlns:foo=\"urn:x\">rect { fill: green }</foo:style><rect width=\"100\" height=\"100\" fill=\"red\"/>",
+        ),
+    ]
 }
 
 /// 大きさの試し（resvg の大きさを並べる）。

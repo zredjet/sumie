@@ -147,6 +147,44 @@
 | `entity` | 内部の一般の実体（比べの基準） | 効く | 効く |
 | `xml-space-preserve-attr` | 属性の値の改行（属性の値の正規化。比べの基準） | 効く | 効く |
 
+## CSS の細部
+
+| 試し | 何を見るか | resvg | Chrome |
+|---|---|---|---|
+| `prop-upper` | プロパティの名前の大文字 `FILL`（CSS は区別しない） | 効かない | 効く |
+| `prop-upper-attr` | style 属性のプロパティの名前の大文字 | 効かない | 効く |
+| `value-upper` | 色の名前の大文字 `GREEN` | 効く | 効く |
+| `escape-class` | クラスの名前の escape `.\61` | 効かない | 効く |
+| `escape-type` | 型の名前の escape `r\65 ct` | 効かない | 効く |
+| `escape-hex-space` | escape のあとの空白 `#\72 ` | 効かない | 効く |
+| `id-upper` | `#R`（id は区別する。当たらないのが正しい） | 効かない | 効かない |
+| `class-upper` | `.A`（class は区別する。当たらないのが正しい） | 効かない | 効かない |
+| `attr-name-upper` | `[DATA-X]`（XML の属性の名前は区別する。当たらないのが正しい） | 効かない | 効かない |
+| `attr-unquoted` | `[data-x=foo]`（引用符なしの値） | 効く | 効く |
+| `attr-xlink-href` | `[href]` が `xlink:href` に当たるか | 効く | 効かない |
+| `first-child-foreign` | `:first-child` の前に別の名前空間の要素 | 効かない | 効かない |
+| `adjacent-foreign` | `desc + rect` の間に別の名前空間の要素 | 効かない | 効かない |
+| `child-foreign` | `g > rect` の間に別の名前空間の要素（子でないので当たらないのが CSS） | 透明 | 透明 |
+| `first-child-text` | `:first-child` の前に文字（文字は数えない） | 効く | 効く |
+| `first-child-root` | 根の要素の `:first-child` | 効く | 効く |
+| `type-foreign` | 別の名前空間の要素の型 `x rect`（`foo:x` に当たるか） | 透明 | 透明 |
+| `important-space` | `! important`（間に空白） | 効く | 効く |
+| `important-upper` | `!IMPORTANT` | 効かない | 効く |
+| `decl-later-wins` | 同じ規則の後の宣言が勝つ | 効く | 効く |
+| `decl-invalid-later` | 後の宣言が壊れた値（前の宣言が残るのが CSS） | どちらでもない（0,0,0） | 効く |
+| `attr-invalid-value` | プレゼンテーション属性の壊れた値（受け継いだ値が残るか） | どちらでもない（0,0,0） | 効く |
+| `cdo-cdc` | `<!--`・`-->` を CSS の中に書く | 効かない | 効く |
+| `comment-in-selector` | セレクタの中の注釈 `rect/**/.a` | 効く | 効く |
+| `combinator-tight` | 空白のない結合子 `g>rect` | 効く | 効く |
+| `unclosed-block` | 閉じていない規則（文書の終わりで閉じる） | 効く | 効く |
+| `string-in-value` | 宣言の値の中の `;` を含む文字列 | 効く | 効く |
+| `bad-selector-block` | 読めないセレクタの規則のあとの規則 | 効く | 効かない |
+| `style-two` | 2 つの `<style>`（後が勝つ） | 効く | 効く |
+| `style-media-attr` | `<style media="print">`（media 属性を見るか。見なければ当たる） | 効く | 効かない |
+| `style-cdata-split` | 文字と CDATA に分かれた `<style>` | 効く | 効く |
+| `style-in-foreign` | 別の名前空間の要素の中の `<style>` | 効く | 効く |
+| `style-foreign-ns` | 別の名前空間の `style` 要素（当たらないのが正しい） | 効く | 効かない |
+
 ## 大きさ
 
 | 試し | 何を見るか | resvg の大きさ |
