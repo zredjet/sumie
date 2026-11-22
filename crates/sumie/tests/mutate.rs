@@ -205,7 +205,7 @@ fn document_survives_seeded_mutations() {
     for (n, case) in cases(0x5eed_0006, 2000, &refs, XML_DICT, 4096).iter().enumerate() {
         let (out, heap) = measure(|| document_parse(case));
         assert_eq!(out.check, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
-        let peak = out.count_peak.max(out.estimate.map_or(0, |e| e.peak_bytes));
+        let peak = out.peak;
         assert_heap_within(&heap, peak, 0, &format!("{n} 件目"));
         assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
         if out.error.is_some() { err += 1 } else { ok += 1 }

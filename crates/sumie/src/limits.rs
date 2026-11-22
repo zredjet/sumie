@@ -14,7 +14,8 @@ pub struct Limits {
     pub depth: u32,
     /// 展開したあとの要素の数（use・marker・複製。木を作る前に見る）
     pub instances: u64,
-    /// 見積もり自身の手間と確保
+    /// 見積もり自身の手間と確保（`estimate_build`。`estimate_parse` は読む段と同じ道を走らせるので、読む段の上限で払う。
+    /// ADR-70）
     pub estimate_work: u64,
     pub estimate_bytes: u64,
     /// 読む段の手間と確保の山

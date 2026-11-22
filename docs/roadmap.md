@@ -86,7 +86,7 @@
 - [ ] `values`：数・長さ・色・paint・変形・角度・並び・`viewBox`・`preserveAspectRatio`（パスのデータは M2）
 - [ ] `style`：プロパティの表・カスケード・継承・`currentColor`・em・ex
 - [ ] `doc`：ID の表・参照（保守的な辺。受け継ぐ参照と use の文脈）・輪・展開の数・`switch`・`tref`・大きさ
-- [ ] `estimate_parse`（本文を 1 度だけ字句に分けて数える）・`estimate_build`（文字を除く）・`Report` の骨組み
+- [ ] `estimate_parse`（読む段と同じ道を走らせて量を測る。ADR-70 で「本文を 1 度だけ字句に分けて数える」から改めた）・`estimate_build`（文字を除く）・`Report` の骨組み
 - [ ] NFR-10 の照らし（ADR-63 (1)）：照合の集まりで、Kura の設定の resvg が読めるもの（大きさが出るもの）を sumie の `parse` が
   断らないこと・大きさが同じこと（`sumie-tools sizes`）。外れるものは一覧にして承認を得る
 - [ ] 大きさを中身で決める文書（ADR-58 (1)）：`Document::size`・`pixel_size` の型（「木が要る」の返し方）と、外接矩形の細かい

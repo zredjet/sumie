@@ -563,14 +563,14 @@ pub struct DocOutcome {
     pub estimate: Option<crate::budget::Estimate>,
     /// 誤り（読めなかったとき）
     pub error: Option<Error>,
-    /// 数える段の確保の山（ヒープの山と照らす）
-    pub count_peak: u64,
+    /// 読む段の確保の山（ヒープの山と照らす）
+    pub peak: u64,
 }
 
 /// 読む段の全体（公開の `estimate_parse` と `parse`）を通し、次を確かめる（ファズの `document` の対象）：
 ///
-/// - 2 つの誤りが同じ（D2）・見積もりが通れば読める・持ち続ける量が見積もりと同じ
-/// - 数える段と本体のどちらでも、1 回の払いが中止の間隔を超えず、返しすぎない
+/// - 2 つの誤りが同じ（D2）・見積もりが通れば読める・手間・山・持ち続ける量が見積もりと同じ（ADR-70）
+/// - 1 回の払いが中止の間隔を超えず、返しすぎない
 /// - 上限を見積もりのちょうどにすれば読め、1 少なくすれば `estimate_parse` と `parse` が同じ `Limit` を返す
 pub fn document_parse(data: &[u8]) -> DocOutcome {
     document_parse_cancel(data, &Never)
@@ -583,12 +583,8 @@ pub fn document_parse_cancel(data: &[u8], cancel: &dyn Cancel) -> DocOutcome {
     let est = estimate_parse(data, &opts, cancel);
     let mut watch = Watch::default();
     let doc = parse_watch(data, &opts, cancel, &mut watch);
-    let mut out = DocOutcome {
-        check: Check::Ok,
-        estimate: est.ok(),
-        error: doc.as_ref().err().copied(),
-        count_peak: watch.count_peak,
-    };
+    let mut out =
+        DocOutcome { check: Check::Ok, estimate: est.ok(), error: doc.as_ref().err().copied(), peak: watch.peak };
     if watch.over_released || watch.max_spend >= CANCEL_INTERVAL {
         out.check = Check::Violation("読む段の勘定が崩れた");
         return out;
@@ -599,11 +595,9 @@ pub fn document_parse_cancel(data: &[u8], cancel: &dyn Cancel) -> DocOutcome {
                 out.check = Check::Violation("持ち続ける量が見積もりと違う");
                 return out;
             }
-            // 見積もりは parse の全体（数える段 ＋ 本体。ADR-68 (1)）
-            if watch.count_work.saturating_add(watch.body_work) > e.work
-                || watch.count_peak.max(watch.body_peak) > e.peak_bytes
-            {
-                out.check = Check::Violation("parse の全体の手間か山が見積もりを超えた");
+            // 見積もりは parse と同じ道の実際（ADR-70）
+            if watch.work != e.work || watch.peak != e.peak_bytes {
+                out.check = Check::Violation("parse の手間か山が見積もりと違う");
                 return out;
             }
             e

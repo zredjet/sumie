@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::cancel::Never;
-use crate::error::InvalidReason;
+use crate::error::{InvalidReason, Resource};
 
 const SVG: &[u8] =
     b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"5\" height=\"5\"/></svg>";
@@ -36,10 +36,31 @@ fn limits_refuse_in_both() {
     opts.limits.parse_work = est.work;
     opts.limits.parse_bytes = est.peak_bytes;
     assert!(parse(SVG, &opts, &Never).is_ok());
-    // 見積もりの上限は数える段で効く
+    // 確保の上限でも両方が同じ誤り。estimate_work・estimate_bytes は読む段には効かない（ADR-70）
+    let mut opts = ParseOptions::DEFAULT;
+    opts.limits.parse_bytes = est.peak_bytes - 1;
+    assert_eq!(estimate_parse(SVG, &opts, &Never).unwrap_err(), parse(SVG, &opts, &Never).unwrap_err());
     let mut opts = ParseOptions::DEFAULT;
     opts.limits.estimate_work = 10;
-    assert!(matches!(parse(SVG, &opts, &Never), Err(Error::Limit(l)) if l.stage == Stage::EstimateParse));
+    opts.limits.estimate_bytes = 10;
+    assert!(parse(SVG, &opts, &Never).is_ok());
+}
+
+/// `<style>` の規則が当たり、条件・報告もまとまる。
+#[test]
+fn styles_and_report() {
+    let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\"><style type=\"TEXT/CSS\">rect { fill: red } @media (min-width: 60px) { rect { stroke: blue } } @import url(a.css); circle:bogus {}</style><style type=\"text/foo\">rect { opacity: .5 }</style><rect fill=\"nonsense\"/></svg>";
+    let doc = parse(svg, &ParseOptions::DEFAULT, &Never).unwrap();
+    let rect = doc.xml().nodes.as_slice().iter().position(|n| n.local.of(svg) == b"rect").unwrap() as u32;
+    let names: Vec<&[u8]> =
+        doc.styles().of(rect).iter().map(|s| crate::style::props::prop(s.prop).unwrap().name).collect();
+    assert_eq!(names, [b"fill".as_slice(), b"stroke"]);
+    let kinds: Vec<_> = doc.report().warnings().map(|w| w.kind).collect();
+    // @import のあとの規則で壊れたセレクタ、属性の壊れた値
+    assert!(kinds.contains(&crate::report::WarningKind::InvalidSelector));
+    assert!(kinds.contains(&crate::report::WarningKind::InvalidValue));
+    let unread: Vec<&[u8]> = doc.report().unread_refs().map(|u| u.href).collect();
+    assert_eq!(unread, [b"a.css".as_slice()]);
 }
 
 #[test]
@@ -62,10 +83,10 @@ fn cancel_is_seen() {
     assert_eq!(estimate_parse(big.as_bytes(), &ParseOptions::DEFAULT, &stop).unwrap_err(), Error::Cancelled);
 }
 
-/// 見積もりは parse の全体（数える段 ＋ 本体）を上から押さえ（ADR-68 (1)）、印がどこで立っても（段の間でも）、立ってから
-/// 止まるまでの手間は 2 × CANCEL_INTERVAL の内（ADR-68 (2)・NFR-06）。
+/// 見積もりは parse と同じ道の実際（ADR-70）で、印がどこで立っても、立ってから止まるまでの手間は 2 × CANCEL_INTERVAL の内
+/// （NFR-06）。
 #[test]
-fn whole_parse_is_estimated_and_cancel_is_prompt() {
+fn estimate_is_exact_and_cancel_is_prompt() {
     use crate::budget::CANCEL_INTERVAL as CI;
     use std::sync::atomic::{AtomicU32, Ordering};
     struct After(AtomicU32);
@@ -74,25 +95,27 @@ fn whole_parse_is_estimated_and_cancel_is_prompt() {
             self.0.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_err()
         }
     }
-    let big = format!("<svg xmlns=\"http://www.w3.org/2000/svg\">{}</svg>", "<g a=\"1\"/>".repeat(25_000));
+    let big = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><style>g {{ fill: red }} .a g {{ stroke: blue }}</style>{}</svg>",
+        "<g a=\"1\" class=\"a\"/>".repeat(4_000)
+    );
     let big = big.as_bytes();
     let opts = ParseOptions::DEFAULT;
     let e = estimate_parse(big, &opts, &Never).unwrap();
     let mut w = Watch::default();
-    parse_watch(big, &opts, &Never, &mut w).unwrap();
-    assert!(w.count_work + w.body_work <= e.work);
-    assert!(w.count_peak.max(w.body_peak) <= e.peak_bytes);
-    let k = w.count_work / CI;
+    let d = parse_watch(big, &opts, &Never, &mut w).unwrap();
+    assert_eq!((w.work, w.peak, d.held_bytes()), (e.work, e.peak_bytes, e.result_bytes));
+    let k = w.work / CI;
     let mut cancelled = 0;
-    for calls in 0..=(k + 2 + w.body_work / CI) {
+    // 40 ほどの所で印を立てる（ほかの所も同じ形）
+    let step = (k / 40).max(1);
+    for calls in (0..=(k + 1)).step_by(step as usize) {
         let c = After(AtomicU32::new(calls as u32));
         let mut w2 = Watch::default();
         if parse_watch(big, &opts, &c, &mut w2).err() == Some(Error::Cancelled) {
             cancelled += 1;
-            // 印が立った時点の手間（数える段の中なら calls 回目の確かめ、段の間なら数える段の終わり、本体なら本体の確かめ）
-            let flag_at = if calls <= k { calls * CI } else { w.count_work + (calls - k - 1) * CI };
-            assert!(w2.count_work + w2.body_work - flag_at < 2 * CI, "{calls} 回目");
+            assert!(w2.work - calls * CI < 2 * CI, "{calls} 回目");
         }
     }
-    assert!(cancelled > k);
+    assert!(cancelled >= (k / step).saturating_sub(1), "{cancelled}");
 }

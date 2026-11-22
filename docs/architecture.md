@@ -43,7 +43,7 @@ docs/
 ## 2. 段の分け方
 
 ```text
-SVG のバイト列 ─────────── estimate_parse（本文を 1 度だけ字句に分けて、実体の参照・要素・属性・規則・セレクタを数える）
+SVG のバイト列 ─────────── estimate_parse（読む段と同じ道を同じ上限で走らせて、手間・確保の山・持ち続ける量を測る。ADR-70）
   │
   ▼ 段 1  XML（xml）
   │   バイト列の字句 → 節の配列。DTD の内部の実体を上限つきで展開。名前空間を解く
@@ -206,11 +206,11 @@ pub enum Error {
 - Kura の今の見積もりの口（`Plan::Tree`・`Plan::Render`）に当たるのは `estimate_build` と `Tree::estimate`。Kura はフックを
   渡す代わりに、段ごとに見積もりを読んで予算を確保してから次の段を呼ぶ（待つのは呼び手の側。ライブラリは待たない）
 - 見積もりの関数は、値を変えない決定的な関数。中で要る小さな確保と手間は、上限の「見積もりの手間」の中で数え、中止の印も見る
-- `estimate_parse` の `work` は `parse` を呼んだときの全体の手間（`parse` が中で走らせる数える段 ＋ 本体）。`parse_work` とは
-  その和で比べる（ADR-68 (1)）。`estimate_parse` が通れば、同じ入力・同じ設定の `parse` は `Limit` にならない（確保器の失敗と
-  中止を除く）。断られる `parse` も数える段では `estimate_work`・`estimate_bytes` まで使うので、`parse` の最大は
-  max(`estimate_*`, `parse_*`)。ほかの見積もりの口（`estimate_build`・`Tree::estimate`）も「その口に当たる段を呼んだときの全体」
-  を返す
+- 読む段は 1 本の道（XML を数える → XML の節を作る → `<style>` を規則の並びに読む → 条件を照らしてカスケードする → 報告）で、
+  道の全体を `parse_work`・`parse_bytes` を上限にした 1 つの `Budget` で払う。`estimate_parse` は同じ道を同じ上限で走らせ、
+  払った手間・確保の山・持ち続ける量を返す（見積もりは実際とぴったり同じ）。`parse` は同じ道を 1 度走らせて結果を持つ。
+  同じ道なので 2 つは同じ誤りを返し（D2）、`estimate_parse` が通れば `parse` も通る（確保器の失敗と中止を除く。ADR-70）。
+  ほかの見積もりの口（`estimate_build`・`Tree::estimate`）は「その口に当たる段を呼んだときの全体」を返す
 - 段に入るときは「見積もり ≤ 上限」を欄ごとに確かめ、`Budget` の上限には見積もりの値を入れる（§5.1。ADR-39）。Kura は
   `RenderEstimate.plan` を共有の分（`shared`）、`Plan::estimate_region` を範囲ごとの作業領域（`per_task`）として予算にできる
 - `Document<'s>` は入力を借りる（名前・値を写さない）。`Tree`・`Plan`・`FontSet` は何も借りない（字形の輪郭は木に写す。
