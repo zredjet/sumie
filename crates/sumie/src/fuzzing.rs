@@ -810,10 +810,21 @@ pub fn document_parse_cancel(data: &[u8], cancel: &dyn Cancel) -> DocOutcome {
             }
             // 計算した値のたどり（木を作る段の前の部分。払いを確かめ、確保をヒープの山と照らす山に入れる）
             let wb = Budget::new(Stage::Build, u64::MAX, u64::MAX, cancel);
+            // 計算した値は有限（NaN・±∞ を値に入れない。文書の 4 回目のレビュー）
+            let finite = core::cell::Cell::new(true);
             let paint = |v: &crate::doc::walk::WalkItem| -> Result<(), Error> {
                 use crate::doc::walk::used_paint;
                 used_paint(&d, v.node, &v.computed.fill, true, v.computed.color, &wb)?;
                 used_paint(&d, v.node, &v.computed.stroke, false, v.computed.color, &wb)?;
+                let c = &v.computed;
+                let t = [c.transform, c.transform_raw, v.ctm];
+                let ok = [c.font_size, c.line_height, c.stroke_width, c.opacity, c.origin_x, c.origin_y]
+                    .iter()
+                    .all(|x| x.is_finite())
+                    && t.iter().all(|m| [m.a, m.b, m.c, m.d, m.e, m.f].iter().all(|x| x.is_finite()));
+                if !ok {
+                    finite.set(false);
+                }
                 Ok(())
             };
             match crate::doc::walk::walk(&d, &wb, &mut |v| paint(v)) {
@@ -825,6 +836,10 @@ pub fn document_parse_cancel(data: &[u8], cancel: &dyn Cancel) -> DocOutcome {
             }
             if wb.over_released() || wb.max_spend() >= CANCEL_INTERVAL {
                 out.check = Check::Violation("計算した値のたどりの勘定が崩れた");
+                return out;
+            }
+            if !finite.get() {
+                out.check = Check::Violation("計算した値に NaN か ±∞ が入った");
                 return out;
             }
             out.peak = out.peak.max(d.held_bytes().saturating_add(wb.peak()));

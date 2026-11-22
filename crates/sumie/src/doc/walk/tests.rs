@@ -284,3 +284,39 @@ fn font_sizes_stay_finite() {
         assert!(c.font_size.is_finite() && c.line_height.is_finite() && c.stroke_width.is_finite(), "{c:?}");
     }
 }
+
+/// lh の単位・言葉の文字の大きさ・大きな変形の入れ子でも、計算した値と根からの変形は有限（文書の 4 回目のレビュー）。
+#[test]
+fn computed_values_stay_finite_at_extremes() {
+    let rows = run(&format!(
+        r#"<svg {X} width="10" height="10"><g style="line-height:1e300px"><g style="line-height:1e10lh"><rect id="a" style="stroke-width:1lh"/></g></g>
+        <g transform="scale(1e200)"><g transform="scale(1e200)"><rect id="b"/></g></g></svg>"#
+    ));
+    let a = get(&rows, "a").1.computed;
+    assert!(a.line_height.is_finite() && a.stroke_width.is_finite(), "{a:?}");
+    let b = get(&rows, "b").1;
+    assert!(ctm(get(&rows, "b")).iter().all(|x| x.is_finite()) && !b.rendered && !b.ctm_known);
+    // 呼び手の大きな既定の文字の大きさと言葉
+    let opts = ParseOptions {
+        style: crate::style::StyleDefaults { font_size: 1e308, ..crate::style::StyleDefaults::USVG },
+        ..ParseOptions::DEFAULT
+    };
+    let svg = format!(r#"<svg {X} width="10" height="10"><rect id="c" style="font-size:xx-large"/></svg>"#);
+    let d = crate::doc::parse(svg.as_bytes(), &opts, &Never).unwrap();
+    let b = Budget::new(crate::error::Stage::Build, u64::MAX, u64::MAX, &Never);
+    walk(&d, &b, &mut |v| {
+        assert!(v.computed.font_size.is_finite() && v.computed.line_height.is_finite(), "{:?}", v.computed);
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// `transform-origin: initial` は CSS の初期の値 50% 50%（参照の箱は view-box。Chrome と同じ。文書の 4 回目のレビュー）。
+#[test]
+fn transform_origin_initial_is_center() {
+    let rows = run(&format!(
+        r#"<svg {X} width="100" height="50"><rect id="r" style="transform: rotate(180deg); transform-origin: initial"/></svg>"#
+    ));
+    // (50, 25) のまわりの半回転：原点は (100, 50) へ
+    ctm_is(get(&rows, "r"), [-1.0, 0.0, 0.0, -1.0, 100.0, 50.0]);
+}

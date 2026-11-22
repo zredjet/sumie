@@ -170,7 +170,8 @@ impl Computed {
             stroke_width: 1.0,
             opacity: 1.0,
             font_size,
-            line_height: NORMAL_LINE * font_size,
+            // 呼び手の既定の文字の大きさが大きくても有限に（文書の 4 回目のレビュー）
+            line_height: if (NORMAL_LINE * font_size).is_finite() { NORMAL_LINE * font_size } else { font_size },
             lh_factor: NORMAL_LINE,
             sw_pct: 0.0,
             transform: Transform::IDENTITY,
@@ -609,7 +610,11 @@ fn font_size(
         if is(b"math") {
             return Ok(Some(parent.font_size));
         }
-        return Ok(FONT_SIZE_SCALE.iter().find(|(w, _)| is(w)).map(|&(_, k)| k * base.default_font));
+        return Ok(FONT_SIZE_SCALE
+            .iter()
+            .find(|(w, _)| is(w))
+            .map(|&(_, k)| k * base.default_font)
+            .filter(|x| x.is_finite()));
     }
     let unitless = s.origin == ORIGIN_ATTR;
     let Some(l) = v.length(unitless)? else { return Ok(None) };
@@ -642,7 +647,7 @@ fn line_height(
     let out = match l.unit {
         Unit::Percent => Some(l.value * font / 100.0).filter(|x| x.is_finite()),
         // lh は親の行の高さ
-        Unit::Lh => Some(l.value * parent.line_height),
+        Unit::Lh => Some(l.value * parent.line_height).filter(|x| x.is_finite()),
         _ => resolve(l, font, parent.line_height, base, Axis::Diag),
     };
     Ok(out.filter(|&x| x >= 0.0).map(|x| (false, x)))
@@ -699,7 +704,15 @@ fn transform(
                     (0.0, 0.0)
                 }
             },
-            _ => (0.0, 0.0),
+            // initial・unset は CSS の初期の値 50% 50%（SVG の要素の 0 0 は UA の規則の値で、initial はそれを上書きする。
+            // Chrome と同じ。文書の 4 回目のレビュー）。参照の箱は view-box（最も近い表示の領域）
+            _ => match base.viewport {
+                Some((w, h)) => (w / 2.0, h / 2.0),
+                None => {
+                    origin_known = false;
+                    (0.0, 0.0)
+                }
+            },
         };
         c.origin_x = x;
         c.origin_y = y;

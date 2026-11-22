@@ -120,10 +120,12 @@ pub(crate) fn walk(
     // 根の svg の変形は viewBox の変形の外側に掛ける（usvg・Chrome と同じ。文書の 1 回目のレビュー）
     let root_own = c0.transform;
     let root_known = c0.transform_known != 0;
-    let root_ok = root_ok && {
+    let root_child = root_own.then(&root_ctm);
+    let root_ok = root_ok && root_child.finite() && {
         let det = root_own.a * root_own.d - root_own.b * root_own.c;
         det != 0.0 && det.is_finite()
     };
+    let root_child = if root_child.finite() { root_child } else { Transform::IDENTITY };
     f(&WalkItem { node: 0, parent: NONE, computed: c0, ctm: root_own, ctm_known: root_known, rendered: root_ok })?;
     let mut stack: MVec<'_, Frame> = MVec::new(budget);
     let (vp_w, vp_h, has_vp) = match root_vp {
@@ -132,7 +134,7 @@ pub(crate) fn walk(
     };
     stack.push(Frame {
         computed: c0,
-        ctm_children: root_own.then(&root_ctm),
+        ctm_children: root_child,
         vp_w,
         vp_h,
         node: 0,
@@ -240,6 +242,13 @@ pub(crate) fn walk(
                     known_ctm = false;
                 }
             }
+        }
+        // 根からの変形があふれたら（大きな変形の入れ子）、描かず、解けない印にして有限に保つ（文書の 4 回目のレビュー）
+        if !ctm.finite() || !child_ctm.finite() {
+            ctm = Transform::IDENTITY;
+            child_ctm = Transform::IDENTITY;
+            known_ctm = false;
+            rendered = false;
         }
         f(&WalkItem { node: next, parent: top.node, computed: comp, ctm, ctm_known: known_ctm, rendered })?;
         let (vp_w, vp_h, has_vp) = match child_vp {

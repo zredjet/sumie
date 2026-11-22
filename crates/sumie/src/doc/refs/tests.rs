@@ -491,3 +491,33 @@ fn chained_cycles_in_one_walk() {
     let (a, b) = (work(1_000), work(2_000));
     assert!(b < a * 3, "{a} → {b}");
 }
+
+/// use の中身の clip-path・mask・filter の inherit は use の値を受け取るので、use の並びの参照先はその要素の数の分も実体に
+/// なる（数え漏らすと入れ子の展開の爆弾が estimate_build を抜ける。文書の 4 回目のレビュー）。
+#[test]
+fn use_content_inherit_multiplies_lists() {
+    let rects: String = (0..10).map(|_| "<rect style=\"mask:inherit\"/>").collect();
+    let mut body = format!("<defs><mask id=\"k0\"><rect/></mask><g id=\"c\" style=\"mask:inherit\">{rects}</g>");
+    for i in 1..=8 {
+        body.push_str(&format!("<mask id=\"k{i}\"><use href=\"#c\" mask=\"url(#k{})\"/></mask>", i - 1));
+    }
+    body.push_str("</defs><rect mask=\"url(#k8)\"/>");
+    let (_, _, n, cycles) = run(&body);
+    assert_eq!(cycles, 0);
+    // 1 段ごとにおよそ 12 倍
+    assert!(n > 10u64.pow(8), "{n}");
+}
+
+/// 受け継ぐ参照の規則の値は値ごとに 1 度だけ引き、読まなかった参照も 1 度だけ載せる（文書の 4 回目のレビュー）。
+#[test]
+fn inherited_sheet_values_resolve_once() {
+    let long = "a".repeat(20_000);
+    let svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><style>path{{marker:url(x.svg#{long})}}</style>{}</svg>",
+        "<path d=\"M0 0L1 1\"/>".repeat(2_000)
+    );
+    let e = crate::doc::estimate_parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+    assert!(e.result_bytes < 4 << 20, "{}", e.result_bytes);
+    let d = crate::doc::parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+    assert_eq!(d.report().unread_refs().count(), 1);
+}

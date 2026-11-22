@@ -148,6 +148,28 @@ fn markable(local: &[u8]) -> bool {
 const INH_PROPS: [&[u8]; 5] = [b"fill", b"stroke", b"marker-start", b"marker-mid", b"marker-end"];
 const INH_KINDS: [u8; 5] = [EDGE_FILL, EDGE_STROKE, EDGE_MARKER_START, EDGE_MARKER_MID, EDGE_MARKER_END];
 
+/// 引く前の印（受け継ぐ参照の規則の値の、引いた先の覚え）。
+const UNRESOLVED: u32 = u32::MAX - 1;
+
+/// 並べて、同じ値を除く（残した数を返す）。
+fn sort_dedup(budget: &Budget<'_>, v: &mut MVec<'_, u32>) -> Result<usize, Error> {
+    stable_sort(budget, v.as_mut_slice(), |a, b| a < b)?;
+    let mut keep = 0usize;
+    for k in 0..v.len() {
+        budget.spend(cost::OP_STEP)?;
+        let x = v.get(k).copied().unwrap_or(0);
+        if keep > 0 && v.get(keep.saturating_sub(1)).copied() == Some(x) {
+            continue;
+        }
+        if let Some(y) = v.get_mut(keep) {
+            *y = x;
+        }
+        keep = keep.saturating_add(1);
+    }
+    v.truncate(keep);
+    Ok(keep)
+}
+
 /// 受け継がない参照（clip-path・mask・filter）の並びの節（値ごとに 1 つ。節の番号は XML の節の数 ＋ 並びの番号）。
 /// 要素は並びの節へ 1 本の辺を張り、並びの節が参照先へ辺を張る（`inherit` は親の並びを指し、規則の値は当たる要素で
 /// 共有する。辺の数を要素の数と値の長さの和に比例させる。文書の 2 回目のレビュー）。
@@ -260,6 +282,46 @@ fn trim_ascii_ws(mut s: &[u8]) -> &[u8] {
     s
 }
 
+/// 受け継がない参照の置き場（0 clip-path・1 mask・2 filter）の inherit の印。
+fn slot_bit(slot: usize) -> u8 {
+    match slot {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        _ => 0,
+    }
+}
+
+/// 規則の値（置き場の位置）のうち、受け継がない参照（`plain`）のものと受け継ぐ参照（`inherited`）のものを集める
+/// （並べず、重なりも除かない）。
+fn sheet_value_keys<'b>(
+    styles: &Styles,
+    n: usize,
+    plain: [Option<u16>; 3],
+    inherited: &[Option<u16>; 5],
+    budget: &'b Budget<'b>,
+) -> Result<(MVec<'b, u32>, MVec<'b, u32>), Error> {
+    let mut sheet_keys: MVec<'_, u32> = MVec::new(budget);
+    let mut inh_keys: MVec<'_, u32> = MVec::new(budget);
+    for i in 0..n {
+        // 指定のない節（文字の節など）も 1 つずつ払う（文書の 3 回目のレビュー）
+        budget.spend(cost::OP_STEP)?;
+        for sp in styles.of(i as u32) {
+            budget.spend(cost::OP_STEP)?;
+            let p = Some(sp.prop);
+            if sp.src != SRC_SHEET || sp.wide != WIDE_NONE {
+                continue;
+            }
+            if plain.contains(&p) {
+                sheet_keys.push(sp.value.start)?;
+            } else if inherited.contains(&p) {
+                inh_keys.push(sp.value.start)?;
+            }
+        }
+    }
+    Ok((sheet_keys, inh_keys))
+}
+
 /// 参照の表を作る。`languages` は `systemLanguage` を照らす言語の並び。
 pub(crate) fn build(
     doc: &XmlDoc,
@@ -291,36 +353,20 @@ pub(crate) fn build(
         lookup(INH_PROPS[4], false),
     ];
     // 規則の並びの値（置き場の位置）を集めて並べる：規則の値の並びの節の番号は、ここでの位置
-    let mut sheet_keys: MVec<'_, u32> = MVec::new(budget);
-    for i in 0..n {
-        // 指定のない節（文字の節など）も 1 つずつ払う（文書の 3 回目のレビュー）
-        budget.spend(cost::OP_STEP)?;
-        for sp in styles.of(i as u32) {
-            budget.spend(cost::OP_STEP)?;
-            let p = Some(sp.prop);
-            if sp.src == SRC_SHEET && sp.wide == WIDE_NONE && (p == clip || p == mask || p == filter) {
-                sheet_keys.push(sp.value.start)?;
-            }
-        }
-    }
-    stable_sort(budget, sheet_keys.as_mut_slice(), |a, b| a < b)?;
-    let mut keep = 0usize;
-    for k in 0..sheet_keys.len() {
-        budget.spend(cost::OP_STEP)?;
-        let v = sheet_keys.get(k).copied().unwrap_or(0);
-        if keep > 0 && sheet_keys.get(keep.saturating_sub(1)).copied() == Some(v) {
-            continue;
-        }
-        if let Some(x) = sheet_keys.get_mut(keep) {
-            *x = v;
-        }
-        keep = keep.saturating_add(1);
-    }
-    sheet_keys.truncate(keep);
+    // 受け継ぐ参照（塗り・marker）の規則の値も、値ごとに 1 度だけ引く（引いた先を覚える。読まなかった参照も値ごとに 1 度。
+    // 要素の数 × 値の長さに膨らまない。文書の 4 回目のレビュー）
+    let (mut sheet_keys, mut inh_keys) = sheet_value_keys(styles, n, [clip, mask, filter], &inh_ids, budget)?;
+    let keep = sort_dedup(budget, &mut sheet_keys)?;
+    let inh_n = sort_dedup(budget, &mut inh_keys)?;
+    let mut inh_cache: MVec<'_, u32> = MVec::with_capacity(budget, inh_n)?;
+    inh_cache.resize_to(inh_n, UNRESOLVED)?;
     let mut lists: MVec<'_, ListRec> = MVec::with_capacity(budget, keep)?;
     lists.resize_to(keep, ListRec { start: 0, len: 0, pos: 0, resolved: 0, pad: [0; 3] })?;
     let mut ledges: MVec<'_, Edge> = MVec::new(budget);
     let mut own_lists: MVec<'_, Lists> = MVec::with_capacity(budget, n)?;
+    // 節ごとの、受け継がない参照の inherit の印（1 clip-path・2 mask・4 filter。展開の数が use の中身で使う）
+    let mut inherit_bits: MVec<'_, u8> = MVec::with_capacity(budget, n)?;
+    inherit_bits.resize_to(n, 0)?;
     // switch の子：選んだか（親ごとに 1 つ目の通る子）
     let mut switch_chosen: MVec<'_, u8> = MVec::with_capacity(budget, n)?;
     switch_chosen.resize_to(n, 0)?;
@@ -420,20 +466,34 @@ pub(crate) fn build(
                     WIDE_INHERIT | WIDE_UNSET => continue,
                     WIDE_INITIAL => NONE,
                     _ => {
-                        let mut found: Option<(Span, bool)> = None;
-                        cx.urls(buf, s.value, &mut |sp, esc| {
-                            if found.is_none() {
-                                found = Some((sp, esc));
-                            }
-                            Ok(())
-                        })?;
                         let want: &[&[u8]] = if k < 2 { PAINT_SERVERS } else { &[b"marker"] };
-                        match found {
-                            Some((sp, esc)) => cx
-                                .resolve(buf, sp, esc, s.src, pos, &mut notes)?
-                                .filter(|&t| target_kind_ok(nodes, input, t, want))
-                                .unwrap_or(NONE),
-                            None => NONE,
+                        let slot = if s.src == SRC_SHEET {
+                            Some(crate::mem::lower_bound(inh_keys.as_slice(), |&x| x < s.value.start))
+                        } else {
+                            None
+                        };
+                        match slot.and_then(|j| inh_cache.get(j).copied()).filter(|&t| t != UNRESOLVED) {
+                            Some(t) => t,
+                            None => {
+                                let mut found: Option<(Span, bool)> = None;
+                                cx.urls(buf, s.value, &mut |sp, esc| {
+                                    if found.is_none() {
+                                        found = Some((sp, esc));
+                                    }
+                                    Ok(())
+                                })?;
+                                let t = match found {
+                                    Some((sp, esc)) => cx
+                                        .resolve(buf, sp, esc, s.src, pos, &mut notes)?
+                                        .filter(|&t| target_kind_ok(nodes, input, t, want))
+                                        .unwrap_or(NONE),
+                                    None => NONE,
+                                };
+                                if let Some(x) = slot.and_then(|j| inh_cache.get_mut(j)) {
+                                    *x = t;
+                                }
+                                t
+                            }
                         }
                     }
                 };
@@ -456,6 +516,11 @@ pub(crate) fn build(
                 EDGE_MASK => 1,
                 _ => 2,
             };
+            if s.wide == WIDE_INHERIT
+                && let Some(b) = inherit_bits.get_mut(i)
+            {
+                *b |= slot_bit(slot);
+            }
             let list = match s.wide {
                 // 受け継がない参照の `inherit` は親の計算した値：親の並びを指す（輪を見落とさず、展開を数え漏らさない）
                 WIDE_INHERIT => parent_lists.t.get(slot).copied().unwrap_or(NONE),
@@ -545,7 +610,7 @@ pub(crate) fn build(
     let start = start.freeze();
     let mut edges = edges;
     remove_cycles(doc, start.as_slice(), &mut edges, &mut notes, list_pos.as_slice(), budget)?;
-    let instances = count_instances(doc, input, start.as_slice(), edges.as_slice(), budget)?;
+    let instances = count_instances(doc, input, start.as_slice(), edges.as_slice(), inherit_bits.as_slice(), budget)?;
     // 覚えは位置の順（足した順は節の順なので、位置の順になっている）
     let mut exact_notes: MVec<'_, RefNote> = MVec::with_capacity(budget, notes.len())?;
     exact_notes.append_slice(notes.as_slice())?;
@@ -840,6 +905,13 @@ struct Tally {
     count: u64,
     paints: u64,
     marks: u64,
+    /// 受け継がない参照（clip-path・mask・filter の順）を `inherit` の鎖で節の親から受け取る、部分木の要素の数（use の中身
+    /// では use の値を受け取る。文書の 4 回目のレビュー）
+    inh: [u64; 3],
+}
+
+impl Tally {
+    const ZERO: Tally = Tally { count: 0, paints: 0, marks: 0, inh: [0; 3] };
 }
 
 impl Plain for Tally {}
@@ -883,6 +955,7 @@ fn count_instances(
     input: &[u8],
     start: &[u32],
     edges: &[Edge],
+    inherit_bits: &[u8],
     budget: &Budget<'_>,
 ) -> Result<u64, Error> {
     let budget = budget_ref(budget);
@@ -893,7 +966,7 @@ fn count_instances(
         return Ok(0);
     }
     let mut done: MVec<'_, Tally> = MVec::with_capacity(budget, total)?;
-    done.resize_to(total, Tally { count: NOT_YET, paints: 0, marks: 0 })?;
+    done.resize_to(total, Tally { count: NOT_YET, ..Tally::ZERO })?;
     let mut on_stack: MVec<'_, u8> = MVec::with_capacity(budget, total)?;
     on_stack.resize_to(total, 0)?;
     let mut stack: MVec<'_, CountFrame> = MVec::new(budget);
@@ -903,25 +976,38 @@ fn count_instances(
     let local_of = |i: u32| nodes.get(i as usize).filter(|x| x.ns == NS_SVG).map(|x| x.local.of(input));
     let is_use = |i: u32| local_of(i).is_some_and(|l| matches!(l, b"use" | b"feImage"));
     // 節を数え始めるときの自分の分
+    let bits = |i: u32| inherit_bits.get(i as usize).copied().unwrap_or(0);
     let own = |i: u32| -> Tally {
         match nodes.get(i as usize) {
-            None => Tally { count: 0, paints: 0, marks: 0 },
+            None => Tally::ZERO,
             Some(_) => {
                 let l = local_of(i).unwrap_or(&[]);
                 let shape = paints(l) && !matches!(l, b"use" | b"feImage");
                 let mark = markable(l) && !matches!(l, b"use" | b"feImage");
-                Tally { count: 1, paints: u64::from(shape), marks: u64::from(mark) }
+                let b = bits(i);
+                Tally {
+                    count: 1,
+                    paints: u64::from(shape),
+                    marks: u64::from(mark),
+                    inh: [u64::from(b & 1 != 0), u64::from(b & 2 != 0), u64::from(b & 4 != 0)],
+                }
             }
         }
     };
     // 子の分（中身の塗る要素と marker を付ける要素も足す）・use の中身の分（同じ）・ほかの参照の分（数だけを倍で）
     // つなぎ：0 子・1 use の中身（数と、塗りを使う要素・marker を付ける要素の数を足す）、2 ほかの中身を作る参照（数だけを倍で）、
     // 3 marker（数を倍で足し、marker の中の塗る要素を「この要素の塗りを使う要素」に倍で足す：context-fill・context-stroke）
-    let add = |a: &mut Tally, t: Tally, link: u8, mult: u64| match link {
+    // 子と use の中身の `inherit` の数は、親（`pb` は親の inherit の印）が inherit のときだけ上へ伝わる
+    let add = |a: &mut Tally, t: Tally, link: u8, mult: u64, pb: u8| match link {
         0 | 1 => {
             a.count = cap_add(a.count, t.count);
             a.paints = cap_add(a.paints, t.paints);
             a.marks = cap_add(a.marks, t.marks);
+            for (k, x) in a.inh.iter_mut().enumerate() {
+                if pb & slot_bit(k) != 0 {
+                    *x = cap_add(*x, t.inh.get(k).copied().unwrap_or(0));
+                }
+            }
         }
         3 => {
             a.count = cap_add(a.count, cap_mul(t.count, mult));
@@ -992,6 +1078,15 @@ fn count_instances(
                     EDGE_MARKER_START | EDGE_MARKER_MID | EDGE_MARKER_END => {
                         (3, if from_use { content.map_or(0, |t| t.marks) } else { 1 })
                     }
+                    // use の受け継がない参照は、中身の中で inherit の鎖で use の値を受け取る要素の分も実体になる
+                    EDGE_CLIP | EDGE_MASK | EDGE_FILTER if from_use => {
+                        let k = match e.kind {
+                            EDGE_CLIP => 0usize,
+                            EDGE_MASK => 1,
+                            _ => 2,
+                        };
+                        (2, cap_add(1, content.map_or(0, |t| t.inh.get(k).copied().unwrap_or(0))))
+                    }
                     _ => (2, 1),
                 };
                 next = Some((e.target, link, mult));
@@ -1003,10 +1098,10 @@ fn count_instances(
         }
         match next {
             Some((t, link, mult)) => {
-                let d = done.get(t as usize).copied().unwrap_or(Tally { count: 0, paints: 0, marks: 0 });
+                let d = done.get(t as usize).copied().unwrap_or(Tally::ZERO);
                 if d.count != NOT_YET {
                     if let Some(a) = acc.last_mut() {
-                        add(a, d, link, mult);
+                        add(a, d, link, mult, bits(top.node));
                     }
                 } else if on_stack.get(t as usize).copied() == Some(0) {
                     if let Some(x) = on_stack.get_mut(t as usize) {
@@ -1026,7 +1121,7 @@ fn count_instances(
             }
             None => {
                 stack.pop();
-                let mine = acc.pop().unwrap_or(Tally { count: 0, paints: 0, marks: 0 });
+                let mine = acc.pop().unwrap_or(Tally::ZERO);
                 if let Some(c) = done.get_mut(top.node as usize) {
                     *c = mine;
                 }
@@ -1034,7 +1129,7 @@ fn count_instances(
                     *x = 0;
                 }
                 if let Some(a) = acc.last_mut() {
-                    add(a, mine, top.link, top.mult);
+                    add(a, mine, top.link, top.mult, stack.last().map_or(0, |f| bits(f.node)));
                 }
             }
         }
