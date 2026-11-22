@@ -4,5 +4,6 @@
 
 pub(crate) mod decl;
 pub(crate) mod lex;
+pub(crate) mod matcher;
 pub(crate) mod select;
 pub(crate) mod sheet;
