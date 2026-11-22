@@ -7,8 +7,8 @@
 //! - **確保**：alloc の口のうち、本体が確保する口を呼ぶもの・入れ物の型（`String`・`Vec`・`Box` …）を返すもの、と、それらを
 //!   呼ぶもの（変わらなくなるまで推移させる。公開でない関数も辺に入れる）。alloc で定義したトレイトの口も
 //! - **浮動小数**：`f32`・`f64` の固有の口のうち、determinism.md §2.1 の使ってよい口（と述語）でないもの
-//! - **Unicode の表**：`char`・`str` の口のうち、本体が core の Unicode の表（`unicode`）を引くものと、それを呼ぶもの
-//!   （推移させる）
+//! - **Unicode の表**：`char`・`str` の口のうち、本体が core の Unicode の表（`unicode`）を引くものと、それを呼ぶもの・
+//!   関数として渡すもの（推移させる。手で書いた Unicode の口も種にする）
 //! - **手で書いた分類**：determinism.md・CLAUDE.md の一覧（並べ替え・探索・時刻・環境・スレッド・`Clone::clone`・
 //!   `Iterator::collect`・演算子のトレイトの口など。std の文書からは決まらないもの）。core・alloc の口は、走査した口に
 //!   あることを確かめる（打ち間違いを黙って無視しない）
@@ -98,8 +98,9 @@ const ALLOC_IDENTS: [&str; 32] = [
 const HEAP_TYPES: [&str; 11] =
     ["String", "Vec", "Box", "Rc", "Arc", "CString", "VecDeque", "BinaryHeap", "BTreeMap", "BTreeSet", "LinkedList"];
 
-/// 手で書いた分類（std の文書からは決まらないもの）。理由つき。
-const HAND: &[(&str, &str)] = &[
+/// 手で書いた分類（std の文書からは決まらないもの）。理由つき。`std::…` の口は走査した口と照らせないので、
+/// `check-lint-probe` が試しのクレートで全部が拾われることを確かめる。
+pub(crate) const HAND: &[(&str, &str)] = &[
     // 確保（std の中で数えずに確保する口。ADR-31）
     (
         "core::clone::Clone::clone",
@@ -115,6 +116,12 @@ const HAND: &[(&str, &str)] = &[
     ),
     ("core::iter::traits::collect::FromIterator::from_iter", "確保：同上"),
     ("core::iter::traits::collect::Extend::extend", "確保：同上"),
+    ("core::iter::traits::iterator::Iterator::unzip", "確保：同上（2 つの入れ物に集める）"),
+    ("core::iter::traits::iterator::Iterator::partition", "確保：同上（2 つの入れ物に分ける）"),
+    (
+        "alloc::vec::Vec::capacity",
+        "確保：Vec の容量は std が決める（数えた量と食い違う）。mem の入れ物は自分で数えた容量を持つ（ADR-39 (3)）",
+    ),
     // 演算子のトレイトの口（arithmetic_side_effects は a / b を拾うが Div::div(a, b) を拾わない）
     ("core::ops::arith::Add::add", "演算子の口：あふれうる。checked_* を使う（arithmetic_side_effects の抜け道）"),
     ("core::ops::arith::Sub::sub", "演算子の口：同上"),
@@ -154,7 +161,8 @@ const HAND: &[(&str, &str)] = &[
     ("slice::binary_search_by", "探索：同上"),
     ("slice::binary_search_by_key", "探索：同上"),
     ("slice::partition_point", "探索：mem::lower_bound にまとめる（determinism.md §4.1）"),
-    // Unicode の表（determinism.md §4.3。本体の走査で拾えないものを足す）
+    // Unicode の表（determinism.md §4.3）。本体の走査で拾えるものもあるが、代わりの口を理由に書くため手でも挙げる。
+    // ここに挙げた口は推移の種にもする（呼ぶ口・関数として渡す口へ広げる）
     (
         "char::is_whitespace",
         "Unicode の表：std の表は Rust の版で上がる。XML・CSS の空白は自前の関数（determinism.md §4.3）",
@@ -170,6 +178,8 @@ const HAND: &[(&str, &str)] = &[
     ("str::trim", "Unicode の表：U+00A0・U+3000 も削る（determinism.md §4.3）。trim_ascii か自前の関数"),
     ("str::trim_start", "Unicode の表：同上"),
     ("str::trim_end", "Unicode の表：同上"),
+    ("str::trim_left", "Unicode の表：同上（非推奨の trim_start の別名）"),
+    ("str::trim_right", "Unicode の表：同上（非推奨の trim_end の別名）"),
     ("str::split_whitespace", "Unicode の表：同上"),
     ("str::to_lowercase", "Unicode の表：同上"),
     ("str::to_uppercase", "Unicode の表：同上"),
@@ -209,7 +219,7 @@ const HAND_INT: &[(&str, &str)] = &[
 const ALLOWED: &[(&str, &str)] = &[
     (
         "core::iter::traits::iterator::Iterator::enumerate",
-        "番号は確保した配列の長さ以下で usize を超えない（文書の Panics は usize を超える数の要素のとき）",
+        "番号が usize を超えるのは usize::MAX を超える数の要素を数えるときだけ（文書の Panics）。ライブラリの反復は確保した配列か、上限を確かめた範囲",
     ),
     ("core::iter::traits::iterator::Iterator::count", "同上"),
     ("core::iter::traits::iterator::Iterator::position", "同上"),
@@ -224,7 +234,7 @@ const PANICS_UNMAPPED_OK: &[(&str, &str, &str)] = &[
     (
         "core/src/ptr/const_ptr.rs",
         "align_offset",
-        "生のポインタの口（ライブラリは unsafe を使わず、生のポインタを作らない）。clippy のパスの書き方も決まらない",
+        "生のポインタの口（安全な口で、2 の冪でない整列で panic する）。ライブラリは生のポインタを作らない（tests/rules.rs が `*const`・`*mut`・`as_ptr` を拾う）。clippy のパスの書き方も決まらない",
     ),
     ("core/src/ptr/mut_ptr.rs", "align_offset", "同上"),
     (
@@ -372,6 +382,18 @@ fn rust_src() -> Result<(String, PathBuf), String> {
         Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
     let version = run(&["--version"])?;
+    // PATH の rustc が固定したツールチェーンか（`cargo +nightly run`・RUSTUP_TOOLCHAIN では別の版の rust-src を読む）
+    let toolchain =
+        std::fs::read_to_string(workspace_root()?.join("rust-toolchain.toml")).map_err(|e| e.to_string())?;
+    let channel = toolchain
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("channel = \"").and_then(|r| r.strip_suffix('"')))
+        .ok_or("rust-toolchain.toml に channel がない")?;
+    if !version.starts_with(&format!("rustc {channel} ")) {
+        return Err(format!(
+            "rustc の版（{version}）が rust-toolchain.toml の {channel} と違う（固定した版の std から作る）"
+        ));
+    }
     let sysroot = run(&["--print", "sysroot"])?;
     let lib = PathBuf::from(sysroot).join("lib/rustlib/src/rust/library");
     if !lib.join("core/src/lib.rs").exists() {
@@ -977,13 +999,47 @@ fn has_panics(docs: &str) -> bool {
     })
 }
 
-/// 本体が `names` のどれかを関数として呼ぶか（`名前(` か `名前::<`）。
+/// 本体が `names` のどれかを関数として呼ぶか（`名前(` か `名前::<`）、関数として渡すか（`trim_matches(char::is_whitespace)`
+/// のような `::名前)`・`::名前,`）。
 fn calls_any(body: &[Token], names: &BTreeSet<String>) -> bool {
     body.iter().enumerate().any(|(k, t)| {
-        t.kind == Kind::Ident
-            && names.contains(&t.text)
-            && body.get(k + 1).is_some_and(|n| n.is_punct('(') || n.is_punct(':'))
+        let next = body.get(k + 1);
+        let call = next.is_some_and(|n| n.is_punct('(') || n.is_punct(':'));
+        let path_ref = k >= 2
+            && body[k - 1].is_punct(':')
+            && body[k - 2].is_punct(':')
+            && next.is_some_and(|n| n.is_punct(')') || n.is_punct(','));
+        t.kind == Kind::Ident && names.contains(&t.text) && (call || path_ref)
     })
+}
+
+/// 手の表の理由（「同上」を、表の上の「同上」でない理由の本文に開いたもの）。
+struct HandReason {
+    text: String,
+    /// 「同上」と書いたもの（同じ分類の理由がもうあれば足さない）
+    weak: bool,
+}
+
+/// [`HAND`] の理由の「同上」を開く（生成したファイルは口の名前で並べ直すので、「同上」が別の行を指さないように）。
+fn hand_reasons() -> Vec<(&'static str, HandReason)> {
+    let mut base = "";
+    let mut out = Vec::new();
+    for (p, why) in HAND {
+        let weak = why.contains("同上");
+        let text = if weak {
+            why.replacen("同上", base, 1)
+        } else {
+            base = why.split_once('：').map(|(_, b)| b).unwrap_or(why);
+            why.to_string()
+        };
+        out.push((*p, HandReason { text, weak }));
+    }
+    out
+}
+
+/// 基本の型の持ち主か（マクロで複数の型に当てた口の持ち主は `i8,i16,…` と連ねる）。
+fn prim_in(owner: &Option<Owner>, types: &[&str]) -> bool {
+    matches!(owner, Some(Owner::Prim(p)) if p.split(',').any(|x| types.contains(&x)))
 }
 
 /// 種から始めて、本体が印のついた関数を呼ぶ関数に、変わらなくなるまで印を広げる。印は関数ごと。辺は名前で張るが、
@@ -1018,9 +1074,16 @@ fn propagate(fns: &[&FnInfo], seed: impl Fn(&FnInfo) -> bool) -> Vec<bool> {
 /// 分類して clippy.toml の中身を作る。
 fn render(rustc: &str, fns: &[FnInfo]) -> Result<String, String> {
     let mut reasons: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut add = |path: &str, why: &str| {
+    // 同じ分類（「：」の前）の理由がもうあれば、弱い理由（手の表で「同上」と書いたもの）は足さず、ほかの理由は置き換える
+    // （手で書いた分類は生成した分類のあとに足すので、代わりの口を書いた手の理由が残る）
+    let mut add = |path: &str, why: &str, weak: bool| {
         let e = reasons.entry(path.to_string()).or_default();
-        if !e.iter().any(|w| w == why) {
+        let cat = |w: &str| w.split('：').next().unwrap_or("").to_string();
+        if let Some(i) = e.iter().position(|w| cat(w) == cat(why)) {
+            if !weak {
+                e[i] = why.to_string();
+            }
+        } else {
             e.push(why.to_string());
         }
     };
@@ -1031,7 +1094,7 @@ fn render(rustc: &str, fns: &[FnInfo]) -> Result<String, String> {
     for f in fns.iter().filter(|f| has_panics(&f.docs)) {
         if !f.paths.is_empty() {
             for p in &f.paths {
-                add(p, "落ちうる：std の文書に Panics の節がある。範囲を確かめた包みか checked_* を使う");
+                add(p, "落ちうる：std の文書に Panics の節がある。範囲を確かめた包みか checked_* を使う", false);
             }
         } else if f.should_map && !PANICS_UNMAPPED_OK.iter().any(|(file, n, _)| *file == f.file && *n == f.name) {
             unmapped.push(format!("{}:{} {}", f.file, f.line, f.name));
@@ -1056,52 +1119,59 @@ fn render(rustc: &str, fns: &[FnInfo]) -> Result<String, String> {
         let trait_in_alloc = matches!(&f.owner, Some(Owner::Trait(_)));
         if trait_in_alloc || *m {
             for p in &f.paths {
-                add(p, "確保：std の中で数えずに確保する。mem の入れ物を使う（ADR-31）");
+                add(p, "確保：std の中で数えずに確保する。mem の入れ物を使う（ADR-31）", false);
             }
         }
     }
     // 3. 浮動小数
     for f in &mapped {
-        if let Some(Owner::Prim(p)) = &f.owner
-            && (p == "f32" || p == "f64")
-            && !FLOAT_OK.contains(&f.name.as_str())
-        {
+        if prim_in(&f.owner, &["f32", "f64"]) && !FLOAT_OK.contains(&f.name.as_str()) {
             for path in &f.paths {
                 add(
                     path,
                     "浮動小数：値が環境・版で変わりうるか、決めた規則と違う。crate::math を使う（determinism.md §2.2・§2.3）",
+                    false,
                 );
             }
         }
     }
     // 4. Unicode の表（core の関数の辺で推移させる。ASCII の口は除く）
     let core_fns: Vec<&FnInfo> = fns.iter().filter(|f| f.krate == "core" && !f.in_trait_impl).collect();
-    let uni = propagate(&core_fns, |f| f.body.iter().any(|t| t.is_ident("unicode")));
+    let hand_unicode: BTreeSet<&str> =
+        HAND.iter().filter(|(_, why)| why.starts_with("Unicode の表")).map(|(p, _)| *p).collect();
+    let uni = propagate(&core_fns, |f| {
+        f.body.iter().any(|t| t.is_ident("unicode")) || f.paths.iter().any(|p| hand_unicode.contains(p.as_str()))
+    });
     for (f, m) in core_fns.iter().zip(&uni) {
-        if let Some(Owner::Prim(p)) = &f.owner
-            && (p == "char" || p == "str")
-            && !f.name.contains("ascii")
-            && *m
-        {
+        if prim_in(&f.owner, &["char", "str"]) && !f.name.contains("ascii") && *m {
             for path in &f.paths {
-                add(path, "Unicode の表：std の表は Rust の版で上がる。自前の表と関数を使う（determinism.md §4.3）");
+                add(
+                    path,
+                    "Unicode の表：std の表は Rust の版で上がる。自前の表と関数を使う（determinism.md §4.3）",
+                    false,
+                );
             }
         }
     }
     // 5. 手で書いた分類（core・alloc・基本の型の口は、走査した口にあることを確かめる）
     let mut typos = Vec::new();
-    for (p, why) in HAND {
+    for (p, why) in hand_reasons() {
         if !p.starts_with("std::") && !all_paths.contains(p) {
-            typos.push(*p);
+            typos.push(p);
         }
-        add(p, why);
+        add(p, &why.text, why.weak);
     }
-    for ty in SIGNED.iter().chain(UNSIGNED.iter()) {
-        for (name, why) in HAND_INT {
+    for (name, why) in HAND_INT {
+        let mut hit = false;
+        for ty in SIGNED.iter().chain(UNSIGNED.iter()) {
             let p = format!("{ty}::{name}");
             if all_paths.contains(p.as_str()) {
-                add(&p, why);
+                add(&p, why, false);
+                hit = true;
             }
+        }
+        if !hit {
+            typos.push(name);
         }
     }
     if !typos.is_empty() {
@@ -1276,6 +1346,53 @@ mod tests {
         assert!(!refs.iter().zip(&marked).all(|(f, m)| f.name != "to_ascii_lowercase" || *m));
         assert!(is("inner_alloc") && is("helper") && is("uses"));
         assert_eq!(return_idents(&lex("fn f(&self) -> Result<String, E> where T: X")), ["Result", "String", "E"]);
+    }
+
+    #[test]
+    fn path_refs_are_edges() {
+        let src = "impl char { pub fn is_ws(self) -> bool { unicode::White_Space(self) } }\n\
+                   impl str { pub fn trim_ws(&self) -> &str { self.trim_matches(char::is_ws) } }";
+        let fns = scan("core/src/str/mod.rs", src);
+        let refs: Vec<&FnInfo> = fns.iter().collect();
+        let marked = propagate(&refs, |f| f.body.iter().any(|t| t.is_ident("unicode")));
+        assert!(marked.iter().all(|m| *m), "関数として渡す口も辺になる");
+        assert!(prim_in(&Some(Owner::Prim("i8,f64".into())), &["f64"]));
+        assert!(!prim_in(&Some(Owner::Prim("f640".into())), &["f64"]));
+    }
+
+    fn fake(name: &str, docs: &str, paths: &[&str], owner: Option<Owner>) -> FnInfo {
+        FnInfo {
+            name: name.into(),
+            krate: "core".into(),
+            file: "core/src/x.rs".into(),
+            line: 1,
+            docs: docs.into(),
+            body: Vec::new(),
+            ret: Vec::new(),
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+            owner,
+            should_map: true,
+            in_trait_impl: false,
+        }
+    }
+
+    #[test]
+    fn hand_reasons_expand_same_as_above() {
+        let r = hand_reasons();
+        assert!(!r[0].1.weak);
+        assert!(r.iter().all(|(_, w)| !w.text.contains("同上")));
+        let unzip = r.iter().find(|(p, _)| p.ends_with("Iterator::unzip")).unwrap();
+        assert!(unzip.1.text.starts_with("確保：std の中で数えずに確保する") && unzip.1.weak);
+    }
+
+    #[test]
+    fn error_paths() {
+        // 写せなかった Panics の口
+        let e = render("rustc", &[fake("x", "# Panics", &[], None)]).unwrap_err();
+        assert!(e.contains("写せなかった"), "{e}");
+        // 手で書いた口が走査した口にない（打ち間違い）
+        let e = render("rustc", &[]).unwrap_err();
+        assert!(e.contains("手で書いた口"), "{e}");
     }
 
     #[test]

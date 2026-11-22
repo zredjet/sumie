@@ -153,7 +153,11 @@ fn run_mem_ops(budget: &Budget<'_>, data: &[u8], bytes_limit: u64) -> Result<Che
             }
             2 => {
                 // 上の位が立っていれば 2 の冪（塊の境目を越える大きさまで。上限は bytes_limit が抑える）
-                let n = if arg & 0x80 != 0 { 1usize << (arg % 22) } else { usize::from(arg).saturating_mul(4) };
+                let n = if arg & 0x80 != 0 {
+                    1usize.checked_shl(u32::from(arg % 22)).unwrap_or(0)
+                } else {
+                    usize::from(arg).saturating_mul(4)
+                };
                 v.resize_to(n, 7)?;
                 cost::resize(len, cap, n as u64, s4)
             }

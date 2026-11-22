@@ -106,8 +106,8 @@ clippy の `disallowed-methods` で禁じる。
 | `midpoint`・`hypot` | 実装が std の版に依る・OS の libm を呼ぶ | 自前の式・`math::hypot` |
 | `algebraic_add`・`algebraic_mul` など（1.99.0 で stable かは M0 で確かめる） | LLVM に並べ替え・縮めを許す | 素の演算子 |
 
-整数の `Ord::max`・`min`・`clamp` は値が一意に決まるので使ってよい（`clamp` は上下の逆で panic するので、上下を
-確かめてから使う）。
+整数の `Ord::max`・`min` は値が一意に決まるので使ってよい。`Ord::clamp` は上下の逆で panic するので禁じる
+（`crates/sumie/clippy.toml`）。`x.max(lo).min(hi)` と書く。
 
 `math::max`・`min` の規則：Kura の `math::max`・`min` と同じく、IEEE 754-2019 の maximumNumber・minimumNumber にする
 （片方が NaN なら、もう片方を返す。-0 < +0 とみなし、`max(-0.0, +0.0)` は `+0.0`、`min(-0.0, +0.0)` は `-0.0`）。NaN は
@@ -148,6 +148,9 @@ clippy の `disallowed-methods` で禁じる。
   使い、その根拠を注釈に書く。clippy の `arithmetic_side_effects` で見張る（CLAUDE.md）
 - 演算子でない口も同じ：整数の `pow`（`checked_pow` を使う）・`abs`（最小の値であふれる。`unsigned_abs`・`checked_abs`）・
   `Iterator::sum`・`product`（debug であふれると panic。`checked_add` で畳む）は禁じる
+- ずらし（`<<`・`>>`・`<<=`・`>>=`）は、ずらし量が桁の数以上だと debug でだけ panic し、release では下位のビットで
+  折り返す。`arithmetic_side_effects` はずらし量が変数のずらしを拾わない（1.99.0 で確かめた）ので、`tests/rules.rs` が
+  「ずらし量が数の字句か定数でないずらし」を拾う。変数のずらしは `checked_shl`・`checked_shr` で書く
 - ÷0 で panic しないよう、除数は手前で確かめるか `checked_div` を使う
 - 負の数の `/` は 0 の向きに切る。固定小数の丸めは、使う所ごとに `div_euclid`・右シフト・自前の丸めの関数のどれかに
   決めて注釈に書く
@@ -166,9 +169,10 @@ clippy の `disallowed-methods` で禁じる。
 - 順序の要る表は、`mem` の並べた入れ物（`SortedVec`・`SortedMap`）を使う。探すのは自前の `lower_bound`（等しいものが
   並ぶときは最初の位置を返すと決めたもの）
 - 並べ替えは `mem::stable_sort`（自前の安定な併合の並べ替え）だけ。比べる関数は全順序にする（浮動小数は `total_cmp` か
-  整数の鍵）。全順序でない比べ方（`partial_cmp(..).unwrap_or(Equal)` など）をしない
+  整数の鍵）。全順序でない比べ方（`partial_cmp(..).unwrap_or(Equal)` など）をしない（`tests/rules.rs` が `partial_cmp` の
+  呼び出しを拾う）
 - `sort_unstable*`・`select_nth_unstable*`・`binary_search*` を使わない
-- ポインタの値・確保の順で順序や鍵を決めない
+- ポインタの値・確保の順で順序や鍵を決めない（`tests/rules.rs` が `as_ptr`・`addr`・`*const`・`*mut` を拾う）
 - 文書の中の処理は文書の順（木の行きがけの順）で行う。ID の重複・規則の重なりなどは、文書の順で決める規則を requirements.md に書く
 
 ### 4.2 std の入れ物と並べ替えを使わない理由（ADR-31）

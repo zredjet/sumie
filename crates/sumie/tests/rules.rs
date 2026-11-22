@@ -1,15 +1,23 @@
 //! ライブラリの src の走査（determinism.md §9・CLAUDE.md）。clippy で拾えない規則を字句で見張る。
 //!
 //! - ビルドで分かれるもの：属性の `cfg(…)`・`cfg_attr`・`cfg!`（`#[cfg(test)] mod tests;` だけ許す）・`is_*_feature_detected!`・
-//!   `#[path]`・`include!`・`env!`・`option_env!`・Cargo.toml の `[features]`・build.rs・ターゲットごとの依存
-//! - std・core・alloc は表にあるモジュールだけ（絶対のパス `::std::…`・別名 `use core as c`・`extern crate` も見る）
-//! - `mul_add`・`algebraic_*`・`unsafe`・大域の状態（`OnceLock`・`Mutex`・内側で変わる型の `static` など）・順序の決まらない
-//!   入れ物（mem の中も）
-//! - `mem` の外での確保（`Vec`・`String`・`Box`・`Rc`・`Arc`・`vec!`・`format!`・`.to_vec()`・`.collect()`・`.clone()`・`.cloned()` など）
-//! - lint の群の allow（どこでも）と、厳しい lint の allow・expect（mem の中だけ、理由つき、内側の属性でなく）
-//! - `MVec`・`Frozen` に入れる型（`Plain`）は `#[repr(C)]`（欄も Plain）か基本の型
-//! - モジュールの層の向き（architecture.md §2。`crate::`・`super::`・`self::` を根から解く）
-//! - 自分の名前を呼ぶ関数（再帰。受け手・パス・turbofish によらず拾う。`self.欄.名前(` の委ねと、理由を書いた表だけ許す）
+//!   `#[path]`・`include!`・`env!`・`option_env!`・属性の外の `cfg(`・`debug_assertions`・`target_*`（マクロの引数で属性を
+//!   作る形）・Cargo.toml の `[features]`・build.rs・ターゲットごとの依存
+//! - std・core・alloc は表にあるモジュールだけ（絶対のパス `::std::…`・別名 `use core as c`・`extern crate` も見る）。
+//!   `libm::` は math.rs だけ
+//! - `mul_add`・`algebraic_*`・`unsafe`・大域の状態（`OnceLock`・`Mutex` など。`static` の型は基本の型・Plain の型・その配列と
+//!   参照だけ）・順序の決まらない入れ物（mem の中も）・ポインタの値（`as_ptr`・`addr`・`*const`）・`partial_cmp`
+//! - ずらし量が数の字句か定数でない `<<`・`>>`（`=` つきも。`arithmetic_side_effects` が拾わない）
+//! - `mem` の外での確保（`Vec`・`String`・`Box`・`Rc`・`Arc`・`vec!`・`format!`・`.to_vec()`・`.collect()`・`.clone()`・`.cloned()` など）。
+//!   mem の中でも `Vec::from`・`Default::default`・`.into()` のような数えない確保の変換
+//! - lint の群の allow（どこでも）と、厳しい lint の allow・expect（mem の中だけ、理由つき、口ごと。内側の属性と、`mod`・
+//!   `impl`・`trait` に付けた外側の属性はモジュールごとの外しとみなす）。マクロの引数で lint の属性を渡す形も
+//! - `MVec`・`Frozen` に入れる型（`Plain`）は `#[repr(C)]`（欄も Plain）か基本の型。`Plain` の別名と、`plain!` 以外の
+//!   マクロでの実装は作らない
+//! - モジュールの層の向き（architecture.md §2。`crate::`・`super::`・`self::` を根から解く。`{…}` の中の `super` も）
+//! - 自分の名前を呼ぶ関数（再帰）。受け手・パス・turbofish・トレイトの名前（`Walk::walk`・`<Self as Walk>::walk`）によらず
+//!   拾い、関数を値として渡す形（`map(depth)`・`map(Self::depth)`・`let g = f;`）も拾う。`self.欄.名前(` の委ねと、理由を
+//!   書いた表だけ許す。互いを呼ぶ輪も
 //!
 //! 試験のコード（`src/**/tests.rs`。`#[cfg(test)] mod tests;` でだけ入れられる）は走査しない。各規則は下の自己試験で、
 //! 拾うことと拾わないことを確かめる。
@@ -116,7 +124,9 @@ const LINT_GROUPS: &[&str] =
     &["all", "restriction", "style", "pedantic", "nursery", "correctness", "suspicious", "complexity", "perf", "cargo"];
 
 /// rustc の lint のうち、allow してはいけないもの。
-const RUSTC_NEVER: &[&str] = &["warnings", "unconditional_recursion", "unsafe_code", "arithmetic_overflow", "unused"];
+/// `deprecated` は、非推奨の口（`str::trim_left` など）を通って禁じる口の一覧をすり抜けないように。
+const RUSTC_NEVER: &[&str] =
+    &["warnings", "unconditional_recursion", "unsafe_code", "arithmetic_overflow", "unused", "deprecated"];
 
 /// mem の外で allow・expect してよい clippy の lint（ふつうの書き方の都合のもの）。
 const CLIPPY_OK_ELSEWHERE: &[&str] =
@@ -162,9 +172,23 @@ const ALLOC_METHODS: &[&str] = &[
 const GLOBAL_STATE: &[&str] =
     &["OnceLock", "OnceCell", "LazyLock", "LazyCell", "Mutex", "RwLock", "thread_local", "Condvar"];
 
-/// `static` に入れてはいけない（内側で変わる）型の名前。`Atomic` で始まるものも。
-const INTERIOR: &[&str] =
-    &["Cell", "RefCell", "UnsafeCell", "OnceCell", "OnceLock", "LazyLock", "LazyCell", "Mutex", "RwLock"];
+/// 組むときの設定の名前（属性の外に出るのは、マクロの引数で `cfg` を作る形）。
+const CFG_KEYS: &[&str] = &[
+    "debug_assertions",
+    "overflow_checks",
+    "target_os",
+    "target_arch",
+    "target_feature",
+    "target_pointer_width",
+    "target_endian",
+    "target_env",
+    "target_family",
+    "target_vendor",
+    "target_has_atomic",
+];
+
+/// ポインタの値を作る口（determinism.md §4.1：ポインタの値で順序や鍵を決めない）。
+const POINTER_METHODS: &[&str] = &["as_ptr", "as_mut_ptr", "addr", "expose_provenance", "to_bits_ptr"];
 
 /// 基本の型（`Plain` を実装してよい）。
 const PRIMS: &[&str] = &[
@@ -175,7 +199,7 @@ const PRIMS: &[&str] = &[
 /// `Plain` にしてよい基本の型（大きさがターゲットで変わる usize・isize と、整列が版で変わった u128・i128 は入れない）。
 const PLAIN_PRIMS: &[&str] = &["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "bool", "char"];
 
-/// 再帰の走査の例外（ファイル, 関数, 理由）。同じ名前の別の型の口を呼ぶ所だけ。理由を書いて足す。
+/// 再帰の走査の例外（ファイル, 関数, 理由）。同じ名前の別の型の口を呼ぶ所だけ。理由を書いて足す（当たらない例外は誤り）。
 const RECURSION_OK: &[(&str, &str, &str)] = &[];
 
 #[derive(Debug)]
@@ -375,6 +399,13 @@ fn check_cfg(s: &Src) -> Vec<Finding> {
             "env" | "option_env" if bang => {
                 out.push(s.find(x.line, format!("{}! は組むときの環境変数を読む（determinism.md §5）", x.text)));
             }
+            "cfg" | "cfg_attr" if punct_at(t, k + 1, '(') => out.push(
+                s.find(x.line, format!("{}(…) を属性の外に書かない（マクロの引数で属性を作ると走査が見ない）", x.text)),
+            ),
+            n if CFG_KEYS.contains(&n) => out.push(s.find(
+                x.line,
+                format!("{n} は組むときの設定の名前（属性の外に出るのはマクロで cfg を作る形。determinism.md §7）"),
+            )),
             "mod" if ident_at(t, k + 1, "tests") => {
                 // #[cfg(test)] の直後か
                 let ok = k >= 1 && s.attrs.iter().any(|&(_, o, c, _)| c + 1 == k && ident_at(t, o + 1, "cfg"));
@@ -490,19 +521,132 @@ fn check_forbidden_idents(s: &Src) -> Vec<Finding> {
                 s.find(x.line, format!("{n} は使わない（順序が決まらないか、std の中で数えずに確保する。mem の中も）")),
             );
         }
-        if n == "static" {
-            if ident_at(t, k + 1, "mut") {
-                out.push(s.find(x.line, "static mut は使わない".into()));
+        if n == "static" && ident_at(t, k + 1, "mut") {
+            out.push(s.find(x.line, "static mut は使わない".into()));
+        }
+        let method = k >= 1 && punct_at(t, k - 1, '.') && punct_at(t, k + 1, '(');
+        if (method && POINTER_METHODS.contains(&n)) || n == "addr_of" || n == "addr_of_mut" {
+            out.push(s.find(x.line, format!("{n} はポインタの値を作る（順序や鍵に使わない。determinism.md §4.1）")));
+        }
+        if (n == "const" || n == "mut") && k >= 1 && punct_at(t, k - 1, '*') && t[k - 1].joint(x) {
+            out.push(s.find(x.line, format!("*{n} は生のポインタ（ポインタの値を使わない。determinism.md §4.1）")));
+        }
+        if n == "libm" && s.rel != "math.rs" {
+            out.push(s.find(x.line, "libm は crate::math を通して使う（±0・NaN の扱いを揃える。CLAUDE.md）".into()));
+        }
+        if n == "partial_cmp" && punct_at(t, k + 1, '(') && !(k >= 1 && ident_at(t, k - 1, "fn")) {
+            out.push(s.find(
+                x.line,
+                "partial_cmp は全順序でない（total_cmp か整数の鍵で比べる。determinism.md §4.1）".into(),
+            ));
+        }
+        if n == "Plain" && ident_at(t, k + 1, "as") {
+            out.push(s.find(x.line, "Plain の別名を作らない（Plain の見張りをすり抜ける）".into()));
+        }
+    }
+    out
+}
+
+/// `t[k]` と `t[k + 1]` が空白なしで接するか。
+fn joint_at(t: &[Token], k: usize) -> bool {
+    matches!((t.get(k), t.get(k + 1)), (Some(a), Some(b)) if a.joint(b))
+}
+
+/// ずらし量が数の字句か定数（大文字の名前）でない `<<`・`>>`・`<<=`・`>>=`。clippy の `arithmetic_side_effects` は
+/// これを拾わず、桁の数以上のずらしは debug でだけ panic して release では折り返す（値がビルドで分かれる）。
+/// 演算子は前後に空白がある（rustfmt の形）ものだけを見る：型の閉じ `Vec<Vec<u8>>` と `<<T as X>::Y` は前か後ろが接する。
+fn check_shifts(s: &Src) -> Vec<Finding> {
+    let t = &s.tokens;
+    let mut out = Vec::new();
+    for k in 1..t.len() {
+        let op = if t[k].is_punct('<') {
+            '<'
+        } else if t[k].is_punct('>') {
+            '>'
+        } else {
+            continue;
+        };
+        if !punct_at(t, k + 1, op) || !joint_at(t, k) || joint_at(t, k - 1) || s.attr_of(k).is_some() {
+            continue;
+        }
+        let mut last = k + 1;
+        if punct_at(t, k + 2, '=') && joint_at(t, k + 1) {
+            last = k + 2;
+        }
+        if joint_at(t, last) {
+            continue;
+        }
+        let Some(x) = t.get(last + 1) else { continue };
+        let number = x.kind == Kind::Literal && x.text.as_bytes().first().is_some_and(u8::is_ascii_digit);
+        let constant = x.kind == Kind::Ident
+            && x.text.len() >= 2
+            && x.text.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_');
+        // 数のあとに続く演算（`a << 2 + b` は `a << (2 + b)`）・呼び出し
+        let more = t.get(last + 2).is_some_and(|y| {
+            y.kind == Kind::Punct && ["+", "-", "*", "/", "%", ".", "(", "["].contains(&y.text.as_str())
+        });
+        if !(number || constant) || more {
+            out.push(s.find(
+                t[k].line,
+                format!(
+                    "ずらし量が数でない {op}{op} は、桁の数以上で debug だけ panic し release では折り返す（checked_shl・checked_shr を使う。determinism.md §3）"
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// `static` の型は基本の型・`str`・Plain の型と、その配列・タプル・参照だけ（内側で変わる型を包んだものを入れない）。
+fn check_statics(all: &[Src]) -> Vec<Finding> {
+    let names: Vec<String> = plain_targets(all).into_iter().map(|(_, x)| x.text).collect();
+    let mut out = Vec::new();
+    for s in all {
+        let t = &s.tokens;
+        for k in 0..t.len() {
+            if !t[k].is_ident("static") || s.attr_of(k).is_some() {
+                continue;
             }
-            // static 名前: 型 = …;
+            // static [mut] 名前: 型 = …;
             let mut j = k + 1;
-            while j < t.len() && !t[j].is_punct('=') && !t[j].is_punct(';') {
-                if t[j].kind == Kind::Ident
-                    && (INTERIOR.contains(&t[j].text.as_str()) || t[j].text.starts_with("Atomic"))
-                {
-                    out.push(s.find(x.line, format!("static に {} を入れない（大域の状態）", t[j].text)));
-                }
+            if ident_at(t, j, "mut") {
                 j += 1;
+            }
+            if !punct_at(t, j + 1, ':') {
+                continue;
+            }
+            let mut depth = 0i32;
+            let mut m = j + 2;
+            while let Some(x) = t.get(m) {
+                if x.is_punct('[') || x.is_punct('(') || x.is_punct('<') {
+                    depth += 1;
+                } else if x.is_punct(']') || x.is_punct(')') || x.is_punct('>') {
+                    depth -= 1;
+                } else if depth <= 0 && (x.is_punct('=') || x.is_punct(';')) {
+                    break;
+                }
+                let ok = match x.kind {
+                    Kind::Ident => {
+                        let n = x.text.as_str();
+                        PRIMS.contains(&n)
+                            || n == "str"
+                            || names.iter().any(|p| p == n)
+                            || (n.len() >= 2
+                                && n.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_'))
+                    }
+                    Kind::Lifetime => x.text == "static",
+                    Kind::Literal => true,
+                    Kind::Punct => ["&", "[", "]", ";", "(", ")", ","].contains(&x.text.as_str()),
+                    _ => false,
+                };
+                if !ok {
+                    out.push(s.find(
+                        t[k].line,
+                        format!("static の型に {} を入れない（基本の型・Plain の型・その配列と参照だけ。大域の状態を作らない）", x.text),
+                    ));
+                    break;
+                }
+                m += 1;
             }
         }
     }
@@ -511,10 +655,10 @@ fn check_forbidden_idents(s: &Src) -> Vec<Finding> {
 
 /// mem の外での確保。
 fn check_alloc(s: &Src) -> Vec<Finding> {
-    if s.in_mem() {
-        return Vec::new();
-    }
     let t = &s.tokens;
+    if s.in_mem() {
+        return check_alloc_in_mem(s);
+    }
     let mut out = Vec::new();
     for k in 0..t.len() {
         let x = &t[k];
@@ -525,8 +669,14 @@ fn check_alloc(s: &Src) -> Vec<Finding> {
         if ALLOC_TYPES.contains(&n) {
             out.push(s.find(x.line, format!("{n} は mem の外で使わない（mem の入れ物を使う。ADR-31）")));
         }
-        if (n == "vec" || n == "format" || n == "format_args") && punct_at(t, k + 1, '!') {
+        if (n == "vec" || n == "format") && punct_at(t, k + 1, '!') {
             out.push(s.find(x.line, format!("{n}! は確保する（ADR-31）")));
+        }
+        if n == "format_args" && punct_at(t, k + 1, '!') {
+            out.push(s.find(
+                x.line,
+                "format_args! を直に書かない（それ自体は確保しないが、fmt::format などの確保する口に渡せる。文字は Display の write! で書く）".into(),
+            ));
         }
         let call = punct_at(t, k + 1, '(') || path_sep(t, k + 1);
         if ALLOC_METHODS.contains(&n) && k >= 1 && punct_at(t, k - 1, '.') && call {
@@ -536,15 +686,79 @@ fn check_alloc(s: &Src) -> Vec<Finding> {
     out
 }
 
+/// mem の中で、clippy の一覧が拾わない確保の変換（`Vec::from`・`String::from`・`Box::from`・`Default::default`・`.into()`）。
+/// mem の入れ物の口は `try_reserve_exact` で確保して数える。数えない変換は使わない。
+fn check_alloc_in_mem(s: &Src) -> Vec<Finding> {
+    let t = &s.tokens;
+    let mut out = Vec::new();
+    for k in 0..t.len() {
+        let x = &t[k];
+        if x.kind != Kind::Ident {
+            continue;
+        }
+        let n = x.text.as_str();
+        let conv = path_sep(t, k + 1)
+            && t.get(k + 3).is_some_and(|y| y.is_ident("from") || y.is_ident("default") || y.is_ident("from_iter"));
+        if (ALLOC_TYPES.contains(&n) || n == "Default") && conv {
+            out.push(s.find(x.line, format!("{n}::… は数えずに確保しうる（mem の口は try_reserve_exact で確保する）")));
+        }
+        if n == "into" && k >= 1 && punct_at(t, k - 1, '.') && punct_at(t, k + 1, '(') {
+            out.push(
+                s.find(x.line, ".into() は確保する変換になりうる（数の変換は u64::from のように型を名指す）".into()),
+            );
+        }
+    }
+    out
+}
+
+/// 属性（`close` は `]`）のあとの項目のキーワード（ほかの属性・文書の注釈・可視性・`unsafe` は飛ばす）。
+fn item_after(t: &[Token], close: usize) -> Option<&str> {
+    let mut j = close + 1;
+    loop {
+        let x = t.get(j)?;
+        if x.is_punct('#') {
+            let open = if punct_at(t, j + 1, '!') { j + 2 } else { j + 1 };
+            j = matching(t, open)? + 1;
+        } else if x.kind == Kind::Doc || x.is_ident("unsafe") || x.is_ident("default") {
+            j += 1;
+        } else if x.is_ident("pub") {
+            j += 1;
+            if punct_at(t, j, '(') {
+                j = matching(t, j)? + 1;
+            }
+        } else {
+            return Some(x.text.as_str());
+        }
+    }
+}
+
 /// lint の allow・expect・warn。
 fn check_allows(s: &Src) -> Vec<Finding> {
     let t = &s.tokens;
     let mut out = Vec::new();
+    // マクロの引数で lint の属性を渡す形（`m!(allow(clippy::x))`）は下の走査が見ない
+    for k in 0..t.len() {
+        let x = &t[k];
+        let lint_attr = ["allow", "expect", "warn", "deny", "forbid"].contains(&x.text.as_str());
+        if x.kind == Kind::Ident
+            && lint_attr
+            && punct_at(t, k + 1, '(')
+            && s.attr_of(k).is_none()
+            && !(k >= 1 && (punct_at(t, k - 1, '.') || punct_at(t, k - 1, ':') || ident_at(t, k - 1, "fn")))
+        {
+            out.push(s.find(
+                x.line,
+                format!("{}(…) を属性の外に書かない（マクロの引数で lint を外すと走査が見ない）", x.text),
+            ));
+        }
+    }
     for &(hash, open, close, inner_attr) in &s.attrs {
         let Some(head) = t.get(open + 1) else { continue };
         if !(head.is_ident("allow") || head.is_ident("expect") || head.is_ident("warn")) {
             continue;
         }
+        // mod・impl・trait に付けた外側の属性は、中の口をまとめて外す（内側の属性と同じに扱う）
+        let module_wide = inner_attr || matches!(item_after(t, close), Some("mod" | "impl" | "trait"));
         let body = &t[open + 1..close];
         let line = t[hash].line;
         let has_reason = body.iter().any(|x| x.is_ident("reason"));
@@ -561,10 +775,11 @@ fn check_allows(s: &Src) -> Vec<Finding> {
                 } else if STRICT_LINTS.contains(&name) {
                     if !s.in_mem() {
                         out.push(s.find(line, format!("厳しい lint clippy::{name} を外すのは mem の中だけ")));
-                    } else if inner_attr {
-                        out.push(
-                            s.find(line, format!("clippy::{name} をモジュールごと外さない（口ごとに expect で）")),
-                        );
+                    } else if module_wide {
+                        out.push(s.find(
+                            line,
+                            format!("clippy::{name} をモジュール・impl・トレイトごと外さない（口ごとに expect で）"),
+                        ));
                     } else if name == "disallowed_types" {
                         out.push(s.find(line, "disallowed_types は mem の中でも外さない".into()));
                     } else if !has_reason {
@@ -620,7 +835,7 @@ fn collect_defs(all: &[Src]) -> Vec<Def> {
                 }
                 if ident_at(t, open + 1, "repr") {
                     let r = t.get(open + 3).map(|r| r.text.as_str()).unwrap_or("");
-                    repr_ok = r == "C" || (is_enum && PRIMS.contains(&r));
+                    repr_ok = r == "C" || (is_enum && PLAIN_PRIMS.contains(&r));
                 }
             }
             // 本体
@@ -692,6 +907,11 @@ fn split_fields(body: &[Token], named: bool) -> Vec<Vec<Token>> {
     out.into_iter()
         .map(|f| {
             let mut f: Vec<Token> = f.into_iter().filter(|x| x.kind != Kind::Doc).collect();
+            // 欄の属性（#[…]）
+            while f.first().is_some_and(|x| x.is_punct('#')) && f.get(1).is_some_and(|x| x.is_punct('[')) {
+                let c = matching(&f, 1).unwrap_or(f.len() - 1);
+                f.drain(0..=c);
+            }
             if f.first().is_some_and(|x| x.is_ident("pub")) {
                 f.remove(0);
                 if f.first().is_some_and(|x| x.is_punct('(')) {
@@ -709,10 +929,24 @@ fn split_fields(body: &[Token], named: bool) -> Vec<Vec<Token>> {
 }
 
 /// `Plain` を実装した型は `#[repr(C)]`（列挙は整数の repr も可）か基本の型で、欄の型も Plain（基本の型・Plain の型・その配列）。
-fn check_plain(all: &[Src]) -> Vec<Finding> {
-    let defs = collect_defs(all);
+/// `macro_rules! 名前 { … }` の範囲と名前。
+fn macro_ranges(t: &[Token]) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
-    // Plain を実装した型の名前（impl …::Plain for X・plain!(…)）
+    for k in 0..t.len() {
+        if t[k].is_ident("macro_rules")
+            && punct_at(t, k + 1, '!')
+            && let Some(name) = t.get(k + 2)
+            && let Some(open) = (k + 3..t.len()).find(|&j| t[j].is_punct('{') || t[j].is_punct('('))
+            && let Some(close) = matching(t, open)
+        {
+            out.push((open, close, name.text.clone()));
+        }
+    }
+    out
+}
+
+/// Plain を実装した型の名前（`impl …::Plain for X`・`plain!(…)`）。マクロの定義の中の `impl Plain for $t` は `$` の字句。
+fn plain_targets(all: &[Src]) -> Vec<(&Src, Token)> {
     let mut targets: Vec<(&Src, Token)> = Vec::new();
     for s in all {
         let t = &s.tokens;
@@ -761,6 +995,13 @@ fn check_plain(all: &[Src]) -> Vec<Finding> {
             }
         }
     }
+    targets
+}
+
+fn check_plain(all: &[Src]) -> Vec<Finding> {
+    let defs = collect_defs(all);
+    let mut out = Vec::new();
+    let targets = plain_targets(all);
     let names: Vec<&str> = targets.iter().map(|(_, x)| x.text.as_str()).collect();
     let ok_type = |f: &[Token]| -> bool {
         match f {
@@ -774,9 +1015,15 @@ fn check_plain(all: &[Src]) -> Vec<Finding> {
         }
     };
     for (s, x) in &targets {
-        // マクロの定義の中（impl Plain for $t）は飛ばす（マクロを呼ぶ所で見る）。ほかの名前でない型（タプル・参照・
-        // ポインタ・配列）は Plain にしない
+        // マクロの定義の中（impl Plain for $t）は plain! だけ許す（plain! を呼ぶ所で見る。ほかの名前のマクロは呼ぶ所を
+        // 見ないので作らない）。ほかの名前でない型（タプル・参照・ポインタ・配列）は Plain にしない
         if x.is_punct('$') {
+            let in_plain = macro_ranges(&s.tokens)
+                .iter()
+                .any(|(o, c, n)| n == "plain" && s.tokens[*o].line <= x.line && x.line <= s.tokens[*c].line);
+            if !in_plain {
+                out.push(s.find(x.line, "Plain の実装をマクロで作るのは plain! だけ（呼ぶ所を見るため）".into()));
+            }
             continue;
         }
         if x.kind != Kind::Ident {
@@ -842,7 +1089,7 @@ fn resolve_paths(s: &Src) -> Vec<(usize, Option<String>)> {
             continue;
         }
         // 基のパス
-        let mut base: Vec<String> = match x.text.as_str() {
+        let base: Vec<String> = match x.text.as_str() {
             "crate" => Vec::new(),
             "self" => s.path.clone(),
             _ => {
@@ -851,23 +1098,35 @@ fn resolve_paths(s: &Src) -> Vec<(usize, Option<String>)> {
                 b
             }
         };
-        let mut j = k + 3;
-        while ident_at(t, j, "super") && path_sep(t, j + 1) {
-            base.pop();
-            j += 3;
-        }
-        let heads: Vec<usize> = if punct_at(t, j, '{') { group_heads(t, j) } else { vec![j] };
-        for h in heads {
+        // (基, 位置)。`{…}` の組の頭の super・self も、外の基から続けて解く（`use super::{super::render::R}`）
+        let mut work: Vec<(Vec<String>, usize)> = vec![(base, k + 3)];
+        while let Some((mut base, mut j)) = work.pop() {
+            loop {
+                if ident_at(t, j, "super") && path_sep(t, j + 1) {
+                    base.pop();
+                    j += 3;
+                } else if ident_at(t, j, "self") && path_sep(t, j + 1) {
+                    j += 3;
+                } else {
+                    break;
+                }
+            }
+            if punct_at(t, j, '{') {
+                for h in group_heads(t, j) {
+                    work.push((base.clone(), h));
+                }
+                continue;
+            }
             match base.first() {
-                Some(m) => out.push((h, Some(m.clone()))),
+                Some(m) => out.push((j, Some(m.clone()))),
                 None => {
-                    let y = t.get(h);
-                    let name = y.map(|y| y.text.clone()).unwrap_or_default();
-                    out.push((h, if LAYERS.iter().any(|l| l.0 == name) { Some(name) } else { None }));
+                    let name = t.get(j).map(|y| y.text.clone()).unwrap_or_default();
+                    out.push((j, if LAYERS.iter().any(|l| l.0 == name) { Some(name) } else { None }));
                 }
             }
         }
     }
+    out.sort_by_key(|x| x.0);
     out
 }
 
@@ -909,10 +1168,19 @@ fn check_layers(s: &Src) -> Vec<Finding> {
     out
 }
 
-/// impl の塊（`{` と `}` の位置と、型の名前）。
-fn impl_blocks(t: &[Token]) -> Vec<(usize, usize, String)> {
+/// impl と trait の塊（`{` と `}` の位置と、自分の側の名前：impl の型とトレイト、trait の名前）。
+fn impl_blocks(t: &[Token]) -> Vec<(usize, usize, Vec<String>)> {
     let mut out = Vec::new();
     for k in 0..t.len() {
+        if t[k].is_ident("trait")
+            && let Some(n) = t.get(k + 1).filter(|n| n.kind == Kind::Ident)
+            && let Some(open) = (k + 2..t.len()).find(|&j| t[j].is_punct('{') || t[j].is_punct(';'))
+            && t[open].is_punct('{')
+            && let Some(close) = matching(t, open)
+        {
+            out.push((open, close, vec![n.text.clone()]));
+            continue;
+        }
         if !t[k].is_ident("impl") {
             continue;
         }
@@ -942,12 +1210,108 @@ fn impl_blocks(t: &[Token]) -> Vec<(usize, usize, String)> {
             j += 1;
         }
         let open = (j..t.len()).find(|&m| t[m].is_punct('{'));
-        let (Some(open), ty) = (open, after_for.or(names.last().copied())) else { continue };
-        if let (Some(close), Some(ty)) = (matching(t, open), ty) {
-            out.push((open, close, ty.to_string()));
+        let Some(open) = open else { continue };
+        let mut owners: Vec<String> = Vec::new();
+        if let Some(ty) = after_for {
+            owners.push(ty.to_string());
+        }
+        if let Some(tr) = names.last() {
+            owners.push(tr.to_string());
+        }
+        if let Some(close) = matching(t, open)
+            && !owners.is_empty()
+        {
+            out.push((open, close, owners));
         }
     }
     out
+}
+
+/// `t[k]` を囲む塊の自分の側の名前（いちばん内側の impl・trait）。
+fn owners_at(impls: &[(usize, usize, Vec<String>)], k: usize) -> Vec<&str> {
+    impls
+        .iter()
+        .rfind(|(o, c, _)| *o < k && k < *c)
+        .map(|(_, _, n)| n.iter().map(String::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// `t[m]` の前の `::` をたどったパスの根が自分の側か（`Self`・`self`・`crate`・`super`・impl の型・トレイトの名前、
+/// `<Self as Walk>::`・`<X as T>::` の X・T）。turbofish（`X::<T>::`）は越えてたどる。
+fn local_path_root(t: &[Token], m: usize, owners: &[&str]) -> bool {
+    let mut r = m - 3;
+    loop {
+        if t[r].is_punct('>') {
+            // 開きの < を探す
+            let mut d = 0i32;
+            let mut q = r;
+            loop {
+                if t[q].is_punct('>') && !(q >= 1 && punct_at(t, q - 1, '-')) {
+                    d += 1;
+                } else if t[q].is_punct('<') {
+                    d -= 1;
+                    if d == 0 {
+                        break;
+                    }
+                }
+                if q == 0 {
+                    return false;
+                }
+                q -= 1;
+            }
+            if after_sep(t, q) && q >= 3 {
+                // turbofish：その前の欄から続ける
+                r = q - 3;
+                continue;
+            }
+            return t[q..r]
+                .iter()
+                .any(|x| x.kind == Kind::Ident && (x.text == "Self" || owners.contains(&x.text.as_str())));
+        }
+        if r >= 3 && after_sep(t, r) && (t[r - 3].kind == Kind::Ident || t[r - 3].is_punct('>')) {
+            r -= 3;
+            continue;
+        }
+        break;
+    }
+    let root = t[r].text.as_str();
+    matches!(root, "Self" | "self" | "crate" | "super") || owners.contains(&root)
+}
+
+/// 関数の引数と本体で束ねた名前（`let x`・`let mut x`・`for x`・`ref x`・`|x|`・引数の `x:`）。値として渡す形の判定から除く。
+fn bound_names(t: &[Token], fn_kw: usize, close: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    for m in fn_kw + 2..close {
+        let x = &t[m];
+        if x.kind != Kind::Ident {
+            continue;
+        }
+        let after_kw = ident_at(t, m - 1, "let")
+            || ident_at(t, m - 1, "mut")
+            || ident_at(t, m - 1, "for")
+            || ident_at(t, m - 1, "ref");
+        let param = punct_at(t, m + 1, ':') && !punct_at(t, m + 2, ':') && !punct_at(t, m - 1, ':');
+        let closure = (punct_at(t, m - 1, '|') || punct_at(t, m - 1, ','))
+            && (punct_at(t, m + 1, '|') || punct_at(t, m + 1, ','))
+            && (punct_at(t, m - 1, '|') || punct_at(t, m + 1, '|'));
+        if after_kw || param || closure {
+            out.push(x.text.as_str());
+        }
+    }
+    out
+}
+
+/// 本体の `t[m]` が自分の側の関数を値として渡す形か（`map(depth)`・`map(Self::depth)`・`let g = f;`）。
+fn value_ref(t: &[Token], m: usize, owners: &[&str], bound: &[&str]) -> bool {
+    let next_ok = punct_at(t, m + 1, ')') || punct_at(t, m + 1, ',') || punct_at(t, m + 1, ';');
+    if !next_ok || punct_at(t, m - 1, '.') {
+        return false;
+    }
+    if after_sep(t, m) {
+        return local_path_root(t, m, owners);
+    }
+    let prev_ok = punct_at(t, m - 1, '(') || punct_at(t, m - 1, ',') || punct_at(t, m - 1, '=');
+    prev_ok && !bound.contains(&t[m].text.as_str())
 }
 
 /// 自分の名前を呼ぶ関数（再帰しない。明示の積み上げで書く）。
@@ -981,13 +1345,23 @@ fn check_recursion(s: &Src) -> Vec<Finding> {
         if RECURSION_OK.iter().any(|(f, n, _)| *f == s.rel && *n == name.text) {
             continue;
         }
-        let ty = impls.iter().filter(|(o, c, _)| *o < k && k < *c).map(|(_, _, n)| n.as_str()).next_back();
+        let owners = owners_at(&impls, k);
+        let bound = bound_names(t, k, close);
         for m in open + 1..close {
             if !t[m].is_ident(&name.text) {
                 continue;
             }
             let call = punct_at(t, m + 1, '(') || (path_sep(t, m + 1) && punct_at(t, m + 3, '<'));
-            if !call || ident_at(t, m - 1, "fn") {
+            if ident_at(t, m - 1, "fn") {
+                continue;
+            }
+            if !call {
+                if value_ref(t, m, &owners, &bound) {
+                    out.push(s.find(
+                        t[m].line,
+                        format!("{} が自分を値として渡す（再帰しない。明示の積み上げで書く）", name.text),
+                    ));
+                }
                 continue;
             }
             let recursive = if punct_at(t, m - 1, '.') {
@@ -999,13 +1373,8 @@ fn check_recursion(s: &Src) -> Vec<Finding> {
                     && !punct_at(t, m - 5, '.');
                 !delegation
             } else if after_sep(t, m) {
-                // パス：根が Self・self・crate・super・impl の型なら自分（libm::sin( などは別のもの）
-                let mut r = m - 3;
-                while r >= 3 && after_sep(t, r) && t[r - 3].kind == Kind::Ident {
-                    r -= 3;
-                }
-                let root = t[r].text.as_str();
-                matches!(root, "Self" | "self" | "crate" | "super") || Some(root) == ty
+                // パス：根が Self・self・crate・super・impl の型・トレイトなら自分（libm::sin( などは別のもの）
+                local_path_root(t, m, &owners)
             } else {
                 true
             };
@@ -1017,26 +1386,27 @@ fn check_recursion(s: &Src) -> Vec<Finding> {
     out
 }
 
-/// 関数の本体から、自分の側の口を呼ぶ名前を集める（`名前(`・`self.名前(`・`Self::名前(`・impl の型や crate・super・self
-/// から始まるパスの `名前(`。`self.欄.名前(` の委ねと、ほかの型・クレートのパスは別のものとみなす）。
-fn local_calls(t: &[Token], open: usize, close: usize, ty: Option<&str>) -> Vec<String> {
+/// 関数の本体から、自分の側の口を呼ぶ・値として渡す名前を集める（`名前(`・`self.名前(`・`Self::名前(`・impl の型や
+/// トレイト・crate・super・self から始まるパスの `名前(`・`map(名前)`・`map(Self::名前)`。`self.欄.名前(` の委ねと、ほかの
+/// 型・クレートのパスは別のものとみなす）。
+fn local_calls(t: &[Token], fn_kw: usize, open: usize, close: usize, owners: &[&str]) -> Vec<String> {
+    let bound = bound_names(t, fn_kw, close);
     let mut out = Vec::new();
     for m in open + 1..close {
-        if t[m].kind != Kind::Ident || !(punct_at(t, m + 1, '(') || (path_sep(t, m + 1) && punct_at(t, m + 3, '<'))) {
+        if t[m].kind != Kind::Ident || ident_at(t, m - 1, "fn") {
             continue;
         }
-        if ident_at(t, m - 1, "fn") {
+        let call = punct_at(t, m + 1, '(') || (path_sep(t, m + 1) && punct_at(t, m + 3, '<'));
+        if !call {
+            if value_ref(t, m, owners, &bound) {
+                out.push(t[m].text.clone());
+            }
             continue;
         }
         let local = if punct_at(t, m - 1, '.') {
             ident_at(t, m - 2, "self") && !punct_at(t, m - 3, '.')
         } else if after_sep(t, m) {
-            let mut r = m - 3;
-            while r >= 3 && after_sep(t, r) && t[r - 3].kind == Kind::Ident {
-                r -= 3;
-            }
-            let root = t[r].text.as_str();
-            matches!(root, "Self" | "self" | "crate" | "super") || Some(root) == ty
+            local_path_root(t, m, owners)
         } else {
             true
         };
@@ -1064,8 +1434,7 @@ fn check_mutual_recursion(all: &[Src]) -> Vec<Finding> {
                 continue;
             }
             let close = matching(t, open).unwrap_or(open);
-            let ty = impls.iter().filter(|(o, c, _)| *o < k && k < *c).map(|(_, _, n)| n.as_str()).next_back();
-            let calls = local_calls(t, open, close, ty);
+            let calls = local_calls(t, k, open, close, &owners_at(&impls, k));
             fns.push((name.text.clone(), s.rel.clone(), name.line, calls));
         }
     }
@@ -1131,12 +1500,14 @@ fn check_all(all: &[Src]) -> Vec<Finding> {
         out.extend(check_cfg(s));
         out.extend(check_std(s));
         out.extend(check_forbidden_idents(s));
+        out.extend(check_shifts(s));
         out.extend(check_alloc(s));
         out.extend(check_allows(s));
         out.extend(check_layers(s));
         out.extend(check_recursion(s));
     }
     out.extend(check_plain(all));
+    out.extend(check_statics(all));
     out.extend(check_mutual_recursion(all));
     out
 }
@@ -1151,6 +1522,13 @@ fn src_follows_the_rules() {
     assert!(all.iter().any(|s| s.rel == "lib.rs"), "src/lib.rs が見つからない");
     let f = check_all(&all);
     assert!(f.is_empty(), "src の規則に反する所：\n{}", report(&f));
+    // 再帰の例外は、今の src のその関数に当たる（当たらない例外を残さない）
+    for (file, name, _) in RECURSION_OK {
+        let hit = all
+            .iter()
+            .any(|s| s.rel == *file && s.tokens.windows(2).any(|w| w[0].is_ident("fn") && w[1].is_ident(name)));
+        assert!(hit, "RECURSION_OK の {file} の {name} が src にない（例外から消す）");
+    }
 }
 
 /// Cargo.toml：[features]・build.rs・ターゲットごとの依存・組むときの依存がなく、本番の依存は libm だけ（既定の feature なし）。
@@ -1177,6 +1555,11 @@ fn check_cargo(toml: &str, has_build_rs: bool) -> Vec<String> {
     if names != ["libm"] {
         errs.push(format!("本番の依存は libm だけ（{names:?}）"));
     }
+    // lint を受け継ぐ（1 行消すと unwrap_used・indexing_slicing などが黙って切れる）
+    let lints = toml.split("\n[lints]").nth(1).unwrap_or("").split("\n[").next().unwrap_or("");
+    if !lints.lines().any(|l| l.split('#').next().unwrap_or("").replace(' ', "") == "workspace=true") {
+        errs.push("[lints] workspace = true がない（workspace の厳しい lint を受け継がない）".to_string());
+    }
     if let Some(l) = lines.first()
         && (!l.contains("version = \"=0.2.16\"")
             || !l.contains("default-features = false")
@@ -1187,11 +1570,42 @@ fn check_cargo(toml: &str, has_build_rs: bool) -> Vec<String> {
     errs
 }
 
+/// 根の Cargo.toml：`[workspace.lints.rust]` に `unsafe_code = "forbid"`、`[workspace.lints.clippy]` に厳しい lint を
+/// すべて deny で持つ（CLAUDE.md の一覧）。
+fn check_workspace_lints(toml: &str) -> Vec<String> {
+    let section = |name: &str| -> Vec<(String, String)> {
+        let whole = format!("\n{toml}");
+        let body = whole.split(&format!("\n[{name}]")).nth(1).unwrap_or("").split("\n[").next().unwrap_or("");
+        body.lines()
+            .filter_map(|l| {
+                let l = l.split('#').next().unwrap_or("").trim();
+                let (k, v) = l.split_once('=')?;
+                Some((k.trim().to_string(), v.trim().trim_matches('"').to_string()))
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut errs = Vec::new();
+    let rust = section("workspace.lints.rust");
+    if !rust.iter().any(|(k, v)| k == "unsafe_code" && v == "forbid") {
+        errs.push("[workspace.lints.rust] に unsafe_code = \"forbid\" がない".to_string());
+    }
+    let clippy = section("workspace.lints.clippy");
+    for name in STRICT_LINTS {
+        if !clippy.iter().any(|(k, v)| k == name && (v == "deny" || v == "forbid")) {
+            errs.push(format!("[workspace.lints.clippy] に {name} = \"deny\" がない"));
+        }
+    }
+    errs
+}
+
 #[test]
 fn library_cargo_toml() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let toml = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
     let errs = check_cargo(&toml, dir.join("build.rs").exists());
+    assert!(errs.is_empty(), "{errs:?}");
+    let root = std::fs::read_to_string(dir.join("../../Cargo.toml")).unwrap();
+    let errs = check_workspace_lints(&root);
     assert!(errs.is_empty(), "{errs:?}");
 }
 
@@ -1210,7 +1624,7 @@ fn rule_cfg() {
     assert_eq!(hits("math.rs", "#[cfg(test)]\nmod tests;"), 0);
     assert_eq!(hits("math.rs", "#[cfg(target_arch = \"x86_64\")] fn f() {}"), 1);
     assert_eq!(hits("math.rs", "#[cfg(debug_assertions)] fn f() {}"), 1);
-    assert_eq!(hits("math.rs", "fn f() -> bool { cfg!(debug_assertions) }"), 1);
+    assert_eq!(hits("math.rs", "fn f() -> bool { cfg!(debug_assertions) }"), 2); // cfg! と設定の名前
     assert_eq!(hits("math.rs", "#[cfg_attr(test, derive(Debug))] struct A;"), 1);
     assert_eq!(hits("math.rs", "#[cfg(test)] mod tests { }"), 1);
     assert_eq!(hits("math.rs", "#[cfg(test)] mod other;"), 1);
@@ -1219,6 +1633,11 @@ fn rule_cfg() {
     assert_eq!(hits("math.rs", "#[path = \"../../x.rs\"] mod x;"), 1);
     assert_eq!(hits("math.rs", "include!(\"../../x.rs\");"), 1);
     assert_eq!(hits("math.rs", "const A: &str = env!(\"HOME\"); const B: Option<&str> = option_env!(\"X\");"), 2);
+    // マクロの引数で属性を作る形（cfg( と設定の名前）
+    let meta = "macro_rules! m { ($a:meta) => { #[$a] fn f() {} }; }\nm!(cfg(debug_assertions));";
+    assert_eq!(hits("math.rs", meta), 2);
+    assert_eq!(hits("math.rs", "m!(cfg_attr(test, derive(Debug)));"), 1);
+    assert_eq!(hits("math.rs", "const A: bool = n!(target_arch);"), 1);
     // 識別子の cfg・注釈と文字列の中は数えない
     assert_eq!(hits("math.rs", "fn f(cfg: u8) -> u8 { cfg }"), 0);
     assert_eq!(hits("math.rs", "// #[cfg(target_os = \"macos\")]\nconst S: &str = \"cfg(test)\";"), 0);
@@ -1266,6 +1685,45 @@ fn rule_forbidden_idents() {
         hits("mem/mod.rs", "#[expect(clippy::disallowed_types, reason = \"x\")] fn f(_: HashMap<u8, u8>) {}"),
         2
     );
+    assert_eq!(hits("math.rs", "fn f(a: f32) -> f32 { libm::fmaf(a, a, a) }"), 1);
+    // 大域の状態
+    assert_eq!(hits("math.rs", "thread_local! { static X: u8 = 0; }"), 1);
+    assert_eq!(hits("math.rs", "static O: OnceLock<u8> = OnceLock::new();"), 3); // OnceLock ×2 と static の型
+    assert_eq!(hits("math.rs", "static C: Cell<u8> = Cell::new(0);"), 1);
+    assert_eq!(hits("math.rs", "static R: RefCell<u8> = RefCell::new(0);"), 1);
+    assert_eq!(hits("math.rs", "static X: crate::cancel::Flag = crate::cancel::Flag::new();"), 1);
+    assert_eq!(hits("math.rs", "static X: ([u8; 1], AtomicBool) = ([0], AtomicBool::new(false));"), 3);
+    assert_eq!(hits("math.rs", "static S: &str = \"x\"; static T: [(u32, u8); 2] = [(1, 2), (3, 4)];"), 0);
+    let plain =
+        "#[repr(C)] struct Pt { x: u32 }\nimpl Plain for Pt {}\nstatic P: [Pt; TABLE_LEN] = [Pt { x: 1 }; TABLE_LEN];";
+    assert_eq!(hits("geom.rs", plain), 0);
+    // ポインタの値・libm・partial_cmp
+    assert_eq!(hits("math.rs", "fn f(a: &[u8]) -> usize { a.as_ptr() as usize }"), 1);
+    assert_eq!(hits("math.rs", "fn f(p: *const u8, q: *mut u8) {}"), 2);
+    assert_eq!(hits("math.rs", "fn f(a: &u8) -> usize { core::ptr::addr_of!(*a).addr() }"), 3); // ptr・addr_of・addr
+    assert_eq!(hits("math.rs", "fn f(a: &u8, b: u8) -> u8 { *a * b }"), 0);
+    assert_eq!(hits("geom.rs", "fn f(x: f64) -> f64 { libm::fmax(x, 0.0) }"), 1);
+    assert_eq!(hits("math.rs", "fn f(x: f64) -> f64 { libm::fmax(x, 0.0) }"), 0);
+    assert_eq!(hits("math.rs", "fn f(a: f64, b: f64) -> bool { a.partial_cmp(&b).is_some() }"), 1);
+    assert_eq!(hits("math.rs", "impl PartialOrd for A { fn partial_cmp(&self, o: &A) -> Option<O> { None } }"), 0);
+}
+
+#[test]
+fn rule_shifts() {
+    assert_eq!(hits("math.rs", "fn f(a: u32, b: u32) -> u32 { a << b }"), 1);
+    assert_eq!(hits("math.rs", "fn f(a: u32, b: u32) -> u32 { a >> b }"), 1);
+    assert_eq!(hits("math.rs", "fn f(mut a: u32, b: u32) { a <<= b; a >>= b; }"), 2);
+    assert_eq!(hits("math.rs", "fn f(a: u32, b: u32) -> u32 { a << 2 + b }"), 1);
+    assert_eq!(hits("math.rs", "fn f(a: u32, b: u8) -> u32 { a >> (b % 8) }"), 1);
+    // 数・定数のずらしは見ない（rustc の arithmetic_overflow が見る）
+    assert_eq!(hits("math.rs", "fn f(mut e: u32) -> u32 { e >>= 1; (e << 3) >> SHIFT_BITS }"), 0);
+    assert_eq!(hits("math.rs", "fn f(a: u32, b: u32) -> u32 { a.checked_shl(b).unwrap_or(0) }"), 0);
+    // 型の閉じと修飾つきのパス
+    assert_eq!(
+        hits("math.rs", "fn f(x: Option<Option<u8>>) -> Option<Option<u8>> { let y: Option<Option<u8>> = x; y }"),
+        0
+    );
+    assert_eq!(hits("math.rs", "fn g() -> u32 { <<u8 as A>::B as C>::d() }"), 0);
 }
 
 #[test]
@@ -1277,6 +1735,14 @@ fn rule_alloc_outside_mem() {
     assert_eq!(hits("doc.rs", "fn f(t: &str) -> usize { t.to_ascii_lowercase().len() }"), 1);
     assert_eq!(hits("doc.rs", "fn f(a: &Arc<u8>) -> usize { a.len() }"), 1);
     assert_eq!(hits("mem/mod.rs", "fn f() { let v: Vec<u8> = Vec::new(); let _ = v.clone(); }"), 0);
+    assert_eq!(hits("doc.rs", "fn f() { let _ = Box::new(1); let _ = String::new(); let _: Cow<str> = x; }"), 3);
+    assert_eq!(hits("doc.rs", "fn f(v: &mut X, a: &[&str]) { v.extend(a); let _ = a.join(\",\"); }"), 2);
+    assert_eq!(hits("doc.rs", "fn f() -> u8 { format_args!(\"x\"); 0 }"), 1);
+    // mem の中の数えない変換
+    assert_eq!(hits("mem/mod.rs", "fn f() -> Vec<u8> { Vec::from([1u8]) }"), 1);
+    assert_eq!(hits("mem/mod.rs", "fn f() -> Box<[u8]> { Default::default() }"), 1);
+    assert_eq!(hits("mem/mod.rs", "fn f(a: &[u8]) -> Box<[u8]> { a.into() }"), 1);
+    assert_eq!(hits("mem/mod.rs", "fn f(a: u32) -> u64 { u64::from(a) }"), 0);
     // 自分の型の名前の一部は拾わない
     assert_eq!(hits("doc.rs", "struct MVecLike; fn f(x: &MVecLike) {}"), 0);
 }
@@ -1296,6 +1762,23 @@ fn rule_allows() {
     assert_eq!(hits("mem/mod.rs", "#[expect(clippy::all, reason = \"x\")] fn f() {}"), 1);
     assert_eq!(hits("lib.rs", "#![allow(clippy::nursery)]"), 1);
     assert_eq!(hits("doc.rs", "#[allow(warnings)] fn f() {}"), 1);
+    assert_eq!(hits("doc.rs", "#[allow(deprecated)] fn f() {}"), 1);
+    assert_eq!(hits("doc.rs", "#[allow(unused)] fn f() {}"), 1);
+    assert_eq!(hits("doc.rs", "#[allow(unconditional_recursion)] fn f() {}"), 1);
+    // mod・impl・trait に付けた外側の属性はモジュールごとの外し
+    assert_eq!(hits("mem/mod.rs", "#[expect(clippy::disallowed_methods, reason = \"x\")] mod sort;"), 1);
+    assert_eq!(hits("mem/mod.rs", "#[expect(clippy::indexing_slicing, reason = \"x\")]\nimpl M { fn f() {} }"), 1);
+    assert_eq!(hits("mem/mod.rs", "#[expect(clippy::indexing_slicing, reason = \"x\")]\npub(crate) trait T {}"), 1);
+    assert_eq!(
+        hits(
+            "mem/mod.rs",
+            "#[expect(clippy::indexing_slicing, reason = \"x\")]\n/// 説明\n#[inline]\npub(crate) fn f() {}"
+        ),
+        0
+    );
+    // マクロの引数で lint の属性を渡す形
+    assert_eq!(hits("doc.rs", "m!(allow(clippy::panic));"), 1);
+    assert_eq!(hits("doc.rs", "fn f(o: Option<u8>) -> u8 { o.expect(\"x\") }"), 0); // clippy が拾う
     assert_eq!(hits("doc.rs", "#[warn(clippy::unwrap_used)] fn f() {}"), 1);
     assert_eq!(hits("doc.rs", "#[expect(dead_code, reason = \"M1 から\")] fn f() {}"), 0);
 }
@@ -1318,6 +1801,11 @@ fn rule_plain() {
     assert_eq!(hits("geom.rs", "#[repr(C)] struct U { a: usize }\nimpl Plain for U {}"), 1);
     assert_eq!(hits("geom.rs", "#[repr(C)] struct S<T> { a: T }\nimpl<T: Plain> Plain for S<T> {}"), 1);
     assert_eq!(hits("mem/mod.rs", "macro_rules! plain { ($($t:ty),*) => { $(impl Plain for $t {})* }; }"), 0);
+    assert_eq!(hits("mem/mod.rs", "macro_rules! mk { ($t:ty) => { impl Plain for $t {} }; }"), 1);
+    assert_eq!(hits("geom.rs", "use crate::mem::Plain as P;\nstruct B { x: u32 }\nimpl P for B {}"), 1);
+    assert_eq!(hits("mem/mod.rs", "#[repr(usize)] #[derive(Clone, Copy)] enum E { A } plain!(E);"), 1);
+    // 欄の属性は型に数えない
+    assert_eq!(hits("geom.rs", "#[repr(C)] struct A(#[doc = \"x\"] u32);\nimpl Plain for A {}"), 0);
     // パスつき・型の引数つきの impl
     assert_eq!(hits("geom.rs", "struct P { x: u32 }\nimpl crate::mem::Plain for P {}"), 1);
     assert_eq!(hits("geom.rs", "struct Q<T> { x: T }\nimpl<T: Copy> mem::Plain for Q<T> {}"), 2);
@@ -1348,6 +1836,9 @@ fn rule_layers() {
     assert_eq!(hits("mem/sort.rs", "use super::MVec;"), 0);
     assert_eq!(hits("math.rs", "use super::render::Render;"), 1);
     assert_eq!(hits("geom/path.rs", "use super::super::render::Render;"), 1);
+    // {…} の中の super・self も外の基から解く
+    assert_eq!(hits("mem/sort.rs", "use super::{super::render::R};"), 1);
+    assert_eq!(hits("mem/sort.rs", "use super::{MVec, super::budget::Budget, self::x};"), 0);
     assert_eq!(hits("math.rs", "use crate::*;"), 1);
     assert_eq!(hits("math.rs", "fn f() { crate::render_all(); }"), 1);
     assert_eq!(hits("math.rs", "use crate::{self as c};"), 1);
@@ -1373,6 +1864,22 @@ fn rule_recursion() {
     assert_eq!(hits("math.rs", "fn walk<T>(x: T) { walk::<T>(x) }"), 1);
     assert_eq!(hits("math.rs", "fn walk(x: u8) { crate::math::walk(x) }"), 1);
     assert_eq!(hits("geom/path.rs", "fn walk(x: u8) { super::path::walk(x) }"), 1);
+    // 関数を値として渡す形
+    assert_eq!(hits("math.rs", "fn depth(n: &N) -> u32 { n.kids.iter().map(depth).fold(0, g) }"), 1);
+    assert_eq!(
+        hits("math.rs", "impl N { fn depth(&self) -> u32 { self.kids.iter().map(Self::depth).fold(0, g) } }"),
+        1
+    );
+    assert_eq!(hits("math.rs", "fn f(n: u32) -> u32 { let g: fn(u32) -> u32 = f; g(n - 1) }"), 1);
+    // トレイトの名前・修飾つきのパス・turbofish
+    assert_eq!(hits("math.rs", "impl Walk for N { fn walk(&self) { for c in &self.kids { Walk::walk(c) } } }"), 1);
+    assert_eq!(hits("math.rs", "impl Walk for N { fn walk(&self) { <Self as Walk>::walk(self) } }"), 1);
+    assert_eq!(hits("math.rs", "trait Walk { fn walk(&self) { Walk::walk(self) } }"), 1);
+    assert_eq!(hits("math.rs", "impl F { fn make() -> F { F::<u8>::make() } }"), 1);
+    // 欄・束ねた名前・ほかの型のパスは拾わない
+    assert_eq!(hits("math.rs", "impl A { fn len(&self) -> usize { self.len } }"), 0);
+    assert_eq!(hits("math.rs", "fn depth(n: u32) -> u32 { let depth = n; g(depth) }"), 0);
+    assert_eq!(hits("math.rs", "fn walk(x: u8) { other::walk(x); h(other::walk) }"), 0);
 }
 
 #[test]
@@ -1387,6 +1894,8 @@ fn rule_mutual_recursion() {
     );
     assert_eq!(hits("math.rs", "fn a() { b() } fn b() { c() } fn c() { a() }"), 1);
     assert_eq!(hits("math.rs", "fn a() { b() } fn b() {}"), 0);
+    assert_eq!(hits("math.rs", "fn a() { run(b) } fn b() { a() }"), 1);
+    assert_eq!(hits("math.rs", "impl W for N { fn a(&self) { W::b(self) } fn b(&self) { self.a() } }"), 1);
     // 委ね・ほかの型のパスは辺にしない
     assert_eq!(
         hits("mem/mod.rs", "impl M { fn len(&self) { self.v.len() } fn get(&self) { Other::len(); self.v.get() } }"),
@@ -1402,8 +1911,19 @@ fn rule_mutual_recursion() {
 
 #[test]
 fn rule_cargo_toml() {
-    let good = "[package]\nname = \"sumie\"\n\n[dependencies]\nlibm = { version = \"=0.2.16\", default-features = false }\n\n[dev-dependencies]\nblake3 = \"=1.8.7\"\n";
+    let good = "[package]\nname = \"sumie\"\n\n[dependencies]\nlibm = { version = \"=0.2.16\", default-features = false }\n\n[dev-dependencies]\nblake3 = \"=1.8.7\"\n\n[lints]\nworkspace = true\n";
     assert!(check_cargo(good, false).is_empty());
+    assert_eq!(check_cargo(&good.replace("workspace = true", "workspace = false"), false).len(), 1);
+    assert_eq!(check_cargo(&good.replace("\n[lints]\nworkspace = true\n", ""), false).len(), 1);
+    // 根の lint
+    let mut ws = String::from("[workspace.lints.rust]\nunsafe_code = \"forbid\"\n\n[workspace.lints.clippy]\n");
+    for l in STRICT_LINTS {
+        ws.push_str(&format!("{l} = \"deny\"\n"));
+    }
+    assert!(check_workspace_lints(&ws).is_empty());
+    assert_eq!(check_workspace_lints(&ws.replace("indexing_slicing = \"deny\"\n", "")).len(), 1);
+    assert_eq!(check_workspace_lints(&ws.replace("panic = \"deny\"", "panic = \"warn\"")).len(), 1);
+    assert_eq!(check_workspace_lints(&ws.replace("\"forbid\"", "\"deny\"")).len(), 1);
     assert_eq!(check_cargo(&format!("{good}[features]\nx = []\n"), false).len(), 1);
     assert_eq!(check_cargo(&format!("{good}[target.'cfg(unix)'.dependencies]\nlibc = \"1\"\n"), false).len(), 1);
     assert_eq!(check_cargo(&format!("{good}[build-dependencies]\ncc = \"1\"\n"), false).len(), 1);

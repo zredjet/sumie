@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# clippy（scripts/verify.sh と CI の両方が呼ぶ）。`-D warnings` でも、clippy.toml の引けない口（does not refer to a
-# reachable function）は警告のまま通るので、出力から拾って落とす（引けない口は禁止が効いていない）。
+# clippy（scripts/verify.sh と CI の両方が呼ぶ）。`-D warnings` でも、clippy.toml の口を引けない・関数でない物を指す
+# （does not refer to a reachable function・expected a function, found a struct など）診断は警告のまま通るので、
+# 出力から拾って落とす（その口は禁止が効いていない）。
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
@@ -8,8 +9,10 @@ log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 status=0
 cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 | tee "$log" || status=$?
-if grep -q "does not refer to a reachable" "$log"; then
-  echo "clippy が引けない口が crates/sumie/clippy.toml にある（禁止が効いていない）" >&2
+# 設定の場所を指す診断（引けない口・関数でない物を指す口 expected a function, found … など）は、その口を黙って無視した印
+if grep -qE "does not refer to a reachable|clippy\.toml:[0-9]+:[0-9]+" "$log"; then
+  echo "clippy が crates/sumie/clippy.toml の口を引けない・関数として扱えない（禁止が効いていない）：" >&2
+  grep -E -B2 "does not refer to a reachable|clippy\.toml:[0-9]+:[0-9]+" "$log" >&2 || true
   exit 1
 fi
 exit "$status"

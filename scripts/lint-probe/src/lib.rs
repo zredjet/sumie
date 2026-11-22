@@ -1,5 +1,6 @@
 //! 禁じる口の代表（種類ごとに 1 つ以上）と、許す口。`sumie-tools check-lint-probe` が行ごとに照らす：
-//! `// 期待: <パス> …` の行ではそのパスがすべて拾われ、`// 許す` の行では何も拾われないこと。
+//! `// 期待: <パス> …` の行ではそのパスがすべて拾われ、`// 許す` の行では警告が 1 つも出ず、`// 警告あり` の行では
+//! 何かの警告が出ること。手で書いた std の口（gen_disallowed.rs の HAND の `std::…`）はすべてここに書く。
 #![allow(clippy::all)]
 #![warn(clippy::disallowed_methods, clippy::disallowed_types, clippy::disallowed_macros)]
 
@@ -84,7 +85,44 @@ pub fn added(a: u32, t: &str, v: &[u32], o: Option<&u32>) -> usize {
     let _ = t.to_ascii_lowercase(); // 期待: str::to_ascii_lowercase
     let _ = std::fmt::format(format_args!("{a}")); // 期待: alloc::fmt::format
     let _ = 'a'.escape_debug(); // 期待: char::escape_debug
+    let (a1, b1): (Vec<u32>, Vec<u32>) = v.iter().map(|x| (*x, *x)).unzip(); // 期待: core::iter::traits::iterator::Iterator::unzip
+    let (c1, d1): (Vec<u32>, Vec<u32>) = v.iter().copied().partition(|x| *x > 1); // 期待: core::iter::traits::iterator::Iterator::partition
+    let _ = a1.capacity(); // 期待: alloc::vec::Vec::capacity
+    b1.len() + c1.len() + d1.len()
+}
+
+/// 非推奨の Unicode の口（ライブラリは `deprecated` を allow できない。tests/rules.rs）。
+#[allow(deprecated)]
+pub fn deprecated_unicode(t: &str) -> usize {
+    let a = t.trim_left(); // 期待: str::trim_left
+    let b = t.trim_right(); // 期待: str::trim_right
+    a.len() + b.len()
+}
+
+/// 手で書いた std の口（走査した口と照らせないもの。check-lint-probe が全部あることを確かめる）。
+pub fn std_hand(flag: bool) -> usize {
+    let _ = std::time::SystemTime::now(); // 期待: std::time::SystemTime::now std::time::SystemTime
+    let _ = std::env::var_os("X"); // 期待: std::env::var_os
+    let _ = std::env::vars(); // 期待: std::env::vars
+    let _ = std::env::vars_os(); // 期待: std::env::vars_os
+    let _ = std::env::args(); // 期待: std::env::args
+    let _ = std::env::args_os(); // 期待: std::env::args_os
+    std::thread::scope(|_| ()); // 期待: std::thread::scope
+    let _ = std::thread::Builder::new().spawn(|| ()); // 期待: std::thread::Builder::spawn
+    if flag {
+        std::process::exit(0); // 期待: std::process::exit
+    }
     0
+}
+
+/// clippy の `arithmetic_side_effects` が拾わない形（ずらし量が変数のシフト。tests/rules.rs が拾う）。clippy が拾うように
+/// なったら「許す」に反して知らせる。足し算の行で lint が効いていることを確かめる。
+#[warn(clippy::arithmetic_side_effects)]
+pub fn shifts(a: u32, b: u32) -> u32 {
+    let c = a + b; // 警告あり
+    let d = a << b; // 許す
+    let e = a >> b; // 許す
+    c ^ d ^ e
 }
 
 pub fn types() -> usize {

@@ -67,15 +67,16 @@ RGBA8（乗算済み）
 
 | 層 | モジュール |
 |---|---|
-| 0 基礎 | `math`・`fixed`・`mem`・`budget`・`cost`・`error`・`report`・`unicode`（生成した表） |
+| 0 基礎 | `math`・`fixed`・`mem`・`budget`・`cost`・`error`・`cancel`（中止の印）・`report`・`unicode`（生成した表） |
 | 1 幾何の型 | `geom`（変形・パス・平坦化・線の外形・破線。字句を知らない） |
 | 2 読み取り | `xml` → `css` → `values`（`geom` の型を作る）→ `style` → `doc` |
 | 3 フォントと文字 | `font` → `text` |
 | 4 木 | `tree`（`impl Document` の `estimate_build`・`build` もここ） |
 | 5 描画 | `raster` → `paint`（塗り・blend の式）→ `filter`（feBlend は `paint` の式を使う）→ `compose`（層・clip・mask・フィルタを当てる）→ `plan`（`impl Tree` の `estimate`・`plan` もここ）→ `render` |
-| 6 公開の口 | `lib.rs` |
+| 6 公開の口 | `lib.rs`・`fuzzing`（ファズの入り口。`#[doc(hidden)]`。ADR-50） |
 
-同じ層の中は矢印の向きにだけ使う。
+層 1〜5 の中は矢印の向きにだけ使う。層 0 の中は互いに使ってよい（順を決めない。`mem` が `budget`・`cost`・`error` を
+使い、`budget` が `cancel` を使う）。`tests/rules.rs` の `LAYERS` が同じ表を持つ。
 
 ---
 
