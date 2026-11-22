@@ -8,8 +8,12 @@
 //! - 各成分の差の最大が 2・8・16 を超える画素の数
 //! - 形の内側（両方の画像で 3 × 3 の近傍の α がすべて 0 か 255）の画素の数・差の最大・差が 2 を超える数
 //!
-//! 出力：`<out>/report.jsonl`（1 件 1 行）・`<out>/summary.txt`（分布と、ADR-15 の候補の基準での通る数）・
-//! `<out>/index.html`（差の大きい順。絵は `<out>/img/`）。
+//! 出力：`<out>/report.jsonl`（1 件 1 行）・`<out>/summary.txt`（群ごとの分布・ADR-56 (1) の基準と目標で通る数・候補の
+//! 値での通る数）・`<out>/index.html`（全画素が分母の割合の大きい順。絵は `<out>/img/`）。
+//!
+//! 群（ADR-56 (1)）：図形と単色（8/255・2%・内側 2/255）・フィルタとグラデーション（16/255・1%）は基準で合否を出す。
+//! 文字（M0 は両方がシステムのフォントで描く）・画像（Kura の設定の resvg は画像を読まない）・未定義の振る舞いの例（題に
+//! 「(UB)」）は分布から外して別に数える。
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -195,18 +199,72 @@ fn one(id: usize, item: &Item, root: &Path, out_dir: &Path, work: &Path, resvg: 
     Outcome { item: item.clone(), id, metrics: Some(m), error: String::new() }
 }
 
-/// ADR-15 の基準で分ける群。
-fn group(item: &Item) -> &'static str {
-    let f = |n: &str| item.features.split(',').any(|x| x == n);
-    if f("image") {
-        "画像を含む（M3。デコーダなしの resvg は描かない）"
-    } else if f("text") {
-        "文字を含む（フォントで差が出る。基準の分布から外す）"
-    } else if f("filter") || f("gradient") {
-        "フィルタ・グラデーションを含む（16/255・1%）"
-    } else {
-        "そのほか（8/255・0.5%・内側 2/255）"
+/// ADR-15・ADR-56 (1) の基準で分ける群。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Group {
+    Plain,
+    Filter,
+    Text,
+    Image,
+    Ub,
+}
+
+/// 基準（差の閾値・全画素に対する割合の上限・形の内側の差の上限）。
+struct Criterion {
+    over: u8,
+    ratio: f64,
+    interior: Option<u8>,
+}
+
+impl Group {
+    const ALL: [Group; 5] = [Group::Plain, Group::Filter, Group::Text, Group::Image, Group::Ub];
+
+    fn label(self) -> &'static str {
+        match self {
+            Group::Plain => "図形と単色（8/255・2%・内側 2/255。ADR-56 (1)）",
+            Group::Filter => "フィルタ・グラデーションを含む（16/255・1%。ADR-35 (1)）",
+            Group::Text => "文字を含む（M0 は両方がシステムのフォントで描く。分布から外す）",
+            Group::Image => "画像を含む（Kura の設定の resvg は画像の参照を読まない。分布から外す）",
+            Group::Ub => "未定義の振る舞いの例（題に (UB)。分布から外す）",
+        }
     }
+
+    /// 合否の基準（分布から外す群は None）。
+    fn criterion(self) -> Option<Criterion> {
+        match self {
+            Group::Plain => Some(Criterion { over: 8, ratio: 0.02, interior: Some(2) }),
+            Group::Filter => Some(Criterion { over: 16, ratio: 0.01, interior: None }),
+            _ => None,
+        }
+    }
+}
+
+/// 図形と単色の群の目標（合否にしない。ADR-56 (1)）。
+const PLAIN_GOAL_RATIO: f64 = 0.005;
+
+fn group(item: &Item) -> Group {
+    let f = |n: &str| item.features.split(',').any(|x| x == n);
+    if f("ub") {
+        Group::Ub
+    } else if f("image") {
+        Group::Image
+    } else if f("text") {
+        Group::Text
+    } else if f("filter") || f("gradient") {
+        Group::Filter
+    } else {
+        Group::Plain
+    }
+}
+
+/// 差の閾値を超えた画素の数。
+fn over(m: &Metrics, t: u8) -> u64 {
+    if t >= 16 { m.over16 } else { m.over8 }
+}
+
+/// 基準で通るか（割合と、決めてあれば形の内側の両方）。
+fn passes(m: &Metrics, c: &Criterion) -> bool {
+    ratio(over(m, c.over), m.n_all) <= c.ratio && c.interior.is_none_or(|lim| m.interior_max <= lim)
 }
 
 fn percentile(v: &mut [f64], p: f64) -> f64 {
@@ -226,7 +284,8 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
             .int("id", o.id as u64)
             .str("path", o.item.path.as_str())
             .str("category", o.item.category.as_str());
-        l = l.str("features", o.item.features.as_str()).str("group", group(&o.item));
+        let g = group(&o.item);
+        l = l.str("features", o.item.features.as_str()).str("group", g.label());
         if let Some(m) = &o.metrics {
             l = l
                 .int("w", m.w)
@@ -240,6 +299,9 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
                 .int("interior_max", m.interior_max)
                 .int("interior_over2", m.interior_over2)
                 .int("max_diff", m.max_diff);
+            if let Some(c) = g.criterion() {
+                l = l.bool("pass", passes(m, &c));
+            }
         }
         l = l.str("error", o.error.as_str());
         jsonl.push_str(&l.to_json());
@@ -250,22 +312,26 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
     // 群ごとの分布と、候補の基準で通る数
     let mut summary = String::new();
     let _ = writeln!(summary, "resvg 0.48.1（Kura の設定）と {chrome} の差（乗算済み RGBA8）\n");
-    let groups = [
-        "そのほか（8/255・0.5%・内側 2/255）",
-        "フィルタ・グラデーションを含む（16/255・1%）",
-        "文字を含む（フォントで差が出る。基準の分布から外す）",
-        "画像を含む（M3。デコーダなしの resvg は描かない）",
-    ];
-    for g in groups {
+    for g in Group::ALL {
         let ms: Vec<&Metrics> =
             results.iter().filter(|o| group(&o.item) == g).filter_map(|o| o.metrics.as_ref()).collect();
         let errors = results.iter().filter(|o| group(&o.item) == g && o.metrics.is_none()).count();
-        let _ = writeln!(summary, "## {g}：{} 件（描けなかった {errors} 件）", ms.len());
+        let _ = writeln!(summary, "## {}：{} 件（描けなかった {errors} 件）", g.label(), ms.len());
         if ms.is_empty() {
             continue;
         }
-        let fil = g.starts_with("フィルタ");
-        let over = |m: &Metrics| if fil { m.over16 } else { m.over8 };
+        let fil = g == Group::Filter;
+        if let Some(c) = g.criterion() {
+            let n = ms.iter().filter(|m| passes(m, &c)).count();
+            let _ = writeln!(summary, "  ADR-56 (1) の基準で通る（割合と内側の両方）：{n}/{}", ms.len());
+            if g == Group::Plain {
+                let goal = Criterion { ratio: PLAIN_GOAL_RATIO, ..c };
+                let n = ms.iter().filter(|m| passes(m, &goal)).count();
+                let _ = writeln!(summary, "  目標（8/255・0.5%・内側 2/255）で通る：{n}/{}", ms.len());
+            }
+        }
+        let t_over = if fil { 16 } else { 8 };
+        let over = |m: &Metrics| over(m, t_over);
         let mut r_all: Vec<f64> = ms.iter().map(|m| ratio(over(m), m.n_all)).collect();
         let mut r_alpha: Vec<f64> = ms.iter().map(|m| ratio(over(m), m.n_alpha)).collect();
         let mut inner: Vec<f64> = ms.iter().map(|m| f64::from(m.interior_max)).collect();
@@ -310,9 +376,9 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
     }
     std::fs::write(out_dir.join("summary.txt"), &summary).map_err(|e| e.to_string())?;
 
-    // HTML（差の大きい順。絵は上から 500 件）
+    // HTML（全画素が分母の割合の大きい順。絵は上から 500 件）
     let mut order: Vec<&Outcome> = results.iter().collect();
-    let key = |o: &Outcome| o.metrics.as_ref().map_or(f64::INFINITY, |m| ratio(m.over8, m.n_alpha));
+    let key = |o: &Outcome| o.metrics.as_ref().map_or(f64::INFINITY, |m| ratio(m.over8, m.n_all));
     order.sort_by(|a, b| key(b).total_cmp(&key(a)));
     let mut h = String::new();
     let _ = write!(
@@ -323,18 +389,24 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
          img{{width:150px;height:auto;image-rendering:pixelated;background:repeating-conic-gradient(#ddd 0 25%,#fff 0 50%) 50%/16px 16px}}\
          pre{{background:#fff;padding:8px;border:1px solid #ddd;white-space:pre-wrap}}</style></head><body>\
          <h1>resvg（左）と Chrome（中）の差（右。灰色は差 × 8、赤は差 &gt; 8/255）</h1><pre>{}</pre><table>\
-         <tr><th>#</th><th>道・群</th><th>差 &gt; 8（α&gt;0）</th><th>差 &gt; 16（α&gt;0）</th><th>内側の最大</th><th>絵</th></tr>",
+         <tr><th>#</th><th>道・群</th><th>差 &gt; 8（全画素）</th><th>差 &gt; 16（全画素）</th><th>内側の最大</th><th>合否</th><th>絵</th></tr>",
         escape(&summary)
     );
     for (rank, o) in order.iter().enumerate() {
+        let g = group(&o.item);
         let cells = match &o.metrics {
             Some(m) => format!(
-                "<td>{:.3}%</td><td>{:.3}%</td><td>{}</td>",
-                ratio(m.over8, m.n_alpha) * 100.0,
-                ratio(m.over16, m.n_alpha) * 100.0,
-                m.interior_max
+                "<td>{:.3}%</td><td>{:.3}%</td><td>{}</td><td>{}</td>",
+                ratio(m.over8, m.n_all) * 100.0,
+                ratio(m.over16, m.n_all) * 100.0,
+                m.interior_max,
+                match g.criterion() {
+                    Some(c) if passes(m, &c) => "通る",
+                    Some(_) => "外れる",
+                    None => "—",
+                }
             ),
-            None => format!("<td colspan=3>{}</td>", escape(&o.error)),
+            None => format!("<td colspan=4>{}</td>", escape(&o.error)),
         };
         let pics = if rank < 500 && o.metrics.is_some() {
             format!("<img src=\"img/{0}-a.png\"><img src=\"img/{0}-b.png\"><img src=\"img/{0}-d.png\">", o.id)
@@ -346,7 +418,7 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
             "<tr><td>{}</td><td>{}<br><small>{}</small></td>{cells}<td>{pics}</td></tr>",
             o.id,
             escape(&o.item.path),
-            escape(group(&o.item))
+            escape(g.label())
         );
     }
     h.push_str("</table></body></html>\n");
@@ -384,5 +456,23 @@ mod tests {
         assert!(m.interior_n >= 1);
         assert_eq!(m.interior_max, 5);
         assert!(measure(&a, &Rgba::transparent(4, 5)).is_none());
+    }
+
+    #[test]
+    fn criteria_and_groups() {
+        let m = Metrics { n_all: 1000, over8: 20, over16: 10, interior_max: 2, ..Metrics::default() };
+        let plain = Group::Plain.criterion().unwrap();
+        assert!(passes(&m, &plain));
+        assert!(!passes(&Metrics { over8: 21, ..m.clone() }, &plain));
+        assert!(!passes(&Metrics { interior_max: 3, ..m.clone() }, &plain));
+        let fil = Group::Filter.criterion().unwrap();
+        assert!(passes(&m, &fil));
+        assert!(!passes(&Metrics { over16: 11, ..m.clone() }, &fil));
+        assert!(Group::Text.criterion().is_none());
+        let item = |f: &str| Item { path: String::new(), category: String::new(), features: f.into() };
+        assert_eq!(group(&item("text,ub")), Group::Ub);
+        assert_eq!(group(&item("filter,image")), Group::Image);
+        assert_eq!(group(&item("gradient")), Group::Filter);
+        assert_eq!(group(&item("")), Group::Plain);
     }
 }

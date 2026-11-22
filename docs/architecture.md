@@ -539,7 +539,7 @@ Unicode の表は、`sumie-tools` の `gen-unicode` が Unicode の文字のデ�
 | 道具 | すること |
 |---|---|
 | `render` | この描画器で PNG に描く（確かめる人のため。PNG の書き出しは道具の側） |
-| `oracle resvg` | resvg 0.48.1（Kura と同じ feature）を、Kura と同じ usvg の設定（総称の書体 Times・Helvetica・Apple Chancery・Papyrus・Courier、フォントを名前の順に登録、languages、`default_size`）で描く（出力は乗算済み） |
+| `oracle resvg` | resvg 0.48.1（Kura と同じ feature）を、Kura と同じ usvg の設定（総称の書体 Times・Helvetica・Apple Chancery・Papyrus・Courier、フォントを名前の順に登録、languages、`default_size`）で描く（出力は乗算済み）。resvg の下の依存（svgtypes・roxmltree・unicode-script など）の版も Kura の Cargo.lock に揃え、`crates/sumie-tools/oracle-lock.txt`（`oracle-lock` が Kura の lock から書く。Kura の rev つき）と試験で照らす（ADR-57 (1)） |
 | `oracle chrome` | `/Applications/Google Chrome.app` のヘッドレスで描く（決めた描き方は下の「Chrome の描き方」。Chrome の版を記録）。PNG はストレートなので、決めた式で乗算済みに直す |
 | `compare` | 2 つの描画の差を乗算済みの RGBA8 で測る（ADR-15 の基準）・差の画像・一覧の HTML |
 | `corpus` | 照合の集まりの取り込み（出どころ・版・ライセンス・ダイジェストの一覧）と、使っている機能での分類（マイルストーンごとの範囲を選ぶ） |
@@ -549,29 +549,40 @@ Unicode の表は、`sumie-tools` の `gen-unicode` が Unicode の文字のデ�
 | `gen-unicode` | Unicode の表の生成（§7.2） |
 | `golden` | ゴールデンの行を足す（凍結した版のファイルは追記だけ） |
 
-**Chrome の描き方**（M0 で決めた。ADR-52）：SVG を HTML の `<img src=… width=W height=H>`（W・H は resvg の大きさ）で左上に置き、
-`--headless --hide-scrollbars --default-background-color=00000000 --force-device-scale-factor=1 --force-color-profile=srgb
---window-size=max(W,800),max(H,600) --screenshot` で撮って、左上の W × H を切り出す。ヘッドレスの窓の幅は 500 より小さく
-できず、SVG の文書を直に開くと viewBox だけの SVG が広い表示の領域の真ん中に描かれるため。画像としての SVG は外の資源を
-読まない（resvg の `resources_dir: None` と揃う）。乗算済みに直す式は `(c × a + 127) / 255`。M0 の照合は Chrome 157.0.8103.79。
+**Chrome の描き方**（M0 で決めた。ADR-52・ADR-57 (2)）：SVG を HTML の `<img src=… width=W height=H>`（W・H は resvg の大きさ）で
+左上に置き、`--headless --disable-gpu --hide-scrollbars --default-background-color=00000000 --force-device-scale-factor=1
+--force-color-profile=srgb --window-size=max(W+1,800),max(H+1,600) --screenshot` で撮って、左上の W × H を切り出す。ヘッドレスの
+窓の幅は 500 より小さくできず、SVG の文書を直に開くと viewBox だけの SVG が広い表示の領域の真ん中に描かれるため。
+`--disable-gpu` は GPU を使わないソフトウェアのラスタ化に固定する（既定の起動では 64 × 64 の円の線で縁の α が 126 → 116
+などと変わり、GPU と駆動の層に依るので、機械が変わると分布が再現しない）。Chrome が SVG を読めないときは `<img>` の
+`onerror` で窓の背景を印の色（rgb(255,0,255)）にし、窓の右下の画素（切り出す領域の外）でそれを見て「Chrome が描けない」に
+する（壊れた画像の印を差として数えない）。撮った絵が窓より小さいときも誤りにする。1 回の撮影の時間の上限は 120 秒。
+画像としての SVG は外の資源を読まない（resvg の `resources_dir: None` と揃う）。乗算済みに直す式は `(c × a + 127) / 255`。
+M0 の照合は Chrome 157.0.8103.79。
 
 `gen-heavy` の入力（M0 で引数を決めた。`sumie-tools gen-heavy` が `local/heavy/` に作り、`index.jsonl` に引数と BLAKE3 を書く。
-S1〜S7 は Kura の説明から作った同じ性質の入力で、Kura の元の入力の写しではない）：
+超越関数を使わず（角は定数の表）、どの OS でも同じバイト列で、道具の試験が BLAKE3 を照らす。S1・S4 の 1 本・pattern の入れ子は
+Kura の試験の入力（`SLOW_SHAPE`・`SLOW_DECODE`・`nested_pattern_clones_are_refused_before_usvg`）と同じ形。ほかは Kura の説明から
+作った同じ性質の入力で、Kura の元の入力の写しではない。地図風の線と S5 は Kura の元の引数が分からない）。「Kura」の列は Kura の
+記録の時間（S1〜S7 は Kura の `docs/editing.md` §9.5 と `svg_worker` の注釈。地図風の線は働き手を通した値の時間）。resvg 単体の
+時間と確保の山は M0 の計測（下の「resvg 単体の計測」）：
 
-| 名前 | 引数 |
-|---|---|
-| `map-lines` | 4096 × 4096・折れ線 1,000 本 × 300 区間（30 万区間）・ランダムウォーク（8 方向・1 歩 2〜12 画素）・線の幅 1.5・継ぎ目と端 round・ChaCha8 の種 1 |
-| `map-shapes` | 4096 × 4096・閉じた path 45,000 本（1 本 20 頂点・半径 4〜20 画素・8 色の塗り）・種 2（約 14.5 MiB） |
-| `s1-rotated-thick-stroke` | 1000 × 1000・`rotate(33)` の下で、太さ 400 の線の 3 次曲線 40 区間（座標 ±50,000） |
-| `s2-many-stops` | 1000 × 1000・stop 10 万のグラデーションで塗った rect 10 枚 |
-| `s3-same-offset-stops` | 1000 × 1000・offset がすべて 0.5 の stop 30 万（入力の上限 16 MiB に収まる数） |
-| `s4-fine-dashes-round-caps` | 1000 × 1000・長さ 1000 の線 37 本・太さ 8・破線 `0.01 0.01`・丸い端 |
-| `s5-rotated-pattern` | 4000 × 4000・`patternTransform="rotate(30)"` の 4 × 4 のタイルで塗った全面 |
-| `s6-textpath-unseparated-transform` | 200 × 100・`transform="translate(10-5)"` の path へのふつうの textPath（かならず描く互換の例） |
-| `s7-turbulence-octaves` | 2000 × 2000・`numOctaves="1000"` の feTurbulence |
-| `bomb-use-doubling` | use の倍々 20 段（2²⁰ 個） |
-| `bomb-pattern-nesting` | objectBoundingBox の pattern の入れ子 24 段 |
-| `bomb-marker-dup` | 頂点 10 万の path の `marker-mid`（種 3） |
+| 名前 | 引数 | Kura |
+|---|---|---|
+| `map-lines` | 4096 × 4096・折れ線 1,000 本 × 300 区間（30 万区間）・ランダムウォーク（8 方向・1 歩 2〜12 画素）・線の幅 1.5・継ぎ目と端 round・ChaCha8 の種 1 | 4.5 秒（働き手を通した値。元の引数は分からない） |
+| `map-shapes` | 4096 × 4096・閉じた path 45,000 本（1 本 20 頂点・半径 4〜20 画素・8 色の塗り）・種 2（約 14.5 MiB） | 形 0.24 秒 |
+| `s1-rotated-thick-stroke` | 100 × 100・`translate(1e9)` と `rotate(-12.5)` の下の、太さ 1e7 の線の 3 次曲線 2 区間（`SLOW_SHAPE`） | 2 区間で 2.6 秒（40 区間・1.4 KB で 7 分） |
+| `s2-many-stops` | 1000 × 1000・stop 10 万のグラデーションで塗った全面の rect 10 枚 | 32 秒 |
+| `s3-same-offset-stops` | 100 × 100・offset がすべて 0.5 の stop 40 万（短く書いて入力の上限 16 MiB に収める） | 形 14 秒 |
+| `s4-fine-dashes-one` | 1000 × 1000・3 次曲線 1 本・太さ 3・破線 `0.0005 0.000501`・丸い端（`SLOW_DECODE`） | 8.9 秒 |
+| `s4-fine-dashes-37` | 同じ曲線を縦に 26 ずつずらした 37 本 | 310 秒 |
+| `s5-rotated-pattern` | 4000 × 4000・`patternTransform="rotate(30)"` の 4 × 4 のタイルで塗った全面 | 102 秒（元の引数は分からない） |
+| `s6-textpath-unseparated-transform` | 200 × 100・`transform="translate(10-5)"` の path へのふつうの textPath（かならず描く互換の例） | — |
+| `s7-turbulence-octaves` | 1000 × 1000・`numOctaves="1000"` の feTurbulence | 18 秒（大きさは分からない） |
+| `bomb-use-doubling-16` | use の倍々 16 段（2¹⁶ 個。usvg 0.48.1 の節の上限の内で受ける最大） | — |
+| `bomb-use-doubling-17` | use の倍々 17 段（2¹⁷ 個。usvg が「nodes limit reached」で断る） | — |
+| `bomb-pattern-nesting` | 8 × 8・objectBoundingBox の pattern の入れ子 16 段・1 段に参照 2 つ（2¹⁶ の複製。Kura の試験は 23 段で、Kura が木を作る前に断る） | — |
+| `bomb-marker-dup` | 頂点 10 万の path の `marker-mid`（種 3） | — |
 
 もとの表（下敷き）：
 

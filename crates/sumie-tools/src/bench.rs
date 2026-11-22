@@ -4,7 +4,12 @@
 //!
 //! 1 件ずつ子のプロセス（`bench-one`）で測る（遅い入力を時間で止め、確保の山をほかの件と混ぜない）。時間は木を作る分と
 //! 描く分の最小（`--repeat` 回）、確保の山は 1 回目の木を作る・描くの間の山（allocation-counter。スレッドごと。ADR-46）。
-//! フォントの集まりを作る時間と量は数えない（Kura の集まりはプロセスで 1 つ）。
+//! `--timeout` は 1 回あたりの秒（子は `--repeat` 倍で止める）。フォントの集まりを作る時間と量は数えない（Kura の集まりは
+//! プロセスで 1 つ）。
+//!
+//! 計り方の違い（ADR-57 (4)）：時間は数える確保器（allocation-counter。確保ごとに数え、`alloc_zeroed`・`realloc` は既定の
+//! 写しになる）のもとで測り、道具の release の設定（workspace の既定）は Kura の設定（codegen-units = 1・thin LTO）と違う。
+//! どちらも resvg と sumie を同じ道具で測る比には効きにくいので、比（NFR-07）だけを約束に使い、絶対の時間は参考にする。
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -40,7 +45,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             continue;
         }
         let file = root.join(path);
-        let r = run_child(&exe, &file, repeat, fonts, timeout)?;
+        let r = run_child(&exe, &file, repeat, fonts, timeout.saturating_mul(repeat))?;
         let mut rl = Line::parse(&r).unwrap_or_else(|_| Line::new().str("error", r.as_str()));
         rl.fields.insert(0, ("path".into(), sumie_testkit::jsonl::Value::Str(path.into())));
         if rl.get_bool("timeout") == Some(true) {
@@ -116,9 +121,11 @@ pub fn one(args: &[String]) -> Result<(), String> {
             let parse = t.elapsed().as_micros();
             size = Resvg::size(&tree);
             let t = Instant::now();
-            if let Some(mut pm) = tiny_skia::Pixmap::new(size.0.max(1), size.1.max(1)) {
-                resvg::render(&tree, tiny_skia::Transform::default(), &mut pm.as_mut());
-            }
+            let Some(mut pm) = tiny_skia::Pixmap::new(size.0.max(1), size.1.max(1)) else {
+                err = Some(format!("画素の領域を作れない（{}×{}）", size.0, size.1));
+                return;
+            };
+            resvg::render(&tree, tiny_skia::Transform::default(), &mut pm.as_mut());
             let render = t.elapsed().as_micros();
             best_parse = best_parse.min(parse);
             best_render = best_render.min(render);

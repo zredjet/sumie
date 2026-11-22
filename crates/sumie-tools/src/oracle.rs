@@ -2,12 +2,15 @@
 //!
 //! - resvg 0.48.1（Kura と同じ feature：text だけ）を、Kura と同じ usvg の設定で描く：外の資源を読まない
 //!   （`resources_dir: None`、画像の参照はすべて読まない）、ほかは `usvg::Options::default()`（既定の書体 Times New Roman・
-//!   12・languages ["en"]・dpi 96・大きさのない文書は 100 × 100）。フォントは Kura と同じく `/System/Library/Fonts` と
-//!   その `Supplemental` の ttf・otf・ttc を、道の名前の順に登録し、総称の書体は Times・Helvetica・Apple Chancery・
-//!   Papyrus・Courier。大きさは Kura と同じく `tree.size().to_int_size()`（切り上げ）
+//!   12・languages ["en"]・dpi 96）。大きさは Kura と同じく `tree.size().to_int_size()`（切り上げ）。viewBox がなく幅・高さが
+//!   ない（か %）の文書は、usvg 0.48.1 は中身の外接矩形の右下を大きさにする（`width`・`height` のない 50 × 50 の rect は
+//!   50 × 50。100 × 100 ではない）。フォントは Kura と同じく `/System/Library/Fonts` とその `Supplemental` の ttf・otf・ttc
+//!   を、道の名前の順に登録し、総称の書体は Times・Helvetica・Apple Chancery・Papyrus・Courier
 //! - Chrome（`/Applications/Google Chrome.app`）のヘッドレス。SVG を HTML の `<img>` で決めた大きさに置き（画像としての
 //!   SVG は外の資源を読まない）、広い窓で撮って左上を切り出す。窓の幅はヘッドレスでは 500 より小さくできないため
-//!   （ADR-52）。透明の背景・倍率 1・sRGB
+//!   （ADR-52）。透明の背景・倍率 1・sRGB・GPU を使わないソフトウェアのラスタ化（`--disable-gpu`。機械の GPU と駆動の層で
+//!   縁の値が変わらないように。ADR-57 (2)）。Chrome が SVG を読めないとき（壊れた画像の印を描く）は、`onerror` で窓の右下
+//!   （切り出す領域の外）に印の色を塗り、それを見て誤りにする
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -52,7 +55,8 @@ impl Fonts {
 }
 
 /// フォルダの ttf・otf・ttc（入れ子は見ない・シンボリックリンクと 1 GiB を超えるものは飛ばす）を道の名前の順に。
-fn font_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
+/// 拡張子は ASCII の大文字小文字を無視する。並べ方は道の文字列の比べ方（Kura の `fonts.rs` の `build` と同じ）。
+pub fn font_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for d in dirs {
         let Ok(rd) = std::fs::read_dir(d) else { continue };
@@ -150,13 +154,33 @@ impl Resvg {
     }
 }
 
-/// 木の文字に使われた書体（`ファミリー名（PostScript 名）`）を並べる。
+/// 木の文字に使われた書体（`ファミリー名（PostScript 名）`）を並べる。pattern・mask・clipPath・フィルタの中の木もたどる。
 pub fn fonts_used(tree: &usvg::Tree) -> Vec<String> {
     let db = tree.fontdb();
     let mut out = Vec::new();
     let mut stack: Vec<&usvg::Group> = vec![tree.root()];
     while let Some(g) = stack.pop() {
+        if let Some(c) = g.clip_path() {
+            stack.push(c.root());
+        }
+        if let Some(m) = g.mask() {
+            stack.push(m.root());
+        }
+        for f in g.filters() {
+            for p in f.primitives() {
+                if let usvg::filter::Kind::Image(img) = p.kind() {
+                    stack.push(img.root());
+                }
+            }
+        }
         for n in g.children() {
+            if let Some(paints) = paints_of(n) {
+                for p in paints {
+                    if let usvg::Paint::Pattern(pt) = p {
+                        stack.push(pt.root());
+                    }
+                }
+            }
             match n {
                 usvg::Node::Group(c) => stack.push(c),
                 usvg::Node::Text(t) => {
@@ -182,6 +206,16 @@ pub fn fonts_used(tree: &usvg::Tree) -> Vec<String> {
     out
 }
 
+/// 節の塗りと線の塗り（pattern の中の木をたどるため）。
+fn paints_of(n: &usvg::Node) -> Option<Vec<&usvg::Paint>> {
+    match n {
+        usvg::Node::Path(p) => {
+            Some(p.fill().map(|f| f.paint()).into_iter().chain(p.stroke().map(|s| s.paint())).collect())
+        }
+        _ => None,
+    }
+}
+
 /// Chrome の照合の相手。
 pub struct Chrome {
     pub exe: PathBuf,
@@ -190,6 +224,12 @@ pub struct Chrome {
 
 /// Chrome の場所（macOS）。
 pub const CHROME: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+
+/// Chrome の 1 回の撮影の時間の上限（重い入力で止まったままにしない）。
+const CHROME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// 読めなかった印の色（窓の右下の画素。切り出す領域の外）。
+const LOAD_ERROR_MARK: [u8; 4] = [255, 0, 255, 255];
 
 impl Chrome {
     pub fn find() -> Result<Chrome, String> {
@@ -216,16 +256,20 @@ impl Chrome {
             format!(
                 "<!doctype html><html><head><meta charset=\"utf-8\"><style>html,body{{margin:0;padding:0;\
                  background:transparent;overflow:hidden}}img{{display:block;position:absolute;left:0;top:0}}</style>\
-                 </head><body><img src=\"{url}\" width=\"{w}\" height=\"{h}\"></body></html>"
+                 </head><body><img src=\"{url}\" width=\"{w}\" height=\"{h}\" \
+                 onerror=\"this.style.display='none';document.documentElement.style.background='rgb(255,0,255)'\">\
+                 </body></html>"
             ),
         )
         .map_err(|e| e.to_string())?;
         let shot = work.join("shot.png");
         let _ = std::fs::remove_file(&shot);
-        let (ww, wh) = (w.max(800), h.max(600));
-        let out = Command::new(&self.exe)
+        // 窓は切り出す領域より 1 画素ずつ大きくして、右下の画素を読めなかった印に使う
+        let (ww, wh) = (w.saturating_add(1).max(800), h.saturating_add(1).max(600));
+        let mut child = Command::new(&self.exe)
             .args([
                 "--headless",
+                "--disable-gpu",
                 "--hide-scrollbars",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -240,12 +284,34 @@ impl Chrome {
             .arg(format!("--window-size={ww},{wh}"))
             .arg(format!("--screenshot={}", shot.display()))
             .arg(file_url(&html))
-            .output()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
             .map_err(|e| format!("Chrome を起動できない：{e}"))?;
-        if !shot.exists() {
-            return Err(format!("Chrome が撮れなかった：{}", String::from_utf8_lossy(&out.stderr)));
+        let start = std::time::Instant::now();
+        loop {
+            if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+                break;
+            }
+            if start.elapsed() > CHROME_TIMEOUT {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Chrome が {} 秒で終わらない", CHROME_TIMEOUT.as_secs()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        Ok(image::read_png(&shot)?.crop(w, h))
+        if !shot.exists() {
+            return Err("Chrome が撮れなかった".into());
+        }
+        let full = image::read_png(&shot)?;
+        if full.w < ww || full.h < wh {
+            return Err(format!("撮った絵が窓より小さい（{}×{}、窓 {ww}×{wh}）", full.w, full.h));
+        }
+        let corner = ((full.h as usize - 1) * full.w as usize + full.w as usize - 1) * 4;
+        if full.px.get(corner..corner + 4) == Some(&LOAD_ERROR_MARK[..]) {
+            return Err("Chrome が SVG を読めなかった（壊れた画像）".into());
+        }
+        Ok(full.crop(w, h))
     }
 }
 
@@ -260,4 +326,46 @@ fn file_url(p: &Path) -> String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn font_files_are_sorted_by_path_and_skip_links_and_other_files() {
+        let dir = std::env::temp_dir().join(format!("sumie-fonts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for n in ["b.ttf", "A.TTC", "a.otf", "c.txt", "sub/d.ttf"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        std::os::unix::fs::symlink(dir.join("b.ttf"), dir.join("link.ttf")).unwrap();
+        let got: Vec<String> = font_files(std::slice::from_ref(&dir))
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        // 道の文字列の順（大文字が先）・入れ子とシンボリックリンクと別の拡張子は飛ばす
+        assert_eq!(got, ["A.TTC", "a.otf", "b.ttf"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Chrome が読めない SVG を誤りにする（Chrome のある macOS で手で回す：`cargo test -p sumie-tools -- --ignored chrome`）。
+    #[test]
+    #[ignore]
+    fn chrome_marks_unreadable_svg() {
+        let chrome = Chrome::find().unwrap();
+        let dir = std::env::temp_dir().join(format!("sumie-chrome-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("bad.svg");
+        std::fs::write(&bad, b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"40\"><rect").unwrap();
+        let e = chrome.render(&bad, 40, 40, &dir.join("w1")).unwrap_err();
+        assert!(e.contains("読めなかった"), "{e}");
+        let good = dir.join("good.svg");
+        std::fs::write(&good, b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"40\"><rect width=\"40\" height=\"40\" fill=\"#f0f\"/></svg>").unwrap();
+        // 全面が印の色でも、切り出す領域の外の画素は透明なので誤りにしない
+        let img = chrome.render(&good, 40, 40, &dir.join("w2")).unwrap();
+        assert_eq!(&img.px[0..4], &[255, 0, 255, 255]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

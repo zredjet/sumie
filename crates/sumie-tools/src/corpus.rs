@@ -1,7 +1,8 @@
 //! 照合の集まり（ADR-21・architecture.md §10 の `corpus`）。
 //!
-//! - `corpus import-resvg --src <resvg のソースの根> --rev <コミット> --sha256 <アーカイブの SHA-256>`：resvg の試験の SVG
-//!   （`crates/resvg/tests/{tests,extra,resources}` の .svg）だけを `corpus/resvg/` に写し、ライセンスの写し・SOURCE.md・
+//! - `corpus import-resvg [--archive <取ったアーカイブ>]`：決めた rev（[`RESVG_REV`]）の resvg のソースのアーカイブを取り
+//!   （`--archive` がなければ curl で `local/` に）、SHA-256（[`RESVG_SHA256`]）を照らして新しい空のフォルダに取り出し、試験の
+//!   SVG（`crates/resvg/tests/{tests,extra,resources}` の .svg）だけを `corpus/resvg/` に写して、ライセンスの写し・SOURCE.md・
 //!   MANIFEST.jsonl（道・バイト数・BLAKE3）を書く。resvg の描いた PNG・画像・フォントは写さない
 //! - `corpus fetch-w3c [--dest local/w3c-svg11-20110816]`：W3C SVG 1.1 第 2 版の試験のアーカイブを取り（SHA-256 を照らす）、
 //!   `svg/*.svg` だけを git の外（`local/`）に置く（ライセンスの書き方が食い違うため。ADR-21 の承認・corpus/README.md）
@@ -17,6 +18,10 @@ use sumie_testkit::jsonl::Line;
 pub const W3C_URL: &str = "https://www.w3.org/Graphics/SVG/Test/20110816/archives/W3C_SVG_11_TestSuite.tar.gz";
 pub const W3C_SHA256: &str = "b5f46cca1ad79b670f9179770b2366c57efd5c671d084144090feab4b7ff1030";
 pub const W3C_BYTES: u64 = 14_651_624;
+
+/// 取り込む resvg の版（タグ `v0.48.1` のコミット。Kura が使う resvg と同じ版）と、そのアーカイブの SHA-256（M0 で取って測った値）。
+pub const RESVG_REV: &str = "68b14c4c3bccdb60344c777406486b54c36ec1a4";
+pub const RESVG_SHA256: &str = "41bf46fdb8abc6fc49ec6f83facff0cdab2759a7212734c92f3f6aec12c51820";
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let sub = args.first().map(String::as_str).unwrap_or("");
@@ -50,15 +55,55 @@ fn walk_svgs(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn import_resvg(args: &[String]) -> Result<(), String> {
-    let src = PathBuf::from(arg(args, "--src").ok_or("--src <resvg のソースの根>")?);
-    let rev = arg(args, "--rev").ok_or("--rev <コミット>")?;
-    let sha = arg(args, "--sha256").ok_or("--sha256 <アーカイブの SHA-256>")?;
+    let (rev, sha) = (RESVG_REV, RESVG_SHA256);
+    let root = workspace_root();
+    let archive = match arg(args, "--archive") {
+        Some(a) => PathBuf::from(a),
+        None => {
+            let a = root.join(format!("local/resvg-{rev}.tar.gz"));
+            if !a.exists() {
+                std::fs::create_dir_all(root.join("local")).map_err(|e| e.to_string())?;
+                let url = format!("https://codeload.github.com/linebender/resvg/tar.gz/{rev}");
+                let st = Command::new("curl")
+                    .args(["-sSfL", "-o"])
+                    .arg(&a)
+                    .arg(&url)
+                    .status()
+                    .map_err(|e| format!("curl を起動できない：{e}"))?;
+                if !st.success() {
+                    return Err(format!("取れなかった：{url}"));
+                }
+            }
+            a
+        }
+    };
+    let got = sha256_of(&archive)?;
+    if got != sha {
+        return Err(format!("SHA-256 が違う：{got}（期待 {sha}）。{} を消して取り直す", archive.display()));
+    }
+    // 取り出すのは新しい空のフォルダ（取ったものは信用しない）
+    let unpack = root.join(format!("local/resvg-src-{}", std::process::id()));
+    if unpack.exists() {
+        return Err(format!("{} がもうある", unpack.display()));
+    }
+    std::fs::create_dir_all(&unpack).map_err(|e| e.to_string())?;
+    let st =
+        Command::new("tar").arg("-xzf").arg(&archive).arg("-C").arg(&unpack).status().map_err(|e| e.to_string())?;
+    if !st.success() {
+        return Err("tar で取り出せない".into());
+    }
+    let src = unpack.join(format!("resvg-{rev}"));
+    let result = import_resvg_from(&src, rev, sha);
+    let _ = std::fs::remove_dir_all(&unpack);
+    result
+}
+
+fn import_resvg_from(src: &Path, rev: &str, sha: &str) -> Result<(), String> {
     let tests = src.join("crates/resvg/tests");
     if !tests.is_dir() {
         return Err(format!("{} がない", tests.display()));
     }
-    let root = workspace_root();
-    let dest = root.join("corpus/resvg");
+    let dest = workspace_root().join("corpus/resvg");
     if dest.exists() {
         std::fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
     }
@@ -97,7 +142,7 @@ fn import_resvg(args: &[String]) -> Result<(), String> {
              | 写さなかったもの | resvg の描いた PNG（照合の相手の絵はゴールデンにしない）・画像・フォント・試験のコード |\n\
              | ライセンス | MIT OR Apache-2.0（リポジトリの README の License の節。`LICENSE-MIT`・`LICENSE-APACHE` はリポジトリの根の写し。試験の README にほかの定めはない） |\n\
              | 一覧 | `MANIFEST.jsonl`（道・バイト数・BLAKE3） |\n\n\
-             作り直し：`cargo run -p sumie-tools -- corpus import-resvg --src <取り出した根> --rev {rev} --sha256 {sha}`\n",
+             作り直し：`cargo run -p sumie-tools -- corpus import-resvg`（rev と SHA-256 は道具の定数。取ったアーカイブを照らしてから写す）\n",
             files.len()
         ),
     )
@@ -199,7 +244,31 @@ fn element_names(svg: &[u8]) -> BTreeSet<String> {
     out
 }
 
-/// 使う機能の印（分類の並べ・マイルストーンごとの範囲の選び方に使う）。
+/// 属性 `name` の値（`name="…"`・`name='…'`。前が空白のもの）を並べる。
+fn attr_values<'a>(text: &'a str, name: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for q in ['"', '\''] {
+        let pat = format!("{name}={q}");
+        let mut from = 0;
+        while let Some(i) = text[from..].find(&pat) {
+            let at = from + i;
+            from = at + pat.len();
+            let before = text[..at].chars().next_back();
+            if !before.is_some_and(|c| c.is_ascii_whitespace()) {
+                continue;
+            }
+            if let Some(end) = text[from..].find(q) {
+                out.push(&text[from..from + end]);
+            }
+        }
+    }
+    out
+}
+
+/// 使う機能の印（分類の並べ・マイルストーンごとの範囲の選び方・ADR-15 の群分けに使う）。
+/// - `filter`：`<filter>`・`fe*` の要素・`filter:` の書き方・`none` でない `filter` の属性（CSS のフィルタ関数 `blur(5)` も）
+/// - `image`：`<image>` と、要素を指さない（`#` で始まらない）参照の `feImage`（Kura の設定の resvg は画像を読まない）
+/// - `ub`：題（`<title>`）に「(UB)」とある、resvg の試験の未定義の振る舞いの例（ADR-56 (1)。分布から外す）
 pub fn features(svg: &[u8]) -> Vec<&'static str> {
     let names = element_names(svg);
     let has = |n: &str| names.contains(n);
@@ -209,12 +278,21 @@ pub fn features(svg: &[u8]) -> Vec<&'static str> {
     if has("text") || has("tspan") || has("textPath") || has("tref") {
         f.push("text");
     }
-    if has("filter") || any(&|n| n.starts_with("fe")) || text.contains("filter:") {
+    let filter_attr = attr_values(text, "filter").iter().any(|v| v.trim() != "none");
+    if has("filter") || any(&|n| n.starts_with("fe")) || text.contains("filter:") || filter_attr {
         f.push("filter");
     }
     if has("linearGradient") || has("radialGradient") {
         f.push("gradient");
     }
+    let fe_image_external = has("feImage") && {
+        // feImage の要素の中の href（xlink:href も）が # で始まらない
+        text.split("<feImage").skip(1).any(|rest| {
+            let tag = rest.split('>').next().unwrap_or("");
+            attr_values(&format!(" {tag}"), "href").iter().any(|v| !v.starts_with('#'))
+                || attr_values(&format!(" {tag}"), "xlink:href").iter().any(|v| !v.starts_with('#'))
+        })
+    };
     for (n, tag) in [
         ("pattern", "pattern"),
         ("mask", "mask"),
@@ -232,11 +310,18 @@ pub fn features(svg: &[u8]) -> Vec<&'static str> {
             f.push(tag);
         }
     }
+    if fe_image_external && !f.contains(&"image") {
+        f.push("image");
+    }
     if any(&|n| n.starts_with("animate") || n == "set") {
         f.push("animation");
     }
     if text.contains("mix-blend-mode") || text.contains("isolation") {
         f.push("blend");
+    }
+    let ub = text.split("<title>").nth(1).and_then(|t| t.split("</title>").next()).is_some_and(|t| t.contains("(UB)"));
+    if ub {
+        f.push("ub");
     }
     f
 }
@@ -304,6 +389,16 @@ mod tests {
             b"<svg><defs><linearGradient/><filter><feGaussianBlur/></filter></defs><text>a</text><svg:use/></svg>",
         );
         assert_eq!(f, ["text", "filter", "gradient", "use"]);
+        // CSS のフィルタ関数・none・外の画像の feImage・要素を指す feImage・未定義の振る舞いの題
+        assert_eq!(features(b"<svg><rect filter=\"blur(5)\"/></svg>"), ["filter"]);
+        assert_eq!(features(b"<svg><rect filter='url(#f)'/></svg>"), ["filter"]);
+        assert!(features(b"<svg><rect filter=\"none\"/></svg>").is_empty());
+        assert!(features(b"<svg><rect data-filter=\"blur(5)\"/></svg>").is_empty());
+        let img = features(b"<svg><filter><feImage xlink:href=\"data:image/png;base64,AA\"/></filter></svg>");
+        assert_eq!(img, ["filter", "image"]);
+        let el = features(b"<svg><filter><feImage href=\"#r\"/></filter></svg>");
+        assert_eq!(el, ["filter"]);
+        assert_eq!(features(b"<svg><title>Recursive (UB)</title><rect/></svg>"), ["ub"]);
         assert_eq!(classify("resvg/tests/painting/stroke-linejoin/miter.svg").1, "painting/stroke-linejoin");
         assert_eq!(
             classify("svg/animate-elem-02-t.svg"),

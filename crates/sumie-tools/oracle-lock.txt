@@ -1,0 +1,60 @@
+# Kura の Cargo.lock の resvg の依存の閉包（`sumie-tools oracle-lock` が書く。手で書き換えない）。
+# この workspace の Cargo.lock の閉包が同じ版かを crates/sumie-tools の試験 oracle_closure_matches_kura が見る
+# kura-rev: 22dbc7b3d279e252a92e36686e00c313f81ed213
+adler2 2.0.1
+arrayref 0.3.9
+arrayvec 0.7.8
+autocfg 1.5.1
+base64 0.23.1
+bitflags 2.13.2
+bytemuck 1.25.2
+bytemuck_derive 1.12.1
+cfg-if 1.0.5
+crc32fast 1.5.2
+data-url 0.3.2
+euclid 0.22.14
+fdeflate 0.3.7
+flate2 1.1.10
+float-cmp 0.9.0
+font-types 0.12.7
+fontdb 0.24.0
+harfrust 0.12.0
+imagesize 0.15.0
+kurbo 0.13.1
+log 0.4.34
+memchr 2.8.3
+miniz_oxide 0.8.9 0.8.9
+miniz_oxide 0.9.1 0.9.1
+num-traits 0.2.19
+once_cell 1.21.4
+pico-args 0.5.0
+png 0.18.1
+polycool 0.4.0
+proc-macro2 1.0.107
+quote 1.0.47
+read-fonts 0.41.0
+resvg 0.48.1
+rgb 0.8.53
+roxmltree 0.21.1
+serde_core 1.0.229
+serde_derive 1.0.229
+simd-adler32 0.3.10
+simplecss 0.2.2
+siphasher 1.0.4
+skrifa 0.44.0
+slotmap 1.1.1
+smallvec 1.16.3
+strict-num 0.1.1
+svgtypes 0.16.1
+syn 3.0.7
+tiny-skia 0.12.0
+tiny-skia-path 0.12.0
+tinyvec 1.13.3
+unicode-bidi 0.3.18
+unicode-ident 1.0.26
+unicode-script 0.5.8
+unicode-vo 0.1.0
+usvg 0.48.1
+version_check 0.9.5
+xmlwriter 0.1.0
+zlib-rs 0.6.8
