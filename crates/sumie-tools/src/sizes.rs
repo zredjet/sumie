@@ -2,6 +2,7 @@
 //! sumie の `parse` で読み、受ける・断ると大きさを比べる。
 //!
 //! - 同じ：どちらも読み、sumie の `Document::size` が resvg の木の大きさと同じ（倍率 1 の画素の大きさも同じ）
+//! - ユーザー単位が近い：画素の大きさは同じで、ユーザー単位の大きさが f32 の最後の桁ほど違う（resvg は f32 で持つ）
 //! - 中身で決まる：sumie の `Document::size` が `None`（木を作るまで決まらない。M2 から比べる）
 //! - 違う：どちらも読み、大きさが違う
 //! - sumie が断る：resvg は読むのに sumie の `parse` が誤り（NFR-10 に触れる。一覧にして承認を得る）
@@ -21,6 +22,8 @@ use crate::oracle::{Fonts, Resvg};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Verdict {
     Same,
+    /// 画素の大きさは同じで、ユーザー単位の大きさが f32 の最後の桁ほど違う（resvg は f32 で持つ）
+    UnitsNear,
     Content,
     Differ,
     SumieRefuses,
@@ -107,10 +110,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     Some(sz) => {
                         let px = d.pixel_size(1.0).ok().flatten();
                         // resvg は f32 で持つ。f32 にして比べる
-                        let same = (sz.width as f32) == rw
-                            && (sz.height as f32) == rh
-                            && px.is_some_and(|p| (p.width, p.height) == (pw, ph));
-                        let v = if same { Verdict::Same } else { Verdict::Differ };
+                        let px_same = px.is_some_and(|p| (p.width, p.height) == (pw, ph));
+                        let exact = (sz.width as f32) == rw && (sz.height as f32) == rh;
+                        let near = |a: f64, b: f32| (a - f64::from(b)).abs() <= 1e-6 * a.abs().max(1.0);
+                        let v = if px_same && exact {
+                            Verdict::Same
+                        } else if px_same && near(sz.width, rw) && near(sz.height, rh) {
+                            Verdict::UnitsNear
+                        } else {
+                            Verdict::Differ
+                        };
                         (
                             v,
                             format!("{rw}×{rh}（{pw}×{ph}）"),

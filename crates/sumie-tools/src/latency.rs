@@ -142,6 +142,24 @@ fn cases(scale: usize) -> Vec<(&'static str, Vec<u8>)> {
         "@media not の問いの並び",
         doc(&format!("@media {} {{rect{{fill:red}}}}", vec!["not a"; n(20_000)].join(", ")), "<rect/>"),
     ));
+    // 文書の段の 1 回目のレビューの形
+    out.push((
+        "g の下の多くの文字の節",
+        format!("{SVG}<g>{}</g></svg>", "a<![CDATA[b]]>".repeat(n(700_000))).into_bytes(),
+    ));
+    out.push((
+        "1 つの要素の多くの filter の url",
+        format!("{SVG}<g id=\"a\"><rect style=\"filter:{}\"/></g></svg>", "url(#a) ".repeat(n(1_500_000)))
+            .into_bytes(),
+    ));
+    out.push((
+        "子の辺で戻る輪 × 12,000",
+        format!(
+            "{SVG}<use href=\"#c\"/><g id=\"top\"><g id=\"c\">{}</g></g></svg>",
+            "<use href=\"#top\"/>".repeat(n(12_000))
+        )
+        .into_bytes(),
+    ));
     out.push(("深い入れ子", format!("{SVG}{}{}</svg>", "<g>".repeat(1000), "</g>".repeat(1000)).into_bytes()));
     out.push(("参照の多い文書（use の鎖）", {
         let mut body = String::from("<defs><rect id=\"r0\"/>");
