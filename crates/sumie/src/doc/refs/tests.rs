@@ -95,6 +95,22 @@ fn instances_count_expansions() {
     }
     let (_, _, instances, _) = run(&body);
     assert!(instances > 2048, "{instances}");
+    // defs の中の use の鎖は、描く参照の分だけ数える（n² にしない）。参照されない defs の中身は数えない
+    let mut chain = String::from("<defs><rect id=\"c0\"/>");
+    for k in 1..=1000 {
+        chain.push_str(&format!("<g id=\"c{k}\"><use href=\"#c{}\"/></g>", k - 1));
+    }
+    chain.push_str("</defs>");
+    let (_, _, unused, _) = run(&chain);
+    assert_eq!(unused, 2, "根と defs");
+    let (_, _, used, _) = run(&format!("{chain}<use href=\"#c1000\"/>"));
+    // 根・defs・use と、c1000 から c1 までの g と use の 2 つずつ・c0
+    assert_eq!(used, 3 + 2 * 1000 + 1);
+    // symbol は use から入ったときだけ中身を数える
+    let (_, _, a, _) = run(r##"<symbol id="s"><rect/><rect/></symbol>"##);
+    let (_, _, b, _) = run(r##"<symbol id="s"><rect/><rect/></symbol><use href="#s"/><use href="#s"/>"##);
+    // use は自分と、symbol と中身の 3 つ
+    assert_eq!((a, b), (2, 2 + 2 * (1 + 3)));
     // グラデーションへの塗りは中身を数えない
     let (_, _, a, _) = run(r##"<linearGradient id="g"><stop/><stop/></linearGradient><rect fill="url(#g)"/>"##);
     let (_, _, b, _) = run(r##"<linearGradient id="g"><stop/><stop/></linearGradient><rect/>"##);

@@ -6,7 +6,9 @@
 //! - 輪は明示の積み上げの深さ優先（3 色）で見つける。戻りの辺が参照の辺ならそれを、子の辺なら積み上げの上でいちばん近い
 //!   参照の辺を取り除き（警告）、取り除いた辺の上で輪がなくなるまでくり返す
 //! - 展開の数：輪のない辺の上で、帰りがけの順に「展開したあとの要素の数」を飽和の足し算で求める（use・pattern・marker・
-//!   clip-path・mask・filter の参照は、参照ごとに中身を数える）
+//!   clip-path・mask・filter の参照は、参照ごとに中身を数える）。子を描かない入れ物（defs・symbol・pattern・marker・
+//!   clipPath・mask・グラデーション・filter など）の中身は、参照の辺で入ったときだけ数える（defs の中の use の鎖を、
+//!   描かないのに n² に数えない）
 //! - 条件（`requiredExtensions`・`systemLanguage`。`requiredFeatures` は無視する）が偽の要素と、`switch` で選ばれない子は
 //!   描かない（その部分木ごと）。`switch` は条件の通る最初の子の要素を選ぶ
 //! - 外の文書への参照（`#` で始まらない `href`・`url()`。`data:` を除く）は読まずに、読まなかった参照に載せる
@@ -643,12 +645,23 @@ fn count_instances(
         let mut next: Option<u32> = None;
         let mut frame = top;
         while frame.child != NONE {
+            budget.spend(cost::OP_STEP)?;
             let c = frame.child;
-            frame.child = nodes.get(c as usize).map_or(NONE, |x| x.next_sibling);
-            if nodes.get(c as usize).is_some_and(|x| x.kind == KIND_ELEMENT) {
-                next = Some(c);
-                break;
+            let Some(x) = nodes.get(c as usize) else { break };
+            frame.child = x.next_sibling;
+            if x.kind != KIND_ELEMENT {
+                continue;
             }
+            // 子を描かない入れ物（defs・symbol・pattern など）は、子の辺では自分の 1 つだけを数え、中身は参照の辺で
+            // 入ったときに数える（木を作る段も参照されたものだけを展開する）
+            if x.ns == NS_SVG && not_rendered(x.local.of(input)) {
+                if let Some(a) = acc.last_mut() {
+                    *a = a.saturating_add(1);
+                }
+                continue;
+            }
+            next = Some(c);
+            break;
         }
         if next.is_none() {
             let end = edge_start(top.node.saturating_add(1));
@@ -698,6 +711,28 @@ fn count_instances(
         }
     }
     Ok(count.get(0).copied().unwrap_or(0))
+}
+
+/// 子を描かない入れ物（参照の辺で入ったときだけ中をたどる）。
+pub(crate) fn not_rendered(local: &[u8]) -> bool {
+    matches!(
+        local,
+        b"defs"
+            | b"symbol"
+            | b"clipPath"
+            | b"mask"
+            | b"pattern"
+            | b"marker"
+            | b"linearGradient"
+            | b"radialGradient"
+            | b"filter"
+            | b"title"
+            | b"desc"
+            | b"metadata"
+            | b"style"
+            | b"script"
+            | b"foreignObject"
+    )
 }
 
 /// 参照ごとに中身を作る辺か（中身を作らない href と、グラデーションへの塗り（stop だけで、描く要素を作らない）は数えない）。

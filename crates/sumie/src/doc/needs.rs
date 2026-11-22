@@ -11,7 +11,7 @@
 use crate::budget::Budget;
 use crate::cost;
 use crate::css::sheet::Sheet;
-use crate::doc::refs::{EDGE_CLIP, EDGE_HREF, Refs};
+use crate::doc::refs::{EDGE_CLIP, EDGE_HREF, Refs, not_rendered};
 use crate::error::Error;
 use crate::mem::MVec;
 use crate::style::cascade::{SRC_SHEET, SRC_STORE, Styles, WIDE_NONE};
@@ -28,28 +28,6 @@ pub struct Needs {
     pub raster_images: bool,
     /// 描く木に入りうる SVG の画像がある（入れ子の SVG は読まない：木を作る段は `Unsupported`）
     pub svg_images: bool,
-}
-
-/// 子を描かない入れ物（参照の辺で入ったときだけ中をたどる）。
-fn not_rendered(local: &[u8]) -> bool {
-    matches!(
-        local,
-        b"defs"
-            | b"symbol"
-            | b"clipPath"
-            | b"mask"
-            | b"pattern"
-            | b"marker"
-            | b"linearGradient"
-            | b"radialGradient"
-            | b"filter"
-            | b"title"
-            | b"desc"
-            | b"metadata"
-            | b"style"
-            | b"script"
-            | b"foreignObject"
-    )
 }
 
 /// 知っている要素（知らない要素は子ごと描かない。FR-ST-02）。
