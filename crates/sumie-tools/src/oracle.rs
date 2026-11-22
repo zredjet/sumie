@@ -134,6 +134,35 @@ impl Resvg {
         usvg::Tree::from_data(svg, &self.options()).map_err(|e| format!("usvg：{e}"))
     }
 
+    /// 木を作り、usvg が描く木のために解こうとした画像の参照（`data:` の MIME の型か、外の参照の文字列）を並べる（画像は
+    /// 読まない：Kura と同じに、どれも解かずに捨てる）。`Document::needs` の照らし（ADR-63 (1)）に使う。
+    pub fn tree_with_images(&self, svg: &[u8]) -> Result<(usvg::Tree, Vec<String>), String> {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (a, b) = (seen.clone(), seen.clone());
+        let opts = usvg::Options {
+            resources_dir: None,
+            image_href_resolver: usvg::ImageHrefResolver {
+                resolve_data: Box::new(move |mime, _, _| {
+                    if let Ok(mut v) = a.lock() {
+                        v.push(format!("data:{mime}"));
+                    }
+                    None
+                }),
+                resolve_string: Box::new(move |href, _| {
+                    if let Ok(mut v) = b.lock() {
+                        v.push(href.to_string());
+                    }
+                    None
+                }),
+            },
+            fontdb: self.db.clone(),
+            ..usvg::Options::default()
+        };
+        let tree = usvg::Tree::from_data(svg, &opts).map_err(|e| format!("usvg：{e}"))?;
+        let list = seen.lock().map(|v| v.clone()).unwrap_or_default();
+        Ok((tree, list))
+    }
+
     /// 倍率 1 の画素の大きさ（Kura と同じ `to_int_size`）。
     pub fn size(tree: &usvg::Tree) -> (u32, u32) {
         let s = tree.size().to_int_size();

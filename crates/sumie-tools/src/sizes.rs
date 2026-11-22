@@ -6,6 +6,9 @@
 //! - 違う：どちらも読み、大きさが違う
 //! - sumie が断る：resvg は読むのに sumie の `parse` が誤り（NFR-10 に触れる。一覧にして承認を得る）
 //! - resvg が断る：resvg が誤り（sumie は読んでも断ってもよい）
+//!
+//! あわせて、どちらも読める文書で、usvg が描く木のために解こうとした画像の種類（ラスターか SVG か。画像は読まずに捨てる）と
+//! `Document::needs` を比べる（ADR-63 (1)）。
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -51,12 +54,46 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut counts: std::collections::BTreeMap<Verdict, usize> = Default::default();
     let mut lines = String::new();
     let mut rows = String::new();
+    let mut image_rows = String::new();
+    let (mut image_diffs, mut with_images) = (0usize, 0usize);
     let opts = sumie::ParseOptions::DEFAULT;
     for f in &files {
         let rel = f.strip_prefix(&root).unwrap_or(f).to_string_lossy().to_string();
         let data = std::fs::read(f).map_err(|e| e.to_string())?;
-        let r = resvg.tree(&data);
+        let r = resvg.tree_with_images(&data).map(|(t, imgs)| {
+            // usvg が解こうとした画像の種類（SVG の画像か、ラスターか）
+            let svg = imgs.iter().any(|h| {
+                let l = h.to_ascii_lowercase();
+                l.starts_with("data:image/svg+xml") || {
+                    let p = l.split(['?', '#']).next().unwrap_or("");
+                    p.ends_with(".svg") || p.ends_with(".svgz")
+                }
+            });
+            let raster = imgs.iter().any(|h| {
+                let l = h.to_ascii_lowercase();
+                !(l.starts_with("data:image/svg+xml") || {
+                    let p = l.split(['?', '#']).next().unwrap_or("");
+                    p.ends_with(".svg") || p.ends_with(".svgz")
+                })
+            });
+            (t, raster, svg)
+        });
         let s = sumie::parse(&data, &opts, &sumie::Never);
+        if let (Ok((_, raster, svg)), Ok(d)) = (&r, &s) {
+            let n = d.needs();
+            if (n.raster_images, n.svg_images) != (*raster, *svg) {
+                let _ = writeln!(
+                    image_rows,
+                    "| `{rel}` | ラスター {} ・SVG {} | ラスター {} ・SVG {} |",
+                    raster, svg, n.raster_images, n.svg_images
+                );
+                image_diffs += 1;
+            }
+            if *raster || *svg {
+                with_images += 1;
+            }
+        }
+        let r = r.map(|(t, _, _)| t);
         let (verdict, rtext, stext) = match (&r, &s) {
             (Err(e), _) => {
                 (Verdict::ResvgRefuses, e.clone(), s.as_ref().map_or_else(|e| format!("{e:?}"), |_| "読む".into()))
@@ -103,8 +140,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     md.push_str("\n## 違う・sumie が断る\n\n| 名前 | 判定 | resvg | sumie |\n|---|---|---|---|\n");
     md.push_str(&rows);
+    let _ = write!(
+        md,
+        "\n## 画像の要るもの（ADR-63 (1)）\n\nusvg が描く木のために解こうとした画像の種類と `Document::needs` の比べ（どちらも読める文書）。\
+         画像のある文書 {with_images} 件・違う {image_diffs} 件。\n\n| 名前 | usvg | sumie |\n|---|---|---|\n{image_rows}"
+    );
     std::fs::write(out_dir.join("summary.md"), &md).map_err(|e| e.to_string())?;
     println!("{} 件 → {}", files.len(), out_dir.join("summary.md").display());
+    println!("  画像のある文書 {with_images}・要るものが違う {image_diffs}");
     for (v, n) in &counts {
         println!("  {v:?}: {n}");
     }
