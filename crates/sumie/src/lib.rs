@@ -29,7 +29,7 @@ pub mod fuzzing;
 
 pub use crate::budget::Estimate;
 pub use crate::cancel::{Cancel, Never};
-pub use crate::doc::Document;
+pub use crate::doc::{Document, PixelSize, Size};
 pub use crate::error::{Error, Feature, Invalid, InvalidReason, LimitError, Resource, Stage, Unsupported};
 pub use crate::limits::Limits;
 pub use crate::report::{Report, UnreadRef, Warning, WarningKind};
