@@ -35,8 +35,11 @@ pub struct LimitError {
 pub enum Resource {
     /// 手間
     Work,
-    /// 確保（数えた量。`try_reserve_exact` の失敗も含む）
+    /// 確保（数えた量が上限を超える）
     Memory,
+    /// 確保器が断った（上限の内でも環境で失敗しうる。D1・D2 の約束の外。`needed` は頼んだバイト数、`allowed` は 0。
+    /// determinism.md §1.2）
+    Allocator,
 }
 
 /// 段（どこで断ったか）。

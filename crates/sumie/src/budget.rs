@@ -114,9 +114,15 @@ impl<'c> Budget<'c> {
         self.bytes.set(now.saturating_sub(bytes));
     }
 
-    /// 確保に失敗したときの誤り（`try_reserve_exact` の失敗。環境に依るので D1・D2 の約束の外。determinism.md §1.2）。
+    /// 確保器が断ったときの誤り（`try_reserve_exact` の失敗。環境に依るので D1・D2 の約束の外。determinism.md §1.2）。
+    /// `needed` は頼んだバイト数、`allowed` は 0。
     pub(crate) fn out_of_memory(&self, bytes: u64) -> Error {
-        Error::limit(Resource::Memory, self.bytes.get().saturating_add(bytes), self.bytes_limit, self.stage)
+        Error::limit(Resource::Allocator, bytes, 0, self.stage)
+    }
+
+    /// 頼んだ量がバイト数で表せない（上限を超える）ときの誤り。
+    pub(crate) fn too_large(&self) -> Error {
+        Error::limit(Resource::Memory, u64::MAX, self.bytes_limit, self.stage)
     }
 
     /// 払った手間。

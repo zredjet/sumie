@@ -22,15 +22,16 @@ pub(crate) fn stable_sort<T: Plain>(
     // 作業の領域（写しの手間は MVec が払う）
     let mut work: MVec<'_, T> = MVec::with_capacity(budget_ref(budget), n)?;
     work.append_slice(s)?;
-    let chunk = chunk_len(cost::MERGE_STEP);
+    let step = cost::merge_step(size_of::<T>() as u64);
+    let chunk = chunk_len(step);
     // 今の並びが s にあるか（偽なら work にある）
     let mut in_s = true;
     let mut width = 1usize;
     while width < n {
         if in_s {
-            merge_pass(budget, s, work.as_mut_slice(), width, chunk, &mut is_less)?;
+            merge_pass(budget, s, work.as_mut_slice(), width, chunk, step, &mut is_less)?;
         } else {
-            merge_pass(budget, work.as_slice(), s, width, chunk, &mut is_less)?;
+            merge_pass(budget, work.as_slice(), s, width, chunk, step, &mut is_less)?;
         }
         in_s = !in_s;
         width = width.saturating_mul(2);
@@ -68,6 +69,7 @@ fn merge_pass<T: Plain>(
     dst: &mut [T],
     width: usize,
     chunk: usize,
+    step: u64,
     is_less: &mut impl FnMut(&T, &T) -> bool,
 ) -> Result<(), Error> {
     let n = src.len().min(dst.len());
@@ -81,7 +83,7 @@ fn merge_pass<T: Plain>(
         for o in lo..hi {
             if o >= paid_until {
                 let k = chunk.min(n - o);
-                budget.spend((k as u64).saturating_mul(cost::MERGE_STEP))?;
+                budget.spend((k as u64).saturating_mul(step))?;
                 paid_until = o + k;
             }
             // 右が左より小さいときだけ右を取る（安定）

@@ -26,3 +26,14 @@ impl Cancel for Never {
         false
     }
 }
+
+/// いつも立っている印（ファズの入り口が、中止の道を通すのに使う。公開の API ではない）。
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Always;
+
+impl Cancel for Always {
+    fn cancelled(&self) -> bool {
+        true
+    }
+}

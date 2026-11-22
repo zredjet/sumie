@@ -1017,6 +1017,114 @@ fn check_recursion(s: &Src) -> Vec<Finding> {
     out
 }
 
+/// 関数の本体から、自分の側の口を呼ぶ名前を集める（`名前(`・`self.名前(`・`Self::名前(`・impl の型や crate・super・self
+/// から始まるパスの `名前(`。`self.欄.名前(` の委ねと、ほかの型・クレートのパスは別のものとみなす）。
+fn local_calls(t: &[Token], open: usize, close: usize, ty: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in open + 1..close {
+        if t[m].kind != Kind::Ident || !(punct_at(t, m + 1, '(') || (path_sep(t, m + 1) && punct_at(t, m + 3, '<'))) {
+            continue;
+        }
+        if ident_at(t, m - 1, "fn") {
+            continue;
+        }
+        let local = if punct_at(t, m - 1, '.') {
+            ident_at(t, m - 2, "self") && !punct_at(t, m - 3, '.')
+        } else if after_sep(t, m) {
+            let mut r = m - 3;
+            while r >= 3 && after_sep(t, r) && t[r - 3].kind == Kind::Ident {
+                r -= 3;
+            }
+            let root = t[r].text.as_str();
+            matches!(root, "Self" | "self" | "crate" | "super") || Some(root) == ty
+        } else {
+            true
+        };
+        if local {
+            out.push(t[m].text.clone());
+        }
+    }
+    out
+}
+
+/// 互いを呼ぶ再帰（呼び出しの輪）。関数の名前で辺を張り、2 つ以上の関数の輪を拾う（自分を呼ぶのは check_recursion）。
+fn check_mutual_recursion(all: &[Src]) -> Vec<Finding> {
+    // 名前 → (ファイル, 行, 呼ぶ名前)
+    let mut fns: Vec<(String, String, u32, Vec<String>)> = Vec::new();
+    for s in all {
+        let t = &s.tokens;
+        let impls = impl_blocks(t);
+        for k in 0..t.len() {
+            if !t[k].is_ident("fn") {
+                continue;
+            }
+            let Some(name) = t.get(k + 1).filter(|n| n.kind == Kind::Ident) else { continue };
+            let Some(open) = (k + 2..t.len()).find(|&j| t[j].is_punct('{') || t[j].is_punct(';')) else { continue };
+            if !t[open].is_punct('{') {
+                continue;
+            }
+            let close = matching(t, open).unwrap_or(open);
+            let ty = impls.iter().filter(|(o, c, _)| *o < k && k < *c).map(|(_, _, n)| n.as_str()).next_back();
+            let calls = local_calls(t, open, close, ty);
+            fns.push((name.text.clone(), s.rel.clone(), name.line, calls));
+        }
+    }
+    let names: Vec<&str> = fns.iter().map(|f| f.0.as_str()).collect();
+    let idx = |n: &str| names.iter().position(|x| *x == n);
+    // 名前ごとの辺（同じ名前の関数はまとめる）
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); fns.len()];
+    for (i, f) in fns.iter().enumerate() {
+        let me = idx(&f.0).unwrap_or(i);
+        for c in &f.3 {
+            if let Some(j) = idx(c)
+                && j != me
+                && !edges[me].contains(&j)
+            {
+                edges[me].push(j);
+            }
+        }
+    }
+    // 輪を探す（色つきの深さ優先。試験のコードなので再帰でよい）
+    let mut color = vec![0u8; fns.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut cycles: Vec<Vec<usize>> = Vec::new();
+    fn dfs(v: usize, edges: &[Vec<usize>], color: &mut [u8], stack: &mut Vec<usize>, cycles: &mut Vec<Vec<usize>>) {
+        color[v] = 1;
+        stack.push(v);
+        for &w in &edges[v] {
+            if color[w] == 1 {
+                let from = stack.iter().position(|&x| x == w).unwrap_or(0);
+                cycles.push(stack[from..].to_vec());
+            } else if color[w] == 0 {
+                dfs(w, edges, color, stack, cycles);
+            }
+        }
+        stack.pop();
+        color[v] = 2;
+    }
+    for v in 0..fns.len() {
+        if color[v] == 0 && idx(&fns[v].0) == Some(v) {
+            dfs(v, &edges, &mut color, &mut stack, &mut cycles);
+        }
+    }
+    cycles
+        .into_iter()
+        .map(|c| {
+            let f = &fns[c[0]];
+            let ring: Vec<&str> = c.iter().map(|&i| fns[i].0.as_str()).collect();
+            Finding {
+                file: f.1.clone(),
+                line: f.2,
+                what: format!(
+                    "関数が互いを呼ぶ（{} → {}。再帰しない。明示の積み上げで書く）",
+                    ring.join(" → "),
+                    ring[0]
+                ),
+            }
+        })
+        .collect()
+}
+
 fn check_all(all: &[Src]) -> Vec<Finding> {
     let mut out = Vec::new();
     for s in all {
@@ -1029,6 +1137,7 @@ fn check_all(all: &[Src]) -> Vec<Finding> {
         out.extend(check_recursion(s));
     }
     out.extend(check_plain(all));
+    out.extend(check_mutual_recursion(all));
     out
 }
 
@@ -1264,6 +1373,31 @@ fn rule_recursion() {
     assert_eq!(hits("math.rs", "fn walk<T>(x: T) { walk::<T>(x) }"), 1);
     assert_eq!(hits("math.rs", "fn walk(x: u8) { crate::math::walk(x) }"), 1);
     assert_eq!(hits("geom/path.rs", "fn walk(x: u8) { super::path::walk(x) }"), 1);
+}
+
+#[test]
+fn rule_mutual_recursion() {
+    assert_eq!(hits("math.rs", "fn a() { b() } fn b() { a() }"), 1);
+    assert_eq!(
+        hits(
+            "mem/mod.rs",
+            "impl M { fn ensure(&mut self) { self.copy_in() } fn copy_in(&mut self) { self.ensure() } }"
+        ),
+        1
+    );
+    assert_eq!(hits("math.rs", "fn a() { b() } fn b() { c() } fn c() { a() }"), 1);
+    assert_eq!(hits("math.rs", "fn a() { b() } fn b() {}"), 0);
+    // 委ね・ほかの型のパスは辺にしない
+    assert_eq!(
+        hits("mem/mod.rs", "impl M { fn len(&self) { self.v.len() } fn get(&self) { Other::len(); self.v.get() } }"),
+        0
+    );
+    // ファイルをまたぐ輪
+    let two = [
+        Src::new("math.rs", "pub(crate) fn a() { crate::cost::b() }"),
+        Src::new("cost.rs", "pub(crate) fn b() { crate::math::a() }"),
+    ];
+    assert_eq!(check_mutual_recursion(&two).len(), 1);
 }
 
 #[test]

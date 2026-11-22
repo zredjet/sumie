@@ -7,11 +7,13 @@
 //! - [`alloc`]：確保を数える確保器の包み（feature `count-alloc`）
 //! - [`stack`]：小さいスタック（128 KiB）のスレッドで回す道具
 //! - [`jsonl`]：平らな JSON の行（ゴールデン・一覧）
+//! - [`corpus`]：照合の集まりの一覧（index.jsonl）の読み込み
 //! - [`rustscan`]：Rust のソースの字句（`tests/rules.rs`・`gen-disallowed`）
 
 #[cfg(feature = "count-alloc")]
 pub mod alloc;
 pub mod chacha;
+pub mod corpus;
 pub mod jsonl;
 pub mod mutate;
 pub mod rustscan;

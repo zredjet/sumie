@@ -6,7 +6,7 @@
 //! 操作ごとに、払った手間と確保の山を `cost` の式（見積もり）と照らす（見積もり ≥ 実際）。
 
 use crate::budget::{Budget, CANCEL_INTERVAL};
-use crate::cancel::{Cancel, Never};
+use crate::cancel::{Always, Cancel, Never};
 use crate::cost;
 use crate::error::{Error, Resource, Stage};
 use crate::math;
@@ -83,14 +83,15 @@ impl Before {
     }
 }
 
-/// mem の入れ物（`MVec`・`SortedVec`・`SortedMap`・`stable_sort`）を動かす。最初の 2 バイトで手間と確保の上限を決める。
+/// mem の入れ物（`MVec`・`SortedVec`・`SortedMap`・`stable_sort`）を動かす。最初の 2 バイトで手間と確保の上限を決める
+/// （手間の上限のバイトの上の位が 1 なら、中止の印を立てたまま回して、中止の道を通す）。
 pub fn mem_ops(data: &[u8]) -> MemOutcome {
-    mem_ops_with(data, &Never)
+    if data.first().is_some_and(|b| b & 0x80 != 0) { mem_ops_with(data, &Always) } else { mem_ops_with(data, &Never) }
 }
 
 /// [`mem_ops`] を、渡した中止の印で回す。
 pub fn mem_ops_with(data: &[u8], cancel: &dyn Cancel) -> MemOutcome {
-    let b0 = data.first().copied().unwrap_or(0);
+    let b0 = data.first().copied().unwrap_or(0) & 0x7f;
     let b1 = data.get(1).copied().unwrap_or(0);
     let work_limit = 1u64.checked_shl(u32::from(b0 % 24).saturating_add(4)).unwrap_or(u64::MAX);
     let bytes_limit = 1u64.checked_shl(u32::from(b1 % 20).saturating_add(6)).unwrap_or(u64::MAX);
@@ -99,8 +100,9 @@ pub fn mem_ops_with(data: &[u8], cancel: &dyn Cancel) -> MemOutcome {
     let (check, limited, cancelled) = match r {
         Ok(c) => (c, false, false),
         Err(Error::Limit(l)) => {
-            // 断るのは上限を超えるときだけ
-            let ok = l.needed > l.allowed && matches!(l.resource, Resource::Work | Resource::Memory);
+            // 断るのは上限を超えるとき（Work・Memory）か、確保器が断ったとき（Allocator。環境に依る）だけ
+            let ok = (l.needed > l.allowed && matches!(l.resource, Resource::Work | Resource::Memory))
+                || l.resource == Resource::Allocator;
             (if ok { Check::Ok } else { Check::Violation("Limit の needed が allowed を超えていない") }, true, false)
         }
         Err(Error::Cancelled) => (Check::Ok, false, true),
@@ -132,8 +134,8 @@ fn run_mem_ops(budget: &Budget<'_>, data: &[u8], bytes_limit: u64) -> Result<Che
         if pre < 4 { SortedMap::new(budget) } else { SortedMap::with_capacity(budget, pre)? };
     let mut ops = Ops { data, at: 0 };
     let mut serial = 0u32;
-    const S4: u64 = 4;
-    const S2: u64 = 2;
+    let s4 = size_of::<u32>() as u64;
+    let s2 = size_of::<u16>() as u64;
     while let Some((op, arg)) = ops.next() {
         serial = serial.wrapping_add(1);
         let before = Before::of(budget);
@@ -141,18 +143,19 @@ fn run_mem_ops(budget: &Budget<'_>, data: &[u8], bytes_limit: u64) -> Result<Che
         let est = match op % 12 {
             0 => {
                 v.push(u32::from(arg))?;
-                cost::append(len, cap, 1, S4)
+                cost::append(len, cap, 1, s4)
             }
             1 => {
                 let src = [u32::from(arg); 16];
                 let k = usize::from(arg % 17);
                 v.append_slice(src.get(..k).unwrap_or(&[]))?;
-                cost::append(len, cap, k as u64, S4)
+                cost::append(len, cap, k as u64, s4)
             }
             2 => {
-                let n = usize::from(arg).saturating_mul(4);
+                // 上の位が立っていれば 2 の冪（塊の境目を越える大きさまで。上限は bytes_limit が抑える）
+                let n = if arg & 0x80 != 0 { 1usize << (arg % 22) } else { usize::from(arg).saturating_mul(4) };
                 v.resize_to(n, 7)?;
-                cost::resize(len, cap, n as u64, S4)
+                cost::resize(len, cap, n as u64, s4)
             }
             3 => {
                 let last = v.last().copied();
@@ -171,7 +174,7 @@ fn run_mem_ops(budget: &Budget<'_>, data: &[u8], bytes_limit: u64) -> Result<Che
             }
             5 => {
                 let x = u16::from(arg).saturating_mul(3) % 50;
-                let est = cost::sorted_insert(sv.len() as u64, sv.capacity() as u64, S2);
+                let est = cost::sorted_insert(sv.len() as u64, sv.capacity() as u64, s2);
                 let at = sv.insert(x)?;
                 if sv.as_slice().get(at) != Some(&x) {
                     return Ok(Check::Violation("SortedVec::insert の位置が違う"));
@@ -180,7 +183,7 @@ fn run_mem_ops(budget: &Budget<'_>, data: &[u8], bytes_limit: u64) -> Result<Che
             }
             6 => {
                 let k = u16::from(arg % 32);
-                let est = cost::map_insert(m.len() as u64, m.capacity() as u64, S2, S4);
+                let est = cost::map_insert(m.len() as u64, m.capacity() as u64, s2, s4);
                 let first = m.get(&k)?.copied();
                 let before = Before::of(budget);
                 let inserted = m.insert_first(k, serial)?;
@@ -213,12 +216,14 @@ fn run_mem_ops(budget: &Budget<'_>, data: &[u8], bytes_limit: u64) -> Result<Che
                 // 探す（lower_bound は最初の等しい位置）
                 let x = u16::from(arg).saturating_mul(3) % 50;
                 let found = sv.find(&x)?;
+                // 線形の走査（最初の等しい位置）と、lower_bound（最初の x 以上の位置）と照らす
+                let want = sv.as_slice().iter().position(|y| *y == x);
                 let lb = lower_bound(sv.as_slice(), |y| *y < x);
-                let want = if sv.as_slice().get(lb) == Some(&x) { Some(lb) } else { None };
-                if found != want {
-                    return Ok(Check::Violation("SortedVec::find が最初の等しい位置でない"));
+                let first_ge = sv.as_slice().iter().position(|y| *y >= x).unwrap_or(sv.len());
+                if found != want || lb != first_ge {
+                    return Ok(Check::Violation("SortedVec::find・lower_bound が最初の位置でない"));
                 }
-                let est = cost::sorted_insert(sv.len() as u64, sv.capacity() as u64, S2);
+                let est = cost::sorted_insert(sv.len() as u64, sv.capacity() as u64, s2);
                 let before = Before::of(budget);
                 if sv.insert_unique(x)? == found.is_some() {
                     return Ok(Check::Violation("insert_unique の真偽が違う"));
@@ -231,7 +236,7 @@ fn run_mem_ops(budget: &Budget<'_>, data: &[u8], bytes_limit: u64) -> Result<Che
             10 => {
                 let k = u16::from(arg % 32);
                 let had = m.get(&k)?.is_some();
-                let est = cost::map_insert(m.len() as u64, m.capacity() as u64, S2, S4);
+                let est = cost::map_insert(m.len() as u64, m.capacity() as u64, s2, s4);
                 let before = Before::of(budget);
                 if m.insert_or_replace(k, serial)? != had || !before.within(budget, est) {
                     return Ok(Check::Violation("insert_or_replace が置き換えないか、見積もりを超えた"));
@@ -247,7 +252,7 @@ fn run_mem_ops(budget: &Budget<'_>, data: &[u8], bytes_limit: u64) -> Result<Che
                 if v.get(at) != Some(&u32::from(arg)) {
                     return Ok(Check::Violation("MVec::insert の位置が違う"));
                 }
-                cost::insert(len, cap, at as u64, S4)
+                cost::insert(len, cap, at as u64, s4)
             }
         };
         if !before.within(budget, est) {
@@ -301,6 +306,10 @@ fn sorted_by<T>(s: &[T], ok: impl Fn(&T, &T) -> bool) -> bool {
 
 /// `v` の値を鍵（下の数ビットを落とす）で安定に並べ、並びと安定さと、手間 ≤ 見積もりを確かめる。
 fn sort_check(budget: &Budget<'_>, v: &MVec<'_, u32>, shift: u8) -> Result<Option<Check>, Error> {
+    let n = v.len() as u64;
+    let size = size_of::<Keyed>() as u64;
+    // 組を作る：まとめて取る 1 回の確保と、n 回の push（伸ばさない）
+    let build = Before::of(budget);
     let mut keyed: MVec<'_, Keyed> = MVec::with_capacity(v.budget(), v.len())?;
     for (i, x) in v.as_slice().iter().enumerate() {
         keyed.push(Keyed {
@@ -308,10 +317,13 @@ fn sort_check(budget: &Budget<'_>, v: &MVec<'_, u32>, shift: u8) -> Result<Optio
             idx: u32::try_from(i).unwrap_or(u32::MAX),
         })?;
     }
+    let alloc = if n > 0 { cost::ALLOC_STEP } else { 0 };
+    let build_est = (alloc.saturating_add(n.saturating_mul(cost::append(0, 1, 1, size).0)), n.saturating_mul(size));
+    if !build.within(budget, build_est) {
+        return Ok(Some(Check::Violation("組を作る手間か確保が見積もりを超えた")));
+    }
     let before = Before::of(budget);
     stable_sort(budget, keyed.as_mut_slice(), |a, b| a.key < b.key)?;
-    let n = keyed.len() as u64;
-    let size = size_of::<Keyed>() as u64;
     // 作業の領域の確保（1 回）と、写し・併合の手間
     let est = (cost::stable_sort(n, size), cost::stable_sort_bytes(n, size));
     if !before.within(budget, est) {
@@ -371,6 +383,21 @@ pub fn math_ops(data: &[u8]) -> Check {
         let p = math::powi(a, n);
         if n == 0 && p != 1.0 {
             return Check::Violation("powi(x, 0) が 1 でない");
+        }
+        // 小さな冪は掛ける順の決まった式と同じビット（x^2 = x·x、x^3 = x·(x·x)、負は逆数）
+        let small = match n {
+            1 => Some(a),
+            2 => Some(a * a),
+            3 => Some(a * (a * a)),
+            -1 => Some(1.0 / a),
+            -2 => Some(1.0 / (a * a)),
+            _ => None,
+        };
+        if let Some(want) = small
+            && !(want.is_nan() && p.is_nan())
+            && want.to_bits() != p.to_bits()
+        {
+            return Check::Violation("powi の小さな冪が決めた掛ける順と違う");
         }
         // 超越関数は panic しないこと（値はダイジェストで照らす）。呼び出しを消されないように black_box で包む
         std::hint::black_box((math::sin(a), math::atan2(a, b), math::pow(a, b), math::hypot(a, b), math::ln(a)));

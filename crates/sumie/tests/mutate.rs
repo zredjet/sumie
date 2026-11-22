@@ -39,7 +39,12 @@ fn mem_ops_survive_seeded_mutations() {
         assert_heap_within(&heap, out.counted_peak, 0, &format!("{n} 件目"));
         assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
         // 山でない時点の数えない確保も見つける：ヒープの確保の合計・回数 ≤ 数えた合計・回数
-        assert!(heap.total <= out.charged_total, "{n} 件目：確保の合計 {} > 数えた {}", heap.total, out.charged_total);
+        // 数える量は頼んだ容量 × size_of で、std の確保と同じ（漏れも払いすぎもない）
+        assert_eq!(
+            heap.total, out.charged_total,
+            "{n} 件目：確保の合計 {} と数えた {} が違う",
+            heap.total, out.charged_total
+        );
         assert!(heap.count <= out.charges, "{n} 件目：確保の回数 {} > 数えた {}", heap.count, out.charges);
         limited += usize::from(out.limited);
     }
@@ -91,14 +96,29 @@ fn mem_ops_survive_cancellation() {
     assert!(cancelled > 0, "中止の道を通らなかった");
 }
 
+/// fuzz/seeds/math_ops と同じもの。
+const MATH_SEEDS: &[&[u8]] = &[
+    &[0u8; 48],
+    &[0xff; 48],
+    &[0, 0, 0, 0, 0, 0, 0xf0, 0x7f, 0, 0, 0, 0, 0, 0, 0xf8, 0x7f, 1, 0, 0, 0, 0, 0, 0, 0x80],
+    &[0x18, 0x2d, 0x44, 0x54, 0xfb, 0x21, 0x09, 0x40, 0, 0, 0, 0, 0, 0, 0xe0, 0x3f, 0, 0, 0, 0, 0, 0, 0, 0],
+];
+
+/// fuzz/seeds/math_ops の種が MATH_SEEDS と同じ（ずれない）。
+#[test]
+fn fuzz_seeds_match_math_seeds() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds/math_ops");
+    let mut files: Vec<Vec<u8>> =
+        std::fs::read_dir(dir).unwrap().flatten().map(|e| std::fs::read(e.path()).unwrap()).collect();
+    files.sort();
+    let mut seeds: Vec<Vec<u8>> = MATH_SEEDS.iter().map(|s| s.to_vec()).collect();
+    seeds.sort();
+    assert_eq!(files, seeds, "fuzz/seeds/math_ops と tests/mutate.rs の MATH_SEEDS を合わせる");
+}
+
 #[test]
 fn math_ops_survive_seeded_mutations() {
-    let seeds: &[&[u8]] = &[
-        &[0u8; 48],
-        &[0xff; 48],
-        &[0, 0, 0, 0, 0, 0, 0xf0, 0x7f, 0, 0, 0, 0, 0, 0, 0xf8, 0x7f, 1, 0, 0, 0, 0, 0, 0, 0x80],
-        &[0x18, 0x2d, 0x44, 0x54, 0xfb, 0x21, 0x09, 0x40, 0, 0, 0, 0, 0, 0, 0xe0, 0x3f, 0, 0, 0, 0, 0, 0, 0, 0],
-    ];
+    let seeds = MATH_SEEDS;
     let dict: &[&[u8]] = &[&[0, 0, 0, 0, 0, 0, 0xf0, 0x7f], &[0, 0, 0, 0, 0, 0, 0, 0x80], &[1, 0, 0, 0, 0, 0, 0, 0]];
     for (n, case) in cases(0x5eed_0002, 4000, seeds, dict, 240).iter().enumerate() {
         assert_eq!(math_ops(case), Check::Ok, "{n} 件目 {case:?}");

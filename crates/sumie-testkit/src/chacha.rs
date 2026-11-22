@@ -105,17 +105,20 @@ impl ChaCha {
         }
     }
 
-    /// `lo..=hi` の一様な数。
+    /// `lo..=hi` の一様な数（`hi < lo` なら `lo`。`0..=u64::MAX` も扱う）。
     pub fn range(&mut self, lo: u64, hi: u64) -> u64 {
         if hi <= lo {
             return lo;
         }
-        lo + self.below(hi - lo + 1)
+        match (hi - lo).checked_add(1) {
+            Some(n) => lo + self.below(n),
+            None => self.next_u64(),
+        }
     }
 
-    /// 確率 `num / den` で真。
+    /// 確率 `num / den` で真（`den` が 0 なら偽）。
     pub fn chance(&mut self, num: u64, den: u64) -> bool {
-        self.below(den) < num
+        den != 0 && self.below(den) < num
     }
 
     /// バイト列を埋める。
@@ -205,6 +208,8 @@ mod tests {
             }
         }
         assert_eq!(a.below(0), 0);
+        let _ = a.range(0, u64::MAX);
+        assert!(!a.chance(1, 0));
         assert!((0..100).all(|_| (5..=9).contains(&a.range(5, 9))));
     }
 }

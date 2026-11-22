@@ -40,15 +40,22 @@ pub(crate) const fn ceil_log2(n: u64) -> u64 {
     if n <= 1 { 0 } else { u64::BITS.saturating_sub(n.saturating_sub(1).leading_zeros()) as u64 }
 }
 
+/// 併合の 1 段で 1 つの要素を比べて写す手間（比べる関数は O(1) で軽いとする。要素の大きさの写しを足す）。
+pub(crate) const fn merge_step(size: u64) -> u64 {
+    MERGE_STEP.saturating_add(copy(size))
+}
+
 /// `n` 個（1 つ `size` バイト）の安定な併合の並べ替えの手間の上限（作業の領域の確保と写し・段ごとの併合・戻しの写し）。
-/// 2 個未満は何もしない。作業の領域の確保の増えは `n × size`（[`stable_sort_bytes`]）。
+/// 2 個未満は何もしない。作業の領域の確保の増えは `n × size`（[`stable_sort_bytes`]）。比べる関数は O(1) で軽いこと
+/// （重い比べ方をするときは、呼び手がその分を別に払う）。
 pub(crate) const fn stable_sort(n: u64, size: u64) -> u64 {
     if n < 2 {
         return 0;
     }
     let bytes = n.saturating_mul(size);
-    let merge = n.saturating_mul(ceil_log2(n)).saturating_mul(MERGE_STEP);
-    ALLOC_STEP.saturating_add(merge).saturating_add(copy(bytes)).saturating_add(copy(bytes))
+    let merge = n.saturating_mul(ceil_log2(n)).saturating_mul(merge_step(size));
+    // 作業の領域の確保（1 回）・作業の領域への写し（append 1 回）・段ごとの併合・戻しの写し
+    ALLOC_STEP.saturating_add(OP_STEP).saturating_add(merge).saturating_add(copy(bytes)).saturating_add(copy(bytes))
 }
 
 /// 安定な併合の並べ替えの作業の領域（確保の増え）。
@@ -69,6 +76,9 @@ pub(crate) const fn shift(moved: u64, size: u64) -> u64 {
 /// 1 回の確保の決まった手間（確保器を呼ぶ分。取った領域に触れる分は fill・copy で数える）。
 pub(crate) const ALLOC_STEP: u64 = 64;
 
+/// 入れ物の操作 1 回の決まった手間（容量の確かめ・勘定・std の口を呼ぶ分。push を 1 単位 ≈ 1 ns に合わせる）。
+pub(crate) const OP_STEP: u64 = 4;
+
 /// 伸ばしたあとの容量（`cap` で `need` 個が入らないとき。倍々・最小 4）。入れ物と見積もりの両方がこれを使う。
 pub(crate) const fn grow_cap(cap: u64, need: u64) -> u64 {
     let doubled = cap.saturating_mul(2);
@@ -86,7 +96,7 @@ pub(crate) const fn append(len: u64, cap: u64, n: u64, size: u64) -> (u64, u64) 
     } else {
         (0, 0)
     };
-    (grow_work.saturating_add(copy(n.saturating_mul(size))), grow_bytes)
+    (OP_STEP.saturating_add(grow_work).saturating_add(copy(n.saturating_mul(size))), grow_bytes)
 }
 
 /// 長さ `len`・容量 `cap` の入れ物の `at` の位置に 1 つ差し込む手間と確保の増え（`MVec::insert` の式）。
@@ -111,7 +121,8 @@ pub(crate) const fn map_insert(len: u64, cap: u64, key_size: u64, value_size: u6
     (search(len).saturating_add(wk).saturating_add(wv), bk.saturating_add(bv))
 }
 
-/// `n` 個（1 つ `size` バイト）を 0 か同じ値で埋めて伸ばす手間と確保の増え（`MVec::resize_to` の式。長さ `len`・容量 `cap`）。
+/// 長さ `len`・容量 `cap` の入れ物を、新しい長さ `n` まで同じ値で埋めて伸ばす手間と確保の増え（`MVec::resize_to` の式。
+/// `n ≤ len` なら切り詰めるだけで手間なし）。
 pub(crate) const fn resize(len: u64, cap: u64, n: u64, size: u64) -> (u64, u64) {
     if n <= len {
         return (0, 0);
@@ -122,7 +133,7 @@ pub(crate) const fn resize(len: u64, cap: u64, n: u64, size: u64) -> (u64, u64) 
     } else {
         (0, 0)
     };
-    (grow_work.saturating_add(fill(n.saturating_sub(len).saturating_mul(size))), grow_bytes)
+    (OP_STEP.saturating_add(grow_work).saturating_add(fill(n.saturating_sub(len).saturating_mul(size))), grow_bytes)
 }
 
 #[cfg(test)]

@@ -9,7 +9,9 @@
 //! - 写し・埋めの手間は `cost` の式で、`CANCEL_INTERVAL` 未満の塊ごとに前払いする
 //! - 入れる型は `Plain`（`#[repr(C)]` か基本の型で `Copy`。`tests/rules.rs` が見張る）
 //! - 段の結果に残すものは `freeze` で `Frozen` にする（`Budget` から切り離す。取り直さない）
-//! - 手間は操作ごとに `cost` の式（`append`・`insert`・`resize`・`sorted_insert`・`map_insert`）と同じだけ払う（試験で照らす）
+//! - 手間は操作ごとに `cost` の式で払う。`MVec` の `push`・`append_slice`・`resize_to`・`insert` は `cost::append`・`resize`・
+//!   `insert` とぴったり同じ（試験で照らす）。`SortedVec`・`SortedMap` は `sorted_insert`・`map_insert` 以下（最悪の位置の式）
+//! - 入れる型の大きさは `MAX_PLAIN_SIZE` まで（組むときに止める。1 回の spend を `CANCEL_INTERVAL` 未満に保つ）
 //! - 誤り（上限・中止）を返したあとの中身は決めない（段は誤りで止まり、結果を作らない。FR-LIM-06）。数えた量は Drop で
 //!   正しく返す
 //!
@@ -36,6 +38,9 @@ macro_rules! plain {
     ($($t:ty),* $(,)?) => { $(impl Plain for $t {})* };
 }
 plain!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, bool, char);
+
+/// 入れ物に入れる型の大きさの上限（バイト）。1 要素の写しの手間（`cost::copy`）を `CANCEL_INTERVAL` よりずっと小さく保つ。
+pub(crate) const MAX_PLAIN_SIZE: usize = 4096;
 
 /// 数を数える入れ物（`Vec` の包み）。
 pub(crate) struct MVec<'b, T: Plain> {
@@ -65,10 +70,10 @@ pub(super) fn spend_cumulative(
     Ok(after)
 }
 
-/// `n` 個の `T` のバイト数。あふれたら `Limit`。
+/// `n` 個の `T` のバイト数。あふれたら `Limit`（上限を超える）。
 fn bytes_for<T>(budget: &Budget<'_>, n: usize) -> Result<u64, Error> {
     let size = size_of::<T>() as u64;
-    (n as u64).checked_mul(size).ok_or_else(|| budget.out_of_memory(u64::MAX))
+    (n as u64).checked_mul(size).ok_or_else(|| budget.too_large())
 }
 
 impl<'b, T: Plain> MVec<'b, T> {
@@ -81,6 +86,11 @@ impl<'b, T: Plain> MVec<'b, T> {
     /// `n` 個の容量をまとめて取る（数えてから確保する）。
     #[expect(clippy::disallowed_methods, reason = "mem の中の確保の口（数えてから try_reserve_exact で取る）")]
     pub(crate) fn with_capacity(budget: &'b Budget<'b>, n: usize) -> Result<MVec<'b, T>, Error> {
+        const {
+            if size_of::<T>() > MAX_PLAIN_SIZE {
+                panic!("MVec に入れる型は MAX_PLAIN_SIZE バイトまで（組むときに止める）");
+            }
+        }
         let bytes = bytes_for::<T>(budget, n)?;
         if bytes > 0 {
             budget.spend(cost::ALLOC_STEP)?;
@@ -157,17 +167,19 @@ impl<'b, T: Plain> MVec<'b, T> {
         }
         let new_cap = cost::grow_cap(self.cap as u64, need as u64);
         let mut next = MVec::with_capacity(self.budget, usize::try_from(new_cap).unwrap_or(usize::MAX))?;
-        next.copy_in(&self.v)?;
+        next.copy_within_cap(&self.v)?;
         // 古い領域はここで捨てられ、Drop で数えた量を返す
         *self = next;
         Ok(())
     }
 
-    /// `s` を後ろに写す（写しの手間を塊ごとに前払いする）。容量は呼び手が ensure で確かめるが、ここでも確かめる
-    /// （std の Vec が数えずに取り直さないように。足りていれば何もしない）。
-    #[expect(clippy::disallowed_methods, reason = "mem の中の写し（容量は ensure で確かめた）")]
-    fn copy_in(&mut self, s: &[T]) -> Result<(), Error> {
-        self.ensure(self.v.len().saturating_add(s.len()))?;
+    /// 容量の内で `s` を後ろに写す（写しの手間を塊ごとに前払いする）。容量は呼び手が ensure で取っておく。足りなければ
+    /// 写さずに誤りを返す（起きない。std の Vec が数えずに取り直さないための歯止め。ensure は呼ばない＝互いを呼ばない）。
+    #[expect(clippy::disallowed_methods, reason = "mem の中の写し（容量は確かめた）")]
+    fn copy_within_cap(&mut self, s: &[T]) -> Result<(), Error> {
+        if self.v.len().saturating_add(s.len()) > self.cap {
+            return Err(self.budget.out_of_memory(0));
+        }
         let size = size_of::<T>() as u64;
         let per = chunk_len(cost::copy(size).max(1));
         let mut rest = s;
@@ -185,17 +197,21 @@ impl<'b, T: Plain> MVec<'b, T> {
     /// 1 つ足す（容量が足りなければ倍々に伸ばす）。
     #[expect(clippy::disallowed_methods, reason = "mem の中の push（容量は ensure で確かめたので取り直さない）")]
     pub(crate) fn push(&mut self, x: T) -> Result<(), Error> {
+        // 1 回の決まった手間と 1 つの写し（cost::append の n = 1）
+        self.budget.spend(cost::OP_STEP.saturating_add(cost::copy(size_of::<T>() as u64)))?;
         self.ensure(self.v.len().saturating_add(1))?;
-        // 1 つの写し（cost::append の n = 1）
-        self.budget.spend(cost::copy(size_of::<T>() as u64))?;
+        if self.v.len() >= self.cap {
+            return Err(self.budget.out_of_memory(0));
+        }
         self.v.push(x);
         Ok(())
     }
 
     /// 並びを後ろに写す（std の `extend_from_slice` と名前を分ける：`tests/rules.rs` が mem の外の std の口を名前で拾う）。
     pub(crate) fn append_slice(&mut self, s: &[T]) -> Result<(), Error> {
+        self.budget.spend(cost::OP_STEP)?;
         self.ensure(self.v.len().saturating_add(s.len()))?;
-        self.copy_in(s)
+        self.copy_within_cap(s)
     }
 
     /// 長さを `n` にする（伸ばす分は `value` で埋める。埋める手間を塊ごとに前払いする。std の `resize` と名前を分ける）。
@@ -205,6 +221,7 @@ impl<'b, T: Plain> MVec<'b, T> {
             self.v.truncate(n);
             return Ok(());
         }
+        self.budget.spend(cost::OP_STEP)?;
         self.ensure(n)?;
         let size = size_of::<T>() as u64;
         let per = chunk_len(cost::fill(size).max(1));

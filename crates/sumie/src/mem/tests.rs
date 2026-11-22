@@ -134,6 +134,16 @@ struct Pair {
 }
 impl Plain for Pair {}
 
+/// 入れ物に入れる型の大きさ（数える量は size_of に依るので、版で変わらないことを照らす。determinism.md §2.6）。
+#[test]
+fn plain_sizes_are_fixed() {
+    assert_eq!(size_of::<Pair>(), 8);
+    assert_eq!(size_of::<u8>(), 1);
+    assert_eq!(size_of::<char>(), 4);
+    assert_eq!(size_of::<f64>(), 8);
+    assert!(size_of::<Pair>() <= MAX_PLAIN_SIZE);
+}
+
 fn random_pairs(seed: u64, n: usize, keys: u64) -> Vec<Pair> {
     let mut r = ChaCha::from_u64(seed);
     (0..n).map(|i| Pair { key: r.below(keys) as u32, idx: i as u32 }).collect()
@@ -153,7 +163,7 @@ fn stable_sort_matches_std_stable_sort() {
         // 見積もり ≥ 実際（併合の分は見積もりとぴったり同じ）
         let est = cost::stable_sort(n as u64, size_of::<Pair>() as u64);
         assert!(b.work() <= est, "n {n}：実際 {} > 見積もり {est}", b.work());
-        let merge = n as u64 * cost::ceil_log2(n as u64) * cost::MERGE_STEP;
+        let merge = n as u64 * cost::ceil_log2(n as u64) * cost::merge_step(size_of::<Pair>() as u64);
         assert!(b.work() >= merge);
         assert_eq!(b.bytes(), 0);
         assert!(b.peak() <= (n * size_of::<Pair>()) as u64);
@@ -332,5 +342,31 @@ fn calibrate() {
     }
     let ns = t.elapsed().as_nanos() as f64;
     println!("shift：{:.3} ns/単位（{} 単位）", ns / (b.work() - w0) as f64, b.work() - w0);
-    std::hint::black_box((v.len(), z.len(), s.len()));
+    // 1 つずつの push・末尾への insert・小さな resize_to（1 回ごとの決まった手間 OP_STEP の校正）
+    let mut p: MVec<'_, u32> = MVec::with_capacity(&b, n).unwrap();
+    let w0 = b.work();
+    let t = Instant::now();
+    for i in 0..n as u32 {
+        p.push(i).unwrap();
+    }
+    let ns = t.elapsed().as_nanos() as f64;
+    println!("push：{:.3} ns/単位（{} 単位）", ns / (b.work() - w0) as f64, b.work() - w0);
+    let mut q: MVec<'_, u32> = MVec::with_capacity(&b, 200_000).unwrap();
+    let w0 = b.work();
+    let t = Instant::now();
+    for i in 0..200_000u32 {
+        let at = q.len();
+        q.insert(at, i).unwrap();
+    }
+    let ns = t.elapsed().as_nanos() as f64;
+    println!("末尾の insert：{:.3} ns/単位（{} 単位）", ns / (b.work() - w0) as f64, b.work() - w0);
+    let mut r: MVec<'_, u32> = MVec::with_capacity(&b, 600_000).unwrap();
+    let w0 = b.work();
+    let t = Instant::now();
+    for k in 1..=200_000usize {
+        r.resize_to(k * 3, 1).unwrap();
+    }
+    let ns = t.elapsed().as_nanos() as f64;
+    println!("小さな resize_to：{:.3} ns/単位（{} 単位）", ns / (b.work() - w0) as f64, b.work() - w0);
+    std::hint::black_box((v.len(), z.len(), s.len(), p.len(), q.len(), r.len()));
 }
