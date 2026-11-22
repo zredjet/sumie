@@ -24,7 +24,7 @@ enum Verdict {
     ResvgRefuses,
 }
 
-fn walk_svgs(dir: &Path, out: &mut Vec<PathBuf>) {
+pub(crate) fn walk_svgs(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();

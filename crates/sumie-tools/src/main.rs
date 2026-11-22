@@ -16,6 +16,7 @@ mod oracle;
 mod oracle_lock;
 mod probe;
 mod sizes;
+mod values;
 mod wellformed;
 
 use std::path::PathBuf;
@@ -35,7 +36,8 @@ const USAGE: &str = "使い方：sumie-tools <命令> …
   probe [--out tests/svg/m1-probe]                                       M1 の範囲を決める試しを resvg・Chrome で描いて表にする
   wellformed [--root corpus] [--kura-fuzz <dir>] [--mutate N]            XML の整形式の厳しさを roxmltree と照らす
   sizes [--root corpus] [--out local/sizes] [--fonts none]                受ける・断ると大きさを resvg と照らす（FR-OUT-02・NFR-10）
-  latency [--scale N] [--filter …]                                       敵対的な入力で、ns／単位と中止を読む間の最大を測る";
+  latency [--scale N] [--filter …]                                       敵対的な入力で、ns／単位と中止を読む間の最大を測る
+  values [--root corpus] [--out local/values] [--dump <in.svg>]           id のある要素の計算した値を usvg の木と照らす（ADR-63 (5)）";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -60,6 +62,7 @@ fn main() {
         "wellformed" => wellformed::run(rest),
         "latency" => latency::run(rest),
         "sizes" => sizes::run(rest),
+        "values" => values::run(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())
