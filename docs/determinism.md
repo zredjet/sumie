@@ -81,6 +81,7 @@ IEEE 754 で結果が一意に決まるものだけを使う。
 - `abs`・`copysign`・`signum`・`floor`・`ceil`・`trunc`・`round`・`round_ties_even`・`fract`・`%`・`rem_euclid`・
   `div_euclid`・`recip`
 - 比較（`<`・`==` など）と `total_cmp`
+- 値の述語：`is_nan`・`is_finite`・`is_infinite`・`is_sign_positive`・`is_sign_negative`（ビットだけで決まる。ADR-56 (4)）
 - `as` による変換（浮動小数から整数は飽和で、NaN は 0）・`f32` と `f64` の間の変換・`to_bits`・`from_bits`
 - `str::parse::<f64>()`・`<f32>`（正しく丸めるので答えが一意。外から来た数の字句は自前で切り出し、ASCII の部分だけを渡す）
 
@@ -294,6 +295,7 @@ M7 で `sumie-render/1` を凍結するまでの値は版 0（`sumie-render/0`�
   ゴールデンにせず、手元の照合の一覧にする）
 - ファイルは版ごと（`goldens/render-v<N>.jsonl`）。凍結した版のファイルは**追記だけ**で、既存の行を書き換えない・消さない。
   例の中身（名前・入力・設定）を変えたいときは、新しい名前の例を足す。`scripts/check-goldens-append-only.sh` が CI と
-  手元の全チェックで見張る（版 0 の `render-v0.jsonl` と `estimate.jsonl` は見張りから外す）
+  手元の全チェックで見張る。版 0 の `render-v0.jsonl` は今の版が 0 の間だけ見張りから外し（作り直してよい。ADR-20）、今の
+  版が 1 以上になったら古い版として凍結する（ADR-56 (3)）。`estimate.jsonl` は見張らない（D2 は rev ごと）
 - 同じファイルを全ターゲットで照らす（ターゲットごとのゴールデンは持たない。持つ必要が出たら、それは決定性の不具合）
 - ダイジェストは BLAKE3（dev 依存）。画素は幅・高さ・行を詰めた RGBA8 を続けたバイト列から取る

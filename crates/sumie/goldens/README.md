@@ -5,7 +5,7 @@ determinism.md §10。入力と画素のダイジェストを版つきで凍結�
 
 | ファイル | 中身 | 書き換え |
 |---|---|---|
-| `render-v<N>.jsonl` | 版 `sumie-render/<N>` の描いた結果（D1） | 凍結した版は**追記だけ**（`scripts/check-goldens-append-only.sh`）。版 0 は M7 まで作り直してよい（ADR-20。作り直すときはコミットを分け、差の一覧を付ける） |
+| `render-v<N>.jsonl` | 版 `sumie-render/<N>` の描いた結果（D1） | 凍結した版は**追記だけ**（`scripts/check-goldens-append-only.sh`）。版 0 は今の版が 0 の間（M7 まで）作り直してよい（ADR-20。作り直すときはコミットを分け、差の一覧を付ける）。今の版が 1 以上になったら、版 0 も古い版として凍結する（ADR-56 (3)） |
 | `estimate.jsonl` | 見積もりと警告の並び（D2。ADR-33） | rev ごとに作り直してよい |
 
 `render-v<N>.jsonl` の 1 行（鍵はこの順。値は文字列か整数。行のバイトは正規の形＝`sumie_testkit::jsonl::Line` で読み直して
