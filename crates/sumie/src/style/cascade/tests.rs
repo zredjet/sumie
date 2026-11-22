@@ -237,3 +237,44 @@ fn geometry_width_height_and_font_once() {
     cascade(&doc, input, &sheet, &env, &b3).unwrap();
     assert!(b3.work() < 20_000_000, "{}", b3.work());
 }
+
+/// CSS の 3 回目のレビューの指摘（Chrome 157 と照らした形）。
+#[test]
+fn third_review_cascade_cases() {
+    let svg =
+        format!("<svg {SVG} xmlns:x=\"urn:x\"><rect id=\"t\"/><x:q id=\"q\" lang=\"fr\"><rect id=\"in\"/></x:q></svg>");
+    // `@import` の層のあとの条件が偽なら、層は層の順に入らない（q は r より前にならない）
+    let out = run(&svg, "@import url(x.css) layer(q) print; @layer r{#t{fill:red}} @layer q{#t{fill:blue}}");
+    assert_eq!(get(&out, "t", "fill"), Some("blue"));
+    let out =
+        run(&svg, "@import url(x.css) layer(q) supports(foo: bar); @layer r{#t{fill:red}} @layer q{#t{fill:blue}}");
+    assert_eq!(get(&out, "t", "fill"), Some("blue"));
+    // 真の条件（宣言の形・条件の形）なら層の順に入る
+    for cond in ["supports(fill: red)", "supports((fill: red) and (stroke: red)) screen", "all"] {
+        let out = run(
+            &svg,
+            &format!("@import url(x.css) layer(q) {cond}; @layer r{{#t{{fill:red}}}} @layer q{{#t{{fill:blue}}}}"),
+        );
+        assert_eq!(get(&out, "t", "fill"), Some("red"), "{cond}");
+    }
+    // 壊れた `@supports` のあとの `@namespace` は読む（正しい規則に数えない）。正しい `@supports` のあとは読まない
+    let out = run(&svg, "@supports foo {} @namespace x url(urn:x); x|q, #t{stroke:blue}");
+    assert_eq!(get(&out, "t", "stroke"), Some("blue"));
+    let out = run(&svg, "@supports (foo) {} @namespace x url(urn:x); x|q, #t{stroke:blue}");
+    assert_eq!(get(&out, "t", "stroke"), None);
+    for bad in ["foo", "(a) and (b) or (c)", "not (a) and (b)", "(a) (b)", "not", "(a) and"] {
+        let out = run(&svg, &format!("@supports {bad} {{}} @namespace x url(urn:x); x|q, #t{{stroke:blue}}"));
+        assert_eq!(get(&out, "t", "stroke"), Some("blue"), "{bad}");
+    }
+    // `@media` の `[…]` の中の `,` で次の問いを始めない
+    let out = run(&svg, "@media [, screen, ] { #t { opacity: .5 } }");
+    assert_eq!(get(&out, "t", "opacity"), None);
+    // 名前空間のない lang は SVG の要素のもの（ほかの名前空間の要素の lang は受け継がない）
+    let out = run(&svg, ":lang(fr) { opacity: .5 }");
+    assert_eq!(get(&out, "in", "opacity"), None);
+    // 文字列の範囲の中の `,` で範囲を分けない
+    let svg2 = format!("<svg {SVG}><rect id=\"e\" lang=\"en\"/></svg>");
+    let out = run(&svg2, ":lang(\"xx,en\") { opacity: .5 } :lang(xx, en) { stroke: red }");
+    assert_eq!(get(&out, "e", "opacity"), None);
+    assert_eq!(get(&out, "e", "stroke"), Some("red"));
+}

@@ -50,6 +50,8 @@ impl Plain for Rule {}
 /// 条件の種類。
 pub(crate) const COND_MEDIA: u8 = 0;
 pub(crate) const COND_SUPPORTS: u8 = 1;
+/// `@import` の `supports(…)`（`<supports-condition>` か 1 つの宣言。CSS Cascade 5 §2.1）
+pub(crate) const COND_SUPPORTS_IMPORT: u8 = 2;
 
 /// 条件（`@media` の問いの並び・`@supports` の条件・`<style media>`）。
 #[repr(C)]
@@ -276,6 +278,8 @@ pub(crate) struct SheetBuilder<'b> {
     conds: MVec<'b, Cond>,
     layers: MVec<'b, Layer>,
     ns: MVec<'b, NsDecl>,
+    /// `ns` の長さの山（同じ接頭辞を除く前。読む段の容量にする：2 度目の読みで伸び直さない）
+    ns_peak: usize,
     ns_names: MVec<'b, u8>,
     notes: MVec<'b, Note>,
     order: u32,
@@ -319,6 +323,7 @@ impl<'b> SheetBuilder<'b> {
             conds: MVec::new(budget),
             layers: MVec::new(budget),
             ns: MVec::new(budget),
+            ns_peak: 0,
             ns_names: MVec::new(budget),
             notes: MVec::new(budget),
             order: 0,
@@ -342,6 +347,7 @@ impl<'b> SheetBuilder<'b> {
             conds: MVec::with_capacity(budget, cap(c.conds)?)?,
             layers: MVec::with_capacity(budget, cap(c.layers)?)?,
             ns: MVec::with_capacity(budget, cap(c.ns)?)?,
+            ns_peak: 0,
             ns_names: MVec::with_capacity(budget, cap(c.ns_names)?)?,
             notes: MVec::with_capacity(budget, cap(c.notes)?)?,
             order: 0,
@@ -361,7 +367,7 @@ impl<'b> SheetBuilder<'b> {
             simples: n(self.tables.simples.len()),
             conds: n(self.conds.len()),
             layers: n(self.layers.len()),
-            ns: n(self.ns.len()),
+            ns: n(self.ns_peak.max(self.ns.len())),
             ns_names: n(self.ns_names.len()),
             notes: n(self.notes.len()),
         }
@@ -369,6 +375,11 @@ impl<'b> SheetBuilder<'b> {
 
     /// `<style>` 1 つ（`css` は揃えた中身、`media` は `media` 属性の値、`pos` は要素の位置）を足す。
     pub(crate) fn add(&mut self, css: &[u8], media: Option<&[u8]>, pos: u32) -> Result<(), Error> {
+        // 置き場の中の範囲は u32 で持つ（上限を広げて 4 GiB を超えたら、範囲を切らずに断る）
+        let total = self.text.len().saturating_add(css.len()).saturating_add(media.map_or(0, <[u8]>::len));
+        if u32::try_from(total).is_err() || u32::try_from(self.tables.names.len().saturating_add(total)).is_err() {
+            return Err(self.budget.too_large());
+        }
         let base = self.text.len();
         self.text.append_slice(css)?;
         let range = Span::new(base, self.text.len());
@@ -387,7 +398,8 @@ impl<'b> SheetBuilder<'b> {
             })?;
         }
         // 字句は text を借りるので、ほかの入れ物を分けて借りる
-        let SheetBuilder { budget, text, tables, rules, decls, conds, layers, ns, ns_names, notes, order } = self;
+        let SheetBuilder { budget, text, tables, rules, decls, conds, layers, ns, ns_peak, ns_names, notes, order } =
+            self;
         let s = text.as_slice();
         let budget: &'b Budget<'b> = budget;
         let mut lex = Lexer::over(s, range, budget);
@@ -403,6 +415,7 @@ impl<'b> SheetBuilder<'b> {
             conds,
             layers,
             ns,
+            ns_peak,
             ns_names,
             ns_start,
             ns_dirty: false,
@@ -475,6 +488,7 @@ struct Ctx<'c, 's, 'b> {
     conds: &'c mut MVec<'b, Cond>,
     layers: &'c mut MVec<'b, Layer>,
     ns: &'c mut MVec<'b, NsDecl>,
+    ns_peak: &'c mut usize,
     ns_names: &'c mut MVec<'b, u8>,
     /// この `<style>` の `@namespace` の表の始まり（`ns` の中）
     ns_start: usize,
@@ -514,6 +528,26 @@ impl<'b> Ctx<'_, '_, 'b> {
 
     /// 読まなかった参照（文字列か url の字句の中身。escape を解いて名前の置き場に写す）。
     fn unread(&mut self, t: &Token) -> Result<(), Error> {
+        // 空と `data:` は外を指さないので載せない（参照の辺の `resolve` と同じ。中身を写さない）
+        let mut head = [0u8; 5];
+        let mut k = 0usize;
+        for c in decode_string(self.s, t.inner, self.budget) {
+            let c = c?;
+            if k == 0 && matches!(c, 0x20 | 0x09 | 0x0A | 0x0C | 0x0D) {
+                continue;
+            }
+            let Some(slot) = head.get_mut(k) else { break };
+            // ASCII の大文字は小文字に、ASCII でない字は比べに当たらない印にする
+            *slot = match c {
+                0x41..=0x5A => (c as u8) | 0x20,
+                0..0x80 => c as u8,
+                _ => 0xFF,
+            };
+            k = k.saturating_add(1);
+        }
+        if k == 0 || head == *b"data:" {
+            return Ok(());
+        }
         let start = self.tables.names.len();
         for c in decode_string(self.s, t.inner, self.budget) {
             let (buf, n) = crate::css::select::utf8_pub(c?);
@@ -535,6 +569,7 @@ impl<'b> Ctx<'_, '_, 'b> {
             return Ok(());
         }
         self.ns_dirty = false;
+        *self.ns_peak = (*self.ns_peak).max(self.ns.len());
         let budget = self.budget;
         let names = self.ns_names.as_slice();
         let start = self.ns_start;
@@ -699,7 +734,11 @@ impl<'b> Ctx<'_, '_, 'b> {
         }
         let closed = Head { may_import: false, may_namespace: false };
         if (is(b"media") || is(b"supports")) && block {
-            *head = closed;
+            // 形の壊れた `@supports` は規則ごと捨て、`@import`・`@namespace` を閉じない（Chrome と同じ。中は条件が偽の塊として
+            // 読み飛ばす）。`@media` の壊れた問いは `not all` なので、規則は正しい
+            if is(b"media") || self.supports_shape_ok(prelude)? {
+                *head = closed;
+            }
             let kind = if is(b"media") { COND_MEDIA } else { COND_SUPPORTS };
             let id = self.conds.len() as u32;
             self.seal_ns()?;
@@ -789,17 +828,70 @@ impl<'b> Ctx<'_, '_, 'b> {
         Ok(Step::Done)
     }
 
-    /// `@import` の前置きの `layer`（名前のない層）か `layer(名前)` を層の順に入れる。
-    fn import_layer(&mut self, blk: Block, prelude: Span) -> Result<(), Error> {
+    /// `@supports` の前置きが `<supports-condition>` の形か（CSS Conditional 3 §2.1。上の段だけを見る：`not` の 1 つの項か、
+    /// `and` か `or` の一方だけでつないだ項の並び。項はかっこか関数で、中は問わない（一般の囲み））。
+    fn supports_shape_ok(&self, prelude: Span) -> Result<bool, Error> {
         let s = self.s;
         let mut lex = Lexer::over(s, prelude, self.budget);
+        let mut items = 0u32;
+        // つなぎ：0 まだ、1 and、2 or
+        let mut op = 0u8;
+        let mut negated = false;
+        let mut want_item = true;
         loop {
             let t = lex.next()?;
             match t.kind {
-                Kind::Eof => return Ok(()),
+                Kind::Whitespace => {}
+                Kind::Eof => return Ok(items > 0 && !want_item),
+                Kind::LParen | Kind::Function if want_item => {
+                    let mut nest = Nest::new(self.budget);
+                    nest.feed(&t)?;
+                    loop {
+                        let u = lex.next()?;
+                        // 閉じないまま終わったかっこは閉じたものとする（CSS Syntax）
+                        if u.kind == Kind::Eof || nest.feed(&u)? {
+                            break;
+                        }
+                    }
+                    items = items.saturating_add(1);
+                    want_item = false;
+                }
+                Kind::Ident if want_item && items == 0 && !negated && ident_is(s, t.inner, t.escaped, b"not") => {
+                    negated = true;
+                }
+                Kind::Ident if !want_item && !negated => {
+                    let o = if ident_is(s, t.inner, t.escaped, b"and") {
+                        1
+                    } else if ident_is(s, t.inner, t.escaped, b"or") {
+                        2
+                    } else {
+                        return Ok(false);
+                    };
+                    if op != 0 && op != o {
+                        return Ok(false);
+                    }
+                    op = o;
+                    want_item = true;
+                }
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    /// `@import` の前置きの `layer`（名前のない層）か `layer(名前)` を層の順に入れる。層のあとの `supports(…)` と媒体の
+    /// 問いの並びは、層を書いた所の条件にする（偽なら層の順に入らない。CSS Cascade 5 §2.1。Chrome と同じ）。
+    fn import_layer(&mut self, blk: Block, prelude: Span) -> Result<(), Error> {
+        let s = self.s;
+        let mut lex = Lexer::over(s, prelude, self.budget);
+        // 層：None（書いていない）・Some(None)（名前のない層）・Some(Some(名前の範囲))
+        let mut layer: Option<Option<Span>> = None;
+        loop {
+            let t = lex.next()?;
+            match t.kind {
+                Kind::Eof => break,
                 Kind::Ident if ident_is(s, t.inner, t.escaped, b"layer") => {
-                    self.anonymous(blk)?;
-                    return Ok(());
+                    layer = Some(None);
+                    break;
                 }
                 Kind::Function if ident_is(s, t.inner, t.escaped, b"layer") => {
                     let start = t.span.end;
@@ -811,16 +903,68 @@ impl<'b> Ctx<'_, '_, 'b> {
                         }
                         end = u.span.end;
                     }
-                    if let Some(list) = self.layer_names(Span { start, end })?
-                        && list.names == 1
-                    {
-                        self.register(blk, list.segs.as_slice())?;
-                    }
-                    return Ok(());
+                    layer = Some(Some(Span { start, end }));
+                    break;
                 }
                 _ => {}
             }
         }
+        let Some(name) = layer else { return Ok(()) };
+        // 層のあとの条件
+        let mut cond = blk.cond;
+        let mut rest = lex.next()?;
+        while rest.kind == Kind::Whitespace {
+            rest = lex.next()?;
+        }
+        if rest.kind == Kind::Function && ident_is(s, rest.inner, rest.escaped, b"supports") {
+            let start = rest.span.end;
+            let mut end = start;
+            let mut nest = Nest::new(self.budget);
+            nest.feed(&rest)?;
+            loop {
+                let u = lex.next()?;
+                if u.kind == Kind::Eof || nest.feed(&u)? {
+                    break;
+                }
+                end = u.span.end;
+            }
+            self.seal_ns()?;
+            let ns = self.ns_range();
+            let id = self.conds.len() as u32;
+            self.conds.push(Cond {
+                text: Span { start, end },
+                parent: cond,
+                ns,
+                kind: COND_SUPPORTS_IMPORT,
+                pad: [0; 3],
+            })?;
+            cond = id;
+            rest = lex.next()?;
+        }
+        // 残りは媒体の問いの並び（空なら条件なし）
+        while rest.kind == Kind::Whitespace {
+            rest = lex.next()?;
+        }
+        if rest.kind != Kind::Eof {
+            let media = Span { start: rest.span.start, end: prelude.end };
+            let id = self.conds.len() as u32;
+            self.conds.push(Cond { text: media, parent: cond, ns: self.ns_range(), kind: COND_MEDIA, pad: [0; 3] })?;
+            cond = id;
+        }
+        let at = Block { cond, layer: blk.layer };
+        match name {
+            None => {
+                self.anonymous(at)?;
+            }
+            Some(span) => {
+                if let Some(list) = self.layer_names(span)?
+                    && list.names == 1
+                {
+                    self.register(at, list.segs.as_slice())?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `@font-face {…}` の中の url を読まなかった参照に載せ、塊を閉じまで読む。

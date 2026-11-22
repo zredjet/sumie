@@ -623,6 +623,8 @@ pub fn dtd_parse(data: &[u8]) -> XmlOutcome {
 
 /// 入力を CSS として、決まった文書の `<style>` に入れて読む段の全体に通す（ファズの `css` の対象。確かめることは
 /// [`document_parse`] と同じ）。文書には、型・id・class・言語・名前空間・リンク・空の要素・深い入れ子を置く。
+/// あわせて、入力を規則の並びに読んで文書に照らし、鍵の索引を使う照合と使わない照合が同じ（要素, 規則, 詳細度）の並びを
+/// 返すことを確かめる（ADR-75 (1)。CSS の 3 回目のレビュー）。
 pub fn css_parse(data: &[u8]) -> DocOutcome {
     let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
     let mut doc: MVec<'_, u8> = MVec::new(&budget);
@@ -631,7 +633,62 @@ pub fn css_parse(data: &[u8]) -> DocOutcome {
             return document_parse(&[]);
         }
     }
-    document_parse(doc.as_slice())
+    let mut out = document_parse(doc.as_slice());
+    if out.check == Check::Ok && !index_matches_unindexed(doc.as_slice(), data) {
+        out.check = Check::Violation("鍵の索引の照合が、索引を使わない照合と違う");
+    }
+    out
+}
+
+/// 照合の知らせの並びの要約（数と、順に混ぜた 64 ビット）。
+struct MatchDigest {
+    n: u64,
+    h: u64,
+}
+
+impl MatchDigest {
+    fn mix(&mut self, v: u64) {
+        self.n = self.n.wrapping_add(1);
+        self.h = (self.h ^ v).wrapping_mul(0x0000_0100_0000_01B3).rotate_left(17);
+    }
+}
+
+impl crate::css::matcher::MatchSink for MatchDigest {
+    fn element(&mut self, node: u32) -> Result<(), Error> {
+        self.mix(u64::from(node) | (1 << 40));
+        Ok(())
+    }
+
+    fn rule(&mut self, rule: u32, spec: u32) -> Result<(), Error> {
+        self.mix(u64::from(rule) | (u64::from(spec) << 32));
+        Ok(())
+    }
+}
+
+/// 文書 `svg` に CSS `css` を、索引を使う照合と使わない照合で当て、同じ並びか（読めない・誤りなら真）。
+fn index_matches_unindexed(svg: &[u8], css: &[u8]) -> bool {
+    use crate::css::matcher::{match_rules, match_rules_unindexed};
+    let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let limits = crate::limits::Limits::DEFAULT;
+    let Ok(counts) = crate::xml::count(svg, &limits, &budget, Stage::Parse) else { return true };
+    let Ok(doc) = crate::xml::build(svg, &counts, &limits, &budget, Stage::Parse) else { return true };
+    let mut sb = crate::css::sheet::SheetBuilder::new(&budget);
+    if sb.add(css, None, 0).is_err() {
+        return true;
+    }
+    let Ok(sheet) = sb.finish() else { return true };
+    let mut active: MVec<'_, u8> = MVec::new(&budget);
+    if active.resize_to(sheet.rules.len(), 1).is_err() {
+        return true;
+    }
+    let mut a = MatchDigest { n: 0, h: 0 };
+    let mut b = MatchDigest { n: 0, h: 0 };
+    let ra = match_rules(&doc, svg, &sheet, active.as_slice(), &budget, &mut a);
+    let rb = match_rules_unindexed(&doc, svg, &sheet, active.as_slice(), &budget, &mut b);
+    match (ra, rb) {
+        (Ok(()), Ok(())) => a.n == b.n && a.h == b.h,
+        _ => true,
+    }
 }
 
 /// [`css_parse`] の文書の頭（CSS の前）。

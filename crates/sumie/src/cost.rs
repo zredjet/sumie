@@ -73,6 +73,12 @@ pub(crate) const fn shift(moved: u64, size: u64) -> u64 {
     copy(moved.saturating_mul(size)).saturating_add(1)
 }
 
+/// CSS の名前の escape を解きながら読む手間（`chars` 字。1 字は生のバイトで 9 まで：`\\`・16 進 6 桁・空白（`\\r\\n`）。
+/// 生のバイトの 1 バイト 1 単位の上限で払う。CSS の 3 回目のレビューで、escape の多い名前の比べの払い不足を指摘された）。
+pub(crate) const fn decode(chars: u64) -> u64 {
+    chars.saturating_mul(9)
+}
+
 /// 入力のバイトを読む手間（XML の字句・展開。1 バイト 1 単位。architecture.md §5.2）。
 pub(crate) const fn scan(bytes: u64) -> u64 {
     bytes

@@ -108,6 +108,19 @@ fn cases(scale: usize) -> Vec<(&'static str, Vec<u8>)> {
             &format!("<defs>{pats}</defs>{}{}{}", "<g>".repeat(60), "<rect/>".repeat(n(5_000)), "</g>".repeat(60)),
         )
     }));
+    // CSS の 3 回目のレビューの形
+    out.push(("escape の多い @namespace の接頭辞", {
+        let p = "\\70".repeat(n(2_000_000));
+        doc(&format!("<![CDATA[@namespace {p}q url(urn:x); {p}q|rect{{fill:red}}]]>"), "<rect/>")
+    }));
+    out.push((
+        "当たる選択子の多い規則 × 要素",
+        doc(&format!("{}{{fill:red}}", vec!["rect"; n(200_000)].join(",")), &"<rect/>".repeat(20)),
+    ));
+    out.push((
+        "@media not の問いの並び",
+        doc(&format!("@media {} {{rect{{fill:red}}}}", vec!["not a"; n(20_000)].join(", ")), "<rect/>"),
+    ));
     out.push(("深い入れ子", format!("{SVG}{}{}</svg>", "<g>".repeat(1000), "</g>".repeat(1000)).into_bytes()));
     out.push(("参照の多い文書（use の鎖）", {
         let mut body = String::from("<defs><rect id=\"r0\"/>");

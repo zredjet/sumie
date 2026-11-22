@@ -205,6 +205,9 @@ impl<'b> Tables<'b> {
     }
 }
 
+/// `:lang()` の範囲の区切り（[`lang_ranges`]）。
+pub(crate) const LANG_SEP: u8 = 0;
+
 /// 符号位置を UTF-8 にする（ほかの css の部品も使う）。
 pub(crate) fn utf8_pub(c: u32) -> ([u8; 4], usize) {
     utf8(c)
@@ -274,18 +277,21 @@ impl NsTable<'_> {
 
 use core::cmp::Ordering::Less;
 
-/// 名前 `a`（UTF-8）と字句 `t` の中身（escape を解いたもの）を比べる。解く符号位置は塊ずつ払う。
+/// 名前 `a`（UTF-8）と字句 `t` の中身（escape を解いたもの）を比べる。解く符号位置は 64 字の塊ごとに、解く前に払う
+/// （1 字は生のバイトで 9 まで。`cost::decode`）。
 fn cmp_name(budget: &Budget<'_>, a: &[u8], s: &[u8], t: &Token) -> Result<core::cmp::Ordering, Error> {
     if !t.escaped {
         return bytes_cmp(budget, a, t.inner.of(s));
     }
     let mut k = 0usize;
     let mut n = 0u32;
-    for c in decode(s, t.inner) {
-        n = n.wrapping_add(1);
+    let mut it = decode(s, t.inner);
+    loop {
         if n.trailing_zeros() >= 6 {
-            budget.spend(cost::copy(64).saturating_add(1))?;
+            budget.spend(cost::decode(64).saturating_add(1))?;
         }
+        n = n.wrapping_add(1);
+        let Some(c) = it.next() else { break };
         let (buf, len) = utf8(c);
         let part = buf.get(..len).unwrap_or(&[]);
         let w = a.get(k..k.saturating_add(len).min(a.len())).unwrap_or(&[]);
@@ -347,6 +353,8 @@ const PE_BEFORE_AFTER: u8 = 1;
 const PE_PART: u8 = 2;
 /// ほかの擬似要素（利用者の動きの擬似クラス）
 const PE_OTHER: u8 = 3;
+/// `::selection`（利用者の動きの擬似クラスと `:window-inactive`）
+const PE_SELECTION: u8 = 4;
 
 /// 入れ子の並び（規則の並び・`:is()`・`:where()`・`:not()`・`:has()`・`of S`）を読んでいる所。
 #[repr(C)]
@@ -390,6 +398,10 @@ struct Frame {
     broken: bool,
     /// この並びの中の、開いているかっこの数（並びの終わりの `,`・`)` を見分ける）
     base: u32,
+    /// 擬似要素のあとに開いた論理の擬似クラスの並び（中は、その擬似要素のあとに書ける擬似クラスだけ。PE_*）
+    outer_pe: u8,
+    /// `:-webkit-any()`（寛容でない複合の並び。詳細度は擬似クラス 1 つ。Chrome と同じ）
+    webkit_any: bool,
 }
 
 impl Frame {
@@ -418,7 +430,14 @@ impl Frame {
             pe: PE_NONE,
             broken: false,
             base: 0,
+            outer_pe: PE_NONE,
+            webkit_any: false,
         }
+    }
+
+    /// 書けるものを決める擬似要素（読んだ擬似要素か、この並びを開いた外の擬似要素）。
+    fn pe_ctx(&self) -> u8 {
+        if self.pe != PE_NONE { self.pe } else { self.outer_pe }
     }
 
     /// 開いているかっこの数が `base` の所から始まる並び。
@@ -633,8 +652,19 @@ fn close_list(f: &Frame, t: &mut Tables<'_>, p: Option<&mut Frame>) -> R<()> {
     if f.any_unsupported {
         p.unsupported = true;
     }
-    let add = if f.zero || f.opaque { Spec::default() } else { f.max_spec };
-    add_simple(p, t, simple, false)?;
+    if f.webkit_any && f.count == 0 {
+        p.broken = true;
+        return Ok(());
+    }
+    let add = if f.zero || f.opaque {
+        Spec::default()
+    } else if f.webkit_any {
+        Spec { a: 0, b: 1, c: 0 }
+    } else {
+        f.max_spec
+    };
+    // 擬似要素のあとの論理の擬似クラスは、中を確かめてある
+    add_simple(p, t, simple, f.outer_pe != PE_NONE)?;
     p.spec = p.spec.add(add);
     Ok(())
 }
@@ -713,7 +743,7 @@ fn push_compound(f: &mut Frame, t: &mut Tables<'_>, implied: u8) -> R<u32> {
 
 /// 単純な選択子を複合に足す（擬似要素のあとは `after_pe` のものだけ）。
 fn add_simple(f: &mut Frame, t: &mut Tables<'_>, s: Simple, after_pe: bool) -> R<()> {
-    if f.pe != PE_NONE && !after_pe {
+    if f.pe_ctx() != PE_NONE && !after_pe {
         return Err(invalid());
     }
     let id = t.push_simple(s)?;
@@ -760,8 +790,8 @@ fn step(
             cur.next()?;
             cur.skip_ws()?;
         }
-        if f.pe != PE_NONE {
-            // 擬似要素のあとに結合子は書けない
+        if f.pe_ctx() != PE_NONE || f.webkit_any {
+            // 擬似要素のあと（とその論理の擬似クラスの中）と `:-webkit-any()` の中に結合子は書けない
             return Err(invalid());
         }
         if f.compound_empty {
@@ -967,6 +997,8 @@ fn pseudo(
             PE_BEFORE_AFTER
         } else if n.kind == Kind::Function && is(b"part") {
             PE_PART
+        } else if n.kind == Kind::Ident && is(b"selection") {
+            PE_SELECTION
         } else {
             PE_OTHER
         };
@@ -999,12 +1031,19 @@ fn pseudo(
                 S_UNIVERSAL
             } else if any(DYNAMIC) {
                 S_NEVER
+            } else if is(b"window-inactive") && f.pe_ctx() == PE_SELECTION {
+                // `::selection` のあとだけに書ける
+                S_NEVER
             } else {
                 return Err(invalid());
             };
-            // 擬似要素のあと：利用者の動きの擬似クラス（`::part()` のあとは構造でない擬似クラス）だけ
-            let after_pe = any(USER_ACTION) || (f.pe == PE_PART && kind == S_NEVER);
-            if f.pe != PE_NONE && !after_pe {
+            // 擬似要素のあと：利用者の動きの擬似クラス（`::part()` のあとは構造でない擬似クラス、`::selection` のあとは
+            // `:window-inactive` も）だけ
+            let pe = f.pe_ctx();
+            let after_pe = any(USER_ACTION)
+                || (pe == PE_PART && matches!(kind, S_NEVER | S_LINK | S_UNIVERSAL))
+                || (pe == PE_SELECTION && is(b"window-inactive"));
+            if pe != PE_NONE && !after_pe {
                 return Err(invalid());
             }
             f.spec.b = f.spec.b.saturating_add(1);
@@ -1013,20 +1052,28 @@ fn pseudo(
             add_simple(f, t, x, true)
         }
         Kind::Function => {
-            if f.pe != PE_NONE {
+            let pe = f.pe_ctx();
+            // 擬似要素のあとに書ける関数は論理の擬似クラスだけ（中もそのあとに書ける擬似クラスだけ。Selectors 4 §3.6.3）
+            if pe != PE_NONE && !(is(b"not") || is(b"is") || is(b"where")) {
                 cur.skip_function()?;
                 return Err(invalid());
             }
             if is(b"not") || is(b"is") || is(b"where") || is(b"-webkit-any") {
+                let webkit_any = is(b"-webkit-any");
                 let (kind, forgiving, zero) = if is(b"not") {
                     (S_NOT, false, false)
                 } else if is(b"where") {
                     (S_IS, true, true)
+                } else if webkit_any {
+                    (S_IS, false, false)
                 } else {
                     (S_IS, true, false)
                 };
                 // 入れ子の並びを始める（外の複合の状態 `f` は、呼び手が外の段に書き戻す）
-                frames.push(Frame::new(kind, false, forgiving, zero, f.in_has).at(cur.depth()))?;
+                let mut g = Frame::new(kind, false, forgiving, zero, f.in_has).at(cur.depth());
+                g.outer_pe = pe;
+                g.webkit_any = webkit_any;
+                frames.push(g)?;
                 cur.skip_ws()?;
                 return Ok(());
             }
@@ -1236,11 +1283,12 @@ struct NForm {
 fn n_form(s: &[u8], span: Span, allow_neg: bool, budget: &Budget<'_>) -> Result<Option<NForm>, Error> {
     let mut it = decode(s, span);
     let mut paid = 0u32;
+    // 64 字の塊ごとに、解く前に払う（1 字は生のバイトで 9 まで）
     let mut next = |budget: &Budget<'_>| -> Result<Option<u32>, Error> {
-        paid = paid.wrapping_add(1);
         if paid.trailing_zeros() >= 6 {
-            budget.spend(cost::scan(64))?;
+            budget.spend(cost::decode(64))?;
         }
+        paid = paid.wrapping_add(1);
         Ok(it.next())
     };
     budget.spend(cost::OP_STEP)?;
@@ -1373,7 +1421,9 @@ fn clamp_i32(v: i64) -> i32 {
     i32::try_from(v).unwrap_or(if v < 0 { i32::MIN } else { i32::MAX })
 }
 
-/// `:lang()` の言語の範囲（ident か文字列を `,` で区切ったもの）を、小文字にして `,` でつないで名前の置き場に足す。
+/// `:lang()` の言語の範囲（ident か文字列を `,` で区切ったもの）を、小文字にして NUL でつないで名前の置き場に足す
+/// （解いた名前と文字列に NUL は現れない：CSS Syntax の前処理と escape の `\0` は U+FFFD。文字列の範囲の中の `,` で
+/// 範囲を分けない）。
 fn lang_ranges(s: &[u8], arg: Span, t: &mut Tables<'_>) -> R<Span> {
     let budget = t.names.budget();
     let mut lex = Lexer::over(s, arg, budget);
@@ -1387,7 +1437,7 @@ fn lang_ranges(s: &[u8], arg: Span, t: &mut Tables<'_>) -> R<Span> {
             Kind::Eof => break,
             Kind::Ident | Kind::Str if want_item => {
                 if any {
-                    t.names.push(b',')?;
+                    t.names.push(LANG_SEP)?;
                 }
                 if tok.kind == Kind::Ident {
                     t.push_name(decode(s, tok.inner), true)?;

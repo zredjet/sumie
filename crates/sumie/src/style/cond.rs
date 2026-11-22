@@ -150,6 +150,18 @@ impl<'s, 'b> Cur<'s, 'b> {
         }
     }
 
+    /// 読んだ開きの字句 `open` の閉じまで読み飛ばす（閉じないまま終われば終わりまで）。
+    fn skip_to_close(&mut self, open: &Token) -> Result<(), Error> {
+        let mut nest = Nest::new(self.lex.budget());
+        nest.feed(open)?;
+        loop {
+            let t = self.next()?;
+            if t.kind == Kind::Eof || nest.feed(&t)? {
+                return Ok(());
+            }
+        }
+    }
+
     /// 開いたままの `depth` 個のかっこを閉じるまで読み飛ばす（壊れた条件の残り。中の `,` で次の問いを始めない）。
     fn close_open(&mut self, depth: usize) -> Result<(), Error> {
         let mut need = depth;
@@ -415,6 +427,11 @@ pub(crate) fn media(s: &[u8], range: Span, env: &Env, budget: &Budget<'_>) -> Re
                 Kind::LParen | Kind::Function => {
                     c.next()?;
                     c.skip_parens()?;
+                }
+                // `[…]`・`{…}` の中の `,` でも次の問いを始めない（Chrome と同じ）
+                Kind::LBracket | Kind::LBrace => {
+                    let open = c.next()?;
+                    c.skip_to_close(&open)?;
                 }
                 _ => {
                     c.next()?;
@@ -831,6 +848,11 @@ pub(crate) fn supports(s: &[u8], range: Span, ns: NsTable<'_>, budget: &Budget<'
     let mut leaf = |cur: &mut Cur<'_, '_>, inner: Span| declaration_leaf(cur.s, inner, budget);
     let mode = Mode { ns, stop_at_comma: false, without_or: false, general: Tri::False };
     Ok(condition(&mut c, budget, &mut leaf, mode)? == Tri::True)
+}
+
+/// `@import` の `supports(…)` の中身（`<supports-condition>` か 1 つの宣言）が真か（CSS Cascade 5 §2.1）。
+pub(crate) fn supports_import(s: &[u8], range: Span, ns: NsTable<'_>, budget: &Budget<'_>) -> Result<bool, Error> {
+    Ok(supports(s, range, ns, budget)? || declaration_leaf(s, range, budget_ref(budget))? == Tri::True)
 }
 
 /// `(名前: 値 [!important])` が sumie の読める宣言か（名前の escape を解く。宣言でない形は偽）。

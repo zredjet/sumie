@@ -14,11 +14,11 @@ use crate::css::decl::{Decl, Item, parse_declarations};
 use crate::css::lex::{Lexer, decode};
 use crate::css::matcher::{MatchSink, match_rules};
 use crate::css::select::NONE;
-use crate::css::sheet::{COND_MEDIA, Sheet};
+use crate::css::sheet::{COND_MEDIA, COND_SUPPORTS_IMPORT, Sheet};
 use crate::error::Error;
 use crate::mem::{Frozen, MVec, Plain, stable_sort};
 use crate::report::WarningKind;
-use crate::style::cond::{Env, media, supports};
+use crate::style::cond::{Env, media, supports, supports_import};
 use crate::style::props::{PROPS, PropertyId, lookup, prop};
 use crate::style::valid::{Ctx, Wide, font_parts, valid, wide};
 use crate::xml::lex::Span;
@@ -232,10 +232,10 @@ pub(crate) fn cascade(
         budget.spend(cost::OP_STEP)?;
         let outer = c.parent == NONE || cond_ok.get(c.parent as usize).copied() == Some(1);
         let ok = outer
-            && if c.kind == COND_MEDIA {
-                media(text, c.text, env, budget)?
-            } else {
-                supports(text, c.text, sheet.ns_table(c), budget)?
+            && match c.kind {
+                COND_MEDIA => media(text, c.text, env, budget)?,
+                COND_SUPPORTS_IMPORT => supports_import(text, c.text, sheet.ns_table(c), budget)?,
+                _ => supports(text, c.text, sheet.ns_table(c), budget)?,
             };
         cond_ok.push(u8::from(ok))?;
     }

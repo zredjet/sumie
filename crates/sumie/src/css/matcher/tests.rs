@@ -266,3 +266,200 @@ fn many_compounds_pay_in_chunks() {
     let out = run("<svg xmlns=\"http://www.w3.org/2000/svg\"><a/></svg>", &css);
     assert!(hits(&out, 0).is_empty());
 }
+
+/// 種つきの xorshift（試験の入力を作るだけ）。
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
+        xs[self.below(xs.len() as u64) as usize]
+    }
+}
+
+/// 要素ごとの（規則, 詳細度）。
+struct Pairs {
+    out: Vec<(u32, Vec<(u32, u32)>)>,
+}
+
+impl MatchSink for Pairs {
+    fn element(&mut self, node: u32) -> Result<(), Error> {
+        self.out.push((node, Vec::new()));
+        Ok(())
+    }
+
+    fn rule(&mut self, rule: u32, spec: u32) -> Result<(), Error> {
+        self.out.last_mut().unwrap().1.push((rule, spec));
+        Ok(())
+    }
+}
+
+const GEN_NAMES: &[&str] = &["g", "rect", "circle", "a", "path", "x:foo", "x:rect", "text"];
+const GEN_IDS: &[&str] = &["i0", "i1", "i2", "I0", "a"];
+const GEN_CLASSES: &[&str] = &["a", "b", "c", "d", "A", "rect"];
+
+fn gen_doc(r: &mut Rng) -> String {
+    let mut s = String::from(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:x=\"urn:x\" xmlns:xl=\"http://www.w3.org/1999/xlink\"",
+    );
+    if r.below(2) == 0 {
+        s.push_str(" xml:lang=\"en-US\"");
+    }
+    s.push('>');
+    let mut stack: Vec<&str> = Vec::new();
+    for _ in 0..5 + r.below(40) {
+        if r.below(10) < 3
+            && let Some(t) = stack.pop()
+        {
+            s.push_str(&format!("</{t}>"));
+            continue;
+        }
+        let name = r.pick(GEN_NAMES);
+        s.push_str(&format!("<{name}"));
+        if r.below(3) == 0 {
+            s.push_str(&format!(" id=\"{}\"", r.pick(GEN_IDS)));
+        }
+        if r.below(2) == 0 {
+            let toks: Vec<&str> = (0..r.below(4)).map(|_| r.pick(GEN_CLASSES)).collect();
+            let sep = if r.below(4) == 0 { "\t" } else { " " };
+            s.push_str(&format!(" class=\"{}{}\"", if r.below(3) == 0 { " " } else { "" }, toks.join(sep)));
+        }
+        if r.below(4) == 0 {
+            s.push_str(" data-k=\"foo-bar\"");
+        }
+        if r.below(5) == 0 {
+            s.push_str(" xl:href=\"#i0\"");
+        }
+        if r.below(6) == 0 {
+            s.push_str(&format!(" lang=\"{}\"", r.pick(&["fr", "en", "de-CH", ""])));
+        }
+        if r.below(2) == 0 {
+            s.push_str("/>");
+        } else {
+            s.push('>');
+            if r.below(4) == 0 {
+                s.push(' ');
+            }
+            stack.push(name);
+        }
+    }
+    while let Some(t) = stack.pop() {
+        s.push_str(&format!("</{t}>"));
+    }
+    s.push_str("</svg>");
+    s
+}
+
+fn gen_compound(r: &mut Rng, depth: u32) -> String {
+    let mut s = String::new();
+    match r.below(6) {
+        0 => s.push_str(r.pick(&["g", "rect", "circle", "a", "path", "foo", "svg", "text"])),
+        1 => s.push('*'),
+        2 => s.push_str(r.pick(&["x|foo", "x|rect", "*|rect", "|rect", "*|*", "x|*"])),
+        _ => {}
+    }
+    let k = r.below(3) + u64::from(s.is_empty());
+    for _ in 0..k {
+        let simple = match r.below(16) {
+            0 => format!("#{}", r.pick(GEN_IDS)),
+            3 => r
+                .pick(&[
+                    "[data-k]",
+                    "[data-k|=foo]",
+                    "[class~=b]",
+                    "[id^=i]",
+                    "[class*=\"a b\"]",
+                    "[xl|href]",
+                    "[href]",
+                ])
+                .to_string(),
+            4 => r.pick(&[":first-child", ":last-child", ":only-child", ":first-of-type", ":last-of-type"]).to_string(),
+            5 => {
+                r.pick(&[":nth-child(2n+1)", ":nth-child(-n+2)", ":nth-of-type(2)", ":nth-last-child(odd)"]).to_string()
+            }
+            6 => r.pick(&[":root", ":empty", ":link", ":hover", ":lang(en)", ":lang(fr)", ":scope"]).to_string(),
+            7 | 8 if depth < 3 => format!(":not({})", gen_list(r, depth + 1)),
+            9 | 10 if depth < 3 => format!(":is({})", gen_list(r, depth + 1)),
+            11 if depth < 3 => format!(":where({})", gen_list(r, depth + 1)),
+            12 => r.pick(&[".a\\ b", "[class~=\"\"]", ".\\61", "#\\69 0"]).to_string(),
+            _ => format!(".{}", r.pick(GEN_CLASSES)),
+        };
+        s.push_str(&simple);
+    }
+    s
+}
+
+fn gen_list(r: &mut Rng, depth: u32) -> String {
+    let n = 1 + r.below(2);
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let mut s = gen_compound(r, depth);
+        for _ in 0..r.below(3) {
+            s.push_str(r.pick(&[" ", " > ", " + ", " ~ "]));
+            s.push_str(&gen_compound(r, depth));
+        }
+        out.push(s);
+    }
+    out.join(", ")
+}
+
+fn gen_css(r: &mut Rng) -> String {
+    let mut s = String::from("@namespace x url(urn:x); @namespace xl url(http://www.w3.org/1999/xlink); ");
+    if r.below(4) == 0 {
+        s.push_str("@namespace url(http://www.w3.org/2000/svg); ");
+    }
+    for _ in 0..1 + r.below(12) {
+        s.push_str(&gen_list(r, 0));
+        s.push_str(" {fill:red}\n");
+    }
+    s
+}
+
+fn pairs(svg: &str, css: &str, index: bool) -> Vec<(u32, Vec<(u32, u32)>)> {
+    let input = svg.as_bytes();
+    let b = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let counts = crate::xml::count(input, &Limits::DEFAULT, &b, Stage::Parse).unwrap();
+    let doc = crate::xml::build(input, &counts, &Limits::DEFAULT, &b, Stage::Parse).unwrap();
+    let mut sb = SheetBuilder::new(&b);
+    sb.add(css.as_bytes(), None, 0).unwrap();
+    let sheet = sb.finish().unwrap();
+    let active = vec![1u8; sheet.rules.len()];
+    let mut c = Pairs { out: Vec::new() };
+    if index {
+        match_rules(&doc, input, &sheet, &active, &b, &mut c).unwrap();
+    } else {
+        match_rules_unindexed(&doc, input, &sheet, &active, &b, &mut c).unwrap();
+    }
+    c.out
+}
+
+/// 鍵の索引（ADR-75 (1)）は、索引を使わない照らし方と同じ（規則, 詳細度）を要素ごとに返す（CSS の 3 回目のレビュー）。
+#[test]
+fn index_matches_like_unindexed() {
+    let mut r = Rng(0x1234_5678_9abc_def1);
+    let mut hits = 0usize;
+    // ファズの `css` の対象も同じ照らしをする（ここは決まった 3,000 件）
+    let cases = 3_000;
+    for case in 0..cases {
+        let svg = gen_doc(&mut r);
+        let css = gen_css(&mut r);
+        let a = pairs(&svg, &css, true);
+        let b = pairs(&svg, &css, false);
+        hits += b.iter().map(|x| x.1.len()).sum::<usize>();
+        assert_eq!(a, b, "{case} 件目\nsvg: {svg}\ncss: {css}");
+    }
+    // 当たる件が十分にある（試験が当たりの道を通る）
+    assert!(hits > cases, "{hits}");
+}

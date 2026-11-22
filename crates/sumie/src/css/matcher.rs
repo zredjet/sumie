@@ -14,7 +14,7 @@
 //! 兄弟の数の表（使うときだけ）。
 //!
 //! 要素の名前空間は種類（SVG・XLink・XML・なし・そのほか）だけを持つので、`@namespace` の「そのほか」の URI は区別しない
-//! （ADR-66 (1)）。どの名前空間の要素も兄弟と親子に数える（照らしの `first-child-foreign`・`adjacent-foreign` と同じ）。
+//! （XML の側は ADR-65。CSS での帰結：`@namespace a "urn:a"; a|*` は urn:b の要素にも当たる。ADR-77 (3)）。どの名前空間の要素も兄弟と親子に数える（照らしの `first-child-foreign`・`adjacent-foreign` と同じ）。
 
 use crate::budget::Budget;
 use crate::cost;
@@ -118,13 +118,14 @@ fn elem_info(
                 (NS_NONE, b"id") if e.id == NONE => e.id = k,
                 (NS_NONE, b"class") if e.class == NONE => e.class = k,
                 (NS_XML, b"lang") if xml_lang == NONE => xml_lang = k,
-                (NS_NONE, b"lang") if plain_lang == NONE => plain_lang = k,
+                // 名前空間のない lang は SVG の要素のもの（SVG 2 §5.10。HTML と同じく、ほかの名前空間の要素は xml:lang だけ）
+                (NS_NONE, b"lang") if plain_lang == NONE && n.ns == NS_SVG => plain_lang = k,
                 (NS_NONE | NS_XLINK, b"href") => href = true,
                 _ => {}
             }
         }
     }
-    // 言語：xml:lang、なければ名前空間のない lang、なければ親から
+    // 言語：xml:lang、なければ（SVG の要素の）名前空間のない lang、なければ親から
     e.lang = if xml_lang != NONE {
         xml_lang
     } else if plain_lang != NONE {
@@ -318,6 +319,31 @@ pub(crate) fn match_rules(
     budget: &Budget<'_>,
     sink: &mut dyn MatchSink,
 ) -> Result<(), Error> {
+    match_rules_with(doc, input, sheet, active, budget, sink, true)
+}
+
+/// 索引を使わずに照合する（すべての複合を鍵のないものとして要素ごとに照らす。索引の取りこぼしと当てすぎを見張る
+/// 照らしの相手。試験とファズの `css` の対象が使う）。
+pub(crate) fn match_rules_unindexed(
+    doc: &XmlDoc,
+    input: &[u8],
+    sheet: &Sheet,
+    active: &[u8],
+    budget: &Budget<'_>,
+    sink: &mut dyn MatchSink,
+) -> Result<(), Error> {
+    match_rules_with(doc, input, sheet, active, budget, sink, false)
+}
+
+fn match_rules_with(
+    doc: &XmlDoc,
+    input: &[u8],
+    sheet: &Sheet,
+    active: &[u8],
+    budget: &Budget<'_>,
+    sink: &mut dyn MatchSink,
+    index: bool,
+) -> Result<(), Error> {
     let budget = budget_ref(budget);
     if sheet.rules.is_empty() {
         // 規則がなければ要素だけを知らせる
@@ -366,6 +392,10 @@ pub(crate) fn match_rules(
             }
             sp = x.next;
         }
+        if !index {
+            keyless.push(k as u32)?;
+            continue;
+        }
         if dead {
             continue;
         }
@@ -400,6 +430,20 @@ pub(crate) fn match_rules(
         }
     }
     stable_sort(budget, subjects.as_mut_slice(), |a, b| a.compound < b.compound)?;
+    // 複合ごとの subjects の始まり（当たるたびに 2 分で探さない。CSS の 3 回目のレビュー）
+    let mut subj_start: MVec<'_, u32> = MVec::with_capacity(budget, ncomp.saturating_add(1))?;
+    {
+        let list = subjects.as_slice();
+        let mut j = 0usize;
+        for k in 0..=ncomp {
+            budget.spend(cost::OP_STEP)?;
+            while list.get(j).is_some_and(|x| (x.compound as usize) < k) {
+                budget.spend(1)?;
+                j = j.saturating_add(1);
+            }
+            subj_start.push(j as u32)?;
+        }
+    }
     // 深さの上限（行きがけの順に親の深さを積む）
     let mut max_depth = 0usize;
     {
@@ -582,13 +626,10 @@ pub(crate) fn match_rules(
             if !bit(nm, 0, k as usize) {
                 continue;
             }
-            let list = subjects.as_slice();
-            let lo = lower_bound_try(budget, list, |x| Ok(x.compound < k))?;
-            for x in list.get(lo..).unwrap_or(&[]) {
+            let lo = subj_start.get(k as usize).copied().unwrap_or(0) as usize;
+            let hi = subj_start.get((k as usize).saturating_add(1)).copied().unwrap_or(0) as usize;
+            for x in subjects.as_slice().get(lo..hi).unwrap_or(&[]) {
                 budget.spend(cost::OP_STEP)?;
-                if x.compound != k {
-                    break;
-                }
                 hits.push(Hit { rule: x.rule, spec: x.spec })?;
             }
         }
@@ -812,7 +853,7 @@ fn nth(a: i32, b: i32, i: u32) -> bool {
     diff.checked_rem(a) == Some(0) && diff.checked_div(a).is_some_and(|q| q >= 0)
 }
 
-/// 言語 `lang` が `,` で区切った範囲（小文字）のどれかに当たるか（RFC 4647 §3.3.2 の拡張の照らし：範囲の頭の部分が `*` か
+/// 言語 `lang` が NUL で区切った範囲（小文字。`LANG_SEP`）のどれかに当たるか（RFC 4647 §3.3.2 の拡張の照らし：範囲の頭の部分が `*` か
 /// 言語の頭と同じで、範囲の残りの部分がそれぞれ、言語のあとの部分に順に現れる。1 文字の部分（`x` など）は飛び越えない。
 /// 大文字小文字を問わない）。範囲のバイトは塊ずつ払って読み、比べるバイトも払う。
 fn lang_in_ranges(budget: &Budget<'_>, lang: &[u8], ranges: &[u8]) -> Result<bool, Error> {
@@ -820,7 +861,7 @@ fn lang_in_ranges(budget: &Budget<'_>, lang: &[u8], ranges: &[u8]) -> Result<boo
     let mut start = 0usize;
     for i in 0..=ranges.len() {
         meter.pay(budget, i)?;
-        if ranges.get(i).is_some_and(|&c| c != b',') {
+        if ranges.get(i).is_some_and(|&c| c != crate::css::select::LANG_SEP) {
             continue;
         }
         let r = ranges.get(start..i).unwrap_or(&[]);

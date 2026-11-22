@@ -9,7 +9,7 @@ architecture.md §9）。種は `seeds/<対象>/`（コミットする）、育�
 | `math_ops` | math の max・min・clamp・powi の性質と、超越関数が panic しないこと | `sumie::fuzzing::math_ops` |
 | `xml` | XML の段（数える段と作る段）。作る段が数える段の見積もりを超えないこと・1 回の払いが中止の間隔を超えないこと・節の鎖と属性の範囲 | `sumie::fuzzing::xml_parse` |
 | `dtd` | 入力を DTD の内部のサブセットにして、実体を本文と属性から参照する文書を `xml` と同じに確かめる（頭の 1 バイトが参照する実体の名前。英小文字ならそのまま） | `sumie::fuzzing::dtd_parse` |
-| `css` | 入力を CSS として、決まった文書（型・id・class・言語・名前空間・リンク・空の要素・深い入れ子）の `<style>` に入れ、`document` と同じに確かめる | `sumie::fuzzing::css_parse` |
+| `css` | 入力を CSS として、決まった文書（型・id・class・言語・名前空間・リンク・空の要素・深い入れ子）の `<style>` に入れ、`document` と同じに確かめる。あわせて鍵の索引の照合が索引を使わない照合と同じ並びを返すか（ADR-77 (2)） | `sumie::fuzzing::css_parse` |
 | `values` | 値の読みの口（style の値の確かめ・values の色・塗り・長さ・変形・viewBox・preserveAspectRatio・`font`・`@media`・`@supports`）。頭の 1 バイトでプロパティと属性かを選ぶ。1 回の払い・同じ入力で同じ結果・手間が長さにおおよそ比例すること | `sumie::fuzzing::values_parse` |
 | `document` | 読む段の全体（公開の `estimate_parse`・`parse`）。2 つの誤りが同じ（D2）・見積もりが通れば読める・持ち続ける量が見積もりと同じ・数える段と本体の勘定（1 回の払い・返しすぎ）・全体の手間と山 ≤ 見積もり・上限を見積もりのちょうどにすれば読め、1 少なければ同じ `Limit` | `sumie::fuzzing::document_parse` |
 

@@ -172,7 +172,7 @@ fn layers_rank() {
 fn namespaces_and_other_at_rules() {
     let sh = sheet(&[
         (
-            "@charset \"utf-8\"; @import url(a.css); @namespace svg url(http://www.w3.org/2000/svg); svg|rect {} @namespace x \"urn:x\"; x|g {} @font-face { src: url(f.woff), url(\"g.ttf\") } @keyframes k { from {} } line {}",
+            "@charset \"utf-8\"; @import url(a.css); @namespace svg url(http://www.w3.org/2000/svg); svg|rect {} @namespace x \"urn:x\"; x|g {} @font-face { src: url(data:font/woff2;base64,AAAA), url( DATA:x), url(f.woff), url(\"g.ttf\"), url(\"\") } @keyframes k { from {} } line {}",
             None,
         ),
         // `@namespace` は `<style>` ごと
@@ -189,6 +189,7 @@ fn namespaces_and_other_at_rules() {
         .filter(|n| n.unread != 0)
         .map(|n| String::from_utf8_lossy(n.href.of(text)).to_string())
         .collect();
+    // 空と `data:` は外を指さないので載せない（中身を写さない。CSS の 3 回目のレビュー）
     assert_eq!(unread, ["a.css", "f.woff", "g.ttf"]);
     assert!(
         sh.notes
@@ -326,4 +327,19 @@ fn layer_statements_and_many_namespaces() {
     let sh = b.finish().unwrap();
     assert_eq!(sh.rules.len(), 1);
     assert!(budget.work() < 100_000_000, "{}", budget.work());
+}
+
+/// 同じ接頭辞の `@namespace` を何度も書いても、読む段の容量（数える段の山）で伸び直さない（CSS の 3 回目のレビュー）。
+#[test]
+fn namespace_counts_cover_the_peak() {
+    let css: String = (0..50).map(|i| format!("@namespace p url(urn:{i}); ")).collect();
+    let b = Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never);
+    let mut sb = SheetBuilder::new(&b);
+    sb.add(css.as_bytes(), None, 0).unwrap();
+    let c = sb.counts();
+    assert!(c.ns >= 50, "{}", c.ns);
+    let mut sb = SheetBuilder::with_counts(&b, &c).unwrap();
+    sb.add(css.as_bytes(), None, 0).unwrap();
+    let sh = sb.finish().unwrap();
+    assert_eq!(sh.ns.len(), 1);
 }

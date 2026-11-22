@@ -1,0 +1,5 @@
+@namespace x url(urn:x);
+#g.a.b > rect.c, .a :is(#r, .c, x|q) ~ circle:not(.d, #q) {fill:red}
+g.a:not(:is(.b, #nope)) rect[class~=c] {stroke:blue}
+:is(g, a) > :where(.c, #q, x|q):first-child, *|*.a .b {opacity:.5}
+rect:is(.c):not(#g *), .\61 , #\72 {fill:green}

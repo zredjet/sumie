@@ -165,7 +165,7 @@ fn pseudo_classes_and_an_b() {
     for bad in [":nth-child(2 n)", ":nth-child(+ 2n)", ":nth-child(n++1)", ":nth-child()", ":nth-of-type(n of a)"] {
         assert_eq!(parse(bad), None, "{bad}");
     }
-    assert_eq!(parse(":lang(EN, \"fr-CA\")").unwrap(), format!(":lang(en,fr-ca)@{}", sp(0, 1, 0)));
+    assert_eq!(parse(":lang(EN, \"fr-CA\")").unwrap(), format!(":lang(en\0fr-ca)@{}", sp(0, 1, 0)));
     assert_eq!(parse("a:link:hover").unwrap(), format!("a:link:never@{}", sp(0, 2, 1)));
     assert_eq!(parse("rect::before").unwrap(), format!("rect:never@{}", sp(0, 0, 2)));
     assert_eq!(parse_full("rect:has(> g), g", &[]), Some((format!("g@{}", sp(0, 0, 1)), true)));
@@ -374,5 +374,42 @@ fn forgiving_recovery_skips_open_brackets() {
     for src in [":is(x(y), rect)", ":is((a), rect)", ":is([a=b(c)], rect)", ":is(:not(x(y)), rect)", ":is(:(a), rect)"]
     {
         assert_eq!(parse(src).unwrap(), ":is(rect@1)@1", "{src}");
+    }
+}
+
+/// CSS の 3 回目のレビュー：`:-webkit-any()`（寛容でない複合の並び・詳細度は擬似クラス 1 つ）と、擬似要素のあとの擬似クラス
+/// （Chrome と同じ）。
+#[test]
+fn webkit_any_and_pseudo_classes_after_pseudo_elements() {
+    assert_eq!(
+        parse("rect:-webkit-any(.a, #b)").unwrap(),
+        format!("rect:is(.a@{}, #b@{})@{}", sp(0, 1, 0), sp(1, 0, 0), sp(0, 1, 1))
+    );
+    for bad in
+        [":-webkit-any(a b)", ":-webkit-any()", ":-webkit-any(a, b c)", ":-webkit-any(a > b)", ":-webkit-any(%, a)"]
+    {
+        assert_eq!(parse(bad), None, "{bad}");
+    }
+    // 擬似要素のあとの論理の擬似クラスは、中が利用者の動きの擬似クラスだけなら書ける（当たらない）
+    for ok in [
+        "rect::before:is(:hover)",
+        "rect::after:not(:focus, :active)",
+        "::part(x):link",
+        "::part(x):is(:hover)",
+        "::selection:window-inactive",
+    ] {
+        assert!(parse(ok).is_some(), "{ok}");
+    }
+    // `:is()` は寛容なので、書けない中身を捨てて空の並びになる（正しいが当たらない）。`:not()` は寛容でない
+    assert_eq!(parse("rect::before:is(.a)").unwrap(), "rect:never:never@2");
+    for bad in [
+        "rect::before:not(.a)",
+        "rect::before:not(:first-child)",
+        "::part(x):first-child",
+        "rect:window-inactive",
+        "rect::before:not(:hover g)",
+        "rect::before:nth-child(1)",
+    ] {
+        assert_eq!(parse(bad), None, "{bad}");
     }
 }
