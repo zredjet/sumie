@@ -2,6 +2,11 @@
 //! 設定（[`ParseOptions`]・[`StyleDefaults`]）を置く（値に効く「読みの設定」。D1）。`@media`・`@supports` の条件も、
 //! この設定とプロパティの表を使うので、この段で照らす（css は条件を読むだけ）。
 
+#![allow(dead_code, reason = "M1 の style の単位で、カスケードからプロパティの表と値の確かめを使う")]
+
+pub(crate) mod props;
+pub(crate) mod valid;
+
 use crate::error::{Error, Invalid, InvalidReason};
 use crate::limits::Limits;
 
