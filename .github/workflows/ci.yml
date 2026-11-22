@@ -1,0 +1,74 @@
+# CI（ADR-22・ADR-44 (7)）。push ごとに 3 つのターゲットで試験とゴールデンを回す（D1・D2 をターゲットをまたいで照らす）。
+# 手元の全チェックは scripts/verify.sh。
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86_64 Linux・aarch64 Linux・aarch64 macOS
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: ツールチェーン（rust-toolchain.toml の 1.99.0）
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: 試験（debug）
+        run: cargo test --workspace
+      - name: 試験（release）
+        run: cargo test -p sumie --release
+      - name: 本番の依存
+        run: scripts/check-deps.sh
+
+  checks:
+    name: checks (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: ツールチェーン
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: 整形
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path scripts/lint-probe/Cargo.toml -- --check
+          cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+      - name: 禁じる口の一覧（std の文書から作り直したものと同じか）
+        run: cargo run -q -p sumie-tools -- gen-disallowed --check
+      - name: 禁じる口の試し
+        run: cargo run -q -p sumie-tools -- check-lint-probe
+      - name: ゴールデンは追記だけ
+        run: |
+          git fetch -q origin main || true
+          scripts/check-goldens-append-only.sh --self-test
+          scripts/check-goldens-append-only.sh
+      - name: 試験（release・target-cpu=native）
+        run: RUSTFLAGS="-C target-cpu=native" cargo test -p sumie --release
+
+  fuzz-build:
+    name: fuzz build (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: nightly と cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked
+      - name: 組み立て
+        working-directory: fuzz
+        run: cargo +nightly fuzz build
