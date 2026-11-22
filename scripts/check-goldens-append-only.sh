@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # 凍結した版のゴールデン（crates/sumie/goldens/render-v<N>.jsonl）が、基準のコミットから変わっていないかを
 # 確かめる（determinism.md §10・ADR-05・ADR-20・ADR-41 (7)・ADR-56 (3)）。
-#   - 今の版（crates/sumie/src/lib.rs の RENDERER）のファイル：基準の中身が今の中身の頭とバイトで同じ（追記だけ）
+#   - 今の版（crates/sumie/src/lib.rs の RENDERER）とそれより新しい版のファイル：基準の中身が今の中身の頭とバイトで
+#     同じ（追記だけ）
 #   - 今の版より古いファイル：基準とまったく同じ（凍結した記録。追記もしない）
+#   - 版は下げない（基準の版が今の版より大きければ誤り。履歴では版が下がるコミットを誤りにする。ADR-62 (1)）
 #   - 基準にあったファイルが消えていない（名前を変えるのも消したのと同じ）
 #   - 版 0（render-v0.jsonl）は、今の版が 0 の間だけ見張らない（作り直してよい。ADR-20）。今の版が 1 以上になったら
 #     古い版として凍結する（ADR-56 (3)）。estimate.jsonl は見張らない（ADR-33）
@@ -10,7 +12,8 @@
 #
 #   scripts/check-goldens-append-only.sh [--strict] [基準のコミット]
 #       基準の既定は origin/main との分かれ目（なければ main との分かれ目、それもなければ最初のコミット）。
-#       --strict は、基準が HEAD と同じ（比べる相手がない）ときに落とす（CI の push で使う）
+#       --strict は、基準が HEAD と同じ（比べる相手がない）ときに落とす（基準を明示して確かめたいときに使う。CI は
+#       --history と、main の版のこのスクリプトでの比べで見る）
 #   scripts/check-goldens-append-only.sh --history     履歴のすべてのコミットで、版のファイルが追記だけで、消して
 #       いない（名前を変えていない）かを確かめる（基準に依らない。CI の取り消された回・失敗のあと・force push でも抜けない）。
 #       版 0 のファイルは、親と子の両方で今の版が 0 のコミットだけ外す。コミットしていない変更も HEAD と比べる
@@ -28,11 +31,45 @@ current_version() {
   version_of < crates/sumie/src/lib.rs
 }
 
-# コミット <c> の版の数（lib.rs がない・読めないコミットは 0）。
+# コミット <c> の版の数。lib.rs がないか RENDERER を持たないコミット（版を決める前）は 0、RENDERER を持つのに決めた
+# 形で読めないコミットは ERR（黙って 0 にしない。ADR-62 (1)）。
 version_at() {
-  local v
-  v="$(git show "$1:crates/sumie/src/lib.rs" 2>/dev/null | version_of || true)"
-  echo "${v:-0}"
+  local text v
+  if ! text="$(git show "$1:crates/sumie/src/lib.rs" 2>/dev/null)"; then
+    echo 0
+    return
+  fi
+  v="$(version_of <<< "$text" || true)"
+  if [[ -n "$v" ]]; then
+    echo "$v"
+  elif grep -q "RENDERER" <<< "$text"; then
+    echo ERR
+  else
+    echo 0
+  fi
+}
+
+# version_order：lib.rs を変えたすべてのコミットで、版が読めて、親より下がっていないかを確かめる。
+version_order() {
+  local bad=0 c p vc vp
+  while IFS= read -r c; do
+    [[ -z "$c" ]] && continue
+    p="$(git rev-parse --verify --quiet "$c^" || true)"
+    vc="$(version_at "$c")"
+    if [[ "$vc" == ERR ]]; then
+      echo "$(git rev-parse --short "$c") の RENDERER の行が読めない（決めた形で書く）" >&2
+      bad=1
+      continue
+    fi
+    [[ -z "$p" ]] && continue
+    vp="$(version_at "$p")"
+    [[ "$vp" == ERR ]] && continue
+    if (( vc < vp )); then
+      echo "$(git rev-parse --short "$c") で版を下げた（$vp → $vc。版は下げない。ADR-62 (1)）" >&2
+      bad=1
+    fi
+  done < <(git rev-list HEAD -- crates/sumie/src/lib.rs)
+  return "$bad"
 }
 
 # check <基準> <今の版>：0 は通る、1 は変えた、2 は確かめられない（基準がない・読めない）
@@ -47,7 +84,16 @@ check() {
     echo "基準 $base のファイルの一覧を読めない" >&2
     return 2
   fi
-  local bad=0 f name v old n
+  local bad=0 f name v old n bv
+  bv="$(version_at "$base")"
+  if [[ "$bv" == ERR ]]; then
+    echo "基準 $base の RENDERER の行が読めない" >&2
+    return 2
+  fi
+  if (( bv > cur )); then
+    echo "基準 $base の版 $bv が今の版 $cur より大きい（版は下げない。ADR-62 (1)）" >&2
+    return 1
+  fi
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     name="${f##*/}"
@@ -70,7 +116,7 @@ check() {
       rm -f "$old"
       return 2
     fi
-    if [[ "$v" == "$cur" ]]; then
+    if (( v >= cur )); then
       n="$(wc -c < "$old" | tr -d ' ')"
       # 今の中身の頭 n バイトが基準の中身と同じか（macOS の cmp -n は短い方の終わりで失敗するので head で切る）
       if ! head -c "$n" "$f" | cmp -s - "$old"; then
@@ -91,11 +137,13 @@ check() {
 # 親と子の両方で今の版が 0 のコミット（凍結の前）だけ外す。
 history_check() {
   local bad=0 c p st f name old n v0_open vc vn
+  version_order || bad=1
   while IFS= read -r c; do
     [[ -z "$c" ]] && continue
     p="$(git rev-parse --verify --quiet "$c^" || true)"
     [[ -z "$p" ]] && continue
     vc="$(version_at "$c")"
+    [[ "$vc" == ERR ]] && vc=0 # 読めないことは version_order が誤りにする
     v0_open=""
     if [[ "$(version_at "$p")" == 0 ]] && [[ "$vc" == 0 ]]; then
       v0_open=1
@@ -241,6 +289,16 @@ self_test() {
     printf '{"name":"r"}\n' >> "$dir/render-v2.jsonl"
     git commit -qam current-append-v2
     history_check 2>/dev/null || { echo "self-test：今の版 2 への追記を誤って断った" >&2; exit 1; }
+    # 版を下げる・RENDERER の行が読めない・基準の版が今より大きい（ADR-62 (1)）
+    printf 'pub const RENDERER: &str = "sumie-render/1";\n' > crates/sumie/src/lib.rs
+    git commit -qam downgrade
+    if history_check 2>/dev/null; then echo "self-test：版を下げるコミットを見逃した" >&2; exit 1; fi
+    git reset -q --hard HEAD~1
+    printf 'pub const RENDERER: &str = "sumie-render/2"; // 注釈\n' > crates/sumie/src/lib.rs
+    git commit -qam unreadable
+    if history_check 2>/dev/null; then echo "self-test：読めない RENDERER の行を見逃した" >&2; exit 1; fi
+    git reset -q --hard HEAD~1
+    expect 1 HEAD 1
   )
   echo "ゴールデンの追記の確かめ：自己試験が通った"
 }

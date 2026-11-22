@@ -479,6 +479,7 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], header: &str) -> Result<()
         let over = |m: &Metrics| over(m, t_over);
         let mut r_all: Vec<f64> = ms.iter().map(|m| ratio(over(m), m.n_all)).collect();
         let mut r_alpha: Vec<f64> = ms.iter().map(|m| ratio(over(m), m.n_alpha)).collect();
+        let mut flat: Vec<f64> = ms.iter().map(|m| f64::from(m.flat_max)).collect();
         let mut inner: Vec<f64> = ms.iter().map(|m| f64::from(m.interior_max)).collect();
         let t = if fil { 16 } else { 8 };
         for (name, v) in [("全画素が分母", &mut r_all), ("α > 0 の画素が分母", &mut r_alpha)] {
@@ -492,14 +493,17 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], header: &str) -> Result<()
                 percentile(v, 1.0) * 100.0
             );
         }
-        let _ = writeln!(
-            summary,
-            "  形の内側の差の最大：中央 {}・90% {}・99% {}・最大 {}",
-            percentile(&mut inner, 0.5),
-            percentile(&mut inner, 0.9),
-            percentile(&mut inner, 0.99),
-            percentile(&mut inner, 1.0)
-        );
+        for (name, v) in [("形の内側（平らな所）", &mut flat), ("（参考）もとの内側（α だけ）", &mut inner)]
+        {
+            let _ = writeln!(
+                summary,
+                "  {name}の差の最大：中央 {}・90% {}・99% {}・最大 {}",
+                percentile(v, 0.5),
+                percentile(v, 0.9),
+                percentile(v, 0.99),
+                percentile(v, 1.0)
+            );
+        }
         for limit in [0.001, 0.0025, 0.005, 0.01, 0.02, 0.05] {
             let pass_all = ms.iter().filter(|m| ratio(over(m), m.n_all) <= limit).count();
             let pass_alpha = ms.iter().filter(|m| ratio(over(m), m.n_alpha) <= limit).count();

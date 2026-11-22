@@ -40,6 +40,8 @@ pub struct GitSet {
     pub take: usize,
     pub seed: u64,
     pub traits: &'static str,
+    /// 帰属（CC BY のもの。空なら行を書かない）
+    pub attribution: &'static str,
 }
 
 pub const GIT_SETS: &[GitSet] = &[
@@ -54,6 +56,7 @@ pub const GIT_SETS: &[GitSet] = &[
         take: 120,
         seed: 1,
         traits: "放射・線形のグラデーションの多い絵文字",
+        attribution: "",
     },
     GitSet {
         name: "fluent-emoji-flat",
@@ -66,6 +69,7 @@ pub const GIT_SETS: &[GitSet] = &[
         take: 150,
         seed: 2,
         traits: "平坦な塗りの絵文字",
+        attribution: "",
     },
     GitSet {
         name: "twemoji",
@@ -78,6 +82,7 @@ pub const GIT_SETS: &[GitSet] = &[
         take: 300,
         seed: 3,
         traits: "svgo で詰めた平坦な path の絵文字",
+        attribution: "Twemoji（2014〜2021 年は Twitter, Inc、2022 年からは Jason Sofonia と Justine De Caires（jdecked/twemoji）と、ほかの貢献者による）。CC BY 4.0（https://creativecommons.org/licenses/by/4.0/）で使い、取ったバイト列のまま変えていない",
     },
     GitSet {
         name: "flag-icons",
@@ -90,6 +95,7 @@ pub const GIT_SETS: &[GitSet] = &[
         take: 0,
         seed: 4,
         traits: "国旗（紋章の細かい path・グラデーション）",
+        attribution: "",
     },
     GitSet {
         name: "bootstrap-icons",
@@ -102,6 +108,7 @@ pub const GIT_SETS: &[GitSet] = &[
         take: 200,
         seed: 5,
         traits: "塗りのアイコン（偶奇・円弧）",
+        attribution: "",
     },
     GitSet {
         name: "tabler-icons",
@@ -114,6 +121,7 @@ pub const GIT_SETS: &[GitSet] = &[
         take: 200,
         seed: 6,
         traits: "線のアイコン（丸い端と継ぎ目）",
+        attribution: "",
     },
 ];
 
@@ -343,6 +351,7 @@ fn fetch_git_set(root: &Path, set: &GitSet) -> Result<(), String> {
              | 取り方 | `https://raw.githubusercontent.com/{repo}/{rev}/<道>` から取り、tree の一覧の git の blob の SHA-1 を照らした |\n\
              | ライセンス | {license}（{files} はリポジトリの根の写し） |\n\
              | 性質 | {traits} |\n\
+             {attribution}\
              | 一覧 | `MANIFEST.jsonl`（道・バイト数・BLAKE3・git の blob） |\n\n\
              作り直し：`cargo run -p sumie-tools -- corpus fetch-real --only {name}`（ADR-59）\n",
             name = set.name,
@@ -357,6 +366,8 @@ fn fetch_git_set(root: &Path, set: &GitSet) -> Result<(), String> {
             license = set.license,
             files = set.license_files.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join("・"),
             traits = set.traits,
+            attribution =
+                if set.attribution.is_empty() { String::new() } else { format!("| 帰属 | {} |\n", set.attribution) },
         );
         std::fs::write(dest.join("SOURCE.md"), source).map_err(|e| e.to_string())?;
         println!("corpus/real/{}：{} 件（候補 {candidates} 件）・{total} バイト", set.name, chosen.len());

@@ -38,7 +38,23 @@ pub fn run(args: &[String]) -> Result<(), String> {
     if let Some(p) = out.parent() {
         std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
     }
-    let mut lines = String::new();
+    // 頭の行に測ったときの設定を書く（あとから回数・CPU・道具の版を読めるように）
+    let rev = std::process::Command::new("git")
+        .args(["-C", &ws.to_string_lossy(), "describe", "--always", "--dirty"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let mut lines = Line::new()
+        .bool("meta", true)
+        .str("root", root.to_string_lossy())
+        .int("repeat", repeat)
+        .int("timeout_s", timeout.as_secs())
+        .str("fonts", fonts)
+        .str("cpu", crate::corpus::cpu_name())
+        .str("rev", rev)
+        .to_json();
+    lines.push('\n');
     let (mut n, mut total_ms, mut timeouts, mut errors) = (0usize, 0.0f64, 0usize, 0usize);
     for l in index.lines() {
         let line = Line::parse(l)?;

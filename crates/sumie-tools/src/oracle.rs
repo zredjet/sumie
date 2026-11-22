@@ -432,6 +432,23 @@ mod tests {
         s
     }
 
+    /// Kura の設定の resvg（raster-images なし）は、絵文字に Apple Color Emoji を選び、何も描かない（送りの幅だけ空く。
+    /// ADR-56 (2) を決めた確かめ）。システムのフォントのある macOS で手で回す：`cargo test -p sumie-tools -- --ignored emoji`
+    #[test]
+    #[ignore]
+    fn emoji_is_not_drawn_by_resvg() {
+        let resvg = Resvg::new(&Fonts::System);
+        let svg = std::fs::read(crate::corpus::workspace_root().join("tests/svg/m0/emoji.svg")).unwrap();
+        let out = resvg.render(&svg, 1.0).unwrap();
+        assert!(out.fonts_used.iter().any(|f| f.starts_with("Apple Color Emoji")), "{:?}", out.fonts_used);
+        // 「A」の右（x ≥ 24）は透明のまま
+        let (w, h) = (out.img.w as usize, out.img.h as usize);
+        let drawn = (0..h).flat_map(|y| (24..w).map(move |x| (y * w + x) * 4 + 3)).any(|i| out.img.px[i] != 0);
+        assert!(!drawn, "絵文字の所に何か描いた");
+        // 「A」は描く
+        assert!(out.img.px.chunks(4).any(|p| p[3] != 0));
+    }
+
     /// Chrome が読めない SVG を誤りにする（Chrome のある macOS で手で回す：`cargo test -p sumie-tools -- --ignored chrome`）。
     #[test]
     #[ignore]

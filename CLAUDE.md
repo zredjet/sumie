@@ -59,7 +59,7 @@ docs/                      # 正本の文書
 | 禁じる口の一覧 | `cargo run -p sumie-tools -- gen-disallowed [--check]`（std の文書から作る）・`cargo run -p sumie-tools -- check-lint-probe`（本当に拾われるか） |
 | テスト | `cargo test --workspace` |
 | ゴールデン | `cargo test -p sumie --test golden` |
-| ゴールデンは追記だけ | `scripts/check-goldens-append-only.sh [--strict] [基準のコミット]`（`--self-test` で自己試験） |
+| ゴールデンは追記だけ | `scripts/check-goldens-append-only.sh [--strict] [基準のコミット]`（`--history` で履歴のすべてのコミット、`--self-test` で自己試験） |
 | 本番の依存が libm だけ | `scripts/check-deps.sh`（`cargo tree -e normal,build --target all -p sumie` と libm の feature・出どころ） |
 | x86_64 の命令で | `cargo test -p sumie --target x86_64-apple-darwin`（Rosetta 2。先に `rustup target add x86_64-apple-darwin`） |
 | ファズ | `cd fuzz && cargo fuzz run <対象> corpus/<対象> seeds/<対象> -- -max_total_time=3600 -rss_limit_mb=4096 -timeout=20`（先に `mkdir -p corpus/<対象>`。nightly は `fuzz/rust-toolchain.toml` の 1 か所）・種の流し直しは `scripts/fuzz-seeds.sh` |

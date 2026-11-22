@@ -538,20 +538,27 @@ Unicode の表は、`sumie-tools` の `gen-unicode` が Unicode の文字のデ�
 
 ## 10. 照合と試験の道具（sumie-tools）
 
+M0 にあるのは `oracle`・`compare`・`bench`（と子の `bench-one`）・`corpus`（`import-resvg`・`resvg-source`・`fetch-w3c`・
+`fetch-real`・`index`）・`gen-heavy`・`kura-compat`・`oracle-lock`・`gen-disallowed`・`check-lint-probe`。「（M2 から）」などの印の
+ものはまだない。
+
 | 道具 | すること |
 |---|---|
-| `render` | この描画器で PNG に描く（確かめる人のため。PNG の書き出しは道具の側） |
+| `render` | （M2 から）この描画器で PNG に描く（確かめる人のため。PNG の書き出しは道具の側） |
 | `oracle resvg` | resvg 0.48.1（Kura と同じ feature）を、Kura と同じ usvg の設定（総称の書体 Times・Helvetica・Apple Chancery・Papyrus・Courier、フォントを名前の順に登録、languages、`default_size`）で描く（出力は乗算済み）。resvg の下の依存（svgtypes・roxmltree・unicode-script など）の版も Kura の Cargo.lock に揃え、`crates/sumie-tools/oracle-lock.txt`（`oracle-lock` が Kura の lock から書く。Kura の rev つき）と試験で照らす（ADR-57 (1)） |
 | `oracle chrome` | `/Applications/Google Chrome.app` のヘッドレスで描く（決めた描き方は下の「Chrome の描き方」。Chrome の版を記録）。PNG はストレートなので、決めた式で乗算済みに直す |
 | `compare` | 2 つの描画の差を乗算済みの RGBA8 で測る（ADR-15 の基準）・差の画像・一覧の HTML |
-| `corpus` | 照合の集まりの取り込み（出どころ・版・ライセンス・ダイジェストの一覧）と、使っている機能での分類（マイルストーンごとの範囲を選ぶ） |
+| `corpus` | 照合の集まりの取り込み（出どころ・版・ライセンス・ダイジェストの一覧。resvg の試験・W3C・実例の SVG。ADR-21・ADR-59）と、使っている機能での分類（マイルストーンごとの範囲を選ぶ） |
+| `kura-compat` | Kura の側の「描く／断る」と大きさの一覧（`corpus/kura-request.md`）と照らす（NFR-10。ADR-62 (4)） |
+| `oracle-lock` | 照合の相手の依存の閉包の版と checksum を Kura の Cargo.lock と照らして記録する（ADR-57 (1)・ADR-60 (5)） |
+| `gen-disallowed`・`check-lint-probe` | ライブラリの禁じる口の一覧を std の文書から作る・それが本当に拾われるかを試しのクレートで確かめる（ADR-49） |
 | `gen-heavy` | 重い入力の生成（下の表）。種と引数を固定し、作った入力のダイジェストを記録する |
-| `gen-fonts` | 試験用の AAT のフォントの生成（写しを許すフォントに fontTools で `morx`・`kerx`・Apple の `kern`・`trak` を足す。作り方と出どころを `tests/fonts/` の一覧に書く） |
-| `bench` | resvg 単体と同じ入力で時間・確保のピークを比べる。タイルで描いたときの合計の時間も測る |
-| `gen-unicode` | Unicode の表の生成（§7.2） |
-| `golden` | ゴールデンの行を足す（凍結した版のファイルは追記だけ） |
+| `gen-fonts` | （M5 から）試験用の AAT のフォントの生成（写しを許すフォントに fontTools で `morx`・`kerx`・Apple の `kern`・`trak` を足す。作り方と出どころを `tests/fonts/` の一覧に書く） |
+| `bench` | resvg 単体と同じ入力で時間・確保のピークを比べる（1 件ずつ子のプロセス `bench-one`）。タイルで描いたときの合計の時間も測る（M2 から） |
+| `gen-unicode` | （M5 から）Unicode の表の生成（§7.2） |
+| `golden` | （M2 から）ゴールデンの行を足す（凍結した版のファイルは追記だけ） |
 
-**Chrome の描き方**（M0 で決めた。ADR-52・ADR-57 (2)）：SVG を HTML の `<img src=… width=W height=H>`（W・H は resvg の大きさ）で
+**Chrome の描き方**（M0 で決めた。ADR-52・ADR-57 (2)・ADR-60）：SVG を HTML の `<img>`（CSS の画素で resvg の小数のままの大きさ、切り出しは resvg の整数の大きさ W・H）で
 左上に置き、`--headless --disable-gpu --hide-scrollbars --default-background-color=00000000 --force-device-scale-factor=1
 --force-color-profile=srgb --window-size=max(W+1,800),max(H+1,600) --screenshot` で撮って、左上の W × H を切り出す。ヘッドレスの
 窓の幅は 500 より小さくできず、SVG の文書を直に開くと viewBox だけの SVG が広い表示の領域の真ん中に描かれるため。
@@ -594,7 +601,11 @@ Kura の試験の入力（`SLOW_SHAPE`・`SLOW_DECODE`・`nested_pattern_clones_
 
 **resvg 単体の計測**（M0。`sumie-tools bench`。Apple M4 Max・道具の release・数える確保器のもと・1 件ずつ子のプロセスで、
 組み立てなどを止めた機械で測った。重い入力は 1 回、集まりは 3 回の最小。時間は木を作る分 ＋ 描く分、確保の山は 1 回目の
-山。フォントの集まりを作る分は数えない。ADR-57 (4)。生の結果は `local/bench/`。確保の山は allocation-counter が realloc を
+山。山は出力の画像（幅 × 高さ × 4 バイト。`s5` の 64 MB の大半・`map-lines` の 72 MB のうち 67 MB）を含む（sumie の
+`peak_bytes` は出力のバッファを除くので、比べるときは引く）。フォントの集まりを作る分は数えない。ADR-57 (4)。生の結果は
+`local/bench/`（`heavy-resvg.jsonl`：`bench --root local/heavy --repeat 1 --timeout 900`、`corpus-resvg.jsonl`：`bench --root
+corpus --repeat 3 --timeout 30`。どちらも道具は 3c6233e。`real-resvg.jsonl`：`bench --root corpus --filter real/ --repeat 3
+--timeout 30`。道具の bench は 3c6233e と同じ）。確保の山は allocation-counter が realloc を
 「新しく確保 → 写す → 古いものを放す」として数えるので、伸ばす瞬間の新旧の和を数える。Vec を伸ばしながら使う resvg は、
 `try_reserve_exact` で決めた量を確保する sumie より大きめに出る（比べるときは参考にする。ADR-60 (7)））：
 
@@ -615,7 +626,8 @@ Kura の試験の入力（`SLOW_SHAPE`・`SLOW_DECODE`・`nested_pattern_clones_
 | `bomb-pattern-nesting` | 8² | 1.07 秒 | 0.02 ms | 111 MB | — |
 | `bomb-marker-dup` | 1000² | 118 ms | 2.82 秒 | 97 MB | — |
 
-照合の集まり（resvg の試験 1,739 件。文字のある 422 件はシステムのフォント）：描けたのは 1,736 件（読めない 3 件：大きさが
+照合の集まり（resvg の試験 1,739 件。描けた件のうち文字の印のある 422 件はシステムのフォント。分布の表の「文字」の群は
+題に (UB) とある例を先に分けるので 408 件（描けない 1）で、数え方が違う）：描けたのは 1,736 件（読めない 3 件：大きさが
 不正 2・UTF-8 でない 1）。1 件の時間は中央 0.13 ms・90% 0.77 ms・99% 3.2 ms・最大 850 ms（`filters/feMorphology/huge-radius`）・
 合計 1.51 秒。確保の山は中央 184 KB・90% 605 KB・99% 1.08 MB・最大 12.2 MB（`filters/filter/huge-region`）。
 
@@ -645,9 +657,12 @@ Flat 146/150・Twemoji 245/300。resvg の試験は 1,691 件が倍率 1 のま�
 （`resvg-tests`・`real` がこの表。倍率 1 は `resvg-tests-scale1`・`real-scale1`、ADR-61 を決めたときの 256 画素の回は
 `real-256`・`resvg-tests-256`、GPU のラスタ化は `resvg-tests.gpu`。git の外）。
 
-Chrome の描き方の違いの記録（倍率 1・もとの内側で測った、ADR-57 (2) を決めたときの数）：GPU のラスタ化（既定の起動）では、
-resvg の試験の図形と単色の 2%・内側 2/255 で 562 件、0.5% で 369 件、フィルタ・グラデーションで 502 件だった（1,739 件のうち
-1,706 件で 8/255 を超える画素の数が変わった）。ソフトウェアのラスタ化（575・462・497）は、図形と単色では resvg に近く、フィルタ・グラデーションではほぼ同じ。外れるものは、
+Chrome の描き方の違いの記録（倍率 1・もとの内側（α だけ）で、`resvg-tests-scale1`（ソフトウェアのラスタ化）と
+`resvg-tests.gpu`（GPU のラスタ化。その回の report.jsonl を今の群分けで数え直した）を同じ 640・561 件で比べた）：図形と単色の
+2%・内側 2/255 でソフトウェア 576 件・GPU 562 件、0.5% で 463 件・369 件、フィルタ・グラデーションの 1% で 500 件・502 件
+（1,739 件のうち 1,706 件で 8/255 を超える画素の数が変わった）。ソフトウェアのラスタ化は、図形と単色では resvg に近く、
+フィルタ・グラデーションではほぼ同じ。ADR-56 の理由の数（639 件で 575・462 など）は、Chrome のやり直しを入れる前の回
+（035792c のときの §10。出力は残っていない）のもの。外れるものは、
 resvg と Chrome の対応の違い（全面が違う 64% の山）と、縁の細かい違いが多い。Chrome は合否にしない（差の一覧に並べる）。
 
 もとの表（下敷き）：

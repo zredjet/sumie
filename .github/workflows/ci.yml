@@ -2,7 +2,7 @@
 # 手元の全チェックは scripts/verify.sh（同じスクリプトを呼ぶ。手元だけの段は verify.sh の頭を見る）。
 name: ci
 
-# push だけで回す（PR を開いても同じ試験を 2 度回さない。含まれる時間の節約。ADR-22・ADR-35）
+# push だけで回す（PR を開いても同じ試験を 2 度回さない。ADR-22・ADR-35。公開のリポジトリにしたので時間の上限はない。ADR-54）
 on:
   push:
   workflow_dispatch:

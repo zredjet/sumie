@@ -3,10 +3,11 @@
 //!
 //! `kura-compat --kura <Kura の一覧.jsonl> [--dir <SVG の根>] [--out local/kura-compat/<名前>.jsonl]`
 //!
-//! - Kura の手元の SVG（ライセンスでコミットできない）は `--dir` に置いたまま読み、git の外に結果の一覧だけを書く。
-//!   一覧には道を書かず、入力の BLAKE3 で指す
-//! - M0 は sumie の読む口がないので、resvg（Kura の設定）の大きさを並べ、Kura の一覧の大きさと照らす（一覧の写し方の
-//!   誤りを見つける）。M1 から sumie の `parse`・`pixel_size`・形（ADR-37）の結果を並べる
+//! - 入力は照合の集まり（`corpus/`。実例の SVG を含む。ADR-59）。ほかのフォルダの SVG（コミットできないもの）も `--dir`
+//!   に置いたまま読める。結果は git の外に書き、道を書かずに入力の BLAKE3 で指す
+//! - Kura の一覧が届いたら、まず resvg（Kura の設定）の大きさと照らし（一覧の写し方の誤りを見つける）、M1 から sumie の
+//!   `parse`・`pixel_size`・形（ADR-37）の結果を並べる。`kura_ok`（描く）は形と値の両方が `ok` のもの、大きさは形が
+//!   `ok` のものだけ照らす（ADR-62 (4)）
 
 use std::path::PathBuf;
 
@@ -24,20 +25,22 @@ pub fn result_line(k: &Line, digest: &str, resvg: &Result<(u32, u32), String>) -
         Some(_) => return Err(format!("{path} のダイジェストが Kura の一覧と違う（別の版の入力）")),
         None => return Err(format!("{path} の行に blake3 がない（入力を照らせない）")),
     }
-    let kura_ok = k.get_str("shape") == Some("ok");
+    let shape_ok = k.get_str("shape") == Some("ok");
+    let kura_ok = shape_ok && k.get_str("decode") == Some("ok");
     let kw = k.get_int("width").unwrap_or(0);
     let kh = k.get_int("height").unwrap_or(0);
     let (rw, rh, rerr) = match resvg {
         Ok((w, h)) => (i128::from(*w), i128::from(*h), String::new()),
         Err(e) => (0, 0, e.clone()),
     };
-    let both = kura_ok && resvg.is_ok();
+    let both = shape_ok && resvg.is_ok();
     let same = both && kw == rw && kh == rh;
     let line = Line::new()
         .str("blake3", digest)
         .str("kura_shape", k.get_str("shape").unwrap_or(""))
         .str("kura_decode", k.get_str("decode").unwrap_or(""))
         .bool("kura_ok", kura_ok)
+        .bool("kura_shape_ok", shape_ok)
         .int("kura_w", kw)
         .int("kura_h", kh)
         .bool("resvg_ok", resvg.is_ok())
@@ -101,7 +104,12 @@ mod tests {
     #[test]
     fn result_lines() {
         let k = |shape: &str, b: Option<&str>| {
-            let mut l = Line::new().str("path", "a.svg").str("shape", shape).int("width", 10).int("height", 20);
+            let mut l = Line::new()
+                .str("path", "a.svg")
+                .str("shape", shape)
+                .str("decode", if shape == "ok" { "ok" } else { shape })
+                .int("width", 10)
+                .int("height", 20);
             if let Some(b) = b {
                 l = l.str("blake3", b);
             }
@@ -116,5 +124,9 @@ mod tests {
         assert_eq!((l.get_bool("size_same"), l.get_bool("kura_ok"), bad), (Some(false), Some(false), false));
         assert!(result_line(&k("ok", Some("x")), "d", &Ok((10, 20))).is_err());
         assert!(result_line(&k("ok", None), "d", &Ok((10, 20))).is_err());
+        // 値で断ったものは「描く」に数えない（大きさは形で照らす）
+        let dec = Line::new().str("path", "a.svg").str("blake3", "d").str("shape", "ok").str("decode", "Limit");
+        let (l, _) = result_line(&dec.int("width", 10).int("height", 20), "d", &Ok((10, 20))).unwrap();
+        assert_eq!((l.get_bool("kura_ok"), l.get_bool("size_same")), (Some(false), Some(true)));
     }
 }
