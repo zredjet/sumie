@@ -25,7 +25,7 @@ XML・CSS・パス・ラスタライズ・フォント・文字の組版まで�
 - dev の依存（照合・計測の道具 `sumie-tools` と試験）：resvg `=0.48.1`（Kura と同じ feature：`text` だけ）・BLAKE3・確保を
   数える確保器のクレートなど。ライブラリの `cargo test` には重い dev の依存を入れない。試験にも `unsafe` を書かない
 - OS に依存しない。Linux でも `cargo test` が通る。crates.io に公開しない（`publish = false`）
-- CI：GitHub Actions（非公開のリポジトリ。`ubuntu-latest`・`ubuntu-24.04-arm`・`macos-15`（arm64）。ADR-22・ADR-44）。Kura は git の rev を
+- CI：GitHub Actions（公開のリポジトリ `zredjet/sumie`。ADR-54。`ubuntu-latest`・`ubuntu-24.04-arm`・`macos-15`（arm64）。ADR-22・ADR-44）。Kura は git の rev を
   固定した依存で取り込む（ADR-18）
 
 ## リポジトリ構成
@@ -63,8 +63,8 @@ docs/                      # 正本の文書
 | 本番の依存が libm だけ | `scripts/check-deps.sh`（`cargo tree -e normal,build --target all -p sumie` と libm の feature・出どころ） |
 | x86_64 の命令で | `cargo test -p sumie --target x86_64-apple-darwin`（Rosetta 2。先に `rustup target add x86_64-apple-darwin`） |
 | ファズ | `cd fuzz && cargo fuzz run <対象> corpus/<対象> seeds/<対象> -- -max_total_time=3600 -rss_limit_mb=4096 -timeout=20`（先に `mkdir -p corpus/<対象>`。nightly は `fuzz/rust-toolchain.toml` の 1 か所）・種の流し直しは `scripts/fuzz-seeds.sh` |
-| 照合 | `cargo run -p sumie-tools --release -- compare <入力> --against resvg\|chrome` |
-| 計測 | `cargo run -p sumie-tools --release -- bench <入力>` |
+| 照合 | `cargo run -p sumie-tools --release -- compare [--root corpus] [--filter <道の一部>] [--min-side 200] [--out local/compare/<名前>]`（M0 は resvg と Chrome。差の一覧の HTML と分布） |
+| 計測 | `cargo run -p sumie-tools --release -- bench [--root corpus\|local/heavy] [--filter <道の一部>] [--repeat N] [--timeout 秒] [--out <file>]`（resvg 単体の時間と確保の山） |
 
 ## 実装ルール（全体）
 

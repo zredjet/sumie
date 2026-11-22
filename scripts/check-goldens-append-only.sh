@@ -86,16 +86,18 @@ check() {
   return "$bad"
 }
 
-# history：版のファイルに触れたすべてのコミットで、親から追記だけか・消していないかを確かめる。版 0 のファイルは、
+# history：版のファイルに触れたすべてのコミットで、親から消していないか、そのコミットの今の版のファイル（とそれより
+# 新しい版）は追記だけか、それより古い版のファイルは変えていない（追記もしていない）かを確かめる。版 0 のファイルは、
 # 親と子の両方で今の版が 0 のコミット（凍結の前）だけ外す。
 history_check() {
-  local bad=0 c p st f name old n v0_open
+  local bad=0 c p st f name old n v0_open vc vn
   while IFS= read -r c; do
     [[ -z "$c" ]] && continue
     p="$(git rev-parse --verify --quiet "$c^" || true)"
     [[ -z "$p" ]] && continue
+    vc="$(version_at "$c")"
     v0_open=""
-    if [[ "$(version_at "$p")" == 0 ]] && [[ "$(version_at "$c")" == 0 ]]; then
+    if [[ "$(version_at "$p")" == 0 ]] && [[ "$vc" == 0 ]]; then
       v0_open=1
     fi
     while IFS=$'\t' read -r st f; do
@@ -111,6 +113,13 @@ history_check() {
           bad=1
           ;;
         M*)
+          vn="${name#render-v}"
+          vn="${vn%.jsonl}"
+          if (( vn < vc )); then
+            echo "$(git rev-parse --short "$c") で古い版を変えた（今の版 $vc）：$f" >&2
+            bad=1
+            continue
+          fi
           old="$(mktemp)"
           if ! git show "$p:$f" > "$old"; then
             rm -f "$old"
@@ -216,6 +225,22 @@ self_test() {
     printf '{"name":"u"}\n' > "$dir/render-v0.jsonl"
     git commit -qam frozen-rewrite
     if history_check 2>/dev/null; then echo "self-test：凍結した版 0 の書き換えを見逃した" >&2; exit 1; fi
+    git reset -q --hard HEAD~1
+    # 履歴：版を上げたあとの、古い版への追記（版 0 も版 1 以上も）を拾う
+    printf '{"name":"t"}\n' >> "$dir/render-v0.jsonl"
+    git commit -qam frozen-append-v0
+    if history_check 2>/dev/null; then echo "self-test：凍結した版 0 への追記を見逃した" >&2; exit 1; fi
+    git reset -q --hard HEAD~1
+    printf 'pub const RENDERER: &str = "sumie-render/2";\n' > crates/sumie/src/lib.rs
+    git commit -qam bump2
+    history_check 2>/dev/null || { echo "self-test：版 2 に上げるだけのコミットを誤って断った" >&2; exit 1; }
+    printf '{"name":"s"}\n' >> "$dir/render-v1.jsonl"
+    git commit -qam old-append-v1
+    if history_check 2>/dev/null; then echo "self-test：古い版 1 への追記を見逃した" >&2; exit 1; fi
+    git reset -q --hard HEAD~1
+    printf '{"name":"r"}\n' >> "$dir/render-v2.jsonl"
+    git commit -qam current-append-v2
+    history_check 2>/dev/null || { echo "self-test：今の版 2 への追記を誤って断った" >&2; exit 1; }
   )
   echo "ゴールデンの追記の確かめ：自己試験が通った"
 }

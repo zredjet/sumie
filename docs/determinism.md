@@ -105,7 +105,7 @@ clippy の `disallowed-methods` で禁じる。
 | 浮動小数の `clamp` | NaN と上下の逆で panic する | `math::clamp` |
 | `to_degrees`・`to_radians` | 掛ける定数が std の版で変わった過去がある | `math` の定数を掛ける |
 | `midpoint`・`hypot` | 実装が std の版に依る・OS の libm を呼ぶ | 自前の式・`math::hypot` |
-| `algebraic_add`・`algebraic_mul` など（1.99.0 で stable かは M0 で確かめる） | LLVM に並べ替え・縮めを許す | 素の演算子 |
+| `algebraic_add`・`algebraic_mul` など（1.99.0 で stable。禁じる口の一覧に入れた。ADR-49） | LLVM に並べ替え・縮めを許す | 素の演算子 |
 
 整数の `Ord::max`・`min` は値が一意に決まるので使ってよい。`Ord::clamp` は上下の逆で panic するので禁じる
 （`crates/sumie/clippy.toml`）。`x.max(lo).min(hi)` と書く。
@@ -294,6 +294,7 @@ M7 で `sumie-render/1` を凍結するまでの値は版 0（`sumie-render/0`�
 - フォントは `tests/fonts/` のものだけを使う（macOS のシステムのフォントは Linux の CI にない。システムのフォントで描く照合は
   ゴールデンにせず、手元の照合の一覧にする）
 - ファイルは版ごと（`goldens/render-v<N>.jsonl`）。凍結した版のファイルは**追記だけ**で、既存の行を書き換えない・消さない。
+  今の版より古い版のファイルは追記もしない（記録として変えない。ADR-51 (5)）
   例の中身（名前・入力・設定）を変えたいときは、新しい名前の例を足す。`scripts/check-goldens-append-only.sh` が CI と
   手元の全チェックで見張る。版 0 の `render-v0.jsonl` は今の版が 0 の間だけ見張りから外し（作り直してよい。ADR-20）、今の
   版が 1 以上になったら古い版として凍結する（ADR-56 (3)）。`estimate.jsonl` は見張らない（D2 は rev ごと）

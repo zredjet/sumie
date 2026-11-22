@@ -17,7 +17,7 @@
 
 | 名前 | 出どころ（rev） | ライセンス | 件数 | 性質 |
 |---|---|---|---|---|
-| `fluent-emoji-color` | github.com/microsoft/fluentui-emoji（`1ffb34c752ec`）の `Color` | MIT（Copyright (c) Microsoft Corporation） | 120（3,145 件から） | 放射・線形のグラデーション・フィルタの多い絵文字 |
+| `fluent-emoji-color` | github.com/microsoft/fluentui-emoji（`1ffb34c752ec`）の `Color` | MIT（Copyright (c) Microsoft Corporation） | 120（3,145 件から） | 放射・線形のグラデーションの多い絵文字（`filter` を使うものもある） |
 | `fluent-emoji-flat` | 同じ（`Flat`） | MIT | 150（3,145 件から） | 平坦な塗りの絵文字 |
 | `twemoji` | github.com/jdecked/twemoji（`b6b55fef1e86`）の `assets/svg` | 絵は CC BY 4.0（`LICENSE-GRAPHICS`）・コードは MIT | 300（4,009 件から） | 詰めた平坦な path の絵文字 |
 | `flag-icons` | github.com/lipis/flag-icons（`ac7e0eb3259e`）の `flags/4x3` | MIT（Copyright (c) 2013 Panayiotis Lipiridis） | 271（全部） | 国旗（紋章の細かい path・グラデーション） |
@@ -42,8 +42,8 @@ commons-featured-vector` は 1 分に 20 件まで・やり直しつきで取る
 | 鍵 | 中身 |
 |---|---|
 | `path` | 根からの相対の道 |
-| `source` | 出どころ（`resvg`・`w3c-svg11`・`gen-heavy` など） |
-| `category` | 分類（resvg は `tests/` の下のフォルダ、W3C は名前の頭の章） |
+| `source` | 出どころ（`resvg`・`real`（実例の SVG）・`w3c-svg11`・`gen-heavy` など） |
+| `category` | 分類（resvg は `tests/` の下のフォルダ、実例は集まりの名前、W3C は名前の頭の章） |
 | `scope` | `in` か `out:<理由>`（アニメーション・操作・スクリプトは v1 の外。requirements.md §4） |
 | `bytes`・`blake3` | 大きさとダイジェスト |
 | `features` | 使う機能の印（`text`・`filter`・`gradient`・`pattern`・`mask`・`clip`・`marker`・`image`・`use`・`switch`・`style`・`symbol`・`foreignObject`・`script`・`animation`・`blend`・`ub`）。マイルストーンごとの範囲と ADR-15 の群を選ぶのに使う。`filter` は CSS のフィルタ関数の `filter` の属性も、`image` は外の画像を指す `feImage` も、`ub` は題に「(UB)」とある resvg の試験の未定義の振る舞いの例（ADR-56 (1)） |
@@ -54,8 +54,9 @@ commons-featured-vector` は 1 分に 20 件まで・やり直しつきで取る
 # resvg の試験（rev 68b14c4c3bcc と SHA-256 は道具の定数。取ったアーカイブを照らしてから写す。--archive <取ったもの> も使える）
 cargo run -p sumie-tools --release -- corpus import-resvg
 cargo run -p sumie-tools --release -- corpus index
-# 実例の SVG（rev は道具の定数。git の blob の SHA-1 を照らしてから写す）
-cargo run -p sumie-tools --release -- corpus fetch-real
+# 実例の SVG（rev は道具の定数。git の blob の SHA-1 を照らしてから写す。集まりの名前を指して 1 つずつ。
+# Commons（commons-featured-vector）は名前で指したときだけ取る。M0 では取っていない。ADR-59 (3)）
+cargo run -p sumie-tools --release -- corpus fetch-real --only fluent-emoji-color   # fluent-emoji-flat・twemoji・flag-icons・bootstrap-icons・tabler-icons も同じ
 # W3C の試験（git の外）
 cargo run -p sumie-tools --release -- corpus fetch-w3c
 cargo run -p sumie-tools --release -- corpus index --root local/w3c-svg11-20110816

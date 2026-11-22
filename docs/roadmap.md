@@ -56,7 +56,7 @@
   resvg 単体の時間・確保のピークを測る（ADR-19・ADR-35）。→ architecture.md §10（ADR-57 (3)・ADR-58 (2)）
 - [x] Kura の側に、照合の集まりを Kura の今の `SvgCodec` に通した「断る／描く」の一覧を作ってもらうよう、ユーザーに頼む
   （働き手を通さず、プロセスの中の `SvgCodec` で。このリポジトリからは Kura で cargo を走らせない。一覧は Kura の rev つきで
-  `corpus/` の横に置く。NFR-10）。Kura の手元の SVG（Kura の働き手の実測に使った 1,439 件）の置き場所をユーザーに聞き、git の
+  `corpus/` の中に置く。NFR-10。依頼文は `corpus/kura-request.md`）。Kura の手元の SVG（Kura の働き手の実測に使った 1,439 件）の置き場所をユーザーに聞き、git の
   外で Kura の `SvgCodec` と sumie の両方に通して「描く／断る」と大きさの一致を照らす仕組みを作る（結果の一覧だけを残す。
   ライセンスでコミットできないため）。→ 仕組みは `kura-compat` で作った。1,439 件は消えていて使えないので、代わりに実例の
   SVG 1,241 件を `corpus/real/` に取り込んだ（ADR-58 (3)・ADR-59）

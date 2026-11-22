@@ -8,7 +8,8 @@
 //!   外す）の SVG を `local/commons-featured-vector/` に取り（大きいので git の外）、Commons の SHA-1 を照らす。一覧（題・
 //!   URL・ライセンス・作者・SHA-1・BLAKE3）は `corpus/real/commons-featured-vector/MANIFEST.jsonl` として git に入れる
 //!
-//! `corpus fetch-real [--only <名前>]`。取ったものは信用しない入力なので、新しい空のフォルダに取ってから照らして写す。
+//! `corpus fetch-real [--only <名前>]`（`--only` がなければ git の集まりだけ。Commons は `--only commons-featured-vector` で
+//! 指したときだけ取る）。取ったものは信用しない入力なので、新しい空のフォルダに取ってから照らして写す。
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -128,8 +129,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
     for set in GIT_SETS.iter().filter(|s| only.is_none_or(|o| o == s.name)) {
         fetch_git_set(&root, set)?;
     }
-    if only.is_none_or(|o| o == COMMONS_NAME) {
+    // Commons は名前で指したときだけ取る（Wikimedia は自動の取り出しを 429 で断るので、間を空けて頼むときだけ。ADR-59 (3)）
+    if only == Some(COMMONS_NAME) {
         fetch_commons(&root)?;
+    } else if only.is_some_and(|o| !GIT_SETS.iter().any(|s| s.name == o)) {
+        return Err(format!("知らない集まり：{}", only.unwrap_or("")));
     }
     Ok(())
 }
@@ -425,6 +429,10 @@ fn commons_list() -> Result<(Vec<CommonsFile>, usize), String> {
         );
         if let Some(c) = &cont {
             let _ = write!(url, "&gcmcontinue={}&continue=gcmcontinue%7C%7C", url_encode(c));
+        }
+        if cont.is_some() {
+            // 一覧の API も間を空けて頼む
+            std::thread::sleep(std::time::Duration::from_secs(3));
         }
         let j = parse_json(&curl_text(&url)?)?;
         for p in j.get("query").and_then(|q| q.get("pages")).and_then(J::as_arr).unwrap_or(&[]) {

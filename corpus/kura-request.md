@@ -20,7 +20,8 @@ sumie のリポジトリからは Kura で cargo を走らせないので、Kura
 
 ## 出してほしい一覧
 
-`corpus/kura-svgcodec-<Kura の rev の先頭 12 桁>.jsonl`（1 件 1 行。sumie のリポジトリの `corpus/` の横に置く）：
+`corpus/kura-svgcodec-<Kura の rev の先頭 12 桁>.jsonl`（1 件 1 行。sumie のリポジトリの `corpus/` の中に置き、コミットする。
+入力の道とダイジェストと結果だけで、SVG の中身は入らない）：
 
 | 鍵 | 中身 |
 |---|---|
@@ -36,5 +37,6 @@ sumie のリポジトリからは Kura で cargo を走らせないので、Kura
 ## Kura の手元の SVG（1,439 件）
 
 消えていて使えない（ADR-58 (3)）。代わりに実例の SVG（`corpus/real/`）を上の一覧に入れた。照らす仕組みは M0 で作った（`sumie-tools kura-compat
---kura <Kura の一覧> --dir <SVG の根>`。git の外に結果の一覧だけを書き、道は書かずに入力の BLAKE3 で指す）。M0 は resvg
-（Kura の設定）の大きさを Kura の一覧と照らし、M1 から sumie の読む口の結果を並べ、M7 で全体を照らす。
+--kura <Kura の一覧> --dir <SVG の根>`。git の外に結果の一覧だけを書き、道は書かずに入力の BLAKE3 で指す）。一覧が届いたら、
+まず resvg（Kura の設定）の大きさを Kura の一覧と照らし（一覧の写し方の誤りを見つける）、M1 から sumie の読む口の結果を並べ、
+M7 で全体を照らす。M0 の終わりの時点で、一覧はまだ届いていない。
