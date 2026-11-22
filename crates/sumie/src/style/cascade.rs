@@ -285,6 +285,7 @@ pub(crate) fn cascade(
     // 照合しながら要素ごとに決める
     let nodes = doc.nodes.len();
     let mut out = Out {
+        short: Shorthands::new(),
         doc,
         input,
         sheet,
@@ -380,7 +381,27 @@ impl Slot {
     }
 }
 
+/// まとめのプロパティの長い名前の番号（表を 1 度だけ引く。CSS の 4 回目のレビュー）。
+#[derive(Debug, Clone, Copy)]
+struct Shorthands {
+    font: Option<PropertyId>,
+    font_longhands: [Option<PropertyId>; 11],
+    markers: [Option<PropertyId>; 3],
+}
+
+impl Shorthands {
+    fn new() -> Shorthands {
+        Shorthands {
+            font: lookup(b"font", false),
+            font_longhands: FONT_LONGHANDS.map(|n| lookup(n, false)),
+            markers: [b"marker-start".as_slice(), b"marker-mid", b"marker-end"].map(|n| lookup(n, false)),
+        }
+    }
+}
+
 struct Out<'a, 'b> {
+    /// まとめのプロパティの長い名前の番号
+    short: Shorthands,
     doc: &'a XmlDoc,
     input: &'a [u8],
     sheet: &'a Sheet,
@@ -416,10 +437,8 @@ impl Out<'_, '_> {
         }
         let name = PROPS.get(usize::from(prop)).map_or(&[][..], |p| p.name);
         if name == b"marker" {
-            for name in [b"marker-start".as_slice(), b"marker-mid", b"marker-end"] {
-                if let Some(id) = lookup(name, false) {
-                    self.put(id, key, Specified { prop: id, ..spec })?;
-                }
+            for id in self.short.markers.into_iter().flatten() {
+                self.put(id, key, Specified { prop: id, ..spec })?;
             }
             return Ok(());
         }
@@ -448,9 +467,9 @@ impl Out<'_, '_> {
         } else {
             None
         };
-        for (k, name) in FONT_LONGHANDS.iter().enumerate() {
+        for (k, id) in self.short.font_longhands.into_iter().enumerate() {
             self.budget.spend(cost::OP_STEP)?;
-            let Some(id) = lookup(name, false) else { continue };
+            let Some(id) = id else { continue };
             let s = match rec {
                 None => Specified { prop: id, ..spec },
                 Some(r) => {
@@ -598,7 +617,7 @@ impl Out<'_, '_> {
                 pad: [0; 3],
             };
             // `style` 属性の `font` は、その宣言の長い名前の範囲をここで求める
-            let font = if lookup(b"font", false) == Some(info.prop) && info.wide == WIDE_NONE {
+            let font = if self.short.font == Some(info.prop) && info.wide == WIDE_NONE {
                 let cx = Ctx { attr: false, unitless: false, viewport: self.viewport };
                 font_parts(buf, d.value, cx, budget)?.map(|p| FontRec::of(&p))
             } else {

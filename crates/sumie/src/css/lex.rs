@@ -823,6 +823,48 @@ impl Iterator for Decode<'_> {
     }
 }
 
+/// 言葉の表と何度も比べる名前（escape を含む名前は 1 度だけ解いて持つ。解く字を払う。CSS の 4 回目のレビュー）。32 バイトを
+/// 超える名前と ASCII でない字を含む名前は、どの言葉（ASCII の短い言葉）にも当たらない。
+pub(crate) struct Name<'a> {
+    raw: &'a [u8],
+    buf: [u8; 32],
+    len: usize,
+    /// 0 生のバイト（escape なし）、1 解いたもの（`buf`）、2 どの言葉にも当たらない
+    mode: u8,
+}
+
+impl Name<'_> {
+    /// 名前が ASCII の `want` と大文字小文字を問わず同じか（`ident_is` と同じ）。
+    pub(crate) fn is(&self, want: &[u8]) -> bool {
+        match self.mode {
+            0 => self.raw.eq_ignore_ascii_case(want),
+            1 => self.buf.get(..self.len).is_some_and(|b| b.eq_ignore_ascii_case(want)),
+            _ => false,
+        }
+    }
+}
+
+/// 字句の中身 `span` を [`Name`] にする（`escaped` なら解く。解く前に `cost::decode` を払う）。
+pub(crate) fn name_of<'a>(s: &'a [u8], span: Span, escaped: bool, budget: &Budget<'_>) -> Result<Name<'a>, Error> {
+    let raw = span.of(s);
+    let mut out = Name { raw, buf: [0; 32], len: 0, mode: 0 };
+    if !escaped {
+        return Ok(out);
+    }
+    out.mode = 1;
+    // 33 字まで読めば足りる（長い名前は当たらない）
+    budget.spend(cost::decode(33))?;
+    for c in decode(s, span) {
+        let Some(slot) = out.buf.get_mut(out.len).filter(|_| c < 0x80) else {
+            out.mode = 2;
+            break;
+        };
+        *slot = c as u8;
+        out.len = out.len.saturating_add(1);
+    }
+    Ok(out)
+}
+
 /// 中身が ASCII の `want` と大文字小文字を問わず同じか（`want` は小文字の ASCII）。
 pub(crate) fn ident_is(s: &[u8], span: Span, escaped: bool, want: &[u8]) -> bool {
     if !escaped {

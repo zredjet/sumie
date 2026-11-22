@@ -278,3 +278,35 @@ fn third_review_cascade_cases() {
     assert_eq!(get(&out, "e", "opacity"), None);
     assert_eq!(get(&out, "e", "stroke"), Some("red"));
 }
+
+/// CSS の 4 回目のレビューの指摘（Chrome 157 と照らした形）。
+#[test]
+fn fourth_review_cascade_cases() {
+    let svg = format!("<svg {SVG}><rect id=\"a\"/></svg>");
+    // `@import` の層は url のすぐあとだけ（条件のあとの layer() は媒体の問いの一部で、層の順に入らない）
+    for imp in ["@import url(x.css) supports(display:block) layer(foo);", "@import url(x.css) screen layer(foo);"] {
+        let out =
+            run(&svg, &format!("{imp}@layer bar, foo;@layer foo{{#a{{fill:green}}}}@layer bar{{#a{{fill:red}}}}"));
+        assert_eq!(get(&out, "a", "fill"), Some("green"), "{imp}");
+    }
+    let out =
+        run(&svg, "@import url(x.css) layer(foo);@layer bar, foo;@layer foo{#a{fill:green}}@layer bar{#a{fill:red}}");
+    assert_eq!(get(&out, "a", "fill"), Some("red"));
+    // 形の壊れた `@supports` の中の規則は窓を閉じない
+    let out = run(
+        &svg,
+        "@supports (a) and (b) or (c) { #z{fill:red} } @namespace s url(http://www.w3.org/2000/svg); s|rect{fill:green}",
+    );
+    assert_eq!(get(&out, "a", "fill"), Some("green"));
+    let out = run(
+        &svg,
+        "@supports not (a) and (b) { @layer q { #z{fill:red} } } @namespace s url(http://www.w3.org/2000/svg); s|rect{stroke:green}",
+    );
+    assert_eq!(get(&out, "a", "stroke"), Some("green"));
+    // `::slotted()` のあとの木に沿う擬似要素は正しい（並びの #a に当たる）
+    let out = run(&svg, "::slotted(*)::before, #a {opacity:.5} ::column::scroll-marker, #a {stroke-width:2}");
+    assert_eq!(get(&out, "a", "opacity"), Some(".5"));
+    assert_eq!(get(&out, "a", "stroke-width"), Some("2"));
+    let out = run(&svg, "::slotted(*)::first-line, #a {opacity:.5}");
+    assert_eq!(get(&out, "a", "opacity"), None);
+}

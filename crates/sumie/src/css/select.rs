@@ -253,20 +253,33 @@ pub(crate) fn ns_of_uri(uri: &[u8]) -> u8 {
 /// 引く前に並べる）。
 #[derive(Clone, Copy)]
 pub(crate) struct NsTable<'a> {
+    /// 接頭辞の順に並べ、同じ接頭辞を除いたもの
     pub(crate) decls: &'a [NsDecl],
+    /// 並べたあとに足した宣言（書いた順。後の宣言が勝つ。並べた部分の宣言にも勝つ）
+    pub(crate) tail: &'a [NsDecl],
     pub(crate) names: &'a [u8],
 }
 
 impl NsTable<'_> {
-    pub(crate) const EMPTY: NsTable<'static> = NsTable { decls: &[], names: &[] };
+    pub(crate) const EMPTY: NsTable<'static> = NsTable { decls: &[], tail: &[], names: &[] };
 
-    /// 既定の名前空間（なければどれでも）。空の接頭辞はいちばん前に並ぶ。
+    /// 既定の名前空間（なければどれでも）。尾は後ろから、並べた部分では空の接頭辞がいちばん前に並ぶ。
     fn default_ns(&self) -> u8 {
+        if let Some(d) = self.tail.iter().rev().find(|d| d.prefix.len() == 0) {
+            return d.ns;
+        }
         self.decls.first().filter(|d| d.prefix.len() == 0).map_or(NS_ANY, |d| d.ns)
     }
 
-    /// 接頭辞の字句 `t`（ident。escape を解いて比べる）の名前空間。宣言がなければ None。
+    /// 接頭辞の字句 `t`（ident。escape を解いて比べる）の名前空間。宣言がなければ None。尾を後ろから見てから、並べた部分を
+    /// 2 分で探す。
     fn lookup(&self, s: &[u8], t: &Token, budget: &Budget<'_>) -> Result<Option<u8>, Error> {
+        for d in self.tail.iter().rev() {
+            budget.spend(cost::OP_STEP)?;
+            if cmp_name(budget, d.prefix.of(self.names), s, t)? == core::cmp::Ordering::Equal {
+                return Ok(Some(d.ns));
+            }
+        }
         let i = lower_bound_try(budget, self.decls, |d| Ok(cmp_name(budget, d.prefix.of(self.names), s, t)? == Less))?;
         match self.decls.get(i) {
             Some(d) if cmp_name(budget, d.prefix.of(self.names), s, t)? == core::cmp::Ordering::Equal => Ok(Some(d.ns)),
@@ -355,6 +368,14 @@ const PE_PART: u8 = 2;
 const PE_OTHER: u8 = 3;
 /// `::selection`（利用者の動きの擬似クラスと `:window-inactive`）
 const PE_SELECTION: u8 = 4;
+/// `::slotted()`（木に沿う擬似要素と、利用者の動きの擬似クラス。CSS Scoping 1 §3.2.2）
+const PE_SLOTTED: u8 = 5;
+/// `::column`（`::scroll-marker` と、利用者の動きの擬似クラス。CSS Overflow 5）
+const PE_COLUMN: u8 = 6;
+
+/// `::slotted()` のあとに書ける木に沿う擬似要素（Chrome 157 と照らした。`::first-line`・`::selection` は書けない）。
+const AFTER_SLOTTED: &[&[u8]] =
+    &[b"before", b"after", b"marker", b"placeholder", b"file-selector-button", b"details-content", b"scroll-marker"];
 
 /// 入れ子の並び（規則の並び・`:is()`・`:where()`・`:not()`・`:has()`・`of S`）を読んでいる所。
 #[repr(C)]
@@ -966,8 +987,10 @@ fn pseudo(
     if element {
         n = cur.next()?;
     }
-    let is = |w: &[u8]| ident_is(s, n.inner, n.escaped, w);
-    let any = |list: &[&[u8]]| list.iter().any(|w| ident_is(s, n.inner, n.escaped, w));
+    // 名前は 1 度だけ解いて、言葉の表と比べる（escape の名前を言葉ごとに解き直さない）
+    let nm = crate::css::lex::name_of(s, n.inner, n.escaped, budget)?;
+    let is = |w: &[u8]| nm.is(w);
+    let any = |list: &[&[u8]]| list.iter().any(|w| nm.is(w));
     let webkit = || n.inner.of(s).get(..8).is_some_and(|p| p.eq_ignore_ascii_case(b"-webkit-")) && !n.escaped;
     let legacy = n.kind == Kind::Ident && any(LEGACY_PSEUDO_ELEMENTS);
     if element || legacy {
@@ -988,6 +1011,8 @@ fn pseudo(
             PE_NONE => true,
             PE_BEFORE_AFTER => n.kind == Kind::Ident && is(b"marker"),
             PE_PART => true,
+            PE_SLOTTED => n.kind == Kind::Ident && any(AFTER_SLOTTED),
+            PE_COLUMN => n.kind == Kind::Ident && is(b"scroll-marker"),
             _ => false,
         };
         if !follows {
@@ -999,6 +1024,10 @@ fn pseudo(
             PE_PART
         } else if n.kind == Kind::Ident && is(b"selection") {
             PE_SELECTION
+        } else if n.kind == Kind::Function && is(b"slotted") {
+            PE_SLOTTED
+        } else if n.kind == Kind::Ident && is(b"column") {
+            PE_COLUMN
         } else {
             PE_OTHER
         };

@@ -364,11 +364,17 @@ fn match_rules_with(
     u.id = true;
     u.class = true;
     let sib = if u.sib { Some(siblings(doc, input, u.ty, budget)?) } else { None };
+    // 生きている複合（当てる規則の選択子から、左の複合と `:is()`・`:not()` などの中の並びをたどって届くもの）。条件が偽の
+    // 規則と、捨てた規則の残りの複合は照らさない（CSS の 4 回目のレビュー）
+    let live = live_compounds(sheet, active, budget)?;
     // 複合の鍵
     let mut keyed: MVec<'_, KeyEntry> = MVec::new(budget);
     let mut keyless: MVec<'_, u32> = MVec::new(budget);
     for (k, c) in sheet.compounds.as_slice().iter().enumerate() {
         budget.spend(cost::OP_STEP)?;
+        if live.get(k).copied() != Some(1) {
+            continue;
+        }
         let mut best: Option<KeyEntry> = None;
         let mut dead = false;
         let mut sp = c.first;
@@ -475,6 +481,10 @@ fn match_rules_with(
     let mut path: MVec<'_, u32> = MVec::with_capacity(budget, max_depth.saturating_add(1))?;
     let mut cands: MVec<'_, u32> = MVec::new(budget);
     let mut keyed_c: MVec<'_, u32> = MVec::new(budget);
+    // 鍵の範囲（同じ鍵の並びの頭）ごとに、最後に候補に足した要素（同じ class の語が重なっても 1 度だけ足す。CSS の 4 回目の
+    // レビュー）
+    let mut range_seen: MVec<'_, u32> = MVec::with_capacity(budget, keyed.len())?;
+    range_seen.resize_to(keyed.len(), NONE)?;
     let mut hits: MVec<'_, Hit> = MVec::new(budget);
     let ctx = Ctx { doc, input, sheet, sib: sib.as_ref().map(MVec::as_slice), budget };
     for (i, n) in nodes.iter().enumerate() {
@@ -500,26 +510,39 @@ fn match_rules_with(
         let info = elem_info(doc, input, n, u, parent_lang, budget)?;
         // 照らす複合：鍵のないものと、要素の id・class・局所名を鍵にするもの（番号の順）
         keyed_c.clear();
-        let add_key = |kind: u8, name: &[u8], cands: &mut MVec<'_, u32>| -> Result<(), Error> {
-            let list = keyed.as_slice();
-            let lo = lower_bound_try(budget, list, |x| {
-                if x.kind != kind {
-                    return Ok(x.kind < kind);
+        let add_key =
+            |kind: u8, name: &[u8], cands: &mut MVec<'_, u32>, seen: &mut MVec<'_, u32>| -> Result<(), Error> {
+                let list = keyed.as_slice();
+                let lo = lower_bound_try(budget, list, |x| {
+                    if x.kind != kind {
+                        return Ok(x.kind < kind);
+                    }
+                    Ok(bytes_cmp(budget, x.name.of(names), name)?.is_lt())
+                })?;
+                // この要素で足した範囲なら飛ばす（範囲の頭が同じ鍵のときだけ印を使う）
+                match list.get(lo) {
+                    Some(x) if x.kind == kind && bytes_eq(budget, x.name.of(names), name)? => {
+                        if seen.get(lo).copied() == Some(e) {
+                            return Ok(());
+                        }
+                        if let Some(s) = seen.get_mut(lo) {
+                            *s = e;
+                        }
+                    }
+                    _ => return Ok(()),
                 }
-                Ok(bytes_cmp(budget, x.name.of(names), name)?.is_lt())
-            })?;
-            for x in list.get(lo..).unwrap_or(&[]) {
-                budget.spend(cost::OP_STEP)?;
-                if x.kind != kind || !bytes_eq(budget, x.name.of(names), name)? {
-                    break;
+                for x in list.get(lo..).unwrap_or(&[]) {
+                    budget.spend(cost::OP_STEP)?;
+                    if x.kind != kind || !bytes_eq(budget, x.name.of(names), name)? {
+                        break;
+                    }
+                    cands.push(x.compound)?;
                 }
-                cands.push(x.compound)?;
-            }
-            Ok(())
-        };
-        add_key(KEY_TYPE, n.local.of(input), &mut keyed_c)?;
+                Ok(())
+            };
+        add_key(KEY_TYPE, n.local.of(input), &mut keyed_c, &mut range_seen)?;
         if let Some(v) = ctx.attr_value(info.id) {
-            add_key(KEY_ID, v, &mut keyed_c)?;
+            add_key(KEY_ID, v, &mut keyed_c, &mut range_seen)?;
         }
         if let Some(v) = ctx.attr_value(info.class) {
             // 空白で区切った語ごと（読むバイトを払う）
@@ -531,7 +554,7 @@ fn match_rules_with(
                     continue;
                 }
                 if k > a {
-                    add_key(KEY_CLASS, v.get(a..k).unwrap_or(&[]), &mut keyed_c)?;
+                    add_key(KEY_CLASS, v.get(a..k).unwrap_or(&[]), &mut keyed_c, &mut range_seen)?;
                 }
                 a = k.saturating_add(1);
             }
@@ -649,6 +672,53 @@ fn match_rules_with(
         }
     }
     Ok(())
+}
+
+/// 生きている複合の印（複合の数の長さ。1 が生きている）。中の並びの複合と左の複合は外の複合より番号が小さいので、番号の
+/// 大きい方から 1 度流せば足りる。
+fn live_compounds<'b>(sheet: &Sheet, active: &[u8], budget: &'b Budget<'b>) -> Result<MVec<'b, u8>, Error> {
+    let comps = sheet.compounds.as_slice();
+    let sels = sheet.selectors.as_slice();
+    let simples = sheet.simples.as_slice();
+    let mut live: MVec<'b, u8> = MVec::with_capacity(budget, comps.len())?;
+    live.resize_to(comps.len(), 0)?;
+    let mark_list = |live: &mut MVec<'b, u8>, mut sel: u32| -> Result<(), Error> {
+        while sel != NONE {
+            budget.spend(cost::OP_STEP)?;
+            let Some(s) = sels.get(sel as usize) else { break };
+            if let Some(x) = live.get_mut(s.subject as usize) {
+                *x = 1;
+            }
+            sel = s.next;
+        }
+        Ok(())
+    };
+    for (r, rule) in sheet.rules.as_slice().iter().enumerate() {
+        budget.spend(cost::OP_STEP)?;
+        if active.get(r).copied().unwrap_or(0) != 0 {
+            mark_list(&mut live, rule.selector)?;
+        }
+    }
+    for k in (0..comps.len()).rev() {
+        budget.spend(cost::OP_STEP)?;
+        if live.get(k).copied() != Some(1) {
+            continue;
+        }
+        let Some(c) = comps.get(k) else { continue };
+        if let Some(x) = live.get_mut(c.prev as usize) {
+            *x = 1;
+        }
+        let mut sp = c.first;
+        while sp != NONE {
+            budget.spend(cost::OP_STEP)?;
+            let Some(x) = simples.get(sp as usize) else { break };
+            if x.list != NONE {
+                mark_list(&mut live, x.list)?;
+            }
+            sp = x.next;
+        }
+    }
+    Ok(live)
 }
 
 fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {

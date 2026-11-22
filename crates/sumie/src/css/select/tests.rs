@@ -94,7 +94,7 @@ fn parse_full(src: &str, ns: &[(&str, &str)]) -> Option<(String, bool)> {
         names.append_slice(p.as_bytes()).unwrap();
         decls.push(NsDecl { prefix: Span::new(start, names.len()), ns: ns_of_uri(u.as_bytes()), pad: [0; 3] }).unwrap();
     }
-    let table = NsTable { decls: decls.as_slice(), names: names.as_slice() };
+    let table = NsTable { decls: decls.as_slice(), tail: &[], names: names.as_slice() };
     let s = src.as_bytes();
     let p = parse_selector_list(s, Span::new(0, s.len()), table, &mut t, &budget).unwrap()?;
     assert!(budget.max_spend() < crate::budget::CANCEL_INTERVAL);

@@ -463,3 +463,50 @@ fn index_matches_like_unindexed() {
     // 当たる件が十分にある（試験が当たりの道を通る）
     assert!(hits > cases, "{hits}");
 }
+
+/// 照合の手間（規則の条件は `active`）。
+fn match_work(svg: &str, css: &str, active_rule: u8) -> u64 {
+    let input = svg.as_bytes();
+    let b = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let counts = crate::xml::count(input, &Limits::DEFAULT, &b, Stage::Parse).unwrap();
+    let doc = crate::xml::build(input, &counts, &Limits::DEFAULT, &b, Stage::Parse).unwrap();
+    let mut sb = SheetBuilder::new(&b);
+    sb.add(css.as_bytes(), None, 0).unwrap();
+    let sheet = sb.finish().unwrap();
+    let active = vec![active_rule; sheet.rules.len()];
+    let mb = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let mut c = Pairs { out: Vec::new() };
+    match_rules(&doc, input, &sheet, &active, &mb, &mut c).unwrap();
+    mb.work()
+}
+
+/// 当たらない規則（条件が偽）と捨てた規則の複合は、要素ごとに照らさない（CSS の 4 回目のレビュー）。
+#[test]
+fn dead_compounds_are_not_matched() {
+    let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\">{}</svg>", "<g/>".repeat(2_000));
+    let long = vec!["*"; 2_000].join(" ");
+    let base = match_work(&svg, "#none{fill:red}", 1);
+    // 条件が偽の規則
+    let dead = match_work(&svg, &format!("{long}{{fill:red}}"), 0);
+    assert!(dead < base + 200_000, "{dead} ≫ {base}");
+    // 捨てた規則の残りの複合（並びの最後の `!` で壊れる）
+    let broken = match_work(&svg, &format!("{long}!{{fill:red}} #none{{fill:red}}"), 1);
+    assert!(broken < base + 200_000, "{broken} ≫ {base}");
+    // 当たる規則なら照らす（比べの相手）
+    let live = match_work(&svg, &format!("{long}{{fill:red}}"), 1);
+    assert!(live > base * 100, "{live} ≤ {base}");
+}
+
+/// 同じ class の語が重なっても、鍵の範囲は要素ごとに 1 度だけ候補に足す（CSS の 4 回目のレビュー）。
+#[test]
+fn repeated_class_words_are_added_once() {
+    let css: String = (0..200).map(|_| ".a{fill:red}").collect();
+    let one = match_work("<svg xmlns=\"http://www.w3.org/2000/svg\"><rect class=\"a\"/></svg>", &css, 1);
+    let many = match_work(
+        &format!("<svg xmlns=\"http://www.w3.org/2000/svg\"><rect class=\"{}\"/></svg>", vec!["a"; 5_000].join(" ")),
+        &css,
+        1,
+    );
+    // 語ごとの探索の手間（2 分の探索と比べ。1 語 500 単位ほど）だけ増え、語 × 複合（20 万の候補の並べ替え）にならない
+    assert!(many < one + 5_000 * 600, "{many} ≫ {one}");
+}

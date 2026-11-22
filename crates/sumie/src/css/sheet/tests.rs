@@ -343,3 +343,21 @@ fn namespace_counts_cover_the_peak() {
     let sh = sb.finish().unwrap();
     assert_eq!(sh.ns.len(), 1);
 }
+
+/// `@namespace` と、窓を閉じないもの（壊れた規則・形の壊れた `@supports`）を交互に書いても、並べ直すのは尾が 64 個を
+/// 超えたときだけ（全体で O(n² / 64)。直す前は 5,000 個で 20 億単位。CSS の 4 回目のレビュー）。
+#[test]
+fn namespace_alternation_is_bounded() {
+    let work = |n: usize, other: &str| {
+        let css: String = (0..n).map(|i| format!("@namespace p{i} url(urn:{i});{other}")).collect();
+        let b = Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never);
+        let mut sb = SheetBuilder::new(&b);
+        sb.add(css.as_bytes(), None, 0).unwrap();
+        let _ = sb.finish().unwrap();
+        b.work()
+    };
+    for other in ["!{}", "@supports (a) and (b) or (c){}"] {
+        let w = work(5_000, other);
+        assert!(w < 40_000_000, "{other}：{w}");
+    }
+}

@@ -117,6 +117,27 @@ fn cases(scale: usize) -> Vec<(&'static str, Vec<u8>)> {
         "当たる選択子の多い規則 × 要素",
         doc(&format!("{}{{fill:red}}", vec!["rect"; n(200_000)].join(",")), &"<rect/>".repeat(20)),
     ));
+    // CSS の 4 回目のレビューの形
+    out.push(("font のまとめ × 要素", {
+        let css: String = (0..100).map(|_| format!("rect{{{}}}", "font:1px a;".repeat(20))).collect();
+        doc(&css, &"<rect/>".repeat(n(5_000)))
+    }));
+    out.push((
+        "偽の条件の長い複合 × 要素",
+        doc(&format!("@media print{{{}{{fill:red}}}}", vec!["*"; 50_000].join(" ")), &"<g/>".repeat(n(5_000))),
+    ));
+    out.push(("@namespace と壊れた規則の交互", {
+        let css: String = (0..n(10_000)).map(|i| format!("@namespace p{i} url(urn:{i});!{{}}")).collect();
+        doc(&css, "<g/>")
+    }));
+    out.push((
+        "class の語の重なり",
+        doc(&".a{fill:red}".repeat(1_000), &format!("<rect class=\"{}\"/>", vec!["a"; n(100_000)].join(" "))),
+    ));
+    out.push((
+        "escape の擬似クラスの名前",
+        doc(&format!("rect{}{{fill:red}}", ":\\000066ocus-visible".repeat(n(20_000))), "<rect/>"),
+    ));
     out.push((
         "@media not の問いの並び",
         doc(&format!("@media {} {{rect{{fill:red}}}}", vec!["not a"; n(20_000)].join(", ")), "<rect/>"),
