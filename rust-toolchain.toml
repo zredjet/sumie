@@ -1,0 +1,6 @@
+# ツールチェーンの固定（ADR-25 (1)。Kura と同じ）。ファズだけ nightly（fuzz/）。
+# rust-src は禁じる口の一覧の生成（`sumie-tools gen-disallowed`）が std の文書を読むのに使う。
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy", "rust-src"]

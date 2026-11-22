@@ -1,0 +1,22 @@
+[package]
+name = "sumie"
+description = "決定的で安全な SVG の描画器（RGBA8・乗算済み）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+# ライブラリは [features] と build.rs を持たない（ビルドで振る舞いを分けない。tests/rules.rs が見張る）
+
+[dependencies]
+# 本番の依存はこれだけ（ADR-02）。`arch` の feature は CPU の命令の経路を選ぶので外す（determinism.md §2.2）
+libm = { version = "=0.2.16", default-features = false }
+
+[dev-dependencies]
+# ゴールデンのダイジェスト（ADR-25 (6)）
+blake3 = "=1.8.7"
+# 試験の共通の道具。count-alloc は確保を数える確保器（allocation-counter）を #[global_allocator] にする（ADR-31 (4)）
+sumie-testkit = { path = "../sumie-testkit", features = ["count-alloc"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,39 @@
+# sumie の workspace（architecture.md §1）。fuzz/ は独立の workspace（nightly）。
+[workspace]
+resolver = "3"
+members = ["crates/sumie", "crates/sumie-testkit", "crates/sumie-tools"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# 決定性と安全の lint。受け継ぐのは crates/sumie だけ（`lints.workspace = true`。ADR-43 (11)）。
+# 道具・testkit は自分のゆるい lints を持つ。禁じる口の一覧は crates/sumie/clippy.toml（`sumie-tools gen-disallowed`）。
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+exit = "deny"
+# 落ちうる添字・`&str` の位置での切り出し・あふれうる素の整数の演算
+indexing_slicing = "deny"
+string_slice = "deny"
+arithmetic_side_effects = "deny"
+# 小さいスタック（NFR-03 の 128 KiB）で回すため。閾値は crates/sumie/clippy.toml
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+# clippy.toml の disallowed-*（警告の既定を誤りにする）
+disallowed_methods = "deny"
+disallowed_types = "deny"
+disallowed_macros = "deny"
+
+[profile.release]
+# overflow-checks は既定（切）のまま（determinism.md §3）。値はビルドの設定に依らない（§1.2）

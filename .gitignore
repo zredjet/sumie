@@ -6,3 +6,6 @@
 /fuzz/target/
 /fuzz/corpus/
 /fuzz/artifacts/
+
+# 手元だけの照合の集まり（W3C の試験など。git の外。ADR-21・corpus/README.md）と、道具の出力
+/local/

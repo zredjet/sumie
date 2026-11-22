@@ -1,0 +1,3 @@
+# 整形（cargo fmt）。注釈の日本語の行が長くなりやすいので幅を 120 にする
+max_width = 120
+use_small_heuristics = "Max"
