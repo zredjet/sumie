@@ -264,3 +264,23 @@ fn inherited_details() {
     assert!(!get(&rows, "s").1.ctm_known && !get(&rows, "r").1.ctm_known && !get(&rows, "u").1.ctm_known);
     assert!(get(&rows, "ok").1.ctm_known);
 }
+
+/// 文字の大きさと行の高さに ∞・NaN を入れない（あふれた値は書かなかったものとする。文書の 3 回目のレビュー）。
+#[test]
+fn font_sizes_stay_finite() {
+    let deep = format!(
+        "<svg {X} width=\"10\" height=\"10\"><style>g{{font-size:300%}} rect{{line-height:0}}</style>{}<rect id=\"r\"/>{}</svg>",
+        "<g>".repeat(700),
+        "</g>".repeat(700)
+    );
+    for svg in [
+        deep,
+        format!(
+            r#"<svg {X} width="10" height="10"><g id="g" style="font-size:1e308%"><rect id="r" style="line-height:0; stroke-width: 1lh"/></g></svg>"#
+        ),
+    ] {
+        let rows = run(&svg);
+        let c = get(&rows, "r").1.computed;
+        assert!(c.font_size.is_finite() && c.line_height.is_finite() && c.stroke_width.is_finite(), "{c:?}");
+    }
+}

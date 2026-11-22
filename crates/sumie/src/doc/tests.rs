@@ -211,3 +211,15 @@ fn unread_refs_are_decoded_and_feimage_is_an_image() {
     assert_eq!(unread, ["a).svg#p"]);
     assert!(d.needs().raster_images);
 }
+
+/// escape を解くと長くなる読まなかった参照（`\0` は U+FFFD）でも、報告の容量を解いた長さで数える（文書の 3 回目のレビュー）。
+#[test]
+fn unread_refs_longer_after_decoding() {
+    for style in [r"fill:url(\0.png)", r"fill:url('\0\0\0')"] {
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect style=\"{style}\"/></svg>"
+        );
+        let d = crate::doc::parse(svg.as_bytes(), &crate::style::ParseOptions::DEFAULT, &Never).unwrap();
+        assert_eq!(d.report().unread_refs().count(), 1, "{style}");
+    }
+}

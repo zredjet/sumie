@@ -327,7 +327,23 @@ fn report(
         budget.spend(cost::OP_STEP)?;
         if n.unread != 0 {
             unread = unread.saturating_add(1);
-            href_bytes = href_bytes.saturating_add(n.href.len());
+            // escape を解いて載せるものは、解いた長さで数える（`\0` は U+FFFD の 3 バイトになり、生より長い。文書の 3 回目の
+            // レビュー）
+            let len = if n.escaped != 0 {
+                let buf = match n.src {
+                    SRC_SHEET => sheet.text.as_slice(),
+                    SRC_STORE => doc.store.as_slice(),
+                    _ => input,
+                };
+                let mut k = 0usize;
+                for c in crate::css::lex::decode_string(buf, n.href, budget) {
+                    k = k.saturating_add(crate::css::select::utf8_pub(c?).1);
+                }
+                k
+            } else {
+                n.href.len()
+            };
+            href_bytes = href_bytes.saturating_add(len);
         } else {
             warns = warns.saturating_add(1);
         }

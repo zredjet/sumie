@@ -843,6 +843,13 @@ pub fn document_parse_cancel(data: &[u8], cancel: &dyn Cancel) -> DocOutcome {
             if a != b {
                 out.check = Check::Violation("estimate_parse と parse の誤りが違う");
             }
+            // 上限より小さな量の Limit（Memory）は、数えた容量の数え違い（文書の 3 回目のレビュー）
+            if let Error::Limit(l) = a
+                && l.resource == Resource::Memory
+                && l.allowed < opts.limits.parse_bytes
+            {
+                out.check = Check::Violation("数えた容量が足りず、上限より小さな量で断った");
+            }
             return out;
         }
         (Err(_), Ok(_)) => {

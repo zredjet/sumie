@@ -3,10 +3,13 @@
 //! - 辺は保守的に張る（輪を見落とさない側に倒す）：要素 → 子（暗に。節の鎖）、`href`（use・feImage・グラデーション・
 //!   pattern・filter・textPath・tref）、受け継がない `url(#)`（clip-path・mask・filter）、受け継ぐ `url(#)`（fill・stroke・
 //!   marker-start・marker-mid・marker-end。行きがけの順に最も近い祖先の指定を持ち、塗る要素と use・feImage から張る）
-//! - 輪は明示の積み上げの深さ優先（3 色）で見つける。戻りの辺が参照の辺ならそれを、子の辺なら積み上げの上でいちばん近い
-//!   参照の辺を取り除き（警告）、取り除いた辺の上で輪がなくなるまでくり返す
+//! - 受け継がない参照は値ごとの並びの節（XML の節の数から後ろ）で共有する（ADR-81 (3)）。textPath・tref の `href` は
+//!   文字の辺で、輪にも展開にも入れない
+//! - 輪は強連結成分（Tarjan。明示の積み上げ）で見つけ、輪のある成分の中の、文書の順に後ろ向きの参照の辺と並びの節に入る辺を
+//!   取り除く（警告。1 度の歩き。取り除く辺はどれももとの図の輪の上にある。ADR-82 (2)）
 //! - 展開の数：輪のない辺の上で、帰りがけの順に「展開したあとの要素の数」を飽和の足し算で求める（use・pattern・marker・
-//!   clip-path・mask・filter の参照は、参照ごとに中身を数える）。子を描かない入れ物（defs・symbol・pattern・marker・
+//!   clip-path・mask・filter の参照は、参照ごとに中身を数える。use の中身と marker の中の塗る要素は、塗りの参照先を
+//!   その数の倍で数える。ADR-81 (1)・ADR-82 (1)）。子を描かない入れ物（defs・symbol・pattern・marker・
 //!   clipPath・mask・グラデーション・filter など）の中身は、参照の辺で入ったときだけ数える（defs の中の use の鎖を、
 //!   描かないのに n² に数えない）
 //! - 条件（`requiredExtensions`・`systemLanguage`。`requiredFeatures` は無視する）が偽の要素と、`switch` で選ばれない子は
@@ -290,6 +293,8 @@ pub(crate) fn build(
     // 規則の並びの値（置き場の位置）を集めて並べる：規則の値の並びの節の番号は、ここでの位置
     let mut sheet_keys: MVec<'_, u32> = MVec::new(budget);
     for i in 0..n {
+        // 指定のない節（文字の節など）も 1 つずつ払う（文書の 3 回目のレビュー）
+        budget.spend(cost::OP_STEP)?;
         for sp in styles.of(i as u32) {
             budget.spend(cost::OP_STEP)?;
             let p = Some(sp.prop);
@@ -509,9 +514,11 @@ pub(crate) fn build(
         }
         own_lists.push(mine)?;
         inh.push(own)?;
-        // 受け継いだ参照の辺（塗る要素・marker を付ける要素）
+        // 受け継いだ参照の辺（塗る要素・marker を付ける要素）。marker の辺を塗りの辺より先に張る（marker の中の
+        // context-fill・context-stroke が要素の塗りを使うので、展開の数で塗りの倍率を決めるときに marker を数え終えている。
+        // 文書の 3 回目のレビュー）
         if paints(local) {
-            for k in 0..INH_KINDS.len() {
+            for k in [2usize, 3, 4, 0, 1] {
                 let marker = k >= 2;
                 if marker && !markable(local) {
                     continue;
@@ -624,40 +631,58 @@ fn conditions_pass(
     Ok(false)
 }
 
-/// 深さ優先の積み上げの段。
+/// 強連結成分を求める歩きの表（Tarjan）。
+struct Tarjan<'a, 'b> {
+    index: &'a mut MVec<'b, u32>,
+    low: &'a mut MVec<'b, u32>,
+    on: &'a mut MVec<'b, u8>,
+    sstack: &'a mut MVec<'b, u32>,
+    next: &'a mut u32,
+}
+
+impl Tarjan<'_, '_> {
+    /// 節 `v` に入る（番号を振り、積み上げに積む）。
+    fn enter(&mut self, v: u32, call: &mut MVec<'_, SccFrame>, child: u32, edge: u32) -> Result<(), Error> {
+        let i = *self.next;
+        if let Some(x) = self.index.get_mut(v as usize) {
+            *x = i;
+        }
+        if let Some(x) = self.low.get_mut(v as usize) {
+            *x = i;
+        }
+        *self.next = i.saturating_add(1);
+        if let Some(x) = self.on.get_mut(v as usize) {
+            *x = 1;
+        }
+        self.sstack.push(v)?;
+        call.push(SccFrame { node: v, child, edge, pad: 0 })
+    }
+}
+
+/// 強連結成分を求める歩きの段。
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Frame {
+struct SccFrame {
     node: u32,
     /// 次に見る子（なければ NONE）
     child: u32,
     /// 次に見る辺の位置（`start` の中の位置）
     edge: u32,
-    /// この段に入った参照の辺（`edges` の番号。子の辺で入ったなら NONE）
-    via: u32,
-    /// 先に見直す行き先と、その辺（入り直した段。NONE ならない）
-    revisit: u32,
-    revisit_via: u32,
-    /// 取り除いた辺より上にあった段（見終えたら白に戻す）
-    orphan: u8,
-    pad: [u8; 3],
+    pad: u32,
 }
 
-impl Plain for Frame {}
+impl Plain for SccFrame {}
 
-const WHITE: u8 = 0;
-const GRAY: u8 = 1;
-const BLACK: u8 = 2;
-
-/// 輪を取り除く（取り除いた辺に印を付け、輪の警告を足す）。輪がなくなるまでくり返す（ふつうは 2 度目の歩きは確かめだけ）。
+/// 輪を取り除く（取り除いた辺に印を付け、輪の警告を足す）。1 度の歩きで済み、手間は節と辺の数に比例する（文書の 3 回目の
+/// レビュー：取り残しの歩きは輪の数だけ歩き直す形と、輪でない辺を取り除く形があった）。
 ///
-/// - 節は XML の節と並びの節（`list_pos` の数。XML の節の数から後ろ）。並びの節は子を持たない
-/// - 輪の辺は、戻りの辺が参照の辺ならそれを、子の辺なら積み上げの上でいちばん近い参照の辺を取り除く。取り除く辺が並びの節から
-///   出る辺なら、その並びの節に入った要素の辺を取り除く（並びは要素で共有するので、輪の上の要素の参照だけを除く）
-/// - 積み上げの中の辺を取り除いたら、その辺で入った段から上を「取り残し」にして歩きを続ける（その段から上はもう祖先でない
-///   が、上の段の道はあるので、そこで見つかる輪は本物）。取り残しの段は見終えたら黒でなく白に戻し、入り直したときは、取り
-///   除いたときに途中だった行き先だけを見直して、子と辺は見終えたものとする（黒の子をたどり直さない。文書の 2 回目の
-///   レビュー：1 度の歩きでまとめて取り除き、手間を節と辺の数に比例させる）
+/// - 図は、子の辺（要素の子）と参照の辺（文字の辺を除く）。節は XML の節と並びの節（`list_pos` の数。XML の節の数から後ろ）
+/// - 強連結成分（Tarjan。明示の積み上げ）を求め、輪のある成分（2 つ以上の節か、自分への辺）の中で、文書の順に後ろ向きの
+///   参照の辺（行き先の番号 ≦ 元の番号）と、並びの節に入る辺を取り除く。子の辺はいつも前向き（節の番号は行きがけの順）、
+///   並びの節は成分の中から入れなくなるので、残りに輪はない
+/// - 取り除く辺はどれも、もとの図の輪の上にある（輪の参照だけを除く。FR-CO-05）。どの辺を除くかは文書の順で決まり、少ない
+///   数を選ぶとは限らない（M2 の木を作る段が use の文脈で確かめる。ADR-78 (8)）
+/// - 並びの節から出る辺は取り除かない（並びは要素で共有するので、輪の上の要素の、並びに入る辺を取り除く）
 fn remove_cycles(
     doc: &XmlDoc,
     start: &[u32],
@@ -673,65 +698,44 @@ fn remove_cycles(
     if n == 0 {
         return Ok(());
     }
-    let mut color: MVec<'_, u8> = MVec::with_capacity(budget, total)?;
-    // 取り残しの節の、入り直したときに見直す行き先とその辺（`resume` が 1 なら子と辺は見終えたものとする）
-    let mut resume: MVec<'_, u8> = MVec::with_capacity(budget, total)?;
-    let mut revisit: MVec<'_, u32> = MVec::with_capacity(budget, total)?;
-    let mut revisit_via: MVec<'_, u32> = MVec::with_capacity(budget, total)?;
-    let mut stack: MVec<'_, Frame> = MVec::new(budget);
     let first_child = |i: u32| nodes.get(i as usize).map_or(NONE, |x| x.first_child);
     let edge_start = |i: u32| start.get(i as usize).copied().unwrap_or(0);
-    let pos_of = |node: u32| -> u32 {
-        match nodes.get(node as usize) {
-            Some(x) => x.pos,
-            None => list_pos.get((node as usize).saturating_sub(n)).copied().unwrap_or(0),
+    let mut index: MVec<'_, u32> = MVec::with_capacity(budget, total)?;
+    index.resize_to(total, NONE)?;
+    let mut low: MVec<'_, u32> = MVec::with_capacity(budget, total)?;
+    low.resize_to(total, 0)?;
+    let mut on: MVec<'_, u8> = MVec::with_capacity(budget, total)?;
+    on.resize_to(total, 0)?;
+    let mut comp: MVec<'_, u32> = MVec::with_capacity(budget, total)?;
+    comp.resize_to(total, NONE)?;
+    let mut sizes: MVec<'_, u32> = MVec::new(budget);
+    let mut sstack: MVec<'_, u32> = MVec::new(budget);
+    let mut call: MVec<'_, SccFrame> = MVec::new(budget);
+    let mut next_index = 0u32;
+    for root in 0..total {
+        budget.spend(cost::OP_STEP)?;
+        let root = root as u32;
+        if index.get(root as usize).copied() != Some(NONE) {
+            continue;
         }
-    };
-    let fresh = |node: u32, via: u32| Frame {
-        node,
-        child: first_child(node),
-        edge: edge_start(node),
-        via,
-        revisit: NONE,
-        revisit_via: NONE,
-        orphan: 0,
-        pad: [0; 3],
-    };
-    loop {
-        let mut removed_any = false;
-        color.clear();
-        color.resize_to(total, WHITE)?;
-        resume.clear();
-        resume.resize_to(total, 0)?;
-        revisit.clear();
-        revisit.resize_to(total, NONE)?;
-        revisit_via.clear();
-        revisit_via.resize_to(total, NONE)?;
-        stack.clear();
-        // 根から（どの XML の節も子の鎖で根から届く。並びの節は要素の辺で届く）
-        if let Some(c) = color.get_mut(0) {
-            *c = GRAY;
-        }
-        stack.push(fresh(0, NONE))?;
-        while let Some(top) = stack.last().copied() {
+        let mut t =
+            Tarjan { index: &mut index, low: &mut low, on: &mut on, sstack: &mut sstack, next: &mut next_index };
+        t.enter(root, &mut call, first_child(root), edge_start(root))?;
+        while let Some(top) = call.last().copied() {
             budget.spend(cost::OP_STEP)?;
-            // 次の行き先：見直す行き先、子（要素だけ）、次に参照の辺（飛ばす子と辺も 1 つずつ払う）
-            let mut next: Option<(u32, u32)> = None;
+            // 次の行き先：子（要素だけ）、次に参照の辺（飛ばす子と辺も 1 つずつ払う）
             let mut frame = top;
-            if frame.revisit != NONE {
-                next = Some((frame.revisit, frame.revisit_via));
-                frame.revisit = NONE;
-                frame.revisit_via = NONE;
-            }
-            while next.is_none() && frame.child != NONE {
+            let mut next = NONE;
+            while frame.child != NONE {
                 budget.spend(cost::OP_STEP)?;
                 let c = frame.child;
                 frame.child = nodes.get(c as usize).map_or(NONE, |x| x.next_sibling);
                 if nodes.get(c as usize).is_some_and(|x| x.kind == KIND_ELEMENT) {
-                    next = Some((c, NONE));
+                    next = c;
+                    break;
                 }
             }
-            if next.is_none() {
+            if next == NONE {
                 let end = edge_start(top.node.saturating_add(1));
                 while frame.edge < end {
                     budget.spend(cost::OP_STEP)?;
@@ -741,128 +745,92 @@ fn remove_cycles(
                         && e.removed == 0
                         && e.kind != EDGE_TEXT
                     {
-                        next = Some((e.target, k));
+                        next = e.target;
                         break;
                     }
                 }
             }
-            if let Some(x) = stack.last_mut() {
+            if let Some(x) = call.last_mut() {
                 *x = frame;
             }
-            let Some((target, via)) = next else {
-                stack.pop();
-                // 取り残しの段は白に戻す（ほかの道から入り直せる）
-                if let Some(c) = color.get_mut(top.node as usize) {
-                    *c = if top.orphan != 0 { WHITE } else { BLACK };
+            if next != NONE {
+                match index.get(next as usize).copied() {
+                    Some(NONE) => {
+                        let mut t = Tarjan {
+                            index: &mut index,
+                            low: &mut low,
+                            on: &mut on,
+                            sstack: &mut sstack,
+                            next: &mut next_index,
+                        };
+                        t.enter(next, &mut call, first_child(next), edge_start(next))?;
+                    }
+                    Some(ix) if on.get(next as usize).copied() == Some(1) => {
+                        if let Some(l) = low.get_mut(top.node as usize) {
+                            *l = (*l).min(ix);
+                        }
+                    }
+                    _ => {}
                 }
                 continue;
-            };
-            // 取り除いた辺（見直す行き先の辺は取り除かれていることがある）
-            if via != NONE && edges.get(via as usize).is_some_and(|e| e.removed != 0) {
-                continue;
             }
-            match color.get(target as usize).copied() {
-                Some(WHITE) => {
-                    if let Some(c) = color.get_mut(target as usize) {
-                        *c = GRAY;
+            // 見終えた：根なら成分を取り出し、親の low を下げる
+            call.pop();
+            let v = top.node;
+            let (lv, iv) = (low.get(v as usize).copied().unwrap_or(0), index.get(v as usize).copied().unwrap_or(0));
+            if lv == iv {
+                let id = sizes.len() as u32;
+                let mut size = 0u32;
+                while let Some(w) = sstack.pop() {
+                    budget.spend(cost::OP_STEP)?;
+                    if let Some(x) = on.get_mut(w as usize) {
+                        *x = 0;
                     }
-                    let mut f = fresh(target, via);
-                    if resume.get(target as usize).copied() == Some(1) {
-                        // 取り残しから入り直す：途中だった行き先だけを見直し、子と辺は見終えたものとする
-                        f.child = NONE;
-                        f.edge = edge_start(target.saturating_add(1));
-                        f.revisit = revisit.get(target as usize).copied().unwrap_or(NONE);
-                        f.revisit_via = revisit_via.get(target as usize).copied().unwrap_or(NONE);
+                    if let Some(x) = comp.get_mut(w as usize) {
+                        *x = id;
                     }
-                    stack.push(f)?;
-                }
-                Some(GRAY) => {
-                    // 取り除く辺と、取り残しにする段（その段から上）
-                    let len = stack.len();
-                    let (mut cut, mut orphan_from) = if via != NONE { (Some(via), None) } else { (None, None) };
-                    if via == NONE {
-                        for (j, f) in stack.as_slice().iter().enumerate().rev() {
-                            budget.spend(cost::OP_STEP)?;
-                            // 行き先の段に入った辺は輪の外
-                            if f.node == target {
-                                break;
-                            }
-                            if f.via != NONE {
-                                cut = Some(f.via);
-                                orphan_from = Some(j);
-                                break;
-                            }
-                        }
-                    }
-                    // 並びの節から出る辺なら、その並びの節に入った要素の辺にする
-                    let frames = stack.as_slice();
-                    match orphan_from {
-                        None if via != NONE => {
-                            if let Some(t) = frames.last()
-                                && t.node as usize >= n
-                                && t.via != NONE
-                            {
-                                cut = Some(t.via);
-                                orphan_from = Some(len.saturating_sub(1));
-                            }
-                        }
-                        Some(j) if j > 0 => {
-                            if let Some(f) = frames.get(j.saturating_sub(1))
-                                && f.node as usize >= n
-                                && f.via != NONE
-                            {
-                                cut = Some(f.via);
-                                orphan_from = Some(j.saturating_sub(1));
-                            }
-                        }
-                        _ => {}
-                    }
-                    if let Some(k) = cut
-                        && let Some(e) = edges.get_mut(k as usize)
-                        && e.removed == 0
-                    {
-                        e.removed = 1;
-                        removed_any = true;
-                        // 警告の位置は辺の元の要素
-                        let pos = pos_of(source_of(start, k));
-                        notes.push(RefNote { pos, href: Span::default(), src: 0, unread: 0, escaped: 0, pad: 0 })?;
-                        if let Some(j) = orphan_from {
-                            // 取り残しの段：途中だった行き先（上の段、いちばん上なら輪を見つけた行き先）を覚える
-                            for i in j..len {
-                                budget.spend(cost::OP_STEP)?;
-                                let (rv, rvia) = match stack.as_slice().get(i.saturating_add(1)) {
-                                    Some(a) => (a.node, a.via),
-                                    None => (target, via),
-                                };
-                                let Some(f) = stack.as_mut_slice().get_mut(i) else { continue };
-                                f.orphan = 1;
-                                let node = f.node as usize;
-                                if let Some(x) = resume.get_mut(node) {
-                                    *x = 1;
-                                }
-                                if let Some(x) = revisit.get_mut(node) {
-                                    *x = rv;
-                                }
-                                if let Some(x) = revisit_via.get_mut(node) {
-                                    *x = rvia;
-                                }
-                            }
-                        }
+                    size = size.saturating_add(1);
+                    if w == v {
+                        break;
                     }
                 }
-                _ => {}
+                sizes.push(size)?;
             }
-        }
-        if !removed_any {
-            return Ok(());
+            if let Some(p) = call.last() {
+                let pn = p.node as usize;
+                if let Some(l) = low.get_mut(pn) {
+                    *l = (*l).min(lv);
+                }
+            }
         }
     }
-}
-
-/// 辺 `k` の元の節（`start` は昇順なので二分探索）。
-fn source_of(start: &[u32], k: u32) -> u32 {
-    let i = crate::mem::lower_bound(start, |&s| s <= k);
-    (i as u32).saturating_sub(1)
+    // 輪のある成分の中の、後ろ向きの参照の辺と並びの節に入る辺を取り除く（元の節の順に。警告は位置の順になる）
+    for src in 0..total {
+        budget.spend(cost::OP_STEP)?;
+        let a = edge_start(src as u32) as usize;
+        let b = edge_start((src as u32).saturating_add(1)) as usize;
+        let cs = comp.get(src).copied().unwrap_or(NONE);
+        for k in a..b {
+            budget.spend(cost::OP_STEP)?;
+            let Some(e) = edges.get(k).copied() else { continue };
+            if e.removed != 0 || e.kind == EDGE_TEXT || comp.get(e.target as usize).copied() != Some(cs) {
+                continue;
+            }
+            let t = e.target as usize;
+            let cyclic = t == src || sizes.get(cs as usize).copied().unwrap_or(0) > 1;
+            let cut = cyclic && src < n && (t >= n || t <= src);
+            if !cut {
+                continue;
+            }
+            if let Some(x) = edges.get_mut(k) {
+                x.removed = 1;
+            }
+            let pos =
+                nodes.get(src).map_or_else(|| list_pos.get(src.saturating_sub(n)).copied().unwrap_or(0), |x| x.pos);
+            notes.push(RefNote { pos, href: Span::default(), src: 0, unread: 0, escaped: 0, pad: 0 })?;
+        }
+    }
+    Ok(())
 }
 
 /// 数えた量（展開したあとの要素の数・その中の塗る要素の数・marker を付ける要素の数）。
@@ -947,11 +915,17 @@ fn count_instances(
         }
     };
     // 子の分（中身の塗る要素と marker を付ける要素も足す）・use の中身の分（同じ）・ほかの参照の分（数だけを倍で）
+    // つなぎ：0 子・1 use の中身（数と、塗りを使う要素・marker を付ける要素の数を足す）、2 ほかの中身を作る参照（数だけを倍で）、
+    // 3 marker（数を倍で足し、marker の中の塗る要素を「この要素の塗りを使う要素」に倍で足す：context-fill・context-stroke）
     let add = |a: &mut Tally, t: Tally, link: u8, mult: u64| match link {
         0 | 1 => {
             a.count = cap_add(a.count, t.count);
             a.paints = cap_add(a.paints, t.paints);
             a.marks = cap_add(a.marks, t.marks);
+        }
+        3 => {
+            a.count = cap_add(a.count, cap_mul(t.count, mult));
+            a.paints = cap_add(a.paints, cap_mul(t.paints, mult));
         }
         _ => a.count = cap_add(a.count, cap_mul(t.count, mult)),
     };
@@ -1008,14 +982,19 @@ fn count_instances(
                     next = Some((e.target, 1, 1));
                     break;
                 }
-                // use の受け継いだ塗りと marker は、中身の要素の数の倍
+                // 塗りの参照先は「この要素の塗りを使う要素」の数の倍（自分・use の中身の塗る要素・marker の中の塗る要素。
+                // 辺は use の中身、marker、塗りの順に張るので、ここまでに数え終えている）。use の marker は中身の marker を
+                // 付ける要素の数の倍
                 let content = done.get(frame.content as usize).copied().filter(|t| t.count != NOT_YET);
-                let mult = match e.kind {
-                    EDGE_FILL | EDGE_STROKE if from_use => content.map_or(0, |t| t.paints),
-                    EDGE_MARKER_START | EDGE_MARKER_MID | EDGE_MARKER_END if from_use => content.map_or(0, |t| t.marks),
-                    _ => 1,
+                let users = acc.last().map_or(1, |a| a.paints);
+                let (link, mult) = match e.kind {
+                    EDGE_FILL | EDGE_STROKE => (2, users),
+                    EDGE_MARKER_START | EDGE_MARKER_MID | EDGE_MARKER_END => {
+                        (3, if from_use { content.map_or(0, |t| t.marks) } else { 1 })
+                    }
+                    _ => (2, 1),
                 };
-                next = Some((e.target, 2, mult));
+                next = Some((e.target, link, mult));
                 break;
             }
         }

@@ -437,7 +437,14 @@ pub(crate) fn compute(
         }
     }
     if c.lh_number != 0 {
-        c.line_height = c.lh_factor * c.font_size;
+        // 数の行の高さは文字の大きさに掛ける（あふれたら親の行の高さのまま）
+        let lh = c.lh_factor * c.font_size;
+        if lh.is_finite() {
+            c.line_height = lh;
+        } else {
+            c.lh_number = 0;
+            c.line_height = parent.line_height;
+        }
     }
     let font = c.font_size;
     let line = c.line_height;
@@ -593,10 +600,10 @@ fn font_size(
     if t.kind == Tk::Ident {
         let is = |w: &[u8]| ident_is(buf, t.inner, t.escaped, w);
         if is(b"larger") {
-            return Ok(Some(parent.font_size * FONT_SIZE_STEP));
+            return Ok(Some(parent.font_size * FONT_SIZE_STEP).filter(|x| x.is_finite()));
         }
         if is(b"smaller") {
-            return Ok(Some(parent.font_size / FONT_SIZE_STEP));
+            return Ok(Some(parent.font_size / FONT_SIZE_STEP).filter(|x| x.is_finite()));
         }
         // math は数式の外では親の大きさ
         if is(b"math") {
@@ -611,7 +618,8 @@ fn font_size(
         Unit::Percent => Some(l.value * parent.font_size / 100.0),
         _ => resolve(l, parent.font_size, parent.line_height, base, Axis::Diag),
     };
-    Ok(out.filter(|&x| x >= 0.0))
+    // 有限でない大きさは書かなかったものとする（NaN・±∞ を値に入れない。文書の 3 回目のレビュー）
+    Ok(out.filter(|&x| x >= 0.0 && x.is_finite()))
 }
 
 /// `line-height`：（数か, 値）。数は子が受け継いで子の文字の大きさに掛ける。
@@ -632,7 +640,7 @@ fn line_height(
     }
     let Some(l) = v.length(false)? else { return Ok(None) };
     let out = match l.unit {
-        Unit::Percent => Some(l.value * font / 100.0),
+        Unit::Percent => Some(l.value * font / 100.0).filter(|x| x.is_finite()),
         // lh は親の行の高さ
         Unit::Lh => Some(l.value * parent.line_height),
         _ => resolve(l, font, parent.line_height, base, Axis::Diag),

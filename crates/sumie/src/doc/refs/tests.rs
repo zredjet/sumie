@@ -1,4 +1,10 @@
-#![allow(clippy::disallowed_macros, clippy::disallowed_methods, clippy::disallowed_types, clippy::indexing_slicing)]
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 
 use super::*;
 use crate::cancel::Never;
@@ -64,7 +70,8 @@ fn edges_by_kind_and_inheritance() {
     assert_eq!(get("r1"), [("g".into(), EDGE_FILL, false), ("p".into(), EDGE_STROKE, false)]);
     assert_eq!(
         get("p1"),
-        [("g".into(), EDGE_FILL, false), ("p".into(), EDGE_STROKE, false), ("mk".into(), EDGE_MARKER_START, false)]
+        // marker の辺を塗りの辺より先に張る（展開の数の倍率のため）
+        [("mk".into(), EDGE_MARKER_START, false), ("g".into(), EDGE_FILL, false), ("p".into(), EDGE_STROKE, false)]
     );
     // initial は受け継ぎを切る
     assert_eq!(get("c1"), [("p".into(), EDGE_STROKE, false)]);
@@ -185,8 +192,8 @@ fn wrong_kind_targets_make_no_edges() {
     assert_eq!(cycles, 1);
 }
 
-/// 子の辺で戻る輪を 1 度の歩きでまとめて取り除く（参照の辺を取り除いたら、その段から上を巻き戻す）。手間は輪の数に
-/// おおよそ比例する（直す前は 4,000 個で 2.4 億単位・12,000 個で手間の上限。文書の 1 回目のレビュー）。
+/// 子の辺で戻る輪を 1 度の歩きでまとめて取り除く。手間は輪の数におおよそ比例する（直す前は 4,000 個で 2.4 億単位・
+/// 12,000 個で手間の上限。文書の 1 回目のレビュー）。
 #[test]
 fn many_child_edge_cycles_in_one_pass() {
     let work = |k: usize| {
@@ -251,10 +258,9 @@ fn saturated_counts_are_not_recounted() {
     );
 }
 
-/// 取り除いた辺より上の段は取り残しにして歩きを続け、入り直すときは途中だった行き先だけを見直す（P の子が多く、Q が深い形
-/// でも手間が節と辺の数に比例する。文書の 2 回目のレビュー）。
+/// P の子が多く、Q が深い形の輪も 1 度の歩きで取り除き、手間が節と辺の数に比例する（文書の 2 回目・3 回目のレビュー）。
 #[test]
-fn orphaned_frames_are_revisited_cheaply() {
+fn many_cycles_with_deep_chains_are_linear() {
     let work = |k: usize, d: usize| {
         let uses: String = (0..k).map(|i| format!("<use href=\"#c{i}\"/>")).collect();
         let inner: String = (0..k).map(|i| format!("<use id=\"c{i}\" href=\"#Q\"/>")).collect();
@@ -310,4 +316,178 @@ fn text_hrefs_are_not_cycles() {
         let (_, _, _, cycles) = run(body);
         assert_eq!(cycles, 0, "{body}");
     }
+}
+
+/// marker の中の context-fill・context-stroke は、marker を付けた要素の塗りの参照先の中身を作るので、塗りの参照先は marker の
+/// 中の塗る要素の数の倍で数える（入れ子にした展開の爆弾を estimate_build で断る。文書の 3 回目のレビュー）。
+#[test]
+fn context_paint_in_markers_multiplies() {
+    let k = 4;
+    let ctx: String = (0..k).map(|_| "<rect fill=\"context-fill\"/>").collect();
+    let mut body = String::from("<defs><pattern id=\"p0\"><rect/></pattern>");
+    for i in 1..=8 {
+        body.push_str(&format!(
+            "<marker id=\"m{i}\">{ctx}</marker><pattern id=\"p{i}\"><path d=\"M0 0L1 1L2 2\" fill=\"url(#p{})\" marker-start=\"url(#m{i})\" marker-end=\"url(#m{i})\"/></pattern>",
+            i - 1
+        ));
+    }
+    body.push_str("</defs><rect fill=\"url(#p8)\"/>");
+    let (_, _, n, _) = run(&body);
+    // 1 段ごとに (2K + 1) 倍
+    assert!(n > 9u64.pow(7), "{n}");
+}
+
+/// 種つきの xorshift（試験の入力を作るだけ）。
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// 参照の多い乱数の文書。
+fn random_doc(r: &mut Rng, size: usize) -> String {
+    let names = ["g", "rect", "use", "pattern", "mask", "filter", "clipPath", "marker", "path", "symbol"];
+    let mut s = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\">");
+    let mut open: Vec<&str> = Vec::new();
+    for i in 0..size {
+        if r.below(4) == 0
+            && let Some(t) = open.pop()
+        {
+            s.push_str(&format!("</{t}>"));
+            continue;
+        }
+        let name = names[r.below(names.len() as u64) as usize];
+        let target = |r: &mut Rng| format!("#e{}", r.below(size as u64));
+        let mut attrs = format!(" id=\"e{i}\"");
+        match r.below(6) {
+            0 => attrs.push_str(&format!(" href=\"{}\"", target(r))),
+            1 => attrs.push_str(&format!(" fill=\"url({})\"", target(r))),
+            2 => attrs.push_str(&format!(" mask=\"url({})\"", target(r))),
+            3 => attrs.push_str(&format!(" filter=\"url({}) url({})\"", target(r), target(r))),
+            4 => attrs.push_str(&format!(" clip-path=\"url({})\" marker-end=\"url({})\"", target(r), target(r))),
+            _ => {}
+        }
+        if r.below(2) == 0 {
+            s.push_str(&format!("<{name}{attrs}/>"));
+        } else {
+            s.push_str(&format!("<{name}{attrs}>"));
+            open.push(name);
+        }
+    }
+    while let Some(t) = open.pop() {
+        s.push_str(&format!("</{t}>"));
+    }
+    s.push_str("</svg>");
+    s
+}
+
+/// 輪を取り除いたあとの図に輪がなく、取り除いた辺はどれももとの図の輪の上にある（乱数の文書 3,000 件。文書の 3 回目の
+/// レビュー）。
+#[test]
+fn removed_edges_are_on_cycles_and_leave_no_cycle() {
+    let mut r = Rng(0x0c0f_fee5_1234_5678);
+    let mut removed_total = 0usize;
+    for case in 0..3_000 {
+        let size = 5 + r.below(40) as usize;
+        let svg = random_doc(&mut r, size);
+        let d = crate::doc::parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+        let doc = d.xml();
+        let refs = d.refs();
+        let total = refs.start.len() - 1;
+        // 図（子の辺と、文字の辺を除く参照の辺）。`all` は取り除く前の図
+        let mut live: Vec<Vec<usize>> = vec![Vec::new(); total];
+        let mut all: Vec<Vec<usize>> = vec![Vec::new(); total];
+        for (i, n) in doc.nodes.as_slice().iter().enumerate() {
+            let mut c = n.first_child;
+            while c != NONE {
+                let x = doc.node(c).unwrap();
+                if x.kind == KIND_ELEMENT {
+                    live[i].push(c as usize);
+                    all[i].push(c as usize);
+                }
+                c = x.next_sibling;
+            }
+        }
+        let mut removed = Vec::new();
+        for (i, adj) in live.iter_mut().enumerate() {
+            for e in refs.of(i as u32) {
+                if e.kind == EDGE_TEXT {
+                    continue;
+                }
+                all[i].push(e.target as usize);
+                if e.removed == 0 {
+                    adj.push(e.target as usize);
+                } else {
+                    removed.push((i, e.target as usize));
+                }
+            }
+        }
+        removed_total += removed.len();
+        // 残りの図に輪がない（入りの数で並べきれる）
+        let mut indeg = vec![0usize; total];
+        for adj in &live {
+            for &t in adj {
+                indeg[t] += 1;
+            }
+        }
+        let mut queue: Vec<usize> = (0..total).filter(|&i| indeg[i] == 0).collect();
+        let mut seen = 0usize;
+        while let Some(v) = queue.pop() {
+            seen += 1;
+            for &t in &live[v] {
+                indeg[t] -= 1;
+                if indeg[t] == 0 {
+                    queue.push(t);
+                }
+            }
+        }
+        assert_eq!(seen, total, "{case} 件目：輪が残る\n{svg}");
+        // 取り除いた辺 u → v は、もとの図で v から u に届く（輪の上にある）
+        for &(u, v) in &removed {
+            let mut mark = vec![false; total];
+            let mut st = vec![v];
+            mark[v] = true;
+            while let Some(x) = st.pop() {
+                for &y in &all[x] {
+                    if !mark[y] {
+                        mark[y] = true;
+                        st.push(y);
+                    }
+                }
+            }
+            assert!(mark[u], "{case} 件目：輪でない辺 {u} → {v} を取り除いた\n{svg}");
+        }
+        // 警告の数は取り除いた辺の数
+        let warns = d.report().warnings().filter(|w| w.kind == crate::report::WarningKind::ReferenceCycle).count();
+        assert_eq!(warns, removed.len(), "{case} 件目\n{svg}");
+    }
+    assert!(removed_total > 1_000, "{removed_total}");
+}
+
+/// 輪の鎖（pattern X の中の mask の鎖が X を塗る）でも 1 度の歩きで取り除き、手間が鎖の長さに比例する（文書の 3 回目の
+/// レビュー：取り残しの歩きは輪ごとに歩き直していた）。
+#[test]
+fn chained_cycles_in_one_walk() {
+    let work = |k: usize| {
+        let masks: String = (1..=k)
+            .map(|i| format!("<mask id=\"Y{i}\"><rect fill=\"url(#X)\" mask=\"url(#Y{})\"/></mask>", i - 1))
+            .collect();
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><pattern id=\"X\"><mask id=\"Y0\"><rect/></mask>{masks}</pattern><rect mask=\"url(#Y{k})\"/></svg>"
+        );
+        crate::doc::estimate_parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap().work
+    };
+    let (a, b) = (work(1_000), work(2_000));
+    assert!(b < a * 3, "{a} → {b}");
 }
