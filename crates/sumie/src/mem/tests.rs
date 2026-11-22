@@ -19,6 +19,7 @@ use sumie_testkit::stack::on_small_stack;
 use super::*;
 use crate::budget::CANCEL_INTERVAL;
 use crate::cancel::Never;
+use crate::cost;
 use crate::error::{LimitError, Resource, Stage};
 
 fn budget(limit: u64) -> Budget<'static> {
@@ -201,6 +202,82 @@ fn works_on_a_small_stack() {
         v.as_slice().windows(2).all(|w| w[0] <= w[1])
     });
     assert!(ok);
+}
+
+/// 塊の境目（65,535 個）をまたぐ差し込みが std の Vec::insert と同じ。
+#[test]
+fn insert_matches_vec_across_chunks() {
+    let b = budget(u64::MAX);
+    let mut ours: MVec<'_, u32> = MVec::new(&b);
+    let mut want: Vec<u32> = Vec::new();
+    let mut r = ChaCha::from_u64(21);
+    for i in 0..140_000u32 {
+        ours.push(i).unwrap();
+        want.push(i);
+    }
+    for k in 0..300u32 {
+        let at = match k % 4 {
+            0 => 0,
+            1 => want.len(),
+            2 => r.below(want.len() as u64 + 1) as usize,
+            _ => want.len().saturating_sub(65_535 + (k as usize % 3)),
+        };
+        ours.insert(at, 1_000_000 + k).unwrap();
+        want.insert(at, 1_000_000 + k);
+    }
+    assert_eq!(ours.as_slice(), want.as_slice());
+}
+
+/// 操作ごとの手間と確保の増えが cost の式とぴったり同じ（見積もりは操作ごとの式の和。cost.rs の頭の注釈）。
+#[test]
+fn operations_spend_exactly_the_cost_formulas() {
+    let b = budget(u64::MAX);
+    let mut v: MVec<'_, u32> = MVec::new(&b);
+    let mut r = ChaCha::from_u64(5);
+    for _ in 0..3000 {
+        let (len, cap) = (v.len() as u64, v.capacity() as u64);
+        let (w0, p0, bytes0) = (b.work(), b.peak(), b.bytes());
+        let est = match r.below(4) {
+            0 => {
+                v.push(r.next_u32()).unwrap();
+                cost::append(len, cap, 1, 4)
+            }
+            1 => {
+                let n = r.below(40) as usize;
+                let src: Vec<u32> = (0..n as u32).collect();
+                v.append_slice(&src).unwrap();
+                cost::append(len, cap, n as u64, 4)
+            }
+            2 => {
+                let n = v.len() + r.below(50) as usize;
+                v.resize_to(n, 9).unwrap();
+                cost::resize(len, cap, n as u64, 4)
+            }
+            _ => {
+                let at = r.below(len + 1) as usize;
+                v.insert(at, 7).unwrap();
+                cost::insert(len, cap, at as u64, 4)
+            }
+        };
+        assert_eq!(b.work() - w0, est.0, "len {len} cap {cap}");
+        // 伸ばしたなら、山は前の量 + 新しい領域
+        if est.1 > 0 {
+            assert_eq!(b.peak(), p0.max(bytes0 + est.1));
+        }
+    }
+    assert!(b.max_spend() < CANCEL_INTERVAL);
+}
+
+/// 数えた量より多く返すと印が立つ（二重に返したことを試験とファズで見つける）。
+#[test]
+fn over_release_is_flagged() {
+    let b = budget(1000);
+    b.charge(10).unwrap();
+    b.release(10);
+    assert!(!b.over_released());
+    b.release(1);
+    assert!(b.over_released());
+    assert_eq!(b.charged(), (10, 1));
 }
 
 /// 並べ替えの途中で印が立ったら、2 × CANCEL_INTERVAL のうちに Cancelled を返す。

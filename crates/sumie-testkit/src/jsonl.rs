@@ -98,6 +98,9 @@ impl Line {
                 p.expect(b':')?;
                 p.ws();
                 let v = p.value()?;
+                if line.get(&k).is_some() {
+                    return Err(format!("鍵 {k} が重なる"));
+                }
                 line.fields.push((k, v));
                 p.ws();
                 match p.next() {
@@ -182,12 +185,18 @@ impl Parser<'_> {
                     Some(b't') => out.push(b'\t'),
                     Some(b'u') => {
                         let mut cp = self.hex4()?;
+                        if (0xdc00..0xe000).contains(&cp) {
+                            return Err("対のない低いサロゲート".into());
+                        }
                         if (0xd800..0xdc00).contains(&cp) {
                             if self.next() != Some(b'\\') || self.next() != Some(b'u') {
                                 return Err("サロゲートの対がない".into());
                             }
                             let lo = self.hex4()?;
-                            cp = 0x10000 + ((cp - 0xd800) << 10) + (lo.wrapping_sub(0xdc00) & 0x3ff);
+                            if !(0xdc00..0xe000).contains(&lo) {
+                                return Err("サロゲートの対の後ろが低いサロゲートでない".into());
+                            }
+                            cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
                         }
                         let c = char::from_u32(cp).ok_or("正しくない符号位置")?;
                         let mut buf = [0u8; 4];
@@ -219,6 +228,11 @@ impl Parser<'_> {
                     self.i += 1;
                 }
                 let s = std::str::from_utf8(&self.b[start..self.i]).map_err(|e| e.to_string())?;
+                // 正規の字句だけ（先頭の 0・-0 を受けない）
+                let digits = s.strip_prefix('-').unwrap_or(s);
+                if digits.is_empty() || (digits.len() > 1 && digits.starts_with('0')) || s == "-0" {
+                    return Err(format!("正規でない整数 {s}"));
+                }
                 s.parse::<i128>().map(Value::Int).map_err(|e| format!("整数でない {s}：{e}"))
             }
             other => Err(format!("{} バイト目：値でない（{other:?}）", self.i)),
@@ -242,7 +256,21 @@ mod tests {
 
     #[test]
     fn rejects_broken() {
-        for bad in ["", "{", "{\"a\"}", "{\"a\":}", "{\"a\":1,}", "{\"a\":1} x", "{\"a\":[1]}", "{\"a\":\"\\q\"}"] {
+        for bad in [
+            "",
+            "{",
+            "{\"a\"}",
+            "{\"a\":}",
+            "{\"a\":1,}",
+            "{\"a\":1} x",
+            "{\"a\":[1]}",
+            "{\"a\":\"\\q\"}",
+            "{\"a\":01}",
+            "{\"a\":-0}",
+            "{\"a\":1,\"a\":2}",
+            "{\"a\":\"\\udc00\"}",
+            "{\"a\":\"\\ud83d\\u0041\"}",
+        ] {
             assert!(Line::parse(bad).is_err(), "{bad}");
         }
     }

@@ -20,4 +20,9 @@ fn ceil_log2_and_div() {
     assert_eq!(shift(4, 4), 2);
     assert_eq!(copy(u64::MAX), u64::MAX / 16 + 1);
     assert_eq!(stable_sort(u64::MAX, 8), u64::MAX);
+    assert_eq!(stable_sort(1, 8), 0);
+    assert_eq!(stable_sort_bytes(1, 8), 0);
+    assert_eq!(grow_cap(0, 1), 4);
+    assert_eq!(grow_cap(4, 5), 8);
+    assert_eq!(grow_cap(4, 100), 100);
 }

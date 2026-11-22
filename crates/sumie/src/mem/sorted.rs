@@ -49,6 +49,11 @@ impl<'b, T: Plain + Ord> SortedVec<'b, T> {
         self.v.as_slice()
     }
 
+    /// 頼んだ容量（見積もりの式に渡す）。
+    pub(crate) fn capacity(&self) -> usize {
+        self.v.capacity()
+    }
+
     /// `x` と等しい最初の位置（なければ None）。
     pub(crate) fn find(&self, x: &T) -> Result<Option<usize>, Error> {
         self.v.budget().spend(cost::search(self.v.len() as u64))?;
@@ -64,12 +69,14 @@ impl<'b, T: Plain + Ord> SortedVec<'b, T> {
         Ok(i)
     }
 
-    /// なければ入れる（入れたら真）。
+    /// なければ入れる（入れたら真）。探すのは 1 度（cost::sorted_insert の式）。
     pub(crate) fn insert_unique(&mut self, x: T) -> Result<bool, Error> {
-        if self.find(&x)?.is_some() {
+        self.v.budget().spend(cost::search(self.v.len() as u64))?;
+        let i = lower_bound(self.v.as_slice(), |y| *y < x);
+        if self.v.get(i) == Some(&x) {
             return Ok(false);
         }
-        self.insert(x)?;
+        self.v.insert(i, x)?;
         Ok(true)
     }
 }
@@ -95,6 +102,11 @@ impl<'b, K: Plain + Ord, V: Plain> SortedMap<'b, K, V> {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.keys.is_empty()
+    }
+
+    /// 頼んだ容量（鍵と値で同じ。見積もりの式に渡す）。
+    pub(crate) fn capacity(&self) -> usize {
+        self.keys.capacity().min(self.vals.capacity())
     }
 
     pub(crate) fn keys(&self) -> &[K] {
@@ -124,6 +136,7 @@ impl<'b, K: Plain + Ord, V: Plain> SortedMap<'b, K, V> {
         if found {
             return Ok(false);
         }
+        self.reserve_one()?;
         self.keys.insert(i, k)?;
         self.vals.insert(i, v)?;
         Ok(true)
@@ -138,8 +151,16 @@ impl<'b, K: Plain + Ord, V: Plain> SortedMap<'b, K, V> {
             }
             return Ok(true);
         }
+        self.reserve_one()?;
         self.keys.insert(i, k)?;
         self.vals.insert(i, v)?;
         Ok(false)
+    }
+
+    /// 鍵と値の両方に 1 つ分の容量を先に取る（確保の失敗で鍵だけが入ることのないように）。
+    fn reserve_one(&mut self) -> Result<(), Error> {
+        let need = self.keys.len().saturating_add(1);
+        self.keys.ensure(need)?;
+        self.vals.ensure(need)
     }
 }

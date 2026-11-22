@@ -8,8 +8,9 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-# 確保を数える確保器（allocation-counter）を #[global_allocator] にする（ADR-31 (4)）。ライブラリの試験だけが入れる。
-# ファズ・道具には入れない（libFuzzer の確保の見張りと重ねない）
+# 確保を数える確保器（allocation-counter）を #[global_allocator] にする（ADR-31 (4)・ADR-46）。ライブラリの dev 依存が入れる。
+# ファズには入れない（libFuzzer の確保の見張りと重ねない）。workspace で組むと feature が合わさって sumie-tools にも入るが、
+# 道具も同じ確保器で測るので、道具は自分の #[global_allocator] を置かない
 count-alloc = ["dep:allocation-counter"]
 
 [dependencies]

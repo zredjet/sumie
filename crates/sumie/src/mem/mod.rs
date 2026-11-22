@@ -9,6 +9,9 @@
 //! - 写し・埋めの手間は `cost` の式で、`CANCEL_INTERVAL` 未満の塊ごとに前払いする
 //! - 入れる型は `Plain`（`#[repr(C)]` か基本の型で `Copy`。`tests/rules.rs` が見張る）
 //! - 段の結果に残すものは `freeze` で `Frozen` にする（`Budget` から切り離す。取り直さない）
+//! - 手間は操作ごとに `cost` の式（`append`・`insert`・`resize`・`sorted_insert`・`map_insert`）と同じだけ払う（試験で照らす）
+//! - 誤り（上限・中止）を返したあとの中身は決めない（段は誤りで止まり、結果を作らない。FR-LIM-06）。数えた量は Drop で
+//!   正しく返す
 //!
 //! このモジュールの中だけは、std の確保の口と、範囲を確かめて使う口を、理由を書いて許す（`#[expect(…, reason)]`）。
 
@@ -79,6 +82,9 @@ impl<'b, T: Plain> MVec<'b, T> {
     #[expect(clippy::disallowed_methods, reason = "mem の中の確保の口（数えてから try_reserve_exact で取る）")]
     pub(crate) fn with_capacity(budget: &'b Budget<'b>, n: usize) -> Result<MVec<'b, T>, Error> {
         let bytes = bytes_for::<T>(budget, n)?;
+        if bytes > 0 {
+            budget.spend(cost::ALLOC_STEP)?;
+        }
         budget.charge(bytes)?;
         let mut v = Vec::new();
         if v.try_reserve_exact(n).is_err() {
@@ -149,18 +155,19 @@ impl<'b, T: Plain> MVec<'b, T> {
         if need <= self.cap {
             return Ok(());
         }
-        let doubled = self.cap.saturating_mul(2);
-        let new_cap = need.max(doubled).max(4);
-        let mut next = MVec::with_capacity(self.budget, new_cap)?;
+        let new_cap = cost::grow_cap(self.cap as u64, need as u64);
+        let mut next = MVec::with_capacity(self.budget, usize::try_from(new_cap).unwrap_or(usize::MAX))?;
         next.copy_in(&self.v)?;
         // 古い領域はここで捨てられ、Drop で数えた量を返す
         *self = next;
         Ok(())
     }
 
-    /// 容量が足りる前提で、`s` を後ろに写す（写しの手間を塊ごとに前払いする）。
+    /// `s` を後ろに写す（写しの手間を塊ごとに前払いする）。容量は呼び手が ensure で確かめるが、ここでも確かめる
+    /// （std の Vec が数えずに取り直さないように。足りていれば何もしない）。
     #[expect(clippy::disallowed_methods, reason = "mem の中の写し（容量は ensure で確かめた）")]
     fn copy_in(&mut self, s: &[T]) -> Result<(), Error> {
+        self.ensure(self.v.len().saturating_add(s.len()))?;
         let size = size_of::<T>() as u64;
         let per = chunk_len(cost::copy(size).max(1));
         let mut rest = s;
@@ -179,6 +186,8 @@ impl<'b, T: Plain> MVec<'b, T> {
     #[expect(clippy::disallowed_methods, reason = "mem の中の push（容量は ensure で確かめたので取り直さない）")]
     pub(crate) fn push(&mut self, x: T) -> Result<(), Error> {
         self.ensure(self.v.len().saturating_add(1))?;
+        // 1 つの写し（cost::append の n = 1）
+        self.budget.spend(cost::copy(size_of::<T>() as u64))?;
         self.v.push(x);
         Ok(())
     }

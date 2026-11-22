@@ -33,6 +33,14 @@ pub(crate) struct Budget<'c> {
     /// 次に中止の印を読む手間（CANCEL_INTERVAL の倍数）
     next_check: Cell<u64>,
     cancel: &'c dyn Cancel,
+    // 試験とファズで照らす見張り（値と勘定には効かない）
+    /// 数えた量より多く返した（二重に返した）か
+    over_released: Cell<bool>,
+    /// 数えた確保の合計と回数（ヒープの合計・回数と照らす）
+    charged_total: Cell<u64>,
+    charges: Cell<u64>,
+    /// 1 回の spend の最大（CANCEL_INTERVAL 未満の約束を照らす）
+    max_spend: Cell<u64>,
 }
 
 impl<'c> Budget<'c> {
@@ -47,6 +55,10 @@ impl<'c> Budget<'c> {
             bytes_limit,
             next_check: Cell::new(CANCEL_INTERVAL),
             cancel,
+            over_released: Cell::new(false),
+            charged_total: Cell::new(0),
+            charges: Cell::new(0),
+            max_spend: Cell::new(0),
         }
     }
 
@@ -62,6 +74,9 @@ impl<'c> Budget<'c> {
             return Err(Error::limit(Resource::Work, w, self.work_limit, self.stage));
         }
         self.work.set(w);
+        if units > self.max_spend.get() {
+            self.max_spend.set(units);
+        }
         if w >= self.next_check.get() {
             // w を越える最初の CANCEL_INTERVAL の倍数
             let next = (w >> CANCEL_SHIFT).saturating_add(1).saturating_mul(CANCEL_INTERVAL);
@@ -85,12 +100,18 @@ impl<'c> Budget<'c> {
         if b > self.peak.get() {
             self.peak.set(b);
         }
+        self.charged_total.set(self.charged_total.get().saturating_add(bytes));
+        self.charges.set(self.charges.get().saturating_add(1));
         Ok(())
     }
 
-    /// 捨てた量を返す。
+    /// 捨てた量を返す。数えた量より多く返したら（二重に返したら）印を立てる（試験とファズが照らす）。
     pub(crate) fn release(&self, bytes: u64) {
-        self.bytes.set(self.bytes.get().saturating_sub(bytes));
+        let now = self.bytes.get();
+        if bytes > now {
+            self.over_released.set(true);
+        }
+        self.bytes.set(now.saturating_sub(bytes));
     }
 
     /// 確保に失敗したときの誤り（`try_reserve_exact` の失敗。環境に依るので D1・D2 の約束の外。determinism.md §1.2）。
@@ -112,13 +133,29 @@ impl<'c> Budget<'c> {
     pub(crate) fn peak(&self) -> u64 {
         self.peak.get()
     }
+
+    /// 数えた量より多く返したことがあるか（不具合の印）。
+    pub(crate) fn over_released(&self) -> bool {
+        self.over_released.get()
+    }
+
+    /// 数えた確保の合計（バイト）と回数。
+    pub(crate) fn charged(&self) -> (u64, u64) {
+        (self.charged_total.get(), self.charges.get())
+    }
+
+    /// 1 回の spend の最大（`CANCEL_INTERVAL` 未満のはず）。
+    pub(crate) fn max_spend(&self) -> u64 {
+        self.max_spend.get()
+    }
 }
 
 /// `CANCEL_INTERVAL` の 2 の冪の指数。
 const CANCEL_SHIFT: u32 = CANCEL_INTERVAL.trailing_zeros();
 
-/// 1 つあたり `per` 単位の仕事を、`CANCEL_INTERVAL` 未満の手間の塊に分けたときの、塊の数（1 以上）。
-/// `per` が `CANCEL_INTERVAL` 以上なら 1（1 つずつ払う）。
+/// 1 つあたり `per` 単位の仕事を、`CANCEL_INTERVAL` 未満の手間の塊に分けたときの、1 つの塊に入れる数（1 以上）。
+/// `per` が `CANCEL_INTERVAL` 以上なら 1（1 つずつ払う。1 回の spend が CANCEL_INTERVAL 以上になるので、そうなる型は
+/// 入れ物に入れない。試験は `max_spend` で照らす）。値は `CANCEL_INTERVAL - 1` 以下なので `usize` に収まる。
 pub(crate) const fn chunk_len(per: u64) -> usize {
     let most = CANCEL_INTERVAL.saturating_sub(1);
     let n = match most.checked_div(per) {
