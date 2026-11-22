@@ -8,6 +8,7 @@ mod corpus;
 mod gen_disallowed;
 mod gen_heavy;
 mod image;
+mod kura_compat;
 mod lint_probe;
 mod oracle;
 
@@ -20,6 +21,7 @@ const USAGE: &str = "使い方：sumie-tools <命令> …
   bench [--root corpus|local/heavy] [--repeat N] [--timeout 秒] [--out …]  resvg 単体の時間と確保の山
   corpus import-resvg|fetch-w3c|index …                                  照合の集まり（ADR-21）
   gen-heavy [--out local/heavy]                                          重い入力を作る（architecture.md §10）
+  kura-compat --kura <一覧> [--dir <SVG の根>]                           Kura の SvgCodec の結果と照らす（NFR-10）
   render・golden                                                         sumie で描く・ゴールデンを足す（M2 から）
   gen-disallowed [--check]                                               crates/sumie/clippy.toml を std の文書から作る
   check-lint-probe                                                       禁じる口が clippy で本当に拾われるかを確かめる";
@@ -38,6 +40,7 @@ fn main() {
         "bench-one" => bench::one(rest),
         "corpus" => corpus::run(rest),
         "gen-heavy" => gen_heavy::run(rest),
+        "kura-compat" => kura_compat::run(rest),
         "render" | "golden" => Err(format!("{cmd} は sumie の描く口ができる M2 から")),
         "gen-disallowed" => gen_disallowed::run(rest),
         "check-lint-probe" => lint_probe::run(rest),
