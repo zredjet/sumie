@@ -56,7 +56,7 @@
   （働き手を通さず、プロセスの中の `SvgCodec` で。このリポジトリからは Kura で cargo を走らせない。一覧は Kura の rev つきで
   `corpus/` の横に置く。NFR-10）。Kura の手元の SVG（Kura の働き手の実測に使った 1,439 件）の置き場所をユーザーに聞き、git の
   外で Kura の `SvgCodec` と sumie の両方に通して「描く／断る」と大きさの一致を照らす仕組みを作る（結果の一覧だけを残す。
-  ライセンスでコミットできないため）
+  ライセンスでコミットできないため）。→ 仕組みは `kura-compat` で作った。1,439 件は消えていて使えない（ADR-58 (3)）
 - [ ] `oracle resvg` は Kura と同じ usvg の設定（総称の書体 Times・Helvetica・Apple Chancery・Papyrus・Courier、フォントを名前の
   順に登録、languages、`default_size`）で描く。`oracle chrome` の透明の背景（`--default-background-color=00000000` など）と窓の
   大きさを決めて architecture.md §10 に追記する

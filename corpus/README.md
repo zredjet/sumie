@@ -25,13 +25,13 @@
 | `category` | 分類（resvg は `tests/` の下のフォルダ、W3C は名前の頭の章） |
 | `scope` | `in` か `out:<理由>`（アニメーション・操作・スクリプトは v1 の外。requirements.md §4） |
 | `bytes`・`blake3` | 大きさとダイジェスト |
-| `features` | 使う機能の印（`text`・`filter`・`gradient`・`pattern`・`mask`・`clip`・`marker`・`image`・`use`・`switch`・`style`・`symbol`・`foreignObject`・`script`・`animation`・`blend`）。マイルストーンごとの範囲を選ぶのに使う |
+| `features` | 使う機能の印（`text`・`filter`・`gradient`・`pattern`・`mask`・`clip`・`marker`・`image`・`use`・`switch`・`style`・`symbol`・`foreignObject`・`script`・`animation`・`blend`・`ub`）。マイルストーンごとの範囲と ADR-15 の群を選ぶのに使う。`filter` は CSS のフィルタ関数の `filter` の属性も、`image` は外の画像を指す `feImage` も、`ub` は題に「(UB)」とある resvg の試験の未定義の振る舞いの例（ADR-56 (1)） |
 
 ## 作り直し
 
 ```bash
-# resvg の試験（取ったソースの根を渡す）
-cargo run -p sumie-tools --release -- corpus import-resvg --src <linebender-resvg-68b14c4> --rev 68b14c4c3bccdb60344c777406486b54c36ec1a4 --sha256 41bf46fdb8abc6fc49ec6f83facff0cdab2759a7212734c92f3f6aec12c51820
+# resvg の試験（rev 68b14c4c3bcc と SHA-256 は道具の定数。取ったアーカイブを照らしてから写す。--archive <取ったもの> も使える）
+cargo run -p sumie-tools --release -- corpus import-resvg
 cargo run -p sumie-tools --release -- corpus index
 # W3C の試験（git の外）
 cargo run -p sumie-tools --release -- corpus fetch-w3c

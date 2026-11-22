@@ -173,7 +173,7 @@ Kura の参考（読むだけ）：`/Users/redjet/aruma/repos/zredjet/kura` の 
 |---|---|
 | D1 | 同じ入力の組（版を含む）なら、対象のどのターゲットでも画素・大きさ・版に入る報告がビット単位で同じ（determinism.md §1） |
 | D2 | 同じ入力の組・上限・rev なら、見積もり・断るかどうか・警告が同じ |
-| 形 | Kura の言葉で、値を描かずに大きさと受け付けるかを読むこと。`parse` → `estimate_build` → `build` → `Tree::estimate`（ADR-37）。大きさだけなら `parse` → `Document::pixel_size` |
+| 形 | Kura の言葉で、値を描かずに大きさと受け付けるかを読むこと。`parse` → `estimate_build` → `build` → `Tree::estimate`（ADR-37）。大きさだけなら `parse` → `Document::pixel_size`（大きさを中身で決める文書は木が要る。ADR-58） |
 | フォントの集まり | 呼び手が渡すフォント（`FontSet`）。照合の集まりとは別 |
 | AAT | Apple の TrueType の組版の表（`morx`・`kerx`・Apple の `kern`・`trak`）。macOS のシステムのフォントの約 2 割（787 書体のうち 165）はこれだけを持つ |
 | 読む・木を作る・計画・描く | `parse`（→ `Document`）・`build`（→ `Tree`）・`plan`（→ `Plan`）・`render`・`render_region` の段 |

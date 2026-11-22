@@ -118,7 +118,7 @@ pub struct StyleDefaults<'a> {         // 既定は const の StyleDefaults::USV
 }
 
 impl<'s> Document<'s> {
-    pub fn size(&self) -> Size;                         // ユーザー単位の幅・高さ
+    pub fn size(&self) -> Size;                         // ユーザー単位の幅・高さ（中身で決まる文書は「木が要る」。下の注）
     pub fn pixel_size(&self, scale: f64) -> Result<PixelSize, Error>;
     pub fn needs(&self) -> Needs;                       // 文字があるか・描く木に入りうる <image> の種類（§3.1）
     pub fn report(&self) -> &Report;                    // この段までの警告・読まなかった参照
@@ -207,7 +207,10 @@ Kura の「形」（値を描かずに大きさなどを読む。今の Kura は
 に当たるのは、`parse` → `estimate_build` → `build` → `Tree::estimate`。形を通ったものは、同じ上限・同じ資源・同じ倍率なら、
 `plan`・`render` で `Limit`・`Unsupported` にならない（確保の失敗と中止を除く）。範囲が全体に含まれるなら、
 `Plan::estimate_region` は `RenderEstimate.render` を超えない（Kura がタイルで描いても形の約束が保てる。試験で確かめる）。
-大きさだけなら `parse` → `pixel_size` で足りる。
+大きさだけなら `parse` → `pixel_size` で足りる。ただし viewBox も幅・高さもない（か %）文書は、usvg と同じく中身の外接矩形の
+右下を大きさにする（FR-OUT-01・ADR-58 (1)）ので、木を作るまで大きさが決まらない。`Document::size`・`pixel_size` はそれを
+「中身で決まる（木が要る）」と返す形にし（型は M1 の計画で決める）、大きさは `Tree::size`・`pixel_size` から読む。Kura の形は
+もともと木まで作るので、Kura の側の手間は変わらない。
 
 `Document::needs` の画像は「描く木に入りうる `<image>`」：参照の辺（§4.3）でたどれるものを保守的に数え、参照されない `defs`・
 `display: none` の部分木・通らない `switch` の枝の中のものは除く（今の Kura は usvg が実際に解いた `<image>` だけで断るので、
@@ -583,6 +586,21 @@ Kura の試験の入力（`SLOW_SHAPE`・`SLOW_DECODE`・`nested_pattern_clones_
 | `bomb-use-doubling-17` | use の倍々 17 段（2¹⁷ 個。usvg が「nodes limit reached」で断る） | — |
 | `bomb-pattern-nesting` | 8 × 8・objectBoundingBox の pattern の入れ子 16 段・1 段に参照 2 つ（2¹⁶ の複製。Kura の試験は 23 段で、Kura が木を作る前に断る） | — |
 | `bomb-marker-dup` | 頂点 10 万の path の `marker-mid`（種 3） | — |
+
+**M0 の照合の分布**（resvg の試験 1,739 件、resvg 0.48.1（Kura の設定）と Chrome 157.0.8103.79（`--disable-gpu`）。
+`sumie-tools compare`。割合の分母は全画素。ADR-56 (1)）：
+
+| 群 | 件数（描けない） | 基準で通る | 割合の分布（中央・90%・95%・99%） | ほか |
+|---|---|---|---|---|
+| 図形と単色（8/255・2%・内側 2/255） | 639（3） | 575（割合だけなら 2% で 603） | 0.03%・1.0%・3.0%・64% | 目標 0.5% で 462。α > 0 を分母にすると 2% で 475 |
+| フィルタ・グラデーション（16/255・1%） | 558（3） | 497 | 0.01%・2.7%・17.8%・64% | 内側の差の最大は 90% で 27 |
+| 文字（分布の外） | 406（2） | — | 4.6%・8.5%・10.2%・16.0% | 書体が両者で違う |
+| 画像（分布の外） | 72（0） | — | 19.6%・64%・64%・64% | resvg は画像を読まない |
+| 未定義の振る舞い（題に (UB)。分布の外） | 56（0） | — | 0.49%・31.6%・64%・64% | — |
+
+GPU のラスタ化（既定の起動）のときは、図形と単色の 2%・内側 2/255 で 562 件、0.5% で 369 件、フィルタ・グラデーションで 502 件
+だった（1,739 件のうち 1,706 件で 8/255 を超える画素の数が変わった）。ソフトウェアのラスタ化の方が resvg に近い。外れるものは、
+resvg と Chrome の対応の違い（全面が違う 64% の山）と、縁の細かい違いが多い。Chrome は合否にしない（差の一覧に並べる）。
 
 もとの表（下敷き）：
 
