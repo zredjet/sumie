@@ -81,22 +81,22 @@
 
 ## M1　XML・CSS・文書
 
-- [ ] `xml`：字句・節の配列・名前空間・文字の参照・DTD の内部の実体（上限つき）・`xml:space`
-- [ ] `css`：字句・規則・セレクタ・詳細度・`!important`・照合（行きがけの順に流す部分ごとの旗。手間の勘定。右端の索引）
-- [ ] `values`：数・長さ・色・paint・変形・角度・並び・`viewBox`・`preserveAspectRatio`（パスのデータは M2）
-- [ ] `style`：プロパティの表・カスケード・継承・`currentColor`・em・ex
-- [ ] `doc`：ID の表・参照（保守的な辺。受け継ぐ参照と use の文脈）・輪・展開の数・`switch`・`tref`・大きさ
-- [ ] `estimate_parse`（読む段と同じ道を走らせて量を測る。ADR-70 で「本文を 1 度だけ字句に分けて数える」から改めた）・`estimate_build`（文字を除く）・`Report` の骨組み
-- [ ] NFR-10 の照らし（ADR-63 (1)）：照合の集まりで、Kura の設定の resvg が読めるもの（大きさが出るもの）を sumie の `parse` が
+- [x] `xml`：字句・節の配列・名前空間・文字の参照・DTD の内部の実体（上限つき）・`xml:space`
+- [x] `css`：字句・規則・セレクタ・詳細度・`!important`・照合（行きがけの順に流す部分ごとの旗。手間の勘定。右端の索引）
+- [x] `values`：数・長さ・色・paint・変形・角度・並び・`viewBox`・`preserveAspectRatio`（パスのデータは M2）
+- [x] `style`：プロパティの表・カスケード・継承・`currentColor`・em・ex
+- [x] `doc`：ID の表・参照（保守的な辺。受け継ぐ参照と use の文脈）・輪・展開の数・`switch`・`tref`・大きさ
+- [x] `estimate_parse`（読む段と同じ道を走らせて量を測る。ADR-70 で「本文を 1 度だけ字句に分けて数える」から改めた）・`estimate_build`（文字を除く）・`Report` の骨組み
+- [x] NFR-10 の照らし（ADR-63 (1)）：照合の集まりで、Kura の設定の resvg が読めるもの（大きさが出るもの）を sumie の `parse` が
   断らないこと・大きさが同じこと（`sumie-tools sizes`）。外れるものは一覧にして承認を得る
-- [ ] 大きさを中身で決める文書（ADR-58 (1)）：`Document::size`・`pixel_size` の型（「木が要る」の返し方）と、外接矩形の細かい
+- [x] 大きさを中身で決める文書（ADR-58 (1)）：`Document::size`・`pixel_size` の型（「木が要る」の返し方）と、外接矩形の細かい
   規則（線の太さを含まない・片方だけある幅と高さ・%）を resvg と照らして決める（例：resvg の試験の `structure/svg/no-size`
   は 199 × 199・`tests/svg/m0/no-size.svg` は 50 × 50・W3C の `struct-frag-01`・`04`）
-- [ ] M1 で resvg と照らして決める項目を確かめ、decisions.md に追記する：同じ id の扱い・`requiredFeatures`・輪の参照の扱い・
+- [x] M1 で resvg と照らして決める項目を確かめ、decisions.md に追記する：同じ id の扱い・`requiredFeatures`・輪の参照の扱い・
   大きさの端（0・負・1 未満・%）・CSS のセレクタとアットルールの範囲・XML の整形式の厳しさ（roxmltree が受けるもの）・ATTLIST の
   既定の属性値を当てないこと（XML 1.0 §5.1 と違うが roxmltree と同じ）・`Document::needs` の `<image>` の判定を usvg が実際に解いた `<image>` と照らす（ADR-63 (1)）
-- [ ] ファズの対象：`xml`・`dtd`・`css`・`values`・`document`
-- [ ] `sumie-tools` に計算した値の照合（usvg 0.48.1 の木と、節の数・変形・塗り・不透明度などを比べる）
+- [x] ファズの対象：`xml`・`dtd`・`css`・`values`・`document`
+- [x] `sumie-tools` に計算した値の照合（usvg 0.48.1 の木と、節の数・変形・塗り・不透明度などを比べる）
 - [ ] CSS の `@scope` を当てるマイルストーンを決めて、この表に足す（M1 では飛ばして警告する。2026-11-23、ユーザーの判断
   「後のマイルストーンで」。ADR-78 (3)）
 - [ ] CSS の `calc()`・`var()`（カスタムプロパティ）を読むマイルストーンを決めて、この表に足す（M1 では壊れた値として警告する。
