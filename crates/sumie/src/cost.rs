@@ -15,7 +15,7 @@ pub(crate) const COPY_BYTES_PER_UNIT: u64 = 16;
 /// 安定な併合の並べ替えの、1 つの要素を 1 段で比べて写す手間。
 pub(crate) const MERGE_STEP: u64 = 4;
 /// 2 分の探索の 1 歩の手間。
-pub(crate) const SEARCH_STEP: u64 = 2;
+pub(crate) const SEARCH_STEP: u64 = 8;
 
 /// 切り上げの割り算（`b` が 0 なら `a`）。
 const fn ceil_div(a: u64, b: u64) -> u64 {
@@ -88,6 +88,10 @@ pub(crate) const ALLOC_STEP: u64 = 64;
 
 /// 入れ物の操作 1 回の決まった手間（容量の確かめ・勘定・std の口を呼ぶ分。push を 1 単位 ≈ 1 ns に合わせる）。
 pub(crate) const OP_STEP: u64 = 4;
+
+/// CSS の字句を 1 つ作る手間（字句の種類を決めて範囲を作る分。読むバイトの `scan` とは別に払う。短い字句の並びで 1 単位
+/// ≈ 1 ns になるように。M7 で校正する）。
+pub(crate) const TOKEN: u64 = 16;
 
 /// プロパティの表を名前で引く手間（名前を小文字にして写し、表を二分探索する。表は 100 の内なので 7 回ほど比べる）。
 pub(crate) const LOOKUP: u64 = 32;

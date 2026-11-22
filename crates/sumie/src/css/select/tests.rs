@@ -84,11 +84,15 @@ fn parse_full(src: &str, ns: &[(&str, &str)]) -> Option<(String, bool)> {
     let mut t = Tables::new(&budget);
     let mut names: MVec<'_, u8> = MVec::new(&budget);
     let mut decls: MVec<'_, NsDecl> = MVec::new(&budget);
+    // 接頭辞の順に、同じ接頭辞は後の宣言（規則の並びが並べるのと同じ形）
+    let mut last: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
     for (p, u) in ns {
+        last.insert(p, u);
+    }
+    for (p, u) in last {
         let start = names.len();
         names.append_slice(p.as_bytes()).unwrap();
-        let d = NsDecl { prefix: Span::new(start, names.len()), ns: ns_of_uri(u.as_bytes()), pad: [0; 3] };
-        ns_insert(&mut decls, names.as_slice(), d, &budget).unwrap();
+        decls.push(NsDecl { prefix: Span::new(start, names.len()), ns: ns_of_uri(u.as_bytes()), pad: [0; 3] }).unwrap();
     }
     let table = NsTable { decls: decls.as_slice(), names: names.as_slice() };
     let s = src.as_bytes();
@@ -362,4 +366,13 @@ fn namespace_table_lookup() {
     assert_eq!(parse_with("\\62|rect", &ns).unwrap(), format!("{NS_XLINK}|rect@1"));
     assert_eq!(parse_with("a|rect", &ns).unwrap(), format!("{NS_OTHER}|rect@1"));
     assert_eq!(parse_with("c|rect", &ns), None);
+}
+
+/// 壊れた選択子の中で開いたかっこは組の閉じまで読んでから、寛容な並びの次の選択子へ進む（Chrome と同じ）。
+#[test]
+fn forgiving_recovery_skips_open_brackets() {
+    for src in [":is(x(y), rect)", ":is((a), rect)", ":is([a=b(c)], rect)", ":is(:not(x(y)), rect)", ":is(:(a), rect)"]
+    {
+        assert_eq!(parse(src).unwrap(), ":is(rect@1)@1", "{src}");
+    }
 }

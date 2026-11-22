@@ -89,7 +89,7 @@ impl Ids {
     ) -> Result<Option<u32>, Error> {
         let list = self.entries.as_slice();
         let value = |e: &IdEntry| doc.attrs.as_slice().get(e.attr as usize).map_or(&[][..], |a| doc.value(input, a));
-        let i = lower_bound_try(list, |e| Ok(bytes_cmp(budget, value(e), name)?.is_lt()))?;
+        let i = lower_bound_try(budget, list, |e| Ok(bytes_cmp(budget, value(e), name)?.is_lt()))?;
         match list.get(i) {
             Some(e) if bytes_cmp(budget, value(e), name)?.is_eq() => Ok(Some(e.node)),
             _ => Ok(None),

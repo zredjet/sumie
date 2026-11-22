@@ -304,3 +304,26 @@ fn unsupported_and_nested_warnings() {
     assert_eq!(sh.rules.as_slice()[0].selector, NONE);
     assert_eq!(sh.rules.len(), 2);
 }
+
+/// `@layer default` は名前として受ける。`;` のないまま閉じた `@layer a` と `@import … layer(a)` も層の順に入る（Chrome と
+/// 同じ）。多くの `@namespace` は書いた順に足し、引く前に 1 度だけ並べる。
+#[test]
+fn layer_statements_and_many_namespaces() {
+    let order = |css: &str| {
+        let sh = sheet(&[(css, None)]);
+        let r = rules(&sh);
+        let rank = |ty: &str| r.iter().find(|x| x.0 == ty).unwrap().3;
+        rank("g") < rank("rect")
+    };
+    assert!(order("@layer default { g {} } @layer x { rect {} }"));
+    assert!(order("@media all { @layer a } @layer b { rect {} } @layer a { g {} }"));
+    assert!(order("@import url(x.css) layer(a); @layer b { rect {} } @layer a { g {} }"));
+    let many: String =
+        (0..20_000).map(|i| format!("@namespace p{i} url(urn:{i});")).collect::<String>() + "p19999|rect {}";
+    let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let mut b = SheetBuilder::new(&budget);
+    b.add(many.as_bytes(), None, 0).unwrap();
+    let sh = b.finish().unwrap();
+    assert_eq!(sh.rules.len(), 1);
+    assert!(budget.work() < 100_000_000, "{}", budget.work());
+}

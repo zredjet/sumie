@@ -23,11 +23,17 @@ pub(crate) fn lower_bound<T>(s: &[T], mut is_less: impl FnMut(&T) -> bool) -> us
     lo
 }
 
-/// [`lower_bound`] の、比べる関数が誤りを返せるもの（比べる関数の中で長さに比例する手間を払う）。
+/// [`lower_bound`] の、比べる関数が誤りを返せるもの。1 歩ごとに `cost::SEARCH_STEP`（大きな表で読む所がキャッシュから
+/// 外れる分を含む）を払い、名前の長さに比例する手間は比べる関数の中で払う。
 #[expect(clippy::arithmetic_side_effects, reason = "lo ≤ mid < hi ≤ len なので、あふれない")]
-pub(crate) fn lower_bound_try<T>(s: &[T], mut is_less: impl FnMut(&T) -> Result<bool, Error>) -> Result<usize, Error> {
+pub(crate) fn lower_bound_try<T>(
+    budget: &crate::budget::Budget<'_>,
+    s: &[T],
+    mut is_less: impl FnMut(&T) -> Result<bool, Error>,
+) -> Result<usize, Error> {
     let (mut lo, mut hi) = (0usize, s.len());
     while lo < hi {
+        budget.spend(crate::cost::SEARCH_STEP)?;
         let mid = lo + (hi - lo) / 2;
         match s.get(mid) {
             Some(x) if is_less(x)? => lo = mid + 1,

@@ -19,15 +19,17 @@
 use crate::budget::Budget;
 use crate::cost;
 use crate::css::select::{
-    COMB_CHILD, COMB_DESC, COMB_LATER, COMB_NEXT, FLAG_CASE_I, NONE, NS_ANY, OP_DASH, OP_EQ, OP_EXISTS, OP_INCLUDES,
-    OP_PREFIX, OP_SUBSTR, OP_SUFFIX, S_ATTR, S_CLASS, S_EMPTY, S_FIRST_CHILD, S_FIRST_OF_TYPE, S_ID, S_IS, S_LANG,
-    S_LAST_CHILD, S_LAST_OF_TYPE, S_LINK, S_NEVER, S_NOT, S_NTH_CHILD, S_NTH_LAST_CHILD, S_NTH_LAST_OF_TYPE,
+    COMB_CHILD, COMB_DESC, COMB_LATER, COMB_NEXT, FLAG_CASE_I, FLAG_NO_TOKEN, NONE, NS_ANY, OP_DASH, OP_EQ, OP_EXISTS,
+    OP_INCLUDES, OP_PREFIX, OP_SUBSTR, OP_SUFFIX, S_ATTR, S_CLASS, S_EMPTY, S_FIRST_CHILD, S_FIRST_OF_TYPE, S_ID, S_IS,
+    S_LANG, S_LAST_CHILD, S_LAST_OF_TYPE, S_LINK, S_NEVER, S_NOT, S_NTH_CHILD, S_NTH_LAST_CHILD, S_NTH_LAST_OF_TYPE,
     S_NTH_OF_TYPE, S_ONLY_CHILD, S_ONLY_OF_TYPE, S_ROOT, S_TYPE, S_UNIVERSAL, Simple,
 };
 use crate::css::sheet::Sheet;
 use crate::error::Error;
-use crate::mem::{MVec, Plain, bytes_cmp, bytes_eq, bytes_eq_ignore_case, stable_sort_try};
-use crate::xml::lex::ScanMeter;
+use crate::mem::{
+    MVec, Plain, bytes_cmp, bytes_eq, bytes_eq_ignore_case, lower_bound_try, stable_sort, stable_sort_try,
+};
+use crate::xml::lex::{ScanMeter, Span};
 use crate::xml::{KIND_ELEMENT, NS_NONE, NS_SVG, NS_XLINK, NS_XML, Node, XmlDoc};
 
 /// 照合の結果を受ける側（要素ごとに `element` のあと、当たった規則を規則の順に `rule`）。
@@ -171,6 +173,7 @@ fn siblings<'b>(doc: &XmlDoc, input: &[u8], with_type: bool, budget: &'b Budget<
         }
         let count = kids.len() as u32;
         for (k, &id) in kids.as_slice().iter().enumerate() {
+            budget.spend(cost::OP_STEP)?;
             if let Some(x) = out.get_mut(id as usize) {
                 x.index = (k as u32).saturating_add(1);
                 x.count = count;
@@ -205,6 +208,7 @@ fn siblings<'b>(doc: &XmlDoc, input: &[u8], with_type: bool, budget: &'b Budget<
                 }
                 let run = (j.saturating_sub(i)) as u32;
                 for (k, id) in ks.get(i..j).unwrap_or(&[]).iter().enumerate() {
+                    budget.spend(cost::OP_STEP)?;
                     if let Some(x) = out.get_mut(*id as usize) {
                         x.type_index = (k as u32).saturating_add(1);
                         x.type_count = run;
@@ -221,6 +225,7 @@ fn siblings<'b>(doc: &XmlDoc, input: &[u8], with_type: bool, budget: &'b Budget<
     }
     // 根の要素
     for (i, n) in nodes.iter().enumerate() {
+        budget.spend(cost::OP_STEP)?;
         if n.kind == KIND_ELEMENT && n.parent == NONE {
             if let Some(x) = out.get_mut(i) {
                 *x = Sib { index: 1, count: 1, type_index: 1, type_count: 1 };
@@ -245,7 +250,66 @@ struct Level {
 
 impl Plain for Level {}
 
+/// 複合の鍵の種類（その複合が当たる要素が必ず持つもの）。
+const KEY_ID: u8 = 0;
+const KEY_CLASS: u8 = 1;
+const KEY_TYPE: u8 = 2;
+
+/// 複合の索引の 1 つ（鍵の種類・名前と複合の番号）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct KeyEntry {
+    name: Span,
+    compound: u32,
+    kind: u8,
+    pad: [u8; 3],
+}
+
+impl Plain for KeyEntry {}
+
+/// 規則の右端の複合ごとの（規則, 詳細度）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Subject {
+    compound: u32,
+    rule: u32,
+    spec: u32,
+}
+
+impl Plain for Subject {}
+
+/// 当たった規則（規則の番号と詳細度）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Hit {
+    rule: u32,
+    spec: u32,
+}
+
+impl Plain for Hit {}
+
+/// 一度に払う語の数（語を埋める・書き換える手間を塊ずつ払う）。
+const WORDS_CHUNK: usize = 2048;
+
+/// 語の並びを 0 で埋める（塊ずつ払う）。
+fn clear_words(budget: &Budget<'_>, w: &mut [u64]) -> Result<(), Error> {
+    let mut a = 0usize;
+    while a < w.len() {
+        let b = a.saturating_add(WORDS_CHUNK).min(w.len());
+        budget.spend(cost::fill((b.saturating_sub(a) as u64).saturating_mul(8)))?;
+        if let Some(part) = w.get_mut(a..b) {
+            part.fill(0);
+        }
+        a = b;
+    }
+    Ok(())
+}
+
 /// 照合する。`active[r]` が 0 の規則は報告しない（条件が偽）。
+///
+/// 複合ごとに、当たる要素が必ず持つ鍵（id・class・型。この順に選ぶ）を決めて索引にし、要素ごとに「鍵のない複合」と
+/// 「要素の id・class・局所名を鍵にする複合」だけを番号の順に照らす（照らさない複合はその要素に当たらない）。当たった
+/// 右端の複合から規則を引く（すべての規則を回らない）。
 pub(crate) fn match_rules(
     doc: &XmlDoc,
     input: &[u8],
@@ -266,10 +330,76 @@ pub(crate) fn match_rules(
         return Ok(());
     }
     let nodes = doc.nodes.as_slice();
+    let names = sheet.names.as_slice();
     let ncomp = sheet.compounds.len();
     let words = ncomp.saturating_add(63).checked_div(64).unwrap_or(0);
-    let u = uses(sheet, budget)?;
+    let mut u = uses(sheet, budget)?;
+    // 鍵の索引：id・class の索引を引くので、要素の id と class を求める
+    u.id = true;
+    u.class = true;
     let sib = if u.sib { Some(siblings(doc, input, u.ty, budget)?) } else { None };
+    // 複合の鍵
+    let mut keyed: MVec<'_, KeyEntry> = MVec::new(budget);
+    let mut keyless: MVec<'_, u32> = MVec::new(budget);
+    for (k, c) in sheet.compounds.as_slice().iter().enumerate() {
+        budget.spend(cost::OP_STEP)?;
+        let mut best: Option<KeyEntry> = None;
+        let mut dead = false;
+        let mut sp = c.first;
+        while sp != NONE {
+            budget.spend(cost::OP_STEP)?;
+            let Some(x) = sheet.simples.as_slice().get(sp as usize) else { break };
+            let cand = match x.kind {
+                S_ID => Some(KEY_ID),
+                S_CLASS if x.flags & FLAG_NO_TOKEN != 0 => {
+                    dead = true;
+                    None
+                }
+                S_CLASS => Some(KEY_CLASS),
+                S_TYPE => Some(KEY_TYPE),
+                _ => None,
+            };
+            if let Some(kind) = cand
+                && best.is_none_or(|b| kind < b.kind)
+            {
+                best = Some(KeyEntry { name: x.a, compound: k as u32, kind, pad: [0; 3] });
+            }
+            sp = x.next;
+        }
+        if dead {
+            continue;
+        }
+        match best {
+            Some(e) => keyed.push(e)?,
+            None => keyless.push(k as u32)?,
+        }
+    }
+    let key_less = |x: &KeyEntry, y: &KeyEntry| -> Result<bool, Error> {
+        if x.kind != y.kind {
+            return Ok(x.kind < y.kind);
+        }
+        match bytes_cmp(budget, x.name.of(names), y.name.of(names))? {
+            core::cmp::Ordering::Equal => Ok(x.compound < y.compound),
+            o => Ok(o.is_lt()),
+        }
+    };
+    stable_sort_try(budget, keyed.as_mut_slice(), key_less)?;
+    // 規則の右端の複合
+    let mut subjects: MVec<'_, Subject> = MVec::new(budget);
+    for (r, rule) in sheet.rules.as_slice().iter().enumerate() {
+        budget.spend(cost::OP_STEP)?;
+        if active.get(r).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        let mut sel = rule.selector;
+        while sel != NONE {
+            budget.spend(cost::OP_STEP)?;
+            let Some(s) = sheet.selectors.as_slice().get(sel as usize) else { break };
+            subjects.push(Subject { compound: s.subject, rule: r as u32, spec: s.spec })?;
+            sel = s.next;
+        }
+    }
+    stable_sort(budget, subjects.as_mut_slice(), |a, b| a.compound < b.compound)?;
     // 深さの上限（行きがけの順に親の深さを積む）
     let mut max_depth = 0usize;
     {
@@ -280,6 +410,7 @@ pub(crate) fn match_rules(
                 continue;
             }
             while stack.last().is_some_and(|&t| t != n.parent) {
+                budget.spend(1)?;
                 stack.pop();
             }
             stack.push(i as u32)?;
@@ -298,6 +429,9 @@ pub(crate) fn match_rules(
     let mut levels: MVec<'_, Level> = MVec::with_capacity(budget, max_depth.saturating_add(1))?;
     levels.resize_to(max_depth.saturating_add(1), Level { node: NONE, last_parent: NONE, lang: NONE, pad: 0 })?;
     let mut path: MVec<'_, u32> = MVec::with_capacity(budget, max_depth.saturating_add(1))?;
+    let mut cands: MVec<'_, u32> = MVec::new(budget);
+    let mut keyed_c: MVec<'_, u32> = MVec::new(budget);
+    let mut hits: MVec<'_, Hit> = MVec::new(budget);
     let ctx = Ctx { doc, input, sheet, sib: sib.as_ref().map(MVec::as_slice), budget };
     for (i, n) in nodes.iter().enumerate() {
         budget.spend(cost::OP_STEP)?;
@@ -306,6 +440,7 @@ pub(crate) fn match_rules(
         }
         let e = i as u32;
         while path.last().is_some_and(|&t| t != n.parent) {
+            budget.spend(1)?;
             path.pop();
         }
         let d = path.len();
@@ -314,25 +449,87 @@ pub(crate) fn match_rules(
         let row = d.saturating_mul(words);
         let prow = d.saturating_sub(1).saturating_mul(words);
         if !same_parent && let Some(w) = later.as_mut_slice().get_mut(row..row.saturating_add(words)) {
-            w.fill(0);
+            clear_words(budget, w)?;
         }
-        budget.spend(cost::fill((words as u64).saturating_mul(8)).saturating_mul(4))?;
         // 要素ごとに 1 度だけ求めるもの（言語は親から受け継ぐ）
         let parent_lang = if d > 0 { levels.get(d.saturating_sub(1)).map_or(NONE, |l| l.lang) } else { NONE };
         let info = elem_info(doc, input, n, u, parent_lang, budget)?;
-        // 旗を番号の順に決める（複合ごとに払う）
-        if let Some(w) = newm.as_mut_slice().get_mut(..) {
-            w.fill(0);
+        // 照らす複合：鍵のないものと、要素の id・class・局所名を鍵にするもの（番号の順）
+        keyed_c.clear();
+        let add_key = |kind: u8, name: &[u8], cands: &mut MVec<'_, u32>| -> Result<(), Error> {
+            let list = keyed.as_slice();
+            let lo = lower_bound_try(budget, list, |x| {
+                if x.kind != kind {
+                    return Ok(x.kind < kind);
+                }
+                Ok(bytes_cmp(budget, x.name.of(names), name)?.is_lt())
+            })?;
+            for x in list.get(lo..).unwrap_or(&[]) {
+                budget.spend(cost::OP_STEP)?;
+                if x.kind != kind || !bytes_eq(budget, x.name.of(names), name)? {
+                    break;
+                }
+                cands.push(x.compound)?;
+            }
+            Ok(())
+        };
+        add_key(KEY_TYPE, n.local.of(input), &mut keyed_c)?;
+        if let Some(v) = ctx.attr_value(info.id) {
+            add_key(KEY_ID, v, &mut keyed_c)?;
         }
-        for k in 0..ncomp {
+        if let Some(v) = ctx.attr_value(info.class) {
+            // 空白で区切った語ごと（読むバイトを払う）
+            let mut meter = crate::xml::lex::ScanMeter::new(0, v.len());
+            let mut a = 0usize;
+            for k in 0..=v.len() {
+                meter.pay(budget, k)?;
+                if v.get(k).is_some_and(|&c| !matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0C)) {
+                    continue;
+                }
+                if k > a {
+                    add_key(KEY_CLASS, v.get(a..k).unwrap_or(&[]), &mut keyed_c)?;
+                }
+                a = k.saturating_add(1);
+            }
+        }
+        // 鍵で引いたもの（短い）を並べ、鍵のないもの（並んでいる）と合わせて番号の順にする
+        stable_sort(budget, keyed_c.as_mut_slice(), |a, b| a < b)?;
+        cands.clear();
+        {
+            let (xs, ys) = (keyless.as_slice(), keyed_c.as_slice());
+            let (mut p, mut q) = (0usize, 0usize);
+            loop {
+                budget.spend(cost::OP_STEP)?;
+                let next = match (xs.get(p), ys.get(q)) {
+                    (Some(&x), Some(&y)) if x <= y => {
+                        p = p.saturating_add(1);
+                        x
+                    }
+                    (_, Some(&y)) => {
+                        q = q.saturating_add(1);
+                        y
+                    }
+                    (Some(&x), None) => {
+                        p = p.saturating_add(1);
+                        x
+                    }
+                    (None, None) => break,
+                };
+                if cands.last() != Some(&next) {
+                    cands.push(next)?;
+                }
+            }
+        }
+        // 旗を番号の順に決める（照らす複合ごとに払う。同じ番号は 1 度だけ）
+        clear_words(budget, newm.as_mut_slice())?;
+        for &k in cands.as_slice() {
             budget.spend(cost::OP_STEP)?;
-            let Some(c) = sheet.compounds.as_slice().get(k) else { continue };
+            let Some(c) = sheet.compounds.as_slice().get(k as usize) else { continue };
             // 型のない複合に効く既定の名前空間
             if c.ns != NS_ANY && c.ns != n.ns {
                 continue;
             }
-            let ok = ctx.compound(e, n, c.first, &info, newm.as_slice())?;
-            if !ok {
+            if !ctx.compound(e, n, c.first, &info, newm.as_slice())? {
                 continue;
             }
             let prev_ok = if c.prev == NONE {
@@ -348,49 +545,66 @@ pub(crate) fn match_rules(
                     _ => false,
                 }
             };
-            let (wi, m) = word_bit(k);
+            let (wi, m) = word_bit(k as usize);
             if prev_ok && let Some(w) = newm.as_mut_slice().get_mut(wi) {
                 *w |= m;
             }
         }
-        // 深さ d の旗を書き換える
+        // 深さ d の旗を書き換える（塊ずつ払う）
         let nm = newm.as_slice();
-        for j in 0..words {
-            let m = nm.get(j).copied().unwrap_or(0);
-            let pa = if d > 0 { anc.as_slice().get(prow.saturating_add(j)).copied().unwrap_or(0) } else { 0 };
-            if let Some(x) = cur.as_mut_slice().get_mut(row.saturating_add(j)) {
-                *x = m;
-            }
-            if let Some(x) = anc.as_mut_slice().get_mut(row.saturating_add(j)) {
-                *x = pa | m;
-            }
-            if let Some(x) = later.as_mut_slice().get_mut(row.saturating_add(j)) {
-                *x |= m;
+        let mut j = 0usize;
+        while j < words {
+            let end = j.saturating_add(WORDS_CHUNK).min(words);
+            budget.spend(cost::fill((end.saturating_sub(j) as u64).saturating_mul(8)).saturating_mul(3))?;
+            while j < end {
+                let m = nm.get(j).copied().unwrap_or(0);
+                let pa = if d > 0 { anc.as_slice().get(prow.saturating_add(j)).copied().unwrap_or(0) } else { 0 };
+                if let Some(x) = cur.as_mut_slice().get_mut(row.saturating_add(j)) {
+                    *x = m;
+                }
+                if let Some(x) = anc.as_mut_slice().get_mut(row.saturating_add(j)) {
+                    *x = pa | m;
+                }
+                if let Some(x) = later.as_mut_slice().get_mut(row.saturating_add(j)) {
+                    *x |= m;
+                }
+                j = j.saturating_add(1);
             }
         }
         if let Some(l) = levels.get_mut(d) {
             *l = Level { node: e, last_parent: n.parent, lang: info.lang, pad: 0 };
         }
-        // 当たった規則を知らせる
+        // 当たった右端の複合から規則を引き、規則の順に知らせる（同じ規則はいちばん高い詳細度）
         sink.element(e)?;
-        for (r, rule) in sheet.rules.as_slice().iter().enumerate() {
+        hits.clear();
+        for &k in cands.as_slice() {
             budget.spend(cost::OP_STEP)?;
-            if active.get(r).copied().unwrap_or(0) == 0 {
+            if !bit(nm, 0, k as usize) {
                 continue;
             }
-            let mut best: Option<u32> = None;
-            let mut sel = rule.selector;
-            while sel != NONE {
+            let list = subjects.as_slice();
+            let lo = lower_bound_try(budget, list, |x| Ok(x.compound < k))?;
+            for x in list.get(lo..).unwrap_or(&[]) {
                 budget.spend(cost::OP_STEP)?;
-                let Some(s) = sheet.selectors.as_slice().get(sel as usize) else { break };
-                if bit(nm, 0, s.subject as usize) {
-                    best = Some(best.map_or(s.spec, |b| b.max(s.spec)));
+                if x.compound != k {
+                    break;
                 }
-                sel = s.next;
+                hits.push(Hit { rule: x.rule, spec: x.spec })?;
             }
-            if let Some(spec) = best {
-                sink.rule(r as u32, spec)?;
+        }
+        stable_sort(budget, hits.as_mut_slice(), |a, b| a.rule < b.rule)?;
+        let mut k = 0usize;
+        let hs = hits.as_slice();
+        while let Some(h) = hs.get(k) {
+            budget.spend(cost::OP_STEP)?;
+            let mut best = h.spec;
+            let mut j = k.saturating_add(1);
+            while let Some(x) = hs.get(j).filter(|x| x.rule == h.rule) {
+                best = best.max(x.spec);
+                j = j.saturating_add(1);
             }
+            sink.rule(h.rule, best)?;
+            k = j;
         }
     }
     Ok(())
@@ -458,7 +672,7 @@ impl Ctx<'_, '_> {
             },
             S_CLASS => {
                 let v = self.attr_value(info.class).unwrap_or(&[]);
-                has_token(self.budget, v, self.name(s), false)?
+                s.flags & FLAG_NO_TOKEN == 0 && has_token(self.budget, v, self.name(s), false)?
             }
             S_ATTR => self.attr(n, s)?,
             S_FIRST_CHILD => sib().index == 1,
@@ -527,7 +741,7 @@ impl Ctx<'_, '_> {
             let ok = match s.op {
                 OP_EXISTS => true,
                 OP_EQ => eq(v, want)?,
-                OP_INCLUDES => has_token(budget, v, want, ci)?,
+                OP_INCLUDES => s.flags & FLAG_NO_TOKEN == 0 && has_token(budget, v, want, ci)?,
                 OP_DASH => {
                     eq(v, want)?
                         || (v.len() > want.len()
@@ -562,10 +776,12 @@ impl Ctx<'_, '_> {
     }
 }
 
-/// 空白で区切った語に `want` があるか（空白は CSS の空白。`want` が空か空白を含めば当たらない）。読むバイトは塊ずつ払う。
+/// 空白で区切った語に `want` があるか（空白は CSS の空白。`want` が空か空白を含むものは、呼び手が `FLAG_NO_TOKEN` で
+/// 先に除く）。読むバイトは塊ずつ払う。
 fn has_token(budget: &Budget<'_>, v: &[u8], want: &[u8], ci: bool) -> Result<bool, Error> {
     let ws = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0C);
-    if want.is_empty() || want.iter().any(|&c| ws(c)) {
+    if want.is_empty() || want.len() > v.len() {
+        budget.spend(1)?;
         return Ok(false);
     }
     let mut meter = ScanMeter::new(0, v.len());
@@ -596,8 +812,9 @@ fn nth(a: i32, b: i32, i: u32) -> bool {
     diff.checked_rem(a) == Some(0) && diff.checked_div(a).is_some_and(|q| q >= 0)
 }
 
-/// 言語 `lang` が `,` で区切った範囲（小文字）のどれかに当たるか（同じか、範囲のあとが `-`。大文字小文字を問わない）。
-/// 範囲のバイトは塊ずつ払って読み、比べるバイトも払う。
+/// 言語 `lang` が `,` で区切った範囲（小文字）のどれかに当たるか（RFC 4647 §3.3.2 の拡張の照らし：範囲の頭の部分が `*` か
+/// 言語の頭と同じで、範囲の残りの部分がそれぞれ、言語のあとの部分に順に現れる。1 文字の部分（`x` など）は飛び越えない。
+/// 大文字小文字を問わない）。範囲のバイトは塊ずつ払って読み、比べるバイトも払う。
 fn lang_in_ranges(budget: &Budget<'_>, lang: &[u8], ranges: &[u8]) -> Result<bool, Error> {
     let mut meter = ScanMeter::new(0, ranges.len());
     let mut start = 0usize;
@@ -608,20 +825,50 @@ fn lang_in_ranges(budget: &Budget<'_>, lang: &[u8], ranges: &[u8]) -> Result<boo
         }
         let r = ranges.get(start..i).unwrap_or(&[]);
         start = i.saturating_add(1);
-        if r.is_empty() {
-            continue;
-        }
-        if r == b"*" {
-            return Ok(true);
-        }
-        if lang.len() >= r.len()
-            && (lang.len() == r.len() || lang.get(r.len()) == Some(&b'-'))
-            && bytes_eq_ignore_case(budget, lang.get(..r.len()).unwrap_or(&[]), r)?
-        {
+        if !r.is_empty() && extended_match(budget, lang, r)? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// 照らす言語の長さの上限（BCP 47 の言語の札はこれよりずっと短い。長いものは当たらないものとする）。
+const MAX_LANG: usize = 4096;
+
+/// RFC 4647 §3.3.2 の拡張の照らし（1 つの範囲）。部分に分けて読む言語と範囲のバイトを払う。
+fn extended_match(budget: &Budget<'_>, lang: &[u8], range: &[u8]) -> Result<bool, Error> {
+    if lang.len() > MAX_LANG || range.len() > MAX_LANG {
+        budget.spend(1)?;
+        return Ok(false);
+    }
+    budget.spend(cost::scan(lang.len().saturating_add(range.len()) as u64))?;
+    let mut rs = range.split(|&c| c == b'-');
+    let mut ls = lang.split(|&c| c == b'-');
+    let (Some(r0), Some(l0)) = (rs.next(), ls.next()) else { return Ok(false) };
+    if r0 != b"*" && !bytes_eq_ignore_case(budget, r0, l0)? {
+        return Ok(false);
+    }
+    let mut lnext = ls.next();
+    for r in rs {
+        budget.spend(cost::OP_STEP)?;
+        if r == b"*" {
+            continue;
+        }
+        loop {
+            budget.spend(cost::OP_STEP)?;
+            let Some(l) = lnext else { return Ok(false) };
+            if bytes_eq_ignore_case(budget, r, l)? {
+                lnext = ls.next();
+                break;
+            }
+            // 1 文字の部分は飛び越えない
+            if l.len() == 1 {
+                return Ok(false);
+            }
+            lnext = ls.next();
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

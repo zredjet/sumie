@@ -21,7 +21,7 @@ use crate::budget::Budget;
 use crate::cost;
 use crate::css::decl::{Decl, Item, parse_declarations};
 use crate::css::lex::{Kind, Lexer, Nest, Token, decode, decode_string, ident_is};
-use crate::css::select::{NONE, NsDecl, NsTable, Tables, ns_insert, ns_of_uri, parse_selector_list};
+use crate::css::select::{NONE, NsDecl, NsTable, Tables, ns_of_uri, parse_selector_list};
 use crate::error::Error;
 use crate::mem::{Frozen, MVec, Plain, bytes_cmp, stable_sort_try};
 use crate::report::WarningKind;
@@ -405,6 +405,7 @@ impl<'b> SheetBuilder<'b> {
             ns,
             ns_names,
             ns_start,
+            ns_dirty: false,
             notes,
             order,
             pos,
@@ -440,7 +441,7 @@ impl<'b> SheetBuilder<'b> {
                 }
             }
         }
-        Ok(())
+        ctx.seal_ns()
     }
 
     /// 同じ層をまとめて、読んだ規則の並びにする。
@@ -477,6 +478,8 @@ struct Ctx<'c, 's, 'b> {
     ns_names: &'c mut MVec<'b, u8>,
     /// この `<style>` の `@namespace` の表の始まり（`ns` の中）
     ns_start: usize,
+    /// 表に足してから、まだ並べていない
+    ns_dirty: bool,
     notes: &'c mut MVec<'b, Note>,
     order: &'c mut u32,
     pos: u32,
@@ -502,7 +505,7 @@ const KNOWN_AT_RULES: &[&[u8]] = &[
 ];
 
 /// 層の名前に使えない言葉（CSS の全体の言葉。CSS Cascade 5 §6.4.2）。
-const RESERVED_LAYER_NAMES: &[&[u8]] = &[b"initial", b"inherit", b"unset", b"revert", b"revert-layer", b"default"];
+const RESERVED_LAYER_NAMES: &[&[u8]] = &[b"initial", b"inherit", b"unset", b"revert", b"revert-layer"];
 
 impl<'b> Ctx<'_, '_, 'b> {
     fn note(&mut self, kind: WarningKind) -> Result<(), Error> {
@@ -512,8 +515,8 @@ impl<'b> Ctx<'_, '_, 'b> {
     /// 読まなかった参照（文字列か url の字句の中身。escape を解いて名前の置き場に写す）。
     fn unread(&mut self, t: &Token) -> Result<(), Error> {
         let start = self.tables.names.len();
-        for c in decode_string(self.s, t.inner) {
-            let (buf, n) = crate::css::select::utf8_pub(c);
+        for c in decode_string(self.s, t.inner, self.budget) {
+            let (buf, n) = crate::css::select::utf8_pub(c?);
             self.tables.names.append_slice(buf.get(..n).unwrap_or(&[]))?;
         }
         let href = Span::new(start, self.tables.names.len());
@@ -523,6 +526,42 @@ impl<'b> Ctx<'_, '_, 'b> {
     /// この `<style>` の `@namespace` の表。
     fn ns_range(&self) -> Span {
         Span::new(self.ns_start, self.ns.len())
+    }
+
+    /// この `<style>` の `@namespace` の表を接頭辞の順に並べ、同じ接頭辞は後の宣言だけを残す（足すのは書いた順で、引く前に
+    /// 1 度だけ並べる。並べ替えは安定なので、同じ接頭辞の並びの最後が後の宣言）。
+    fn seal_ns(&mut self) -> Result<(), Error> {
+        if !self.ns_dirty {
+            return Ok(());
+        }
+        self.ns_dirty = false;
+        let budget = self.budget;
+        let names = self.ns_names.as_slice();
+        let start = self.ns_start;
+        let Some(own) = self.ns.as_mut_slice().get_mut(start..) else { return Ok(()) };
+        stable_sort_try(budget, own, |a, b| Ok(bytes_cmp(budget, a.prefix.of(names), b.prefix.of(names))?.is_lt()))?;
+        let mut keep = start;
+        let n = self.ns.len();
+        for k in start..n {
+            budget.spend(cost::OP_STEP)?;
+            let Some(&d) = self.ns.get(k) else { continue };
+            // 次が同じ接頭辞なら、これは前の宣言
+            let later_same = match self.ns.get(k.saturating_add(1)) {
+                Some(x) if k.saturating_add(1) < n => {
+                    bytes_cmp(budget, x.prefix.of(names), d.prefix.of(names))?.is_eq()
+                }
+                _ => false,
+            };
+            if later_same {
+                continue;
+            }
+            if let Some(x) = self.ns.get_mut(keep) {
+                *x = d;
+            }
+            keep = keep.saturating_add(1);
+        }
+        self.ns.truncate(keep);
+        Ok(())
     }
 
     /// 前置き（`first` から）を、深さ 0 の `{`・`;`（`stop_semicolon`）・`}`（入れ子のとき）・終わりまで読む。前置きの範囲と
@@ -594,6 +633,7 @@ impl<'b> Ctx<'_, '_, 'b> {
                 return Ok((false, false));
             }
         }
+        self.seal_ns()?;
         let table =
             NsTable { decls: self.ns.as_slice().get(self.ns_start..).unwrap_or(&[]), names: self.ns_names.as_slice() };
         let sel = parse_selector_list(self.s, prelude, table, self.tables, self.budget)?;
@@ -646,8 +686,15 @@ impl<'b> Ctx<'_, '_, 'b> {
         let (prelude, stop) = self.prelude(lex, first, true, nested)?;
         let block = stop.kind == Kind::LBrace;
         if stop.kind == Kind::RBrace && nested {
-            // `;` も塊もないまま入れ子の塊が閉じた（このアットルールは壊れている）
-            self.note(WarningKind::AtRule)?;
+            // `;` のないまま入れ子の塊が閉じた：文のアットルールはそこで終わる（CSS Syntax。`@layer a` は層を足す）
+            if is(b"layer")
+                && let Some(list) = self.layer_names(prelude)?
+                && !list.segs.is_empty()
+            {
+                self.register(blk, list.segs.as_slice())?;
+            } else {
+                self.note(WarningKind::AtRule)?;
+            }
             return Ok(Step::Close);
         }
         let closed = Head { may_import: false, may_namespace: false };
@@ -655,6 +702,7 @@ impl<'b> Ctx<'_, '_, 'b> {
             *head = closed;
             let kind = if is(b"media") { COND_MEDIA } else { COND_SUPPORTS };
             let id = self.conds.len() as u32;
+            self.seal_ns()?;
             let ns = self.ns_range();
             self.conds.push(Cond { text: prelude, parent: blk.cond, ns, kind, pad: [0; 3] })?;
             return Ok(Step::Open(Block { cond: id, layer: blk.layer }));
@@ -662,7 +710,7 @@ impl<'b> Ctx<'_, '_, 'b> {
         if is(b"layer") {
             let names = self.layer_names(prelude)?;
             match (names, block) {
-                (Some(list), true) if list.iter_names() <= 1 => {
+                (Some(list), true) if list.names <= 1 => {
                     *head = closed;
                     let layer = if list.segs.is_empty() {
                         self.anonymous(blk)?
@@ -700,12 +748,9 @@ impl<'b> Ctx<'_, '_, 'b> {
                 let u: MVec<'_, u8> = decode_uri(s, uri, self.budget)?;
                 let d =
                     NsDecl { prefix: Span::new(start, self.ns_names.len()), ns: ns_of_uri(u.as_slice()), pad: [0; 3] };
-                // この `<style>` の表（ns_start から後ろ）に接頭辞の順で足す
-                let mut own: MVec<'_, NsDecl> = MVec::new(self.budget);
-                own.append_slice(self.ns.as_slice().get(self.ns_start..).unwrap_or(&[]))?;
-                ns_insert(&mut own, self.ns_names.as_slice(), d, self.budget)?;
-                self.ns.truncate(self.ns_start);
-                self.ns.append_slice(own.as_slice())?;
+                // 書いた順に足し、引く前に並べる（seal_ns）
+                self.ns.push(d)?;
+                self.ns_dirty = true;
                 head.may_import = false;
                 return Ok(Step::Done);
             }
@@ -713,9 +758,13 @@ impl<'b> Ctx<'_, '_, 'b> {
             return Ok(Step::Done);
         }
         if is(b"import") && !block {
-            // 外の規則は読まない（読まなかった参照）。正しい規則より後ろの @import は捨てる
+            // 外の規則は読まない（読まなかった参照）。正しい規則より後ろの @import は捨てる。`layer`・`layer(名前)` は、
+            // 読まなくても層の順に入れる（Chrome と同じ）
             match first_url(s, prelude, self.budget)? {
-                Some(href) if head.may_import && !nested => self.unread(&href)?,
+                Some(href) if head.may_import && !nested => {
+                    self.unread(&href)?;
+                    self.import_layer(blk, prelude)?;
+                }
                 _ => self.note(WarningKind::AtRule)?,
             }
             return Ok(Step::Done);
@@ -738,6 +787,40 @@ impl<'b> Ctx<'_, '_, 'b> {
             self.skip_block(lex)?;
         }
         Ok(Step::Done)
+    }
+
+    /// `@import` の前置きの `layer`（名前のない層）か `layer(名前)` を層の順に入れる。
+    fn import_layer(&mut self, blk: Block, prelude: Span) -> Result<(), Error> {
+        let s = self.s;
+        let mut lex = Lexer::over(s, prelude, self.budget);
+        loop {
+            let t = lex.next()?;
+            match t.kind {
+                Kind::Eof => return Ok(()),
+                Kind::Ident if ident_is(s, t.inner, t.escaped, b"layer") => {
+                    self.anonymous(blk)?;
+                    return Ok(());
+                }
+                Kind::Function if ident_is(s, t.inner, t.escaped, b"layer") => {
+                    let start = t.span.end;
+                    let mut end = start;
+                    loop {
+                        let u = lex.next()?;
+                        if matches!(u.kind, Kind::Eof | Kind::RParen) {
+                            break;
+                        }
+                        end = u.span.end;
+                    }
+                    if let Some(list) = self.layer_names(Span { start, end })?
+                        && list.names == 1
+                    {
+                        self.register(blk, list.segs.as_slice())?;
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
     }
 
     /// `@font-face {…}` の中の url を読まなかった参照に載せ、塊を閉じまで読む。
@@ -811,6 +894,7 @@ impl<'b> Ctx<'_, '_, 'b> {
         // 0：名前を待つ（並びの頭か `,` のあと）、1：段を読んだ、2：`.` のあと、3：名前のあとの空白
         let mut state = 0u8;
         let mut any = false;
+        let mut names = 0usize;
         loop {
             let t = lex.next()?;
             match (t.kind, state) {
@@ -826,6 +910,9 @@ impl<'b> Ctx<'_, '_, 'b> {
                         self.tables.names.append_slice(buf.get(..n).unwrap_or(&[]))?;
                     }
                     segs.push(Seg { name: Span::new(start, self.tables.names.len()), last: 1, pad: [0; 3] })?;
+                    if state == 0 {
+                        names = names.saturating_add(1);
+                    }
                     state = 1;
                     any = true;
                 }
@@ -836,8 +923,8 @@ impl<'b> Ctx<'_, '_, 'b> {
                     state = 2;
                 }
                 (Kind::Comma, 1 | 3) => state = 0,
-                (Kind::Eof, 1 | 3) => return Ok(Some(LayerNames { segs })),
-                (Kind::Eof, 0) if !any => return Ok(Some(LayerNames { segs })),
+                (Kind::Eof, 1 | 3) => return Ok(Some(LayerNames { segs, names })),
+                (Kind::Eof, 0) if !any => return Ok(Some(LayerNames { segs, names })),
                 _ => return Ok(None),
             }
         }
@@ -856,16 +943,10 @@ struct Seg {
 
 impl Plain for Seg {}
 
-/// `@layer` の前置きの名前（段の並び）。
+/// `@layer` の前置きの名前（段の並び）と名前の数。
 struct LayerNames<'b> {
     segs: MVec<'b, Seg>,
-}
-
-impl LayerNames<'_> {
-    /// 名前の数。
-    fn iter_names(&self) -> usize {
-        self.segs.as_slice().iter().filter(|g| g.last != 0).count()
-    }
+    names: usize,
 }
 
 /// `@namespace` の前置き：`[接頭辞]? (文字列 | url)`。
@@ -910,8 +991,8 @@ fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {
 /// 文字列か url の字句の中身を解いて UTF-8 にする（短い一時の入れ物）。
 fn decode_uri<'b>(s: &[u8], t: Token, budget: &'b Budget<'b>) -> Result<MVec<'b, u8>, Error> {
     let mut out: MVec<'b, u8> = MVec::new(budget);
-    for c in decode_string(s, t.inner) {
-        let (buf, n) = crate::css::select::utf8_pub(c);
+    for c in decode_string(s, t.inner, budget) {
+        let (buf, n) = crate::css::select::utf8_pub(c?);
         out.append_slice(buf.get(..n).unwrap_or(&[]))?;
     }
     Ok(out)
@@ -1036,12 +1117,14 @@ fn canonicalize_layers<'b>(
             prev = Some(x);
         }
         for (k, &x) in seg.as_slice().iter().enumerate() {
+            budget.spend(cost::OP_STEP)?;
             if let (Some(c), Some(&v)) = (canon.get_mut(x as usize), assign.get(k)) {
                 *c = v;
             }
         }
     }
     for (l, &c) in layers.as_mut_slice().iter_mut().zip(canon.as_slice()) {
+        budget.spend(cost::OP_STEP)?;
         l.canon = c;
     }
     Ok(parents)

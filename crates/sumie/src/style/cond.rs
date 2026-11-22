@@ -220,7 +220,11 @@ fn condition(c: &mut Cur<'_, '_>, budget: &Budget<'_>, leaf: Leaf<'_>, mode: Mod
                     c.next()?;
                     // かっこの中が条件（`(`・`not` で始まる）なら入れ子の段、そうでなければ葉
                     let n = c.peek()?;
-                    if n.kind == Kind::LParen || (n.kind == Kind::Ident && ident_is(c.s, n.inner, n.escaped, b"not")) {
+                    // `(selector(…))` のように、かっこの中の関数も条件
+                    if n.kind == Kind::LParen
+                        || n.kind == Kind::Function
+                        || (n.kind == Kind::Ident && ident_is(c.s, n.inner, n.escaped, b"not"))
+                    {
                         stack.push(Frame {
                             acc: Tri::True,
                             op: 0,
@@ -324,8 +328,15 @@ fn function_leaf(s: &[u8], f: Token, inner: Span, mode: Mode<'_>, budget: &Budge
     if !ident_is(s, f.inner, f.escaped, b"selector") {
         return Ok(mode.general);
     }
+    // 1 つの複雑なセレクタ（CSS Conditional 4）。当てないセレクタ（`:has()` など）は読めないものとする
     let mut t = Tables::new(budget_ref(budget));
-    Ok(Tri::of(parse_selector_list(s, inner, mode.ns, &mut t, budget)?.is_some()))
+    let ok = match parse_selector_list(s, inner, mode.ns, &mut t, budget)? {
+        Some(p) if !p.unsupported => {
+            t.selectors.get(p.first as usize).is_some_and(|x| x.next == crate::css::select::NONE)
+        }
+        _ => false,
+    };
+    Ok(Tri::of(ok))
 }
 
 /// `@media` の条件の読み方。
@@ -750,6 +761,10 @@ fn declaration_leaf(s: &[u8], inner: Span, budget: &Budget<'_>) -> Result<Tri, E
         Ok(())
     })?;
     let (Some(d), 1) = (first, count) else { return Ok(Tri::False) };
+    // カスタムプロパティ（`--` で始まる名前）はどの値も受ける
+    if d.name.of(s).starts_with(b"--") {
+        return Ok(Tri::True);
+    }
     let Some(p) = decl_prop(s, &d, budget)?.and_then(prop) else { return Ok(Tri::False) };
     if wide(s, d.value, budget)?.is_some() {
         return Ok(Tri::True);

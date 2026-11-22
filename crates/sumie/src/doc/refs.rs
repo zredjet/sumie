@@ -165,8 +165,8 @@ impl Cx<'_, '_> {
     ) -> Result<Option<u32>, Error> {
         self.scratch.clear();
         if escaped {
-            for c in decode_string(buf, raw) {
-                let (b, n) = crate::css::select::utf8_pub(c);
+            for c in decode_string(buf, raw, self.budget) {
+                let (b, n) = crate::css::select::utf8_pub(c?);
                 self.scratch.append_slice(b.get(..n).unwrap_or(&[]))?;
             }
         } else {

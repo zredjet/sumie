@@ -130,3 +130,16 @@ fn supports_general_enclosed_and_important() {
     // 表示の領域の単位は形だけを見る
     assert!(sp("(width: 10vw)"));
 }
+
+#[test]
+fn supports_selector_and_custom_properties() {
+    let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let sp =
+        |q: &str| supports(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap();
+    assert!(sp("(--x: 1)"));
+    assert!(sp("(selector(a))"));
+    // 1 つの複雑なセレクタだけ。当てないセレクタは読めないもの
+    assert!(!sp("selector(rect, a)"));
+    assert!(!sp("selector(:has(a))"));
+    assert!(sp("not selector(:has(a))"));
+}

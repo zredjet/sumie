@@ -220,3 +220,49 @@ fn work_covers_compounds_and_attributes() {
     let out = run(&svg, &css);
     assert_eq!(hits(&out, 49).len(), 101);
 }
+
+/// `:lang()` の範囲は拡張の照らし（RFC 4647 §3.3.2）。
+#[test]
+fn lang_extended_ranges() {
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg"><g id="a" lang="de-CH"/><g id="b" lang="de-Latn-CH"/><g id="c" lang="de-x-CH"/><g id="d" lang="fr"/></svg>"##;
+    let out = run(svg, ":lang(\"*-CH\") {} :lang(de-CH) {} :lang(\\*) {}");
+    assert_eq!(hits(&out, 0), ["a", "b"]);
+    assert_eq!(hits(&out, 1), ["a", "b"]);
+    assert_eq!(hits(&out, 2).len(), 4);
+}
+
+/// 鍵の索引：規則 2,000 × 要素 5 万（Illustrator 風）でも、照らすのは要素の鍵に合う複合だけ（NFR-10）。
+#[test]
+fn key_index_keeps_class_rules_cheap() {
+    let css: String = (0..2000).map(|i| format!(".st{i}{{fill:#000;stroke:#000}}")).collect();
+    let svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\">{}</svg>",
+        (0..50_000).map(|i| format!("<path class=\"st{}\"/>", i % 2000)).collect::<String>()
+    );
+    let input = svg.as_bytes();
+    let b = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let counts = crate::xml::count(input, &Limits::DEFAULT, &b, Stage::Parse).unwrap();
+    let doc = crate::xml::build(input, &counts, &Limits::DEFAULT, &b, Stage::Parse).unwrap();
+    let mut sb = SheetBuilder::new(&b);
+    sb.add(css.as_bytes(), None, 0).unwrap();
+    let sheet = sb.finish().unwrap();
+    let active = vec![1u8; sheet.rules.len()];
+    let b3 = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let mut c = Collect { doc: &doc, input, out: Vec::new() };
+    match_rules(&doc, input, &sheet, &active, &b3, &mut c).unwrap();
+    assert!(b3.work() < 200_000_000, "{}", b3.work());
+    assert_eq!(c.out.iter().filter(|(_, r)| r.len() == 1).count(), 50_000);
+    // 長い class の名前・語に当たらない名前は、要素ごとに走査しない
+    let long = format!(".{}{{}} [class~=\"a b\"] {{}}", "a".repeat(400_000));
+    let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\">{}</svg>", "<g class=\"x\"/>".repeat(2_000));
+    let out = run(&svg, &long);
+    assert!(hits(&out, 0).is_empty() && hits(&out, 1).is_empty());
+}
+
+/// 複合の多い規則でも、要素ごとの旗の書き換えは塊ずつ払う（1 回の払いが中止の間隔を超えない。run が確かめる）。
+#[test]
+fn many_compounds_pay_in_chunks() {
+    let css = format!("{} {{fill:red}}", vec!["a"; 300_000].join(" "));
+    let out = run("<svg xmlns=\"http://www.w3.org/2000/svg\"><a/></svg>", &css);
+    assert!(hits(&out, 0).is_empty());
+}

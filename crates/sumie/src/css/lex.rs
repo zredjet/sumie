@@ -245,6 +245,8 @@ impl<'a, 'b> Lexer<'a, 'b> {
 
     /// 次の字句。
     pub(crate) fn next(&mut self) -> Result<Token, Error> {
+        // 字句ごとの決まった手間（字句を作る分。読むバイトは別に払う）
+        self.budget.spend(cost::TOKEN)?;
         // 注釈を飛ばす
         loop {
             let i = self.i;
@@ -682,6 +684,11 @@ impl<'b> Nest<'b> {
         self.stack.is_empty()
     }
 
+    /// 開いているかっこの数。
+    pub(crate) fn depth(&self) -> usize {
+        self.stack.len()
+    }
+
     /// 字句 `t` を積み上げに入れる（開きは積み、いちばん内の開きと組の閉じは降ろす。ほかの閉じはただの字句）。降ろして
     /// どのかっこの中でもなくなったら真。
     pub(crate) fn feed(&mut self, t: &Token) -> Result<bool, Error> {
@@ -706,16 +713,49 @@ pub(crate) struct Decode<'a> {
     end: usize,
     /// 文字列の中か（終わりの `\` は、文字列の中では何もせず、名前の中では U+FFFD。§4.3.5・§4.3.7）
     string: bool,
+    /// 続けて読み飛ばした改行の続きの数（一定の数で [`SKIPPED`] を返し、呼び手に払わせる）
+    skips: u32,
 }
+
+/// 何も出さずに読み飛ばした印（文字列の中の改行の続き。[`DecodeStr`] が払って捨てる）。
+const SKIPPED: u32 = u32::MAX;
+
+/// 1 回の `next` で読み飛ばす改行の続きの数の上限。
+const SKIP_RUN: u32 = 64;
 
 /// 名前（ident・function・at-keyword・hash・dimension の単位）の中身を解いて読む。
 pub(crate) fn decode(s: &[u8], span: Span) -> Decode<'_> {
-    Decode { s, i: span.start as usize, end: (span.end as usize).min(s.len()), string: false }
+    Decode { s, i: span.start as usize, end: (span.end as usize).min(s.len()), string: false, skips: 0 }
 }
 
-/// 文字列・url の中身を解いて読む。
-pub(crate) fn decode_string(s: &[u8], span: Span) -> Decode<'_> {
-    Decode { s, i: span.start as usize, end: (span.end as usize).min(s.len()), string: true }
+/// 文字列・url の中身を解いて読む口（読んだ生のバイトを塊ずつ払う。改行の続きだけが長く続いても、払わずに長く回らない）。
+pub(crate) struct DecodeStr<'a, 'b> {
+    d: Decode<'a>,
+    meter: ScanMeter,
+    budget: &'b Budget<'b>,
+}
+
+/// 文字列・url の中身を解いて読む（読む分を払う）。
+pub(crate) fn decode_string<'a, 'b>(s: &'a [u8], span: Span, budget: &'b Budget<'b>) -> DecodeStr<'a, 'b> {
+    let end = (span.end as usize).min(s.len());
+    let start = (span.start as usize).min(end);
+    DecodeStr { d: Decode { s, i: start, end, string: true, skips: 0 }, meter: ScanMeter::new(start, end), budget }
+}
+
+impl Iterator for DecodeStr<'_, '_> {
+    type Item = Result<u32, Error>;
+
+    fn next(&mut self) -> Option<Result<u32, Error>> {
+        loop {
+            let c = self.d.next()?;
+            if let Err(e) = self.meter.pay(self.budget, self.d.i) {
+                return Some(Err(e));
+            }
+            if c != SKIPPED {
+                return Some(Ok(c));
+            }
+        }
+    }
 }
 
 impl Iterator for Decode<'_> {
@@ -735,12 +775,17 @@ impl Iterator for Decode<'_> {
                     return if self.string { None } else { Some(0xFFFD) };
                 };
                 if is_newline(n) {
-                    // 文字列の中の改行の続き
+                    // 文字列の中の改行の続き（一定の数ごとに、払わせるために印を返す）
                     self.i = if n == b'\r' && self.s.get(k.saturating_add(1)) == Some(&b'\n') {
                         k.saturating_add(2)
                     } else {
                         k.saturating_add(1)
                     };
+                    self.skips = self.skips.saturating_add(1);
+                    if self.skips >= SKIP_RUN {
+                        self.skips = 0;
+                        return Some(SKIPPED);
+                    }
                     continue;
                 }
                 let mut j = k;

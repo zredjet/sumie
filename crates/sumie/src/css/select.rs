@@ -67,6 +67,23 @@ pub(crate) const OP_SUBSTR: u8 = 6;
 
 /// 単純な選択子の印：属性の値を大文字小文字を問わずに比べる（`i`）。
 pub(crate) const FLAG_CASE_I: u8 = 1;
+/// 単純な選択子の印：空白で区切った語として比べる名前が空か空白を含む（`.class`・`[a~=v]` はどの要素にも当たらない）。
+pub(crate) const FLAG_NO_TOKEN: u8 = 2;
+
+/// 空白で区切った語として比べる名前が、当たりえないか（空か CSS の空白を含む。読むバイトを払う）。
+fn no_token(name: &[u8], budget: &Budget<'_>) -> Result<bool, Error> {
+    if name.is_empty() {
+        return Ok(true);
+    }
+    let mut meter = crate::xml::lex::ScanMeter::new(0, name.len());
+    for (k, &c) in name.iter().enumerate() {
+        meter.pay(budget, k)?;
+        if matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0C) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 /// 選択子（複合を結合子でつないだもの）。
 #[repr(C)]
@@ -168,6 +185,19 @@ impl<'b> Tables<'b> {
         Ok(Span::new(start, self.names.len()))
     }
 
+    /// 文字列の字句の中身を解いて（読む分を払う）名前の置き場に足す。
+    fn push_name_str(&mut self, s: &[u8], span: Span, lower: bool) -> Result<Span, Error> {
+        let start = self.names.len();
+        let budget = self.names.budget();
+        for c in decode_string(s, span, budget) {
+            let c = c?;
+            let c = if lower && (0x41..=0x5A).contains(&c) { c.saturating_add(0x20) } else { c };
+            let (buf, n) = utf8(c);
+            self.names.append_slice(buf.get(..n).unwrap_or(&[]))?;
+        }
+        Ok(Span::new(start, self.names.len()))
+    }
+
     fn push_simple(&mut self, s: Simple) -> Result<u32, Error> {
         let id = self.simples.len() as u32;
         self.simples.push(s)?;
@@ -216,7 +246,8 @@ pub(crate) fn ns_of_uri(uri: &[u8]) -> u8 {
     }
 }
 
-/// `@namespace` の表（`<style>` ごと）。宣言は接頭辞のバイトの順に並べ、同じ接頭辞は後の宣言だけを残す（[`ns_insert`]）。
+/// `@namespace` の表（`<style>` ごと）。宣言は接頭辞のバイトの順に並べ、同じ接頭辞は後の宣言だけを残す（規則の並びが
+/// 引く前に並べる）。
 #[derive(Clone, Copy)]
 pub(crate) struct NsTable<'a> {
     pub(crate) decls: &'a [NsDecl],
@@ -233,7 +264,7 @@ impl NsTable<'_> {
 
     /// 接頭辞の字句 `t`（ident。escape を解いて比べる）の名前空間。宣言がなければ None。
     fn lookup(&self, s: &[u8], t: &Token, budget: &Budget<'_>) -> Result<Option<u8>, Error> {
-        let i = lower_bound_try(self.decls, |d| Ok(cmp_name(budget, d.prefix.of(self.names), s, t)? == Less))?;
+        let i = lower_bound_try(budget, self.decls, |d| Ok(cmp_name(budget, d.prefix.of(self.names), s, t)? == Less))?;
         match self.decls.get(i) {
             Some(d) if cmp_name(budget, d.prefix.of(self.names), s, t)? == core::cmp::Ordering::Equal => Ok(Some(d.ns)),
             _ => Ok(None),
@@ -242,27 +273,6 @@ impl NsTable<'_> {
 }
 
 use core::cmp::Ordering::Less;
-
-/// `decls`（接頭辞の順）に宣言を足す。同じ接頭辞があれば置き換える（後の宣言が勝つ）。
-pub(crate) fn ns_insert(
-    decls: &mut MVec<'_, NsDecl>,
-    names: &[u8],
-    d: NsDecl,
-    budget: &Budget<'_>,
-) -> Result<(), Error> {
-    let key = d.prefix.of(names);
-    let list = decls.as_slice();
-    let i = lower_bound_try(list, |x| Ok(bytes_cmp(budget, x.prefix.of(names), key)? == Less))?;
-    if let Some(x) = list.get(i)
-        && bytes_cmp(budget, x.prefix.of(names), key)? == core::cmp::Ordering::Equal
-    {
-        if let Some(x) = decls.get_mut(i) {
-            *x = d;
-        }
-        return Ok(());
-    }
-    decls.insert(i, d)
-}
 
 /// 名前 `a`（UTF-8）と字句 `t` の中身（escape を解いたもの）を比べる。解く符号位置は塊ずつ払う。
 fn cmp_name(budget: &Budget<'_>, a: &[u8], s: &[u8], t: &Token) -> Result<core::cmp::Ordering, Error> {
@@ -378,6 +388,8 @@ struct Frame {
     pe: u8,
     /// 読んでいる選択子が壊れた
     broken: bool,
+    /// この並びの中の、開いているかっこの数（並びの終わりの `,`・`)` を見分ける）
+    base: u32,
 }
 
 impl Frame {
@@ -405,7 +417,14 @@ impl Frame {
             has_type: false,
             pe: PE_NONE,
             broken: false,
+            base: 0,
         }
+    }
+
+    /// 開いているかっこの数が `base` の所から始まる並び。
+    fn at(mut self, base: usize) -> Frame {
+        self.base = u32::try_from(base).unwrap_or(u32::MAX);
+        self
     }
 }
 
@@ -426,11 +445,14 @@ impl Cursor<'_, '_, '_> {
         Ok(t)
     }
 
+    /// 次の字句を読む（読んだ字句はかっこの積み上げに入れる。開いているかっこの数で、並びの終わりを見分ける）。
     fn next(&mut self) -> Result<Token, Error> {
-        if let Some(t) = self.peeked.take() {
-            return Ok(t);
-        }
-        self.lex.next()
+        let t = match self.peeked.take() {
+            Some(t) => t,
+            None => self.lex.next()?,
+        };
+        self.nest.feed(&t)?;
+        Ok(t)
     }
 
     fn skip_ws(&mut self) -> Result<bool, Error> {
@@ -442,36 +464,39 @@ impl Cursor<'_, '_, '_> {
         Ok(any)
     }
 
-    /// 深さ 0 の `,` か `)`（読まない）・終わりまで飛ばす（かっこは種類ごとに組で）。
-    fn skip_to_list_end(&mut self) -> Result<(), Error> {
-        self.nest.clear();
+    /// 開いているかっこの数が `base` の所の `,` か `)`（読まない）・終わりまで飛ばす（壊れた選択子の中で開いたかっこは、
+    /// 組の閉じまで読む）。
+    fn skip_to_list_end(&mut self, base: usize) -> Result<(), Error> {
         loop {
             let t = self.peek()?;
             match t.kind {
                 Kind::Eof => return Ok(()),
-                Kind::Comma | Kind::RParen if self.nest.top() => return Ok(()),
+                Kind::Comma | Kind::RParen if self.nest.depth() <= base => return Ok(()),
                 _ => {}
             }
-            self.nest.feed(&t)?;
             self.next()?;
         }
     }
 
-    /// 関数の中身を組の `)` まで読み飛ばし、中身の範囲（`)` の前まで）を返す（かっこは種類ごとに組で）。
+    /// 関数（開きの字句は読んだあと）の中身を組の `)` まで読み飛ばし、中身の範囲（`)` の前まで）を返す。
     fn skip_function(&mut self) -> Result<Span, Error> {
         let start = self.peek()?.span.start;
         let mut end = start;
-        self.nest.clear();
+        let target = self.nest.depth().saturating_sub(1);
         loop {
             let t = self.next()?;
             match t.kind {
                 Kind::Eof => return Ok(Span { start, end: t.span.start }),
-                Kind::RParen if self.nest.top() => return Ok(Span { start, end }),
+                Kind::RParen if self.nest.depth() <= target => return Ok(Span { start, end }),
                 _ => {}
             }
-            self.nest.feed(&t)?;
             end = t.span.end;
         }
+    }
+
+    /// 開いているかっこの数。
+    fn depth(&self) -> usize {
+        self.nest.depth()
     }
 }
 
@@ -512,7 +537,14 @@ fn parse_list(s: &[u8], range: Span, ns: NsTable<'_>, t: &mut Tables<'_>, budget
         let tok = cur.peek()?;
         let depth = frames.len();
         let Some(mut f) = frames.last().copied() else { return Err(invalid()) };
-        if matches!(tok.kind, Kind::Eof | Kind::RParen | Kind::Comma) {
+        let base = f.base as usize;
+        let list_end = tok.kind == Kind::Eof || (matches!(tok.kind, Kind::RParen | Kind::Comma) && cur.depth() <= base);
+        if f.broken && !list_end {
+            // 壊れた選択子の残りを飛ばす（中で開いたかっこは組の閉じまで。寛容な並びなら次の `,` まで）
+            cur.skip_to_list_end(base)?;
+            continue;
+        }
+        if list_end {
             if tok.kind != Kind::Eof {
                 cur.next()?;
             }
@@ -531,10 +563,10 @@ fn parse_list(s: &[u8], range: Span, ns: NsTable<'_>, t: &mut Tables<'_>, budget
                 }
                 if tok.kind == Kind::Comma {
                     // 並びの残りを飛ばして閉じのかっこまで
-                    cur.skip_to_list_end()?;
+                    cur.skip_to_list_end(base)?;
                     while cur.peek()?.kind == Kind::Comma {
                         cur.next()?;
-                        cur.skip_to_list_end()?;
+                        cur.skip_to_list_end(base)?;
                     }
                     if cur.peek()?.kind == Kind::RParen {
                         cur.next()?;
@@ -560,11 +592,6 @@ fn parse_list(s: &[u8], range: Span, ns: NsTable<'_>, t: &mut Tables<'_>, budget
             }
             frames.pop();
             close_list(&f, t, frames.last_mut())?;
-            continue;
-        }
-        if f.broken {
-            // 壊れた選択子の残りを飛ばす（寛容な並びなら次の `,` まで）
-            cur.skip_to_list_end()?;
             continue;
         }
         let r = step(&mut cur, s, &mut f, t, ns, default_ns, &mut frames);
@@ -797,6 +824,9 @@ fn step(
             }
             let mut x = Simple::new(S_CLASS);
             x.a = t.push_name(decode(s, n.inner), false)?;
+            if no_token(x.a.of(t.names.as_slice()), t.names.budget())? {
+                x.flags |= FLAG_NO_TOKEN;
+            }
             f.spec.b = f.spec.b.saturating_add(1);
             add_simple(f, t, x, false)
         }
@@ -863,7 +893,7 @@ fn attribute(cur: &mut Cursor<'_, '_, '_>, s: &[u8], t: &mut Tables<'_>, ns: NsT
     let v = cur.next()?;
     x.b = match v.kind {
         Kind::Ident => t.push_name(decode(s, v.inner), false)?,
-        Kind::Str => t.push_name(decode_string(s, v.inner), false)?,
+        Kind::Str => t.push_name_str(s, v.inner, false)?,
         _ => return Err(invalid()),
     };
     cur.skip_ws()?;
@@ -879,6 +909,9 @@ fn attribute(cur: &mut Cursor<'_, '_, '_>, s: &[u8], t: &mut Tables<'_>, ns: NsT
     }
     if end.kind != Kind::RBracket {
         return Err(invalid());
+    }
+    if x.op == OP_INCLUDES && no_token(x.b.of(t.names.as_slice()), budget)? {
+        x.flags |= FLAG_NO_TOKEN;
     }
     Ok(x)
 }
@@ -993,7 +1026,7 @@ fn pseudo(
                     (S_IS, true, false)
                 };
                 // 入れ子の並びを始める（外の複合の状態 `f` は、呼び手が外の段に書き戻す）
-                frames.push(Frame::new(kind, false, forgiving, zero, f.in_has))?;
+                frames.push(Frame::new(kind, false, forgiving, zero, f.in_has).at(cur.depth()))?;
                 cur.skip_ws()?;
                 return Ok(());
             }
@@ -1003,7 +1036,7 @@ fn pseudo(
                     cur.skip_function()?;
                     return Err(invalid());
                 }
-                let mut g = Frame::new(S_NEVER, false, false, false, true);
+                let mut g = Frame::new(S_NEVER, false, false, false, true).at(cur.depth());
                 g.opaque = true;
                 g.relative = true;
                 frames.push(g)?;
@@ -1042,7 +1075,7 @@ fn pseudo(
                 {
                     // `of S`：S を確かめて読むが当てない
                     cur.next()?;
-                    let mut g = Frame::new(S_NEVER, false, false, false, f.in_has);
+                    let mut g = Frame::new(S_NEVER, false, false, false, f.in_has).at(cur.depth());
                     g.opaque = true;
                     frames.push(g)?;
                     cur.skip_ws()?;
@@ -1359,7 +1392,7 @@ fn lang_ranges(s: &[u8], arg: Span, t: &mut Tables<'_>) -> R<Span> {
                 if tok.kind == Kind::Ident {
                     t.push_name(decode(s, tok.inner), true)?;
                 } else {
-                    t.push_name(decode_string(s, tok.inner), true)?;
+                    t.push_name_str(s, tok.inner, true)?;
                 }
                 any = true;
                 want_item = false;

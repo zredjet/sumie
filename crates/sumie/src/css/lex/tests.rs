@@ -34,7 +34,8 @@ fn kinds(src: &str) -> Vec<Kind> {
 
 fn text(src: &str, t: &Token) -> String {
     let d: Vec<u32> = if matches!(t.kind, Kind::Str | Kind::Url) {
-        decode_string(src.as_bytes(), t.inner).collect()
+        let b = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+        decode_string(src.as_bytes(), t.inner, &b).map(Result::unwrap).collect()
     } else {
         decode(src.as_bytes(), t.inner).collect()
     };
@@ -159,4 +160,19 @@ fn long_numbers_round_like_short_ones() {
     let v = value(&format!("{}px", "1".repeat(5000)));
     assert_eq!(v.2, Kind::Dimension);
     assert!(!v.1);
+}
+
+/// 文字列の中の改行の続きだけが長く続いても、解くときに払いながら読む。
+#[test]
+fn string_continuations_are_paid() {
+    let src = format!("\"{}x\"", "\\\n".repeat(200_000));
+    let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let mut lex = Lexer::over(src.as_bytes(), Span::new(0, src.len()), &budget);
+    let t = lex.next().unwrap();
+    assert_eq!(t.kind, Kind::Str);
+    let before = budget.work();
+    let chars: Vec<u32> = decode_string(src.as_bytes(), t.inner, &budget).map(Result::unwrap).collect();
+    assert_eq!(chars, [u32::from(b'x')]);
+    assert!(budget.work() - before >= 400_000);
+    assert!(budget.max_spend() < crate::budget::CANCEL_INTERVAL);
 }
