@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+
+# Cargo（M0 から）
+/target/
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
