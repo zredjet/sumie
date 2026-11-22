@@ -7,6 +7,7 @@
 //! `estimate_parse` と `parse` は同じ誤りを返し（D2）、`estimate_parse` が通れば `parse` も通る（確保器の失敗と中止を除く）。
 
 pub(crate) mod ids;
+pub(crate) mod needs;
 pub(crate) mod refs;
 pub(crate) mod size;
 
@@ -26,6 +27,7 @@ use crate::style::props::lookup;
 use crate::values::{Unit, Values};
 use crate::xml::{self, KIND_ELEMENT, KIND_TEXT, NS_NONE, NS_SVG, XmlDoc};
 use ids::Ids;
+pub use needs::Needs;
 use refs::Refs;
 pub use size::{PixelSize, Size};
 use size::{SizeRule, size_rule};
@@ -38,6 +40,7 @@ pub struct Document<'s> {
     styles: Styles,
     ids: Ids,
     refs: Refs,
+    needs: Needs,
     size: SizeRule,
     limits: Limits,
     report: Report,
@@ -77,6 +80,12 @@ impl<'s> Document<'s> {
                 Ok(None)
             }
         }
+    }
+
+    /// 描く木を作るのに要るもの（文字・画像。architecture.md §3.1）。フォントの集まりが空なのに文字があるか、画像の
+    /// デコーダがないのにラスターの画像があるか、SVG の画像があれば、木を作る段が `Unsupported` を返す。
+    pub fn needs(&self) -> Needs {
+        self.needs
     }
 
     /// 持ち続ける量（`Estimate::result_bytes` と同じ）。
@@ -152,8 +161,9 @@ fn pipeline<'s>(svg: &'s [u8], opts: &ParseOptions<'_>, budget: &Budget<'_>) -> 
     let size = if root_font == opts.style.font_size { media_size } else { size_rule(&doc, svg, root_font, budget)? };
     let ids = Ids::build(&doc, svg, budget)?;
     let refs = refs::build(&doc, svg, &sheet, &styles, &ids, opts.style.languages, budget)?;
+    let needs = needs::needs(&doc, svg, &sheet, &styles, &refs, budget)?;
     let report = report(&doc, svg, &sheet, &styles, &refs, budget)?;
-    Ok(Document { input: svg, xml: doc, sheet, styles, ids, refs, size, limits: opts.limits, report })
+    Ok(Document { input: svg, xml: doc, sheet, styles, ids, refs, needs, size, limits: opts.limits, report })
 }
 
 /// 根の要素の文字の大きさ（px）。指定の値が長さか割合ならそれ（em・ex・% は既定の文字の大きさに対して）、ほか（言葉・
