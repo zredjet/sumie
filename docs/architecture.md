@@ -115,6 +115,7 @@ pub struct StyleDefaults<'a> {         // 既定は const の StyleDefaults::USV
     pub languages: &'a [&'a str],      // switch の systemLanguage。既定 ["en"]（usvg と同じ）。ロケールは読まない
     pub generic: GenericFamilies<'a>,  // serif・sans-serif・cursive・fantasy・monospace（FR-FO-04）
     pub fallback: &'a [&'a str],       // 代わりの書体の並び（FR-FO-05）
+    pub color_scheme: ColorScheme,     // @media の prefers-color-scheme（既定 Light。ADR-66 (2)）
 }
 
 impl<'s> Document<'s> {
@@ -231,11 +232,13 @@ Kura の「形」（値を描かずに大きさなどを読む。今の Kura は
 
 ### 4.1 XML（段 1）
 
-- 節は 1 本の `MVec<Node>`（`mem` の入れ物。§5.1）に行きがけの順で並べ、`NodeId(u32)` で指す。`Node { kind, name,
-  parent, first_child, next_sibling, attrs: 範囲, text: 範囲, pos }`
+- 節は 1 本の `Frozen<Node>`（`mem` の入れ物。§5.1）に行きがけの順で並べ、番号（u32）で指す。`Node { kind, ns, flags,
+  parent, first_child, next_sibling, local: 範囲, attrs: 範囲, text: 範囲, pos }`
 - 文字の節と属性の値は、実体を展開して空白を決めたあとの形で 1 本のバイト列（文字の置き場）に詰め、範囲で指す。
   展開しない値は入力を借りる
-- 名前は「名前空間の URI と局所名」の組を整数にする。SVG・XLink・XML の名前空間の既知の名前は列挙の定数
+- 名前は名前空間の種類（u8：なし・SVG・XLink・XML・そのほか）と局所名（入力の範囲）。「そのほか」は URI を持たない。
+  既知の名前を整数にするのは style の段で行う
+- ATTLIST の既定の属性値は、名前空間を解く前に書いていない属性として足す（ADR-67 (7)）
 - 木をたどるのは `first_child`・`next_sibling`・`parent` の鎖で行う（行きがけの順のたどりは積み上げすら要らない）
 - 走査はバイト列の上の位置で進め、どの枝も必ず 1 バイト以上進む（`tests/rules.rs` では見られないので、ファズと
   「すべての 3 バイトの並び」のテストで確かめる）
@@ -248,8 +251,10 @@ Kura の「形」（値を描かずに大きさなどを読む。今の Kura は
 ### 4.2 スタイル（段 2）
 
 - CSS は CSS Syntax Level 3 の字句の部分集合を自作する。規則は `(セレクタ, 宣言の範囲, 詳細度, 順)` の並び
-- セレクタの範囲は resvg と同じ（型・`*`・`#id`・`.class`・`[a]`・`=`・`~=`・`|=`・`:first-child`・子孫・`>`・`+`・並び。
-  ADR-64 (1)）。後の兄弟（`~`）と、後ろを見る擬似クラスがないので、行きがけに 1 度流すだけで決まる
+- セレクタの範囲は Selectors 3 の全部と、Selectors 4 の `:is()`・`:where()`・`:not()`・`:lang()`・属性の印（FR-ST-07・
+  ADR-66 (1)）。後ろの兄弟を見る構造の擬似クラス（`:last-child`・`:nth-last-child()`・`:only-child`・`*-of-type` の後ろの側）は、
+  作り終えた節の配列から兄弟の数（要素の兄弟の数と、同じ型の兄弟の数）を照合の前に数えておくので、照合は行きがけに 1 度流す
+  だけで決まる。`:is()` などの中の複合のセレクタは、同じ要素の旗として外の部分より先に決める。`:has()` は当てない（警告）
 - セレクタの照合は、文書を行きがけの順に 1 度流しながら、セレクタの部分（複合のセレクタ）ごとの旗で行う（ADR-41）。
   要素 e で「部分 1〜k が当たり、部分 k が e に当たる」を `M[e][k]` とし、結合子ごとに次の旗から決める：
   - 子孫：祖先のどれかで `M[·][k-1]` が立っているか（親から受け継ぐ旗。深さごとの積み上げで持つ）
@@ -268,8 +273,8 @@ Kura の「形」（値を描かずに大きさなどを読む。今の Kura は
 
 ### 4.3 文書（段 3）
 
-- ID の表は `mem::SortedMap<名前, NodeId>`（並べた `MVec` と自前の `lower_bound`。同じ id は文書の順で後の要素。FR-ST-13・
-  ADR-64 (5)）
+- ID の表は `mem::SortedMap<名前, NodeId>`（並べた `MVec` と自前の `lower_bound`。同じ id は文書の順で最初の要素。FR-ST-13・
+  ADR-66 (5)）
 - 参照の辺（保守的に作る。輪を見落とさない側に倒す。辺の数は要素の数に比例する）：
   - 要素 → 子（参照先の中身を描くと子を描くので、pattern → 中身の rect のような辺もこれで張られる）
   - use・feImage の href、href の鎖（gradient・pattern・filter・textPath）

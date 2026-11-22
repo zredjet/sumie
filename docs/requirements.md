@@ -62,7 +62,7 @@
 | FR-IN-04 | M | XML 1.0 の整形式でなければ `Invalid`（入力の位置つき）。閉じていない要素・属性の重複・不正な名前・不正な文字の参照など。roxmltree（resvg の中）が受けて描いているものを `Invalid` にしないかを、M1 で照合の集まりと Kura のファズのコーパスで照らし、受けるものは受ける（NFR-10）。細かい扱いは roxmltree 0.21.1 に合わせる（ADR-65） |
 | FR-IN-05 | M | 名前空間：接頭辞は宣言で URI に解いて見る（接頭辞の文字では見ない）。描くのは SVG の名前空間の要素だけ。`href` と `xlink:href` の両方を読み、両方あれば `href` を使う |
 | FR-IN-06 | M | 文字の参照（`&#…;`・`&#x…;`）と定義済みの 5 つの実体。値が u32 に入らないもの・文書の文字でないもの（`&#0;`・`&#xFFFE;` など）は `Invalid`、サロゲートと U+10FFFF を超える値は U+FFFD（roxmltree と同じ。ADR-65） |
-| FR-IN-07 | M | DTD：内部のサブセットの一般の実体だけを、展開した量に上限を付けて扱う。パラメタ実体・外部の実体・マークアップか参照を含む実体は `Unsupported`（今の Kura と同じ）。外部の DTD の識別子（`SYSTEM`・`PUBLIC`）は読まずに無視する（Illustrator の DOCTYPE を読める）。ELEMENT・ATTLIST・NOTATION の宣言は読み飛ばす。宣言の外の文字と知らない宣言は `Invalid`（ADR-65）。ATTLIST の既定の属性値は当てない（XML 1.0 §5.1 は非検証の処理器にも当てることを求めるが、roxmltree・今の Kura と同じにする。M1 で照らす） |
+| FR-IN-07 | M | DTD：内部のサブセットの一般の実体だけを、展開した量に上限を付けて扱う。パラメタ実体・外部の実体・マークアップか参照を含む実体は `Unsupported`（今の Kura と同じ）。外部の DTD の識別子（`SYSTEM`・`PUBLIC`）は読まずに無視する（Illustrator の DOCTYPE を読める）。ELEMENT・NOTATION の宣言は読み飛ばす。宣言の外の文字と知らない宣言は `Invalid`（ADR-65）。ATTLIST の既定の属性値は、要素が書いていない属性に当て、CDATA でない型の値は空白を揃える（XML 1.0 §3.3・§5.1。読めない ATTLIST の宣言は当てずに受ける。ADR-66 (7)・ADR-67 (7)） |
 | FR-IN-08 | M | 外部の資源（ファイル・http・相対のパス・`@import`・`@font-face` の `src`）を読まない。外を指す参照（use・塗り・filter など）は描かずに、報告の「読まなかった参照」に載せる。`<image>` は FR-IMG |
 | FR-IN-09 | M | 外から来たバイト列を `&str` の位置で切らない。名前・値の走査はバイト列で行い、文字の節・属性の値は UTF-8 として確かめてから使う |
 
@@ -74,15 +74,15 @@
 | FR-ST-02 | M | `g`・`defs`・`a`（`g` と同じに描く）・`title`・`desc`・`metadata`（描かない）。知らない要素は子ごと描かない（警告） |
 | FR-ST-03 | M | `use`：要素・`symbol`・`svg` への参照、`x`・`y`（平行移動）、`symbol`・`svg` への `width`・`height`。参照先の中身は use の文脈で継承する。輪は FR-CO-05。外の文書への参照は FR-IN-08 |
 | FR-ST-04 | M | `symbol`：`viewBox`・`preserveAspectRatio`・`refX`・`refY`、SVG 2 の `x`・`y`・`width`・`height` |
-| FR-ST-05 | M | `switch`：`systemLanguage`（呼び手が渡す言語の並びで照らす）・`requiredExtensions`・`requiredFeatures` で、通る最初の子だけを描く。`requiredFeatures` は resvg と同じく照らす：空・知らない機能は偽（SVG 2・Chrome は無視する）。`systemLanguage` は言語の頭で照らす（`en-US` は `en` で通る）。通る機能の文字列の一覧は M1 で resvg と照らして決める（ADR-64 (6)） |
-| FR-ST-06 | M | `style` 要素（`type` がないか `text/css`）と `style` 属性。CDATA の中も読む |
-| FR-ST-07 | M | CSS のセレクタ（resvg と同じ範囲。ADR-64 (1)）：型（大文字小文字を区別する）・`*`・`#id`・`.class`・属性（`[a]`・`=`・`~=`・`|=`）・`:first-child`、結合子の子孫・`>`・`+`、並び（`,`）。詳細度と出てきた順で決める。`^=`・`$=`・`*=`・`i` の印・`~`・ほかの擬似クラス・擬似要素・名前空間のセレクタは当てない（警告）。並びの中に当てないセレクタがあっても、残りのセレクタは当てる（resvg と同じ。CSS の仕様は規則ごと捨てる） |
-| FR-ST-08 | M | アットルール（`@media`（`screen`・`all` も）・`@import`・`@font-face`・`@supports`・`@layer`・`@charset`・知らないもの）は中身ごと飛ばし（警告）、そのあとの規則は当てる（resvg と同じ。ADR-64 (2)） |
-| FR-ST-09 | M | カスケードの順（弱い順。resvg と同じ。ADR-64 (3)）：プレゼンテーション属性 ＜ `style` 要素の規則（詳細度・順） ＜ `style` 属性 ＜ `style` 要素の `!important`。`style` 属性の `!important` は `style` 属性のふつうの宣言と同じに扱う（規則の `!important` に勝たない）。`<style>` は `type` がないか `text/css` のものだけ、文書のどこにあってもすべての要素に当てる。プレゼンテーション属性の一覧は SVG 1.1 と、resvg が読む SVG 2 のもの（`transform-origin`・`paint-order`・`isolation`・`mask-type`）。`mix-blend-mode` は CSS のプロパティとしてだけ読み、属性としては読まない（resvg・Chrome と同じ）。`marker` のまとめのプロパティを読む。CSS の `transform` プロパティ・`vector-effect`・CSS の幾何のプロパティ（`x`・`width`・`r`・`d` など）は読まない（ADR-64 (4)） |
+| FR-ST-05 | M | `switch`：`systemLanguage`（呼び手が渡す言語の並びで照らす。言語の頭で照らし、`en-US` は `en` で通る。空は偽）・`requiredExtensions`（属性がなければ真、空と知らない拡張は偽）で、通る最初の子だけを描く。`requiredFeatures` は無視する（SVG 2 で廃止。Chrome と同じ。ADR-66 (6)） |
+| FR-ST-06 | M | `style` 要素（SVG の名前空間のもので、`type` がないか空か `text/css`。`media` 属性は `@media` と同じに照らす）と `style` 属性。CDATA の中も読む（ADR-66 (3)） |
+| FR-ST-07 | M | CSS のセレクタ（ADR-66 (1)）：Selectors 3 の全部（型（大文字小文字を区別する）・`*`・`#id`・`.class`・属性（`[a]`・`=`・`~=`・`\|=`・`^=`・`$=`・`*=`。名前空間のない属性だけに当たる）・構造の擬似クラス（`:first-child`・`:last-child`・`:only-child`・`:nth-child()`・`:nth-last-child()`・`*-of-type`・`:root`・`:empty`）・`:not()`、結合子の子孫・`>`・`+`・`~`）と、Selectors 4 の `:is()`・`:where()`・`:not()`（複合のセレクタの並び）・`:lang()`・属性の印 `i`・`s`、名前空間のセレクタ（`@namespace`）。`:link`・`:any-link` は href のある `a`。動く擬似クラスと擬似要素は当てない。`:has()`・`:nth-child(… of S)` は読むが当てない（警告）。詳細度と出てきた順で決める。並びの中の壊れたセレクタは規則ごと捨てる（CSS の仕様のとおり）。CSS の escape を解く |
+| FR-ST-08 | M | アットルール（ADR-66 (2)）：`@media` は照らす（`screen`・`all` は真、`print` などは偽。`prefers-color-scheme` は呼び手の設定で既定は light。大きさの条件は文書の大きさ（FR-OUT-01 で width・height・viewBox から決まるもの）で照らし、中身で大きさが決まる文書では偽）。`@supports` は読めるプロパティと値か・`selector()` で照らす。`@layer` は層の順でカスケードする。`@namespace` を読む。`@import`（外を読まない）・`@font-face`・`@charset`・`@keyframes`・`@page`・知らないものは飛ばし（警告）、そのあとの規則は当てる。`<!--`・`-->` は飛ばす |
+| FR-ST-09 | M | カスケードの順（弱い順。CSS Cascade のとおり。ADR-66 (3)）：プレゼンテーション属性 ＜ `style` 要素の規則（層・詳細度・順） ＜ `style` 属性 ＜ 規則の `!important`（層は逆の順） ＜ `style` 属性の `!important`。プロパティの名前と `!important` は大文字小文字を区別しない。`<style>` は文書のどこにあってもすべての要素に当てる。プレゼンテーション属性の一覧は SVG 2 のもの（SVG 1.1 のものと、`transform-origin`・`paint-order`・`isolation`・`mask-type`・`vector-effect`、幾何の `x`・`y`・`width`・`height`・`r`・`rx`・`ry`・`cx`・`cy`・`d`）。幾何のプロパティは CSS でも読む（効くのは M2 から）。`mix-blend-mode` は CSS のプロパティとしてだけ読み、属性としては読まない（Chrome と同じ）。`marker` のまとめのプロパティを読む（ADR-66 (4)） |
 | FR-ST-10 | M | 継承・`inherit`・`currentColor`（`color` の継承）。em・ex は計算した `font-size` から |
-| FR-ST-11 | M | `transform`（`matrix`・`translate`・`scale`・`rotate`・`skewX`・`skewY`。区切りのない数 `10-5`・`.5.5` を正しく区切る）と `transform-origin` 属性。CSS の `transform` プロパティは読まない（resvg と同じ。ADR-64 (4)） |
+| FR-ST-11 | M | `transform` 属性（`matrix`・`translate`・`scale`・`rotate`・`skewX`・`skewY`。区切りのない数 `10-5`・`.5.5` を正しく区切る）と `transform-origin` 属性。CSS の `transform` プロパティ（CSS Transforms の単位つきの書き方）と `transform-box` も読む（ADR-66 (4)） |
 | FR-ST-12 | M | `display: none`・`visibility`（`hidden`・`collapse`。子の `visible` は描く）・`opacity` |
-| FR-ST-13 | M | 同じ `id` が複数あれば、文書の順で後の要素を指す（resvg と同じ。M1 で照らして確かめた。Chrome・DOM は最初のもの。ADR-64 (5)） |
+| FR-ST-13 | M | 同じ `id` が複数あれば、文書の順で最初の要素を指す（DOM・Chrome と同じ。ADR-66 (5)） |
 | FR-ST-14 | M | `tref`（SVG 1.1。usvg が解くので受ける） |
 | FR-ST-15 | M | 数：字句を自前で切り出し、`f64` に読む。有限でない数（`1e999` など）は壊れた値として、その属性・宣言を無視して警告する（CSS・SVG の誤りの扱い）。数の大きさの上限は持たない（ADR-32。安全は幾何の側で守る。architecture.md §6.1） |
 
@@ -93,14 +93,14 @@
 | FR-SH-01 | M | `path`：パスのデータの文法すべて（暗黙の命令の繰り返し・区切りのない数・弧の旗の詰め書き）。途中で壊れていれば、そこまでを描く（SVG の誤りの扱い）。弧は SVG 1.1 の付録 F の式で中心の形に直し、半径が足りなければ広げる |
 | FR-SH-02 | M | `rect`（`rx`・`ry` の `auto` と半分への切り詰め）・`circle`・`ellipse`（SVG 2 の `auto`）・`line`・`polyline`・`polygon`（数が奇数なら最後を捨てる）。大きさが 0 か負なら描かない |
 | FR-SH-03 | S | `pathLength`（破線と textPath の `startOffset` の割合に効く。resvg が受けるなら M） |
-| FR-SH-04 | M | 長さの単位：数・px・in・cm・mm・pt・pc・em・ex・%（向きに応じた表示の領域の幅・高さ・対角の √2 で割ったもの） |
+| FR-SH-04 | M | 長さの単位：数・px・in・cm・mm・pt・pc・em・ex（em の半分）・rem・%（向きに応じた表示の領域の幅・高さ・対角の √2 で割ったもの）・vw・vh・vmin・vmax（`@media` と同じ文書の大きさから。中身で大きさが決まる文書では壊れた値）。単位の大文字小文字は区別しない（ADR-66 (4)） |
 
 ### 2.4 塗りと線（FR-PT）
 
 | ID | 優先 | 要件 |
 |---|---|---|
 | FR-PT-01 | M | 塗り：`none`・色・`url(#id)`（あとに代わりの色を付けられる）・`currentColor`・`context-fill`・`context-stroke`（marker の中。SVG 2） |
-| FR-PT-02 | M | 色：SVG の 147 の名前・`#rgb`・`#rgba`・`#rrggbb`・`#rrggbbaa`・`rgb()`・`rgba()`・`hsl()`・`hsla()`・`transparent`。CSS Color 4 のほかの書き方は resvg が受けるものだけ（M1 で照らす） |
+| FR-PT-02 | M | 色：SVG の 147 の名前・`#rgb`・`#rgba`・`#rrggbb`・`#rrggbbaa`・`rgb()`・`rgba()`・`hsl()`・`hsla()`・`transparent`。CSS Color 4 の `/` の α と `hwb()` も読む。システムの色は読まない。`lab()`・`oklch()` などは M1 では読まずに警告し、照らしてから決める（ADR-66 (4)） |
 | FR-PT-03 | M | `fill-rule`・`fill-opacity`・`stroke-opacity`・`stroke-width`・`stroke-linecap`・`stroke-linejoin`（`miter`・`round`・`bevel`・`miter-clip`・`arcs` は resvg と同じ扱い）・`stroke-miterlimit`・`stroke-dasharray`（奇数個は 2 度並べる・% ・負や合計 0 は実線）・`stroke-dashoffset` |
 | FR-PT-04 | M | `paint-order`・`vector-effect: non-scaling-stroke`・`shape-rendering`（`crispEdges` は反エイリアスなし。`optimizeSpeed` は resvg と同じ扱い。M2 で照らす） |
 | FR-PT-05 | M | `linearGradient`・`radialGradient`：`gradientUnits`・`gradientTransform`・`spreadMethod`（pad・reflect・repeat）・`href` の鎖での属性と stop の受け継ぎ（輪は FR-CO-05）・焦点（`fx`・`fy`・SVG 2 の `fr`）・stop の offset の切り詰めと単調化・`stop-color`・`stop-opacity`。stop が 1 つなら単色、0 なら塗らない。stop が多くても・同じ offset が多くても、画素ごとの仕事は stop の数に比例しない（Kura の S2・S3） |
