@@ -538,7 +538,7 @@ Unicode の表は、`sumie-tools` の `gen-unicode` が Unicode の文字のデ�
 |---|---|
 | `render` | この描画器で PNG に描く（確かめる人のため。PNG の書き出しは道具の側） |
 | `oracle resvg` | resvg 0.48.1（Kura と同じ feature）を、Kura と同じ usvg の設定（総称の書体 Times・Helvetica・Apple Chancery・Papyrus・Courier、フォントを名前の順に登録、languages、`default_size`）で描く（出力は乗算済み） |
-| `oracle chrome` | `/Applications/Google Chrome.app` のヘッドレスで描く（透明の背景（`--default-background-color=00000000` など）・窓の大きさ＝画像の大きさ・`--force-device-scale-factor=1`・`--force-color-profile=srgb`。M0 で決めて追記する。Chrome の版を記録）。PNG はストレートなので、決めた式で乗算済みに直す |
+| `oracle chrome` | `/Applications/Google Chrome.app` のヘッドレスで描く（決めた描き方は下の「Chrome の描き方」。Chrome の版を記録）。PNG はストレートなので、決めた式で乗算済みに直す |
 | `compare` | 2 つの描画の差を乗算済みの RGBA8 で測る（ADR-15 の基準）・差の画像・一覧の HTML |
 | `corpus` | 照合の集まりの取り込み（出どころ・版・ライセンス・ダイジェストの一覧）と、使っている機能での分類（マイルストーンごとの範囲を選ぶ） |
 | `gen-heavy` | 重い入力の生成（下の表）。種と引数を固定し、作った入力のダイジェストを記録する |
@@ -547,7 +547,31 @@ Unicode の表は、`sumie-tools` の `gen-unicode` が Unicode の文字のデ�
 | `gen-unicode` | Unicode の表の生成（§7.2） |
 | `golden` | ゴールデンの行を足す（凍結した版のファイルは追記だけ） |
 
-`gen-heavy` の入力（引数は M0 で決めて、この表に追記する）：
+**Chrome の描き方**（M0 で決めた。ADR-52）：SVG を HTML の `<img src=… width=W height=H>`（W・H は resvg の大きさ）で左上に置き、
+`--headless --hide-scrollbars --default-background-color=00000000 --force-device-scale-factor=1 --force-color-profile=srgb
+--window-size=max(W,800),max(H,600) --screenshot` で撮って、左上の W × H を切り出す。ヘッドレスの窓の幅は 500 より小さく
+できず、SVG の文書を直に開くと viewBox だけの SVG が広い表示の領域の真ん中に描かれるため。画像としての SVG は外の資源を
+読まない（resvg の `resources_dir: None` と揃う）。乗算済みに直す式は `(c × a + 127) / 255`。M0 の照合は Chrome 157.0.8103.79。
+
+`gen-heavy` の入力（M0 で引数を決めた。`sumie-tools gen-heavy` が `local/heavy/` に作り、`index.jsonl` に引数と BLAKE3 を書く。
+S1〜S7 は Kura の説明から作った同じ性質の入力で、Kura の元の入力の写しではない）：
+
+| 名前 | 引数 |
+|---|---|
+| `map-lines` | 4096 × 4096・折れ線 1,000 本 × 300 区間（30 万区間）・ランダムウォーク（8 方向・1 歩 2〜12 画素）・線の幅 1.5・継ぎ目と端 round・ChaCha8 の種 1 |
+| `map-shapes` | 4096 × 4096・閉じた path 45,000 本（1 本 20 頂点・半径 4〜20 画素・8 色の塗り）・種 2（約 14.5 MiB） |
+| `s1-rotated-thick-stroke` | 1000 × 1000・`rotate(33)` の下で、太さ 400 の線の 3 次曲線 40 区間（座標 ±50,000） |
+| `s2-many-stops` | 1000 × 1000・stop 10 万のグラデーションで塗った rect 10 枚 |
+| `s3-same-offset-stops` | 1000 × 1000・offset がすべて 0.5 の stop 30 万（入力の上限 16 MiB に収まる数） |
+| `s4-fine-dashes-round-caps` | 1000 × 1000・長さ 1000 の線 37 本・太さ 8・破線 `0.01 0.01`・丸い端 |
+| `s5-rotated-pattern` | 4000 × 4000・`patternTransform="rotate(30)"` の 4 × 4 のタイルで塗った全面 |
+| `s6-textpath-unseparated-transform` | 200 × 100・`transform="translate(10-5)"` の path へのふつうの textPath（かならず描く互換の例） |
+| `s7-turbulence-octaves` | 2000 × 2000・`numOctaves="1000"` の feTurbulence |
+| `bomb-use-doubling` | use の倍々 20 段（2²⁰ 個） |
+| `bomb-pattern-nesting` | objectBoundingBox の pattern の入れ子 24 段 |
+| `bomb-marker-dup` | 頂点 10 万の path の `marker-mid`（種 3） |
+
+もとの表（下敷き）：
 
 | 名前 | 中身 | 下敷き |
 |---|---|---|
