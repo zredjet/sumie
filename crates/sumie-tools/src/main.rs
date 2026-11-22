@@ -10,6 +10,7 @@ mod gen_disallowed;
 mod gen_heavy;
 mod image;
 mod kura_compat;
+mod latency;
 mod lint_probe;
 mod oracle;
 mod oracle_lock;
@@ -31,7 +32,8 @@ const USAGE: &str = "使い方：sumie-tools <命令> …
   check-lint-probe                                                       禁じる口が clippy で本当に拾われるかを確かめる
   oracle-lock --kura <Kura の Cargo.lock> --rev <コミット>                 照合の相手の依存の版を Kura と照らして記録する
   probe [--out tests/svg/m1-probe]                                       M1 の範囲を決める試しを resvg・Chrome で描いて表にする
-  wellformed [--root corpus] [--kura-fuzz <dir>] [--mutate N]            XML の整形式の厳しさを roxmltree と照らす";
+  wellformed [--root corpus] [--kura-fuzz <dir>] [--mutate N]            XML の整形式の厳しさを roxmltree と照らす
+  latency [--scale N] [--filter …]                                       敵対的な入力で、ns／単位と中止を読む間の最大を測る";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -54,6 +56,7 @@ fn main() {
         "oracle-lock" => oracle_lock::run(rest),
         "probe" => probe::run(rest),
         "wellformed" => wellformed::run(rest),
+        "latency" => latency::run(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())

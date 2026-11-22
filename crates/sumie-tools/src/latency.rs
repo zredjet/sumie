@@ -1,0 +1,129 @@
+//! 中止の間と手間の係数の計測（`sumie-tools latency`）。敵対的な入力を作って `sumie::parse` に通し、手間（単位）・実時間・
+//! 1 単位あたりの実時間・中止の印を読む間の実時間の最大を表にする（FR-LIM-04・FR-LIM-05・NFR-05・NFR-06）。払わない長い
+//! ループは、単位で見る検査では見えず、ここで「中止の印を読む間」が延びて見える（レビューで見つかった形を集めた）。
+
+use std::sync::Mutex;
+use std::time::Instant;
+
+use crate::corpus::{arg, check_args, num_arg};
+
+/// 中止の印を読むたびに、前に読んだときからの実時間を測る（いちばん長い間を覚える）。
+struct GapMeter {
+    state: Mutex<(Instant, f64)>,
+}
+
+impl sumie::Cancel for GapMeter {
+    fn cancelled(&self) -> bool {
+        if let Ok(mut s) = self.state.lock() {
+            let now = Instant::now();
+            let gap = now.duration_since(s.0).as_secs_f64() * 1000.0;
+            if gap > s.1 {
+                s.1 = gap;
+            }
+            s.0 = now;
+        }
+        false
+    }
+}
+
+/// 名前と入力。
+fn cases(scale: usize) -> Vec<(&'static str, Vec<u8>)> {
+    const SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\">";
+    let n = |base: usize| base.saturating_mul(scale).max(1);
+    let doc = |css: &str, body: &str| format!("{SVG}<style>{css}</style>{body}</svg>").into_bytes();
+    let mut out: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    out.push(("ふつう：.class の規則 × 要素", {
+        let css: String = (0..2000).map(|i| format!(".c{i}{{fill:red}}")).collect();
+        let body: String = (0..n(20_000)).map(|i| format!("<rect class=\"c{}\"/>", i % 2000)).collect();
+        doc(&css, &body)
+    }));
+    out.push(("Illustrator 風：.stN 2000 × path", {
+        let css: String = (0..2000).map(|i| format!(".st{i}{{fill:#000;stroke:#000;stroke-miterlimit:10;}}")).collect();
+        let body: String =
+            (0..n(50_000)).map(|i| format!("<path class=\"st{}\" d=\"M0 0h1v1z\"/>", i % 2000)).collect();
+        doc(&css, &body)
+    }));
+    out.push((
+        "長い class の名前 × 要素",
+        doc(&format!(".{}{{fill:red}}", "a".repeat(n(400_000))), &"<g class=\"x\"/>".repeat(n(2000))),
+    ));
+    out.push(("多くの複合（a a a …）", doc(&format!("{}{{fill:red}}", vec!["a"; n(300_000)].join(" ")), "<a/>")));
+    out.push((
+        "当てない擬似クラスの鎖 × 要素",
+        doc(&format!("{}{{fill:red}}", vec![":hover"; n(2_000)].join(" ")), &"<g/>".repeat(n(2_000))),
+    ));
+    out.push(("兄弟 × :first-child", doc("g:first-child{fill:red}", &"<g/>".repeat(n(200_000)))));
+    out.push((
+        "多くの層",
+        doc(&format!("@layer {};", (0..n(100_000)).map(|i| format!("l{i}")).collect::<Vec<_>>().join(",")), ""),
+    ));
+    out.push((
+        "多くの @namespace",
+        doc(&(0..n(20_000)).map(|i| format!("@namespace p{i} url(urn:{i});")).collect::<String>(), ""),
+    ));
+    out.push(("文字列の改行の続き", doc(&format!("[a=\"{}x\"]{{fill:red}}", "\\\n".repeat(n(400_000))), "<g/>")));
+    out.push(("長い数", doc(&format!("rect{{stroke-width:{}1px}}", "0".repeat(n(1_000_000))), "<rect/>")));
+    out.push(("属性の多い根 × :lang", {
+        let attrs: String = (0..n(100_000)).map(|i| format!(" a{i}=\"\"")).collect();
+        let css: String = (0..100).map(|_| ":lang(en){fill:red}").collect();
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"{attrs} lang=\"en\"><style>{css}</style>{}</svg>",
+            "<g/>".repeat(1000)
+        )
+        .into_bytes()
+    }));
+    out.push(("実体の表 × 参照", {
+        let ents: String = (0..n(50_000)).map(|i| format!("<!ENTITY e{i} \"\">")).collect();
+        let refs: String = (0..n(100_000)).map(|i| format!("&e{};", (i * 7919) % n(50_000))).collect();
+        format!("<!DOCTYPE svg [{ents}]>{SVG}<text>{refs}</text></svg>").into_bytes()
+    }));
+    out.push(("壊れた ATTLIST × 要素", {
+        let decls: String = (0..n(20_000)).map(|_| " a CDATA \"&n;\"").collect();
+        format!("<!DOCTYPE svg [<!ATTLIST g{decls}>]>{SVG}{}</svg>", "<g/>".repeat(n(5_000))).into_bytes()
+    }));
+    out.push(("深い入れ子", format!("{SVG}{}{}</svg>", "<g>".repeat(1000), "</g>".repeat(1000)).into_bytes()));
+    out.push(("参照の多い文書（use の鎖）", {
+        let mut body = String::from("<defs><rect id=\"r0\"/>");
+        for k in 1..n(2_000) {
+            body.push_str(&format!("<g id=\"r{k}\"><use href=\"#r{}\"/></g>", k - 1));
+        }
+        body.push_str("</defs>");
+        format!("{SVG}{body}</svg>").into_bytes()
+    }));
+    out
+}
+
+pub fn run(args: &[String]) -> Result<(), String> {
+    check_args(args, &["--scale", "--filter"], &[], 0)?;
+    let scale = num_arg::<usize>(args, "--scale", 1)?;
+    let filter = arg(args, "--filter");
+    let opts = sumie::ParseOptions::DEFAULT;
+    println!("| 入力 | バイト | 手間（単位） | 実時間（ms） | ns／単位 | 中止を読む間の最大（ms） | 結果 |");
+    println!("|---|---|---|---|---|---|---|");
+    for (name, data) in cases(scale) {
+        if filter.is_some_and(|f| !name.contains(f)) {
+            continue;
+        }
+        let est = sumie::estimate_parse(&data, &opts, &sumie::Never);
+        let meter = GapMeter { state: Mutex::new((Instant::now(), 0.0)) };
+        let t0 = Instant::now();
+        if let Ok(mut s) = meter.state.lock() {
+            s.0 = t0;
+        }
+        let r = sumie::parse(&data, &opts, &meter);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let gap = meter.state.lock().map(|s| s.1).unwrap_or(0.0);
+        let (work, result) = match (&est, &r) {
+            (Ok(e), Ok(_)) => (e.work, "読む".to_string()),
+            (_, Err(e)) => (0, format!("{e:?}")),
+            (Err(e), Ok(_)) => (0, format!("見積もり：{e:?}")),
+        };
+        let per = if work > 0 { ms * 1e6 / work as f64 } else { 0.0 };
+        println!(
+            "| {name} | {} | {work} | {ms:.1} | {per:.2} | {gap:.3} | {} |",
+            data.len(),
+            result.chars().take(60).collect::<String>()
+        );
+    }
+    Ok(())
+}

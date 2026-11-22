@@ -574,7 +574,7 @@ Unicode の表は、`sumie-tools` の `gen-unicode` が Unicode の文字のデ�
 ## 10. 照合と試験の道具（sumie-tools）
 
 M0 にあるのは `oracle`・`compare`・`bench`（と子の `bench-one`）・`corpus`（`import-resvg`・`resvg-source`・`fetch-w3c`・
-`fetch-real`・`index`）・`gen-heavy`・`kura-compat`・`oracle-lock`・`gen-disallowed`・`check-lint-probe`。M1 で `probe`・`wellformed`
+`fetch-real`・`index`）・`gen-heavy`・`kura-compat`・`oracle-lock`・`gen-disallowed`・`check-lint-probe`。M1 で `probe`・`wellformed`・`latency`
 を足した。「（M2 から）」などの印のものはまだない。
 
 | 道具 | すること |
@@ -585,7 +585,8 @@ M0 にあるのは `oracle`・`compare`・`bench`（と子の `bench-one`）・`
 | `compare` | 2 つの描画の差を乗算済みの RGBA8 で測る（ADR-15 の基準）・差の画像・一覧の HTML |
 | `corpus` | 照合の集まりの取り込み（出どころ・版・ライセンス・ダイジェストの一覧。resvg の試験・W3C・実例の SVG。ADR-21・ADR-59）と、使っている機能での分類（マイルストーンごとの範囲を選ぶ） |
 | `probe` | M1 の範囲を決める照らし：CSS のセレクタ・アットルール・カスケード・SVG 2 の属性・値の書き方・大きさの端の小さな SVG を `tests/svg/m1-probe/` に書き、resvg と Chrome で描いて、決めた点の色で「効く・効かない」を表にする（`README.md`。ADR-64） |
-| `wellformed` | XML の整形式の照らし：照合の集まり・Kura のファズのコーパス（`--kura-fuzz <dir>`。読むだけで、名前は BLAKE3 にする）・変異（`--mutate N`）・端の例を、roxmltree（usvg が外に出しているもの）と sumie の XML の段（`sumie::fuzzing::xml_parse`）の両方で読み、受ける・断るの食い違いを `local/wellformed/`（`summary.md`・`result.jsonl`・食い違った入力の `diff/`）に書く（FR-IN-04・ADR-65） |
+| `wellformed` | XML の整形式の照らし：照合の集まり・Kura のファズのコーパス（`--kura-fuzz <dir>`。読むだけで、名前は BLAKE3 にする）・変異（`--mutate N`）・端の例を、roxmltree（usvg が外に出しているもの）と sumie の XML の段（`sumie::fuzzing::xml_parse`）の両方で読み、受ける・断るの食い違いと、どちらも読む文書の木（名前空間・名前・属性・文字。`sumie::fuzzing::xml_tree`。ATTLIST のある文書は比べない）の違いを `local/wellformed/`（`summary.md`・`result.jsonl`・食い違った入力の `diff/`）に書く（FR-IN-04・ADR-65） |
+| `latency` | 敵対的な入力（レビューで見つかった、払わない長いループや 2 乗の形を集めたもの。`--scale N` で大きくする）を `sumie::parse` に通し、手間・実時間・1 単位あたりの実時間・中止の印を読む間の実時間の最大を表にする（FR-LIM-04・FR-LIM-05・NFR-05・NFR-06。M7 の校正の資料にもする） |
 | `kura-compat` | Kura の側の「描く／断る」と大きさの一覧（`corpus/kura-request.md`）と照らす（ADR-62 (4)。依頼は取り下げたので、一覧が届いたときに使う。ADR-63 (1)） |
 | `oracle-lock` | 照合の相手の依存の閉包の版と checksum を Kura の Cargo.lock と照らして記録する（ADR-57 (1)・ADR-60 (5)） |
 | `gen-disallowed`・`check-lint-probe` | ライブラリの禁じる口の一覧を std の文書から作る・それが本当に拾われるかを試しのクレートで確かめる（ADR-49） |
