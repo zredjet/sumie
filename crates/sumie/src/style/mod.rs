@@ -1,5 +1,6 @@
 //! 段 2：スタイル（architecture.md §4.2）。プロパティの表・カスケード・継承は M1 の style の単位で足す。ここには読む段の
-//! 設定（[`ParseOptions`]・[`StyleDefaults`]）を置く（値に効く「読みの設定」。D1）。
+//! 設定（[`ParseOptions`]・[`StyleDefaults`]）を置く（値に効く「読みの設定」。D1）。`@media`・`@supports` の条件も、
+//! この設定とプロパティの表を使うので、この段で照らす（css は条件を読むだけ）。
 
 use crate::error::{Error, Invalid, InvalidReason};
 use crate::limits::Limits;
@@ -23,7 +24,7 @@ impl Default for ParseOptions<'static> {
     }
 }
 
-/// スタイルの既定（usvg の `Options` の同じ名前のものに当たる）。
+/// スタイルの既定（書体・大きさ・言語は usvg の `Options` の同じ名前のものに当たる）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StyleDefaults<'a> {
     /// 書体の既定
@@ -81,7 +82,7 @@ pub struct GenericFamilies<'a> {
 }
 
 impl GenericFamilies<'static> {
-    /// fontdb の既定（FR-FO-04）。
+    /// FR-FO-04 の既定（macOS のほかの fontdb の既定と同じ。fontdb は macOS では fantasy を Papyrus にする）。
     pub const USVG: GenericFamilies<'static> = GenericFamilies {
         serif: "Times New Roman",
         sans_serif: "Arial",

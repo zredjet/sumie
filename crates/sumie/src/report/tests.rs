@@ -42,3 +42,17 @@ fn empty_report() {
     assert_eq!(report.unread_refs().len(), 0);
     assert_eq!(report.bytes(), 0);
 }
+
+/// 数えた容量を超えて足すのは見積もりの不具合（伸ばさずに誤り）。
+#[test]
+fn capacity_is_not_exceeded() {
+    let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let mut r = ReportBuilder::with_capacity(&budget, 1, 1, 2).unwrap();
+    r.warn(WarningKind::AtRule, None).unwrap();
+    assert!(matches!(r.warn(WarningKind::AtRule, None), Err(Error::Limit(l)) if l.stage == Stage::Parse));
+    assert!(r.unread(b"abc", 0).is_err());
+    r.unread(b"ab", 0).unwrap();
+    assert!(r.unread(b"", 1).is_err());
+    let report = r.finish().unwrap();
+    assert_eq!(report.bytes(), (size_of::<WarningEntry>() + size_of::<UnreadEntry>() + 2) as u64);
+}

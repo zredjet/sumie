@@ -194,6 +194,8 @@ pub enum Error {
 - Kura の今の見積もりの口（`Plan::Tree`・`Plan::Render`）に当たるのは `estimate_build` と `Tree::estimate`。Kura はフックを
   渡す代わりに、段ごとに見積もりを読んで予算を確保してから次の段を呼ぶ（待つのは呼び手の側。ライブラリは待たない）
 - 見積もりの関数は、値を変えない決定的な関数。中で要る小さな確保と手間は、上限の「見積もりの手間」の中で数え、中止の印も見る
+- `estimate_parse` の `work` は `parse` を呼んだときの全体の手間（`parse` が中で走らせる数える段 ＋ 本体）。`parse_work` とは
+  その和で比べる（ADR-68 (1)）
 - 段に入るときは「見積もり ≤ 上限」を欄ごとに確かめ、`Budget` の上限には見積もりの値を入れる（§5.1。ADR-39）。Kura は
   `RenderEstimate.plan` を共有の分（`shared`）、`Plan::estimate_region` を範囲ごとの作業領域（`per_task`）として予算にできる
 - `Document<'s>` は入力を借りる（名前・値を写さない）。`Tree`・`Plan`・`FontSet` は何も借りない（字形の輪郭は木に写す。

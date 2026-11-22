@@ -1,12 +1,12 @@
 //! 報告（requirements.md FR-REP-03・04）：警告（種類と位置）と、読まなかった参照（href と要素の位置）。使ったフォント・
 //! 見つからなかった文字・使った画像のデコーダは、それを作る段（M3・M5）で足す。
 //!
-//! - 並びは入力の位置の順（同じ位置は足した順。D1・D2）。段は足す順を気にしなくてよい（終わりに並べる）
+//! - 並びは入力の位置の順（同じ位置は足した順。D2。determinism.md §1.1）。段は足す順を気にしなくてよい（終わりに並べる）
 //! - 文言は持たない（種類の列挙を返し、呼び手が訳す。FR-REP-04）
 //! - 報告は何も借りない（`Tree` が持ち続ける。href は写して持つ）
 
 use crate::budget::Budget;
-use crate::error::Error;
+use crate::error::{Error, Resource};
 use crate::mem::{Frozen, MVec, Plain, stable_sort};
 
 /// 警告の種類（版に入らない。足してよい。determinism.md §8）。
@@ -128,14 +128,18 @@ impl<'b> ReportBuilder<'b> {
     }
 
     pub(crate) fn warn(&mut self, kind: WarningKind, position: Option<u64>) -> Result<(), Error> {
+        full(self.budget, self.warnings.len(), self.warnings.capacity(), 1, size_of::<WarningEntry>())?;
         self.warnings.push(WarningEntry { position: position.unwrap_or(NO_POSITION), kind, pad: [0; 6] })
     }
 
     pub(crate) fn unread(&mut self, href: &[u8], position: u64) -> Result<(), Error> {
+        full(self.budget, self.unread.len(), self.unread.capacity(), 1, size_of::<UnreadEntry>())?;
+        full(self.budget, self.store.len(), self.store.capacity(), href.len(), 1)?;
         let start = self.store.len();
         self.store.append_slice(href)?;
         let end = self.store.len();
-        self.unread.push(UnreadEntry { position, start: start as u32, end: end as u32 })
+        let to_u32 = |x: usize| u32::try_from(x).map_err(|_| self.budget.too_large());
+        self.unread.push(UnreadEntry { position, start: to_u32(start)?, end: to_u32(end)? })
     }
 
     /// 位置の順に並べて（同じ位置は足した順）報告にする。
@@ -144,6 +148,15 @@ impl<'b> ReportBuilder<'b> {
         stable_sort(self.budget, self.unread.as_mut_slice(), |x, y| x.position < y.position)?;
         Ok(Report { warnings: self.warnings.freeze(), unread: self.unread.freeze(), store: self.store.freeze() })
     }
+}
+
+/// 数えた容量を超えて足そうとしたら誤り（見積もりの不具合。伸ばさない）。
+fn full(budget: &Budget<'_>, len: usize, cap: usize, n: usize, size: usize) -> Result<(), Error> {
+    if len.saturating_add(n) > cap {
+        let need = (len.saturating_add(n) as u64).saturating_mul(size as u64);
+        return Err(Error::limit(Resource::Memory, need, (cap as u64).saturating_mul(size as u64), budget.stage()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

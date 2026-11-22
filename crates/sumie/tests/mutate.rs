@@ -13,7 +13,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use sumie::Cancel;
-use sumie::fuzzing::{Check, document_parse, dtd_parse, math_ops, mem_ops, mem_ops_with, xml_parse};
+use sumie::fuzzing::{
+    Check, document_parse, document_parse_cancel, dtd_parse, math_ops, mem_ops, mem_ops_with, xml_parse,
+};
 use sumie_testkit::alloc::{assert_heap_within, measure};
 use sumie_testkit::mutate::cases;
 
@@ -201,14 +203,29 @@ fn document_survives_seeded_mutations() {
     let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
     let (mut ok, mut err) = (0usize, 0usize);
     for (n, case) in cases(0x5eed_0006, 2000, &refs, XML_DICT, 4096).iter().enumerate() {
-        // 数える段の山は XML の段の結果から（読む段の中の数える段と同じ歩き）
-        let count_peak = xml_parse(case).count_peak;
         let (out, heap) = measure(|| document_parse(case));
         assert_eq!(out.check, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
-        let peak = count_peak.max(out.estimate.map_or(0, |e| e.peak_bytes));
+        let peak = out.count_peak.max(out.estimate.map_or(0, |e| e.peak_bytes));
         assert_heap_within(&heap, peak, 0, &format!("{n} 件目"));
         assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
         if out.error.is_some() { err += 1 } else { ok += 1 }
     }
     assert!(ok > 30 && err > 100, "読めた {ok}・読めない {err}");
+}
+
+/// 読む段の全体を途中で中止しても（数える段でも本体でも）、勘定が崩れず、確保をすべて返す。
+#[test]
+fn document_survives_cancellation() {
+    let big = format!("<svg xmlns=\"http://www.w3.org/2000/svg\">{}</svg>", "<g a=\"1\"/>".repeat(100_000));
+    let mut cancelled = 0usize;
+    for calls in [0u32, 1, 20, 40, 41, 42, 43, 44, 60, 103, 104] {
+        let c = AfterCalls { left: AtomicU32::new(calls) };
+        let (out, heap) = measure(|| document_parse_cancel(big.as_bytes(), &c));
+        assert_eq!(out.check, Check::Ok, "{calls} 回で中止");
+        assert_eq!(heap.current, 0);
+        if out.error == Some(sumie::Error::Cancelled) {
+            cancelled += 1;
+        }
+    }
+    assert!(cancelled >= 8, "中止の道を通らなかった（{cancelled}）");
 }

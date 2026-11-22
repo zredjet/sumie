@@ -165,6 +165,11 @@ impl<'c> Budget<'c> {
     pub(crate) fn max_spend(&self) -> u64 {
         self.max_spend.get()
     }
+
+    /// 段。
+    pub(crate) fn stage(&self) -> Stage {
+        self.stage
+    }
 }
 
 /// `CANCEL_INTERVAL` の 2 の冪の指数。

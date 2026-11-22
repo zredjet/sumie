@@ -563,32 +563,88 @@ pub struct DocOutcome {
     pub estimate: Option<crate::budget::Estimate>,
     /// 誤り（読めなかったとき）
     pub error: Option<Error>,
+    /// 数える段の確保の山（ヒープの山と照らす）
+    pub count_peak: u64,
 }
 
-/// 読む段の全体（公開の `estimate_parse` と `parse`）を既定の設定で通し、2 つの誤りが同じこと（D2）・見積もりが通れば
-/// 読めること（本体が見積もりを超えれば `Limit` になる）・持ち続ける量が見積もりと同じことを確かめる（ファズの `document`
-/// の対象）。
+/// 読む段の全体（公開の `estimate_parse` と `parse`）を通し、次を確かめる（ファズの `document` の対象）：
+///
+/// - 2 つの誤りが同じ（D2）・見積もりが通れば読める・持ち続ける量が見積もりと同じ
+/// - 数える段と本体のどちらでも、1 回の払いが中止の間隔を超えず、返しすぎない
+/// - 上限を見積もりのちょうどにすれば読め、1 少なくすれば `estimate_parse` と `parse` が同じ `Limit` を返す
 pub fn document_parse(data: &[u8]) -> DocOutcome {
+    document_parse_cancel(data, &Never)
+}
+
+/// [`document_parse`] に中止の印を渡すもの（中止の試験）。上限のきわの確かめは中止の印なしで行う。
+pub fn document_parse_cancel(data: &[u8], cancel: &dyn Cancel) -> DocOutcome {
+    use crate::doc::{Watch, estimate_parse, parse, parse_watch};
     let opts = crate::style::ParseOptions::DEFAULT;
-    let est = crate::doc::estimate_parse(data, &opts, &Never);
-    let doc = crate::doc::parse(data, &opts, &Never);
-    let mut out = DocOutcome { check: Check::Ok, estimate: est.ok(), error: doc.as_ref().err().copied() };
-    match (est, doc) {
+    let est = estimate_parse(data, &opts, cancel);
+    let mut watch = Watch::default();
+    let doc = parse_watch(data, &opts, cancel, &mut watch);
+    let mut out = DocOutcome {
+        check: Check::Ok,
+        estimate: est.ok(),
+        error: doc.as_ref().err().copied(),
+        count_peak: watch.count_peak,
+    };
+    if watch.over_released || watch.max_spend >= CANCEL_INTERVAL {
+        out.check = Check::Violation("読む段の勘定が崩れた");
+        return out;
+    }
+    let e = match (est, doc) {
         (Ok(e), Ok(d)) => {
             if d.held_bytes() != e.result_bytes {
                 out.check = Check::Violation("持ち続ける量が見積もりと違う");
+                return out;
             }
+            e
         }
+        (_, Err(Error::Cancelled)) | (Err(Error::Cancelled), _) => return out,
         (Ok(_), Err(Error::Limit(l))) if l.resource == Resource::Work || l.resource == Resource::Memory => {
             out.check = Check::Violation("読む段の本体が見積もりを超えた");
+            return out;
         }
-        (Ok(_), Err(_)) => out.check = Check::Violation("見積もりが通ったのに読めない"),
+        (Ok(_), Err(_)) => {
+            out.check = Check::Violation("見積もりが通ったのに読めない");
+            return out;
+        }
         (Err(a), Err(b)) => {
             if a != b {
                 out.check = Check::Violation("estimate_parse と parse の誤りが違う");
             }
+            return out;
         }
-        (Err(_), Ok(_)) => out.check = Check::Violation("見積もりが断ったのに読めた"),
+        (Err(_), Ok(_)) => {
+            out.check = Check::Violation("見積もりが断ったのに読めた");
+            return out;
+        }
+    };
+    // 上限のきわ：ちょうどなら読め、1 少なければ同じ Limit
+    let mut exact = opts;
+    exact.limits.parse_work = e.work;
+    exact.limits.parse_bytes = e.peak_bytes;
+    if parse(data, &exact, &Never).is_err() {
+        out.check = Check::Violation("上限を見積もりのちょうどにすると読めない");
+        return out;
+    }
+    for less in [0u8, 1] {
+        let mut o = exact;
+        if less == 0 {
+            o.limits.parse_work = e.work.saturating_sub(1);
+        } else {
+            o.limits.parse_bytes = e.peak_bytes.saturating_sub(1);
+        }
+        let a = estimate_parse(data, &o, &Never);
+        let b = parse(data, &o, &Never).map(|_| ());
+        let same = matches!((&a, &b), (Err(x), Err(y)) if x == y && matches!(x, Error::Limit(_)));
+        // 見積もりが 0 なら 1 少なくできない
+        let zero = if less == 0 { e.work == 0 } else { e.peak_bytes == 0 };
+        if !same && !zero {
+            out.check = Check::Violation("上限を見積もりより 1 少なくしても、同じ Limit にならない");
+            return out;
+        }
     }
     out
 }

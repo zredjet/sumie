@@ -45,3 +45,24 @@ fn xml_deep_nesting_on_a_small_stack() {
     assert_eq!(out.check, Check::Ok, "{out:?}");
     assert_eq!(out.nodes, Some(n + 1), "{out:?}");
 }
+
+/// 公開の口（estimate_parse・parse）でも、深い入れ子を小さなスタックで読める（読む段の全体の段が増えても見張る）。
+#[test]
+fn parse_deep_nesting_on_a_small_stack() {
+    let n = 100_000;
+    let src = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><style>g {{ fill: red }}</style>{}{}</svg>",
+        "<g a=\"1\">".repeat(n),
+        "</g>".repeat(n)
+    );
+    let opts = sumie::ParseOptions {
+        limits: Limits { depth: 200_000, nodes: 400_000, ..Limits::DEFAULT },
+        ..sumie::ParseOptions::DEFAULT
+    };
+    let ok = on_small_stack(move || {
+        let e = sumie::estimate_parse(src.as_bytes(), &opts, &sumie::Never).is_ok();
+        let p = sumie::parse(src.as_bytes(), &opts, &sumie::Never).is_ok();
+        e && p
+    });
+    assert!(ok);
+}

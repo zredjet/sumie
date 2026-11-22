@@ -789,6 +789,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// sumie の `StyleDefaults::USVG` の書体・大きさ・言語が usvg 0.48.1 の既定と同じ。
+    #[test]
+    fn style_defaults_match_usvg() {
+        let u = resvg::usvg::Options::default();
+        let s = sumie::StyleDefaults::USVG;
+        assert_eq!(u.font_family, s.font_family);
+        assert_eq!(f64::from(u.font_size), s.font_size);
+        assert_eq!(u.languages, s.languages.iter().map(|l| l.to_string()).collect::<Vec<_>>());
+    }
+
     #[test]
     fn probes_have_unique_names_and_parse() {
         let ps = probes();

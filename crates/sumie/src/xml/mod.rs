@@ -1166,8 +1166,10 @@ impl Sink for BuildSink<'_> {
 
 /// 数える段（`estimate_parse` と `parse` の前半）。前置きから歩きの終わりまでを `budget` で払い、作る段の容量と手間の
 /// 上限を返す。実体を展開したあとのバイト数が上限を超えれば、超えた所で `Limit`（展開する前に、実体ごとに求めた長さで
-/// 数える）。`budget` はまだ何も払っていないものを渡す（歩きの手間と確保の山を `budget` の通算から読む）。
+/// 数える）。歩きの手間は払った差から読む。確保の山は `budget` の通算から読むので、まだ何も確保していない `budget` を
+/// 渡す（確保の山は差で読めない）。
 pub(crate) fn count(b: &[u8], limits: &Limits, budget: &Budget<'_>, stage: Stage) -> Result<XmlCounts, Error> {
+    let work_before = budget.work();
     let start = prelude(b, limits, budget, stage)?;
     let mut sink = CountSink::default();
     let grown = walk(b, start, limits, budget_ref(budget), &mut sink, stage)?;
@@ -1177,7 +1179,7 @@ pub(crate) fn count(b: &[u8], limits: &Limits, budget: &Budget<'_>, stage: Stage
         attrs: sink.attrs,
         store: sink.store,
         expanded,
-        walk_work: budget.work(),
+        walk_work: budget.work().saturating_sub(work_before),
         walk_peak: budget.peak(),
         write_work: sink.write_work,
         elements: sink.elements,
