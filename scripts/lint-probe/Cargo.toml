@@ -1,0 +1,9 @@
+# crates/sumie/clippy.toml の禁じる口が本当に拾われるかを確かめる試しのクレート（scripts/check-lint-probe.sh が
+# CLIPPY_CONF_DIR=crates/sumie で clippy を回す）。workspace には入れない。
+[package]
+name = "sumie-lint-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]

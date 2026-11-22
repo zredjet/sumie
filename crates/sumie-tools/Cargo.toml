@@ -1,0 +1,20 @@
+[package]
+name = "sumie-tools"
+description = "sumie の照合・計測・生成の道具（本番に入らない）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sumie-tools"
+path = "src/main.rs"
+
+[dependencies]
+sumie = { path = "../sumie" }
+sumie-testkit = { path = "../sumie-testkit" }
+
+# workspace の lints は受け継がない（ゆるい道具。ADR-43 (11)）。clippy.toml も別のゆるいもの
+[lints.rust]
+unsafe_code = "forbid"

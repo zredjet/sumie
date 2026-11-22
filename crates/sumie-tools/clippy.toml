@@ -1,0 +1,3 @@
+# 道具のゆるい設定（ライブラリの厳しい規則は crates/sumie/clippy.toml だけにかかる。ADR-41 (6)）。
+# clippy はクレートの場所から上へ設定を探すので、ここに置くと根や crates/sumie の設定は読まれない。
+too-many-arguments-threshold = 10
