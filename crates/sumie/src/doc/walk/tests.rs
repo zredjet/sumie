@@ -320,3 +320,29 @@ fn transform_origin_initial_is_center() {
     // (50, 25) のまわりの半回転：原点は (100, 50) へ
     ctm_is(get(&rows, "r"), [-1.0, 0.0, 0.0, -1.0, 100.0, 50.0]);
 }
+
+/// 根の svg の `transform-origin` の既定は表示の領域の真ん中で、参照の箱は `transform-box` に依らず表示の領域の箱
+/// （UA の規則の 0 0 は根の svg に当たらない。Chrome と同じ。ADR-85 (1)）。入れ子の svg は 0 0 のまま。
+#[test]
+fn root_transform_origin_is_center() {
+    let rows = run(&format!(
+        r##"<svg {X} id="root" width="100" height="50" viewBox="0 0 50 25" transform="rotate(90)"><rect id="r"/>
+        <svg id="in" transform="rotate(90)" width="10" height="10"/></svg>"##
+    ));
+    // (50, 25) のまわりの 4 分の 1 回転
+    ctm_is(get(&rows, "root"), [0.0, 1.0, -1.0, 0.0, 75.0, -25.0]);
+    ctm_is(get(&rows, "r"), [0.0, 2.0, -2.0, 0.0, 75.0, -25.0]);
+    // 入れ子の svg は UA の規則の 0 0 のまわりに自分の 4 分の 1 回転（根と合わせて半回転）
+    ctm_is(get(&rows, "in"), [-2.0, 0.0, 0.0, -2.0, 75.0, -25.0]);
+    let rows = run(&format!(
+        r##"<svg {X} id="root" width="100" height="50" transform="rotate(90)" style="transform-origin: 0 0"/>"##
+    ));
+    ctm_is(get(&rows, "root"), [0.0, 1.0, -1.0, 0.0, 0.0, 0.0]);
+    // 参照の箱は表示の領域の箱なので、fill-box でも % が解ける
+    let rows = run(&format!(
+        r##"<svg {X} id="root" width="100" height="50" style="transform-box: fill-box; transform-origin: 100% 0; transform: rotate(90deg)"/>"##
+    ));
+    let root = get(&rows, "root");
+    assert!(root.1.ctm_known);
+    ctm_is(root, [0.0, 1.0, -1.0, 0.0, 100.0, -100.0]);
+}

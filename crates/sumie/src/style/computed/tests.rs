@@ -3,7 +3,7 @@
 use super::*;
 
 fn base(viewport: Option<(f64, f64)>, doc: Option<(f64, f64)>) -> Base {
-    Base { default_font: 12.0, root_font: 20.0, root_line: 30.0, viewport, doc }
+    Base { default_font: 12.0, root_font: 20.0, root_line: 30.0, viewport, doc, outermost: false }
 }
 
 #[test]

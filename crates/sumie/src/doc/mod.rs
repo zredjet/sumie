@@ -233,8 +233,14 @@ fn root_font_size(
 ) -> Result<f64, Error> {
     use crate::style::computed::{Base, Bufs, Computed, PropIds, compute};
     let initial = Computed::initial(default);
-    let base =
-        Base { default_font: default, root_font: default, root_line: initial.line_height, viewport: media, doc: media };
+    let base = Base {
+        default_font: default,
+        root_font: default,
+        root_line: initial.line_height,
+        viewport: media,
+        doc: media,
+        outermost: true,
+    };
     let bufs = Bufs { input, store: doc.store.as_slice(), sheet: sheet.text.as_slice() };
     let c = compute(&initial, styles.of(0), &PropIds::new(), &bufs, &base, budget)?;
     Ok(c.font_size)

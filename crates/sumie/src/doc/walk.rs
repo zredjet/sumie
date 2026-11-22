@@ -90,11 +90,13 @@ pub(crate) fn walk(
         viewport: size,
         // vw などは `@media` と同じ文書の大きさ（既定の文字の大きさで解いたもの。ADR-74 (7)）
         doc: d.media_size,
+        outermost: true,
     };
     budget.spend(cost::OP_STEP)?;
     let c0 = compute(&initial, d.styles.of(0), &ids, &bufs, &base, budget)?;
     base.root_font = c0.font_size;
     base.root_line = c0.line_height;
+    base.outermost = false;
     // 根の viewBox の変形と、子の表示の領域
     // 幅か高さが 0 の viewBox の根は描かない（大きさは viewBox がないものとして決める。ADR-78 (7)）
     let mut root_drawn = true;
@@ -117,7 +119,8 @@ pub(crate) fn walk(
     let is_hidden = |i: u32| hidden.get(i as usize).copied().unwrap_or(0) != 0;
     let root_ok =
         root.ns == NS_SVG && root.local.of(input) == b"svg" && c0.display_none == 0 && !is_hidden(0) && root_drawn;
-    // 根の svg の変形は viewBox の変形の外側に掛ける（usvg・Chrome と同じ。文書の 1 回目のレビュー）
+    // 根の svg の変形は viewBox の変形の外側に掛ける（usvg・Chrome と同じ。文書の 1 回目のレビュー）。原点の既定は表示の
+    // 領域の真ん中（Chrome と同じ。usvg は原点。ADR-85 (1)）
     let root_own = c0.transform;
     let root_known = c0.transform_known != 0;
     let root_child = root_own.then(&root_ctm);

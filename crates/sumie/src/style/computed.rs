@@ -319,6 +319,9 @@ pub(crate) struct Base {
     pub(crate) viewport: Option<(f64, f64)>,
     /// 文書の大きさ（vw などの基準。決まらなければ None）
     pub(crate) doc: Option<(f64, f64)>,
+    /// 根の要素を求めるか。根の svg には UA の規則の `transform-origin: 0 0` が当たらず、既定は 50% 50%。参照の箱は
+    /// `transform-box` に依らず表示の領域の箱（CSS の箱を持つ要素の border-box。Chrome と同じ。ADR-85 (1)）
+    pub(crate) outermost: bool,
 }
 
 /// % の向き。
@@ -688,11 +691,22 @@ fn transform(
             _ => 1,
         };
     }
-    let view_box = c.box_vb != 0;
+    let view_box = c.box_vb != 0 || base.outermost;
     let font = c.font_size;
     let line = c.line_height;
     // 変形の原点（受け継がない。inherit は親の点。解けなければ (0, 0) で、変形があれば「解けない」印）
     let mut origin_known = true;
+    // 根の svg の既定は表示の領域の真ん中（ADR-85 (1)）
+    let center = |known: &mut bool| match base.viewport {
+        Some((w, h)) => (w / 2.0, h / 2.0),
+        None => {
+            *known = false;
+            (0.0, 0.0)
+        }
+    };
+    if p.transform_origin.is_none() && base.outermost {
+        (c.origin_x, c.origin_y) = center(&mut origin_known);
+    }
     if let Some(o) = p.transform_origin.as_ref() {
         budget.spend(cost::OP_STEP)?;
         let (x, y) = match o.wide {
@@ -706,13 +720,7 @@ fn transform(
             },
             // initial・unset は CSS の初期の値 50% 50%（SVG の要素の 0 0 は UA の規則の値で、initial はそれを上書きする。
             // Chrome と同じ。文書の 4 回目のレビュー）。参照の箱は view-box（最も近い表示の領域）
-            _ => match base.viewport {
-                Some((w, h)) => (w / 2.0, h / 2.0),
-                None => {
-                    origin_known = false;
-                    (0.0, 0.0)
-                }
-            },
+            _ => center(&mut origin_known),
         };
         c.origin_x = x;
         c.origin_y = y;
