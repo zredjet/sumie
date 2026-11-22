@@ -36,16 +36,27 @@ pub struct StyleDefaults<'a> {
     pub generic: GenericFamilies<'a>,
     /// 代わりの書体の並び（FR-FO-05）
     pub fallback: &'a [&'a str],
+    /// `@media (prefers-color-scheme)` で照らす明暗（ADR-66 (2)）
+    pub color_scheme: ColorScheme,
+}
+
+/// 明暗の設定（`prefers-color-scheme`）。
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorScheme {
+    Light,
+    Dark,
 }
 
 impl StyleDefaults<'static> {
-    /// usvg 0.48 の既定と同じ（書体 Times New Roman・大きさ 12・言語 en・総称の書体は fontdb の既定）。
+    /// usvg 0.48 の既定と同じ（書体 Times New Roman・大きさ 12・言語 en・総称の書体は fontdb の既定）。明暗は light。
     pub const USVG: StyleDefaults<'static> = StyleDefaults {
         font_family: "Times New Roman",
         font_size: 12.0,
         languages: &["en"],
         generic: GenericFamilies::USVG,
         fallback: &[],
+        color_scheme: ColorScheme::Light,
     };
 }
 

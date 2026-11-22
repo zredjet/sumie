@@ -31,7 +31,7 @@ pub use crate::doc::Document;
 pub use crate::error::{Error, Feature, Invalid, InvalidReason, LimitError, Resource, Stage, Unsupported};
 pub use crate::limits::Limits;
 pub use crate::report::{Report, UnreadRef, Warning, WarningKind};
-pub use crate::style::{GenericFamilies, ParseOptions, StyleDefaults};
+pub use crate::style::{ColorScheme, GenericFamilies, ParseOptions, StyleDefaults};
 
 /// 描画器の識別子。値を変える変更で数を上げる（determinism.md §8）。開発中は 0、M7 で 1 に凍結する。
 pub const RENDERER: &str = "sumie-render/0";
