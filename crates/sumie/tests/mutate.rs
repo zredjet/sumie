@@ -13,7 +13,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use sumie::Cancel;
-use sumie::fuzzing::{Check, dtd_parse, math_ops, mem_ops, mem_ops_with, xml_parse};
+use sumie::fuzzing::{Check, document_parse, dtd_parse, math_ops, mem_ops, mem_ops_with, xml_parse};
 use sumie_testkit::alloc::{assert_heap_within, measure};
 use sumie_testkit::mutate::cases;
 
@@ -193,4 +193,22 @@ fn dtd_survives_seeded_mutations() {
         assert_eq!(out.check, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
         assert_heap_within(&heap, out.count_peak.max(out.build_peak).saturating_add(4096), 0, &format!("{n} 件目"));
     }
+}
+
+#[test]
+fn document_survives_seeded_mutations() {
+    let seeds = fuzz_seeds("document");
+    let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
+    let (mut ok, mut err) = (0usize, 0usize);
+    for (n, case) in cases(0x5eed_0006, 2000, &refs, XML_DICT, 4096).iter().enumerate() {
+        // 数える段の山は XML の段の結果から（読む段の中の数える段と同じ歩き）
+        let count_peak = xml_parse(case).count_peak;
+        let (out, heap) = measure(|| document_parse(case));
+        assert_eq!(out.check, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
+        let peak = count_peak.max(out.estimate.map_or(0, |e| e.peak_bytes));
+        assert_heap_within(&heap, peak, 0, &format!("{n} 件目"));
+        assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
+        if out.error.is_some() { err += 1 } else { ok += 1 }
+    }
+    assert!(ok > 30 && err > 100, "読めた {ok}・読めない {err}");
 }

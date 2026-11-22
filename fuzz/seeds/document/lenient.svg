@@ -1,0 +1,7 @@
+<?xml version = '1.0' encoding="UTF-8" standalone="no" ?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd" [
+  <!ENTITY  ns_svg   "http://www.w3.org/2000/svg" >
+  <!ATTLIST svg a CDATA "x>y">
+  <!NOTATION n SYSTEM "x">
+]>
+<:svg :xmlns="&ns_svg;" xmlns="urn:later" xmlns:p="" p:a="1" a="2"><?XML x?><rect :width="&#x10FFFF;&#xD800;" height="2"/></svg>

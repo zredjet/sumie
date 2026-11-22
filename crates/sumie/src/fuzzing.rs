@@ -537,3 +537,41 @@ pub fn dtd_parse(data: &[u8]) -> XmlOutcome {
     }
     xml_parse(doc.as_slice())
 }
+
+/// [`document_parse`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocOutcome {
+    pub check: Check,
+    /// 見積もり（誤りなら None）
+    pub estimate: Option<crate::budget::Estimate>,
+    /// 誤り（読めなかったとき）
+    pub error: Option<Error>,
+}
+
+/// 読む段の全体（公開の `estimate_parse` と `parse`）を既定の設定で通し、2 つの誤りが同じこと（D2）・見積もりが通れば
+/// 読めること（本体が見積もりを超えれば `Limit` になる）・持ち続ける量が見積もりと同じことを確かめる（ファズの `document`
+/// の対象）。
+pub fn document_parse(data: &[u8]) -> DocOutcome {
+    let opts = crate::style::ParseOptions::DEFAULT;
+    let est = crate::doc::estimate_parse(data, &opts, &Never);
+    let doc = crate::doc::parse(data, &opts, &Never);
+    let mut out = DocOutcome { check: Check::Ok, estimate: est.ok(), error: doc.as_ref().err().copied() };
+    match (est, doc) {
+        (Ok(e), Ok(d)) => {
+            if d.held_bytes() != e.result_bytes {
+                out.check = Check::Violation("持ち続ける量が見積もりと違う");
+            }
+        }
+        (Ok(_), Err(Error::Limit(l))) if l.resource == Resource::Work || l.resource == Resource::Memory => {
+            out.check = Check::Violation("読む段の本体が見積もりを超えた");
+        }
+        (Ok(_), Err(_)) => out.check = Check::Violation("見積もりが通ったのに読めない"),
+        (Err(a), Err(b)) => {
+            if a != b {
+                out.check = Check::Violation("estimate_parse と parse の誤りが違う");
+            }
+        }
+        (Err(_), Ok(_)) => out.check = Check::Violation("見積もりが断ったのに読めた"),
+    }
+    out
+}
