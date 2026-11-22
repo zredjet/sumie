@@ -626,7 +626,7 @@ fn end_selector(f: &mut Frame, t: &mut Tables<'_>, default_ns: u8) -> R<()> {
         f.broken = true;
         return Ok(());
     }
-    // 右端の複合：入れ子の並びの中では既定の名前空間が効かない（Selectors 4 §4.? の `:is()` などの決まり）
+    // 右端の複合：入れ子の並びの中では既定の名前空間が効かない（Selectors 4 の `:is()` などの決まり。ADR-73 (8)）
     let c = push_compound(f, t, if f.top { default_ns } else { NS_ANY })?;
     f.count = f.count.saturating_add(1);
     if f.unsupported {
