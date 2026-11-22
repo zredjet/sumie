@@ -59,6 +59,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut rows = String::new();
     let mut image_rows = String::new();
     let (mut image_diffs, mut with_images) = (0usize, 0usize);
+    // NFR-10 の断りは木の見積もり（展開の数・入れ子の svg の深さ）でも起きる。読めた文書の estimate_build の断りを数える
+    let mut build_refusals: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut build_rows = String::new();
     let opts = sumie::ParseOptions::DEFAULT;
     for f in &files {
         let rel = f.strip_prefix(&root).unwrap_or(f).to_string_lossy().to_string();
@@ -82,6 +85,27 @@ pub fn run(args: &[String]) -> Result<(), String> {
             (t, raster, svg)
         });
         let s = sumie::parse(&data, &opts, &sumie::Never);
+        if let Ok(d) = &s
+            && let Err(e) = d.estimate_build(&sumie::Never)
+        {
+            // 上限の断りだけが NFR-10 の照らしの相手。未対応（後のマイルストーンで描く機能）は数だけ載せる
+            let key = match &e {
+                sumie::Error::Limit(l) => {
+                    let _ = writeln!(
+                        build_rows,
+                        "| `{rel}` | {:?}（要る {}・上限 {}） | {} |",
+                        l.resource,
+                        l.needed,
+                        l.allowed,
+                        r.is_ok()
+                    );
+                    format!("Limit({:?})", l.resource)
+                }
+                sumie::Error::Unsupported(u) => format!("未対応（{:?}）", u.feature),
+                other => format!("{other:?}"),
+            };
+            *build_refusals.entry(key).or_default() += 1;
+        }
         if let (Ok((_, raster, svg)), Ok(d)) = (&r, &s) {
             let n = d.needs();
             if (n.raster_images, n.svg_images) != (*raster, *svg) {
@@ -154,9 +178,22 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "\n## 画像の要るもの（ADR-63 (1)）\n\nusvg が描く木のために解こうとした画像の種類と `Document::needs` の比べ（どちらも読める文書）。\
          画像のある文書 {with_images} 件・違う {image_diffs} 件。\n\n| 名前 | usvg | sumie |\n|---|---|---|\n{image_rows}"
     );
+    let n_build: usize = build_refusals.values().sum();
+    let _ = write!(
+        md,
+        "\n## 木の見積もりの断り（NFR-10）\n\n読めた文書のうち `estimate_build` が断ったもの {n_build} 件。\n\n"
+    );
+    for (k, n) in &build_refusals {
+        let _ = writeln!(md, "- {k}：{n}");
+    }
+    let _ = write!(md, "\n上限による断り：\n\n| 名前 | 断り | resvg が読む |\n|---|---|---|\n{build_rows}");
     std::fs::write(out_dir.join("summary.md"), &md).map_err(|e| e.to_string())?;
     println!("{} 件 → {}", files.len(), out_dir.join("summary.md").display());
     println!("  画像のある文書 {with_images}・要るものが違う {image_diffs}");
+    println!("  木の見積もりの断り {n_build}");
+    for (k, n) in &build_refusals {
+        println!("    {k}: {n}");
+    }
     for (v, n) in &counts {
         println!("  {v:?}: {n}");
     }

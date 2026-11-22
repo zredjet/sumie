@@ -200,6 +200,26 @@ fn cases(scale: usize) -> Vec<(&'static str, Vec<u8>)> {
         )
         .into_bytes()
     }));
+    // 文書の段の 4 回目のレビューの形
+    out.push((
+        "受け継ぐ参照の長い外の URL × 要素",
+        doc(&format!("path{{marker:url(x.svg#{})}}", "a".repeat(20_000)), &"<path d=\"M0 0L1 1\"/>".repeat(n(20_000))),
+    ));
+    out.push(("規則の長い #id の塗り × 要素", {
+        let id = "a".repeat(20_000);
+        doc(
+            &format!("rect{{fill:url(#{id})}}"),
+            &format!("<linearGradient id=\"{id}\"/>{}", "<rect/>".repeat(n(20_000))),
+        )
+    }));
+    out.push(("use の中身の mask の inherit の爆弾", {
+        let rects = "<rect style=\"mask:inherit\"/>".repeat(10);
+        let mut body = format!("<defs><mask id=\"k0\"><rect/></mask><g id=\"c\" style=\"mask:inherit\">{rects}</g>");
+        for i in 1..=8 {
+            body.push_str(&format!("<mask id=\"k{i}\"><use href=\"#c\" mask=\"url(#k{})\"/></mask>", i - 1));
+        }
+        format!("{SVG}{body}</defs><rect mask=\"url(#k8)\"/></svg>").into_bytes()
+    }));
     out.push(("深い入れ子", format!("{SVG}{}{}</svg>", "<g>".repeat(1000), "</g>".repeat(1000)).into_bytes()));
     out.push(("参照の多い文書（use の鎖）", {
         let mut body = String::from("<defs><rect id=\"r0\"/>");
