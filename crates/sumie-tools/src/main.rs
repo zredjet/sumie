@@ -15,6 +15,7 @@ mod lint_probe;
 mod oracle;
 mod oracle_lock;
 mod probe;
+mod sizes;
 mod wellformed;
 
 use std::path::PathBuf;
@@ -33,6 +34,7 @@ const USAGE: &str = "使い方：sumie-tools <命令> …
   oracle-lock --kura <Kura の Cargo.lock> --rev <コミット>                 照合の相手の依存の版を Kura と照らして記録する
   probe [--out tests/svg/m1-probe]                                       M1 の範囲を決める試しを resvg・Chrome で描いて表にする
   wellformed [--root corpus] [--kura-fuzz <dir>] [--mutate N]            XML の整形式の厳しさを roxmltree と照らす
+  sizes [--root corpus] [--out local/sizes] [--fonts none]                受ける・断ると大きさを resvg と照らす（FR-OUT-02・NFR-10）
   latency [--scale N] [--filter …]                                       敵対的な入力で、ns／単位と中止を読む間の最大を測る";
 
 fn main() {
@@ -57,6 +59,7 @@ fn main() {
         "probe" => probe::run(rest),
         "wellformed" => wellformed::run(rest),
         "latency" => latency::run(rest),
+        "sizes" => sizes::run(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())
