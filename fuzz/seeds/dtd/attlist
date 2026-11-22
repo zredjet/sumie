@@ -1,0 +1,4 @@
+<!ATTLIST svg fill CDATA "green" id ID #IMPLIED class NMTOKENS " a  b " xml:space (default|preserve) #FIXED "preserve">
+<!ATTLIST svg fill CDATA "red">
+<!ENTITY X "x">
+<!ATTLIST rect stroke CDATA "&X;">

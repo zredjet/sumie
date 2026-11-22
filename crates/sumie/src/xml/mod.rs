@@ -18,12 +18,14 @@ pub(crate) mod chars;
 mod dtd;
 pub(crate) mod lex;
 
+use std::cell::Cell;
+
 use crate::budget::{Budget, chunk_len};
 use crate::cost;
 use crate::error::{Error, Feature, Invalid, InvalidReason, Resource, Stage, Unsupported};
 use crate::limits::Limits;
 use crate::mem::{Frozen, MVec, Plain, stable_sort};
-use crate::xml::dtd::Entity;
+use crate::xml::dtd::{AttDecl, Entity};
 use crate::xml::lex::{Event, Lexer, ScanMeter, Span};
 
 /// 節がないことの印。
@@ -150,7 +152,7 @@ pub(crate) struct XmlCounts {
     pub(crate) walk_peak: u64,
     /// 作る段が書き込む手間（節・属性・置き場）
     pub(crate) write_work: u64,
-    /// 要素の数・文字の節の数（後ろの段の見積もり）
+    /// 要素の数（後ろの段の見積もり）
     pub(crate) elements: u64,
 }
 
@@ -288,18 +290,29 @@ struct RawAttr {
     name: Span,
     value: Span,
     pos: u32,
+    /// 書いた順（ATTLIST の既定の値で足したものは後ろ）
+    order: u32,
     /// 解いた名前空間と局所名
-    ns: u8,
-    pad: [u8; 3],
     local: Span,
+    ns: u8,
+    /// ATTLIST で CDATA でない型と宣言した属性（値の空白を 1 つに揃える）
+    tokens: u8,
+    pad: [u8; 2],
 }
 
 impl Plain for RawAttr {}
 
+impl RawAttr {
+    /// 値の揃え方。
+    fn mode(&self) -> Mode {
+        if self.tokens != 0 { Mode::Tokens } else { Mode::Attr }
+    }
+}
+
 /// 歩きの事象を受ける側（数える段と作る段）。
 trait Sink {
     fn element(&mut self, ns: u8, local: Span, pos: u32, preserve: bool, parent: u32) -> Result<u32, Error>;
-    fn attr(&mut self, w: &Walk<'_, '_>, ns: u8, local: Span, value: Span, pos: u32) -> Result<(), Error>;
+    fn attr(&mut self, w: &Walk<'_, '_>, a: &RawAttr) -> Result<(), Error>;
     fn element_done(&mut self, node: u32, attrs_start: u64) -> Result<(), Error>;
     fn text(&mut self, w: &Walk<'_, '_>, raw: Span, cdata: bool, parent: u32, preserve: bool) -> Result<u32, Error>;
     fn link(&mut self, parent: u32, prev: u32, child: u32);
@@ -311,24 +324,106 @@ struct Walk<'a, 'b> {
     b: &'a [u8],
     budget: &'b Budget<'b>,
     entities: MVec<'b, Entity>,
+    /// ATTLIST の属性の宣言（要素の名前・属性の名前で並べたもの）
+    attlists: MVec<'b, AttDecl>,
+    /// 展開で増えた分（入力 ＋ これが展開したあとのバイト数）と、その上限（`Limits::expanded_bytes`。置き場の位置は
+    /// u32 なので u32 の内に抑える）
+    grown: Cell<u64>,
+    expanded_limit: u64,
+    stage: Stage,
 }
 
 /// 文字と値を展開して書き出す先（数えるか、置き場に書く）。
 trait Out {
     fn write(&mut self, s: &[u8]) -> Result<(), Error>;
+    /// 実体の値を書く（数える側は前に求めた量を足すだけで、値を走査しない）。
+    fn entity(&mut self, w: &Walk<'_, '_>, e: &Entity, mode: Mode) -> Result<(), Error>;
 }
 
-/// 数える側：バイト数と、作る段で置き場に書く手間（`cost::append` の伸ばさない形）。
+/// 数える側：バイト数と、作る段で置き場に書く手間（`cost::append` の伸ばさない形）。`limit` があれば、書く量が展開の
+/// 上限を超えた所で `Limit(Expanded)` を返す（展開したあとのバイト数は「`base` ＋ 書いた量」。全部を数える前に止まる）。
 struct CountOut {
     bytes: u64,
     work: u64,
+    limit: Option<(u64, u64, Stage)>,
+}
+
+impl CountOut {
+    const fn new() -> CountOut {
+        CountOut { bytes: 0, work: 0, limit: None }
+    }
+
+    fn check(&self) -> Result<(), Error> {
+        if let Some((base, allowed, stage)) = self.limit {
+            let needed = base.saturating_add(self.bytes);
+            if needed > allowed {
+                return Err(Error::limit(Resource::Expanded, needed, allowed, stage));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Out for CountOut {
     fn write(&mut self, s: &[u8]) -> Result<(), Error> {
         self.bytes = self.bytes.saturating_add(s.len() as u64);
         self.work = self.work.saturating_add(cost::append(0, u64::MAX, s.len() as u64, 1).0);
-        Ok(())
+        self.check()
+    }
+
+    fn entity(&mut self, _w: &Walk<'_, '_>, e: &Entity, mode: Mode) -> Result<(), Error> {
+        let (bytes, work) = if mode == Mode::Attr { (e.attr_bytes, e.attr_work) } else { (e.text_bytes, e.text_work) };
+        self.bytes = self.bytes.saturating_add(bytes);
+        // 作る段は値を読みながら書く（読む手間も作る段の手間に入れる）
+        self.work = self.work.saturating_add(work).saturating_add(cost::scan(e.value.len() as u64));
+        self.check()
+    }
+}
+
+/// CDATA でない型の属性の値：揃えた値の頭と終わりの空白を捨て、続く空白を 1 つにして `inner` に書く（XML 1.0 §3.3.3）。
+/// 実体の値もこれを通す（前に求めた長さは使えないので走査する）。通すバイトは塊ずつ払う。
+struct Collapse<'o, 'c> {
+    inner: &'o mut dyn Out,
+    budget: &'c Budget<'c>,
+    /// 前に空白があり、まだ書いていない
+    pending: bool,
+    /// 空白でないものを 1 つでも書いた
+    started: bool,
+}
+
+impl Collapse<'_, '_> {
+    fn emit(&mut self, part: &[u8]) -> Result<(), Error> {
+        if part.is_empty() {
+            return Ok(());
+        }
+        if self.pending {
+            self.inner.write(b" ")?;
+            self.pending = false;
+        }
+        self.started = true;
+        self.inner.write(part)
+    }
+}
+
+impl Out for Collapse<'_, '_> {
+    fn write(&mut self, s: &[u8]) -> Result<(), Error> {
+        let mut meter = ScanMeter::new(0, s.len());
+        let mut run = 0usize;
+        let mut i = 0usize;
+        while let Some(&c) = s.get(i) {
+            meter.pay(self.budget, i)?;
+            if c == b' ' {
+                self.emit(s.get(run..i).unwrap_or(&[]))?;
+                self.pending = self.started;
+                run = i.saturating_add(1);
+            }
+            i = i.saturating_add(1);
+        }
+        self.emit(s.get(run..).unwrap_or(&[]))
+    }
+
+    fn entity(&mut self, w: &Walk<'_, '_>, e: &Entity, mode: Mode) -> Result<(), Error> {
+        normalize(w.b, w.budget, e.value, mode, self).map(|_| ())
     }
 }
 
@@ -341,28 +436,51 @@ impl Out for StoreOut<'_, '_> {
     fn write(&mut self, s: &[u8]) -> Result<(), Error> {
         self.store.append_slice(s)
     }
+
+    fn entity(&mut self, w: &Walk<'_, '_>, e: &Entity, mode: Mode) -> Result<(), Error> {
+        normalize(w.b, w.budget, e.value, mode, self).map(|_| ())
+    }
 }
 
 /// 展開の仕方。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Attr,
+    /// CDATA でない型の属性（`Attr` に加えて空白を 1 つに揃える）
+    Tokens,
     Text,
     CData,
 }
 
-impl Walk<'_, '_> {
+impl<'a> Walk<'a, '_> {
     /// `raw` を置き場に書く要るか（参照・改行の揃え・属性の空白の揃えがあるか）。
     fn needs_store(&self, raw: Span, mode: Mode) -> bool {
-        raw.of(self.b).iter().any(|&c| match mode {
-            Mode::Attr => c == b'&' || c == b'\t' || c == b'\n' || c == b'\r',
+        let s = raw.of(self.b);
+        if mode == Mode::Tokens
+            && (s.first() == Some(&b' ')
+                || s.last() == Some(&b' ')
+                || (1..s.len()).any(|k| s.get(k.saturating_sub(1)) == Some(&b' ') && s.get(k) == Some(&b' ')))
+        {
+            return true;
+        }
+        s.iter().any(|&c| match mode {
+            Mode::Attr | Mode::Tokens => c == b'&' || c == b'\t' || c == b'\n' || c == b'\r',
             Mode::Text => c == b'&' || c == b'\r',
             Mode::CData => c == b'\r',
         })
     }
 
-    /// `raw` を展開して `out` に書く（参照・改行・属性の空白）。生のバイトは読む前に塊ずつ払う。
+    /// `raw` を展開して `out` に書く（参照・改行・属性の空白。`Tokens` は空白も揃える）。
     fn expand(&self, raw: Span, mode: Mode, out: &mut dyn Out) -> Result<(), Error> {
+        if mode == Mode::Tokens {
+            let mut c = Collapse { inner: out, budget: self.budget, pending: false, started: false };
+            return self.expand_raw(raw, Mode::Attr, &mut c);
+        }
+        self.expand_raw(raw, mode, out)
+    }
+
+    /// `raw` を展開して `out` に書く（参照・改行・属性の空白）。生のバイトは読む前に塊ずつ払う。
+    fn expand_raw(&self, raw: Span, mode: Mode, out: &mut dyn Out) -> Result<(), Error> {
         let s = raw.of(self.b);
         let mut meter = ScanMeter::new(0, s.len());
         let base = raw.start as usize;
@@ -453,51 +571,106 @@ impl Walk<'_, '_> {
         let Some(e) = dtd::lookup(self.b, self.entities.as_slice(), name, self.budget)? else {
             return Err(xml_err(pos));
         };
-        // 実体の値：改行を揃え、属性の中なら空白も揃える（値は参照を含まない。DTD で確かめた）
-        self.normalize(e.value, mode, out)
+        // 実体の値：改行を揃え、属性の中なら空白も揃える（値は参照を含まない。DTD で確かめた）。文字の中では、値が
+        // 文書の文字だけで `]]>` を含まないこと（DOCTYPE を読んだときに 1 度だけ求めた）
+        if mode == Mode::Text && e.text_ok == 0 {
+            return Err(xml_err(pos));
+        }
+        out.entity(self, &e, mode)
     }
 
-    /// 参照を含まない `raw` を、改行（と属性なら空白）を揃えて書く（実体の値）。文字の中では、値の文字が文書の文字か
-    /// を確かめる（属性の値の中では確かめない。roxmltree と同じ。DTD の中の文字は字句で確かめていない）。
-    fn normalize(&self, raw: Span, mode: Mode, out: &mut dyn Out) -> Result<(), Error> {
-        let s = raw.of(self.b);
-        let mut meter = ScanMeter::new(0, s.len());
-        let mut run = 0usize;
-        let mut i = 0usize;
-        while let Some(&c) = s.get(i) {
-            meter.pay(self.budget, i.saturating_add(3))?;
-            // 多バイトの文字は頭のバイトで確かめる（続きのバイトは飛ばす）
-            if mode == Mode::Text
-                && ((c < 0x20 && !chars::is_space(c))
-                    || (c >= 0xC0 && !chars::decode(s, i).is_some_and(|(u, _)| chars::is_char(u))))
-            {
-                return Err(xml_err((raw.start as usize).saturating_add(i)));
-            }
-            let attr_space = mode == Mode::Attr && (c == b'\n' || c == b'\t');
-            if c == b'\r' || attr_space {
-                if i > run {
-                    out.write(s.get(run..i).unwrap_or(&[]))?;
-                }
-                out.write(if mode == Mode::Attr { b" " } else { b"\n" })?;
-                let crlf = c == b'\r' && s.get(i.saturating_add(1)) == Some(&b'\n');
-                i = i.saturating_add(if crlf { 2 } else { 1 });
-                run = i;
-            } else {
-                i = i.saturating_add(1);
-            }
-        }
-        if s.len() > run {
-            out.write(s.get(run..).unwrap_or(&[]))?;
+    /// 展開で増えた分を足し、上限と比べる（`out` は展開したあとのバイト数、`raw` は元のバイト数）。2 つの段で同じに呼ぶ。
+    fn grow(&self, out: u64, raw: u64) -> Result<(), Error> {
+        let g = self.grown.get().saturating_add(out.saturating_sub(raw));
+        self.grown.set(g);
+        let needed = (self.b.len() as u64).saturating_add(g);
+        if needed > self.expanded_limit {
+            return Err(Error::limit(Resource::Expanded, needed, self.expanded_limit, self.stage));
         }
         Ok(())
     }
 
+    /// 属性の値を揃えた形で見る。揃える要がなければ入力のまま、要れば `scratch` に書く（増えた分は先に数えて上限と比べる）。
+    fn attr_value<'x>(&self, a: &RawAttr, scratch: &'x mut MVec<'_, u8>) -> Result<&'x [u8], Error>
+    where
+        'a: 'x,
+    {
+        let mode = a.mode();
+        if !self.needs_store(a.value, mode) {
+            return Ok(a.value.of(self.b));
+        }
+        let c = self.expanded_len(a.value, mode)?;
+        self.grow(c.bytes, a.value.len() as u64)?;
+        scratch.clear();
+        self.expand(a.value, mode, &mut StoreOut { store: scratch })?;
+        Ok(scratch.as_slice())
+    }
+
     /// 書き出す量（数える）。
     fn expanded_len(&self, raw: Span, mode: Mode) -> Result<CountOut, Error> {
-        let mut c = CountOut { bytes: 0, work: 0 };
+        let base = (self.b.len() as u64).saturating_add(self.grown.get()).saturating_sub(raw.len() as u64);
+        let mut c = CountOut { limit: Some((base, self.expanded_limit, self.stage)), ..CountOut::new() };
         self.expand(raw, mode, &mut c)?;
+        c.limit = None;
         Ok(c)
     }
+}
+
+/// 参照を含まない実体の値 `raw` を、改行（と属性なら空白）を揃えて `out` に書く。文字の中（`Mode::Text`）では、値が
+/// 文書の文字だけで `]]>` を含まないかも確かめ、外れたら書くのをやめて偽を返す（属性の値の中では確かめない。roxmltree と
+/// 同じ。DTD の中の文字は字句で確かめていない）。読むバイトは塊ずつ払う。
+fn normalize(b: &[u8], budget: &Budget<'_>, raw: Span, mode: Mode, out: &mut dyn Out) -> Result<bool, Error> {
+    let s = raw.of(b);
+    let mut meter = ScanMeter::new(0, s.len());
+    let mut run = 0usize;
+    let mut i = 0usize;
+    while let Some(&c) = s.get(i) {
+        meter.pay(budget, i.saturating_add(3))?;
+        // 多バイトの文字は頭のバイトで確かめる（続きのバイトは飛ばす）
+        if mode == Mode::Text
+            && ((c < 0x20 && !chars::is_space(c))
+                || (c >= 0xC0 && !chars::decode(s, i).is_some_and(|(u, _)| chars::is_char(u)))
+                || (c == b']' && s.get(i.saturating_add(1)..).is_some_and(|r| r.starts_with(b"]>"))))
+        {
+            return Ok(false);
+        }
+        let attr_space = mode == Mode::Attr && (c == b'\n' || c == b'\t');
+        if c == b'\r' || attr_space {
+            if i > run {
+                out.write(s.get(run..i).unwrap_or(&[]))?;
+            }
+            out.write(if mode == Mode::Attr { b" " } else { b"\n" })?;
+            let crlf = c == b'\r' && s.get(i.saturating_add(1)) == Some(&b'\n');
+            i = i.saturating_add(if crlf { 2 } else { 1 });
+            run = i;
+        } else {
+            i = i.saturating_add(1);
+        }
+    }
+    if s.len() > run {
+        out.write(s.get(run..).unwrap_or(&[]))?;
+    }
+    Ok(true)
+}
+
+/// 実体の表に、揃えたあとの量と文字の中で使えるかを 1 度だけ求めて書く（参照ごとに値を走査しないため）。
+fn shape_entities(b: &[u8], budget: &Budget<'_>, table: &mut MVec<'_, Entity>) -> Result<(), Error> {
+    for k in 0..table.len() {
+        budget.spend(cost::OP_STEP)?;
+        let Some(&e) = table.get(k) else { continue };
+        let mut attr = CountOut::new();
+        normalize(b, budget, e.value, Mode::Attr, &mut attr)?;
+        let mut text = CountOut::new();
+        let ok = normalize(b, budget, e.value, Mode::Text, &mut text)?;
+        if let Some(x) = table.get_mut(k) {
+            x.attr_bytes = attr.bytes;
+            x.attr_work = attr.work;
+            x.text_bytes = text.bytes;
+            x.text_work = text.work;
+            x.text_ok = u32::from(ok);
+        }
+    }
+    Ok(())
 }
 
 /// 符号位置を UTF-8 にする（`is_char` で確かめた値。std の `encode_utf8` は短い領域で panic するので自前で）。
@@ -552,9 +725,18 @@ fn walk<'b>(
     budget: &'b Budget<'b>,
     sink: &mut dyn Sink,
     stage: Stage,
-) -> Result<(), Error> {
+) -> Result<u64, Error> {
     let mut lex = Lexer::new(b, start, budget);
-    let mut w = Walk { b, budget, entities: MVec::new(budget) };
+    let expanded_limit = limits.expanded_bytes.min(u64::from(u32::MAX).saturating_sub(1));
+    let mut w = Walk {
+        b,
+        budget,
+        entities: MVec::new(budget),
+        attlists: MVec::new(budget),
+        grown: Cell::new(0),
+        expanded_limit,
+        stage,
+    };
     let mut open: MVec<'b, Open> = MVec::new(budget);
     let mut bindings: MVec<'b, Binding> = MVec::new(budget);
     let mut raw: MVec<'b, RawAttr> = MVec::new(budget);
@@ -566,7 +748,28 @@ fn walk<'b>(
         match lex.next()? {
             Event::Doctype { subset } => {
                 if let Some(s) = subset {
-                    w.entities = dtd::entities(b, s, budget)?;
+                    let sub = dtd::parse_subset(b, s, budget)?;
+                    let mut table = sub.entities;
+                    shape_entities(b, budget, &mut table)?;
+                    w.entities = table;
+                    w.attlists = sub.attlists;
+                    // 既定の値の参照を確かめ、壊れた既定の値（知らない実体・文書の文字でない文字の参照）の宣言は当てない
+                    // （roxmltree は ATTLIST を読まずに受ける。NFR-10・ADR-66）
+                    for k in 0..w.attlists.len() {
+                        let Some(&d) = w.attlists.get(k) else { continue };
+                        if d.has_default != 0 {
+                            match w.expanded_len(d.value, Mode::Attr) {
+                                Ok(_) => {}
+                                Err(Error::Invalid(_)) => {
+                                    if let Some(x) = w.attlists.get_mut(k) {
+                                        x.has_default = 0;
+                                        x.tokens = 0;
+                                    }
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
                 }
             }
             Event::Start { pos, name } => {
@@ -574,7 +777,8 @@ fn walk<'b>(
                 pending = Some((name, pos));
             }
             Event::Attr { pos, name, value } => {
-                raw.push(RawAttr { name, value, pos, ns: NS_NONE, pad: [0; 3], local: name })?;
+                let order = raw.len() as u32;
+                raw.push(RawAttr { name, value, pos, order, local: name, ns: NS_NONE, tokens: 0, pad: [0; 2] })?;
             }
             Event::StartEnd { empty } => {
                 let Some((qname, pos)) = pending.take() else { return Err(xml_err(lex.pos())) };
@@ -586,6 +790,8 @@ fn walk<'b>(
                 if nodes > limits.nodes {
                     return Err(Error::limit(Resource::Nodes, nodes, limits.nodes, stage));
                 }
+                // ATTLIST：書いた属性の型を知り、書いていない属性に既定の値を足す（名前空間を解く前。xmlns の既定も効く）
+                apply_attlists(&w, qname, &mut raw)?;
                 let mark = bindings.len() as u32;
                 let mut default_bound = false;
                 // 名前空間の宣言を束ねる
@@ -601,13 +807,20 @@ fn walk<'b>(
                         None
                     };
                     let Some(p) = decl_prefix else { continue };
-                    uri.clear();
-                    w.expand(a.value, Mode::Attr, &mut StoreOut { store: &mut uri })?;
-                    let u = uri.as_slice();
+                    let u = w.attr_value(&a, &mut uri)?;
                     let pb = p.of(b);
-                    // xmlns は束ねられない。xml は XML の名前空間にだけ、XML の名前空間は xml にだけ束ねる
-                    if pb == b"xmlns" || u == URI_XMLNS || ((pb == b"xml") != (u == URI_XML)) {
+                    // XMLNS の名前空間は宣言できない。xml は XML の名前空間にだけ、XML の名前空間は xml にだけ束ねる
+                    if u == URI_XMLNS || ((pb == b"xml") != (u == URI_XML)) {
                         return Err(xml_err(a.pos as usize));
+                    }
+                    // 宣言の局所名は接頭辞（既定の名前空間なら空）
+                    if let Some(r) = raw.get_mut(k) {
+                        r.ns = NS_XMLNS;
+                        r.local = p;
+                    }
+                    // `xmlns:xmlns` の宣言は受けるが束ねない（その接頭辞を名前に使えば束ねていない接頭辞の誤り。roxmltree と同じ）
+                    if pb == b"xmlns" {
+                        continue;
                     }
                     // 接頭辞つきの宣言を空にするのは名前空間 1.0 では誤りだが、roxmltree は空の URI の名前空間として受ける
                     // （SVG でも なし でもない「そのほか」）。既定の名前空間の宣言が重なれば最初のものを使う（roxmltree と同じ。
@@ -617,11 +830,6 @@ fn walk<'b>(
                         bindings.push(Binding { prefix: p, ns, pad: [0; 3] })?;
                     }
                     default_bound |= pb.is_empty();
-                    // 宣言の局所名は接頭辞（既定の名前空間なら空）
-                    if let Some(r) = raw.get_mut(k) {
-                        r.ns = NS_XMLNS;
-                        r.local = p;
-                    }
                 }
                 let resolve = |prefix: Option<Span>,
                                default_ns: bool,
@@ -635,7 +843,7 @@ fn walk<'b>(
                         return Ok(Some(NS_XML));
                     }
                     for k in (0..bindings.len()).rev() {
-                        budget.spend(cost::copy(pb.len() as u64).saturating_add(1))?;
+                        budget.spend_large(cost::copy(pb.len() as u64).saturating_add(1))?;
                         if let Some(bd) = bindings.get(k)
                             && bd.prefix.of(b) == pb
                         {
@@ -662,12 +870,13 @@ fn walk<'b>(
                 }
                 // 属性の重なり（名前空間と局所名で並べて隣を比べる。名前を比べる分を前払いする）
                 check_duplicates(b, &mut raw, budget)?;
-                // xml:space
+                // xml:space（揃えたあとの値で見る。`preserve`・`default` のほかの値は無いものとして親から受け継ぐ）
                 let parent = open.last().copied();
                 let mut preserve = parent.is_some_and(|p| p.preserve);
-                for a in raw.as_slice() {
+                for k in 0..raw.len() {
+                    let Some(&a) = raw.get(k) else { continue };
                     if a.ns == NS_XML && a.local.of(b) == b"space" {
-                        match a.value.of(b) {
+                        match w.attr_value(&a, &mut uri)? {
                             b"preserve" => preserve = true,
                             b"default" => preserve = false,
                             _ => {}
@@ -686,7 +895,7 @@ fn walk<'b>(
                     if a.ns == NS_XMLNS {
                         continue;
                     }
-                    sink.attr(&w, a.ns, a.local, a.value, a.pos)?;
+                    sink.attr(&w, &a)?;
                 }
                 sink.element_done(node, attrs_start)?;
                 if empty {
@@ -697,7 +906,7 @@ fn walk<'b>(
             }
             Event::End { pos, name } => {
                 let Some(o) = open.pop() else { return Err(xml_err(pos as usize)) };
-                budget.spend(cost::copy(name.len() as u64).saturating_add(1))?;
+                budget.spend_large(cost::copy(name.len() as u64).saturating_add(1))?;
                 // 接頭辞と局所名で比べる（`</:svg>` は `<svg>` を閉じる。roxmltree と同じ）
                 let (op, ol) = split_qname(b, o.name)?;
                 let (ep, el) = split_qname(b, name)?;
@@ -724,9 +933,55 @@ fn walk<'b>(
                     p.last_child = node;
                 }
             }
-            Event::Eof => return Ok(()),
+            Event::Eof => return Ok(w.grown.get()),
         }
     }
+}
+
+/// ATTLIST の宣言を開きのタグに当てる：書いた属性は CDATA でない型なら印を付け、書いていない属性で既定の値のあるものを
+/// 後ろに足す（XML 1.0 §3.3・§5.1）。同じ属性の 2 つめからの宣言は飛ばす。比べる名前の分を払う。
+fn apply_attlists(w: &Walk<'_, '_>, qname: Span, raw: &mut MVec<'_, RawAttr>) -> Result<(), Error> {
+    if w.attlists.is_empty() {
+        return Ok(());
+    }
+    let b = w.b;
+    let (lo, hi) = dtd::att_range(b, w.attlists.as_slice(), qname.of(b), w.budget)?;
+    let written = raw.len();
+    let mut last: Option<Span> = None;
+    for k in lo..hi {
+        let Some(&d) = w.attlists.get(k) else { continue };
+        let name = d.name.of(b);
+        w.budget.spend_large(cost::copy(name.len() as u64).saturating_add(1))?;
+        if last.is_some_and(|l| l.of(b) == name) {
+            continue;
+        }
+        last = Some(d.name);
+        let mut found = false;
+        for j in 0..written {
+            w.budget.spend_large(cost::copy(name.len() as u64).saturating_add(1))?;
+            if let Some(r) = raw.get_mut(j)
+                && r.name.of(b) == name
+            {
+                r.tokens = u8::from(d.tokens != 0);
+                found = true;
+                break;
+            }
+        }
+        if !found && d.has_default != 0 {
+            let order = raw.len() as u32;
+            raw.push(RawAttr {
+                name: d.name,
+                value: d.value,
+                pos: d.name.start,
+                order,
+                local: d.name,
+                ns: NS_NONE,
+                tokens: u8::from(d.tokens != 0),
+                pad: [0; 2],
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// 開きのタグの属性の重なりを確かめる（名前空間と局所名）。`raw` の並びは変える。
@@ -753,7 +1008,7 @@ fn check_duplicates(b: &[u8], raw: &mut MVec<'_, RawAttr>, budget: &Budget<'_>) 
         }
     }
     // 元の順に戻す（作る段は属性を書いた順に持つ）
-    stable_sort(budget, raw.as_mut_slice(), |x, y| x.pos < y.pos)?;
+    stable_sort(budget, raw.as_mut_slice(), |x, y| x.order < y.order)?;
     Ok(())
 }
 
@@ -767,17 +1022,15 @@ struct CountSink {
     elements: u64,
     store: u64,
     write_work: u64,
-    /// 展開で増えた分（入力 ＋ これが展開したあとのバイト数）
-    grown: u64,
 }
 
 impl CountSink {
     fn store_value(&mut self, w: &Walk<'_, '_>, raw: Span, mode: Mode) -> Result<(), Error> {
         if w.needs_store(raw, mode) {
             let c = w.expanded_len(raw, mode)?;
+            w.grow(c.bytes, raw.len() as u64)?;
             self.store = self.store.saturating_add(c.bytes);
             self.write_work = self.write_work.saturating_add(c.work);
-            self.grown = self.grown.saturating_add(c.bytes.saturating_sub(raw.len() as u64));
         }
         Ok(())
     }
@@ -792,10 +1045,10 @@ impl Sink for CountSink {
         Ok(u32::try_from(id).unwrap_or(NONE))
     }
 
-    fn attr(&mut self, w: &Walk<'_, '_>, _ns: u8, _local: Span, value: Span, _pos: u32) -> Result<(), Error> {
+    fn attr(&mut self, w: &Walk<'_, '_>, a: &RawAttr) -> Result<(), Error> {
         self.attrs = self.attrs.saturating_add(1);
         self.write_work = self.write_work.saturating_add(cost::append(0, u64::MAX, 1, size_of::<Attr>() as u64).0);
-        self.store_value(w, value, Mode::Attr)
+        self.store_value(w, a.value, a.mode())
     }
 
     fn element_done(&mut self, _node: u32, _attrs_start: u64) -> Result<(), Error> {
@@ -832,7 +1085,10 @@ impl BuildSink<'_> {
         }
         let start = self.store.len();
         w.expand(raw, mode, &mut StoreOut { store: &mut self.store })?;
-        Ok((Span::new(start, self.store.len()), FLAG_IN_STORE))
+        let end = self.store.len();
+        // 数える段と同じに増えた分を足す（数える段で上限の内と確かめてある）
+        w.grow(end.saturating_sub(start) as u64, raw.len() as u64)?;
+        Ok((Span::new(start, end), FLAG_IN_STORE))
     }
 }
 
@@ -855,9 +1111,9 @@ impl Sink for BuildSink<'_> {
         Ok(id)
     }
 
-    fn attr(&mut self, w: &Walk<'_, '_>, ns: u8, local: Span, value: Span, pos: u32) -> Result<(), Error> {
-        let (v, flags) = self.value(w, value, Mode::Attr)?;
-        self.attrs.push(Attr { ns, flags, pad: [0; 2], local, value: v, pos })
+    fn attr(&mut self, w: &Walk<'_, '_>, a: &RawAttr) -> Result<(), Error> {
+        let (v, flags) = self.value(w, a.value, a.mode())?;
+        self.attrs.push(Attr { ns: a.ns, flags, pad: [0; 2], local: a.local, value: v, pos: a.pos })
     }
 
     fn element_done(&mut self, node: u32, attrs_start: u64) -> Result<(), Error> {
@@ -909,15 +1165,13 @@ impl Sink for BuildSink<'_> {
 }
 
 /// 数える段（`estimate_parse` と `parse` の前半）。前置きから歩きの終わりまでを `budget` で払い、作る段の容量と手間の
-/// 上限を返す。実体を展開したあとのバイト数が上限を超えれば `Limit`。
+/// 上限を返す。実体を展開したあとのバイト数が上限を超えれば、超えた所で `Limit`（展開する前に、実体ごとに求めた長さで
+/// 数える）。`budget` はまだ何も払っていないものを渡す（歩きの手間と確保の山を `budget` の通算から読む）。
 pub(crate) fn count(b: &[u8], limits: &Limits, budget: &Budget<'_>, stage: Stage) -> Result<XmlCounts, Error> {
     let start = prelude(b, limits, budget, stage)?;
     let mut sink = CountSink::default();
-    walk(b, start, limits, budget_ref(budget), &mut sink, stage)?;
-    let expanded = (b.len() as u64).saturating_add(sink.grown);
-    if expanded > limits.expanded_bytes {
-        return Err(Error::limit(Resource::Expanded, expanded, limits.expanded_bytes, stage));
-    }
+    let grown = walk(b, start, limits, budget_ref(budget), &mut sink, stage)?;
+    let expanded = (b.len() as u64).saturating_add(grown);
     Ok(XmlCounts {
         nodes: sink.nodes,
         attrs: sink.attrs,

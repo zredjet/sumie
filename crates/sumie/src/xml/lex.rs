@@ -217,19 +217,20 @@ impl<'a, 'b> Lexer<'a, 'b> {
         Ok(e.saturating_add(3))
     }
 
-    /// 処理命令（`<?` の位置から）を飛ばし、終わりのあとの位置を返す。名前がちょうど `xml`（小文字）なら誤り（XML の
-    /// 宣言は文書の頭だけ。`XML` などは名前として受ける。roxmltree と同じ）。
+    /// 処理命令（`<?` の位置から）を飛ばし、終わりのあとの位置を返す。`<?xml` に #x20 が続くものは XML の宣言で、文書の
+    /// 頭のほかでは誤り。ほかの名前は `xml`・`XML`（`<?xml?>`・`<?xml\tx?>` など）も処理命令として受ける（roxmltree と同じ。
+    /// XML 1.0 は `xml` を大文字小文字を問わず処理命令の名前に使えないとするが、roxmltree が受けるものは受ける。NFR-10）。
     fn pi(&mut self, i: usize) -> Result<usize, Error> {
-        let t = i.saturating_add(2);
-        let te = self.name(t)?;
-        if Span::new(t, te).of(self.b) == b"xml" {
+        if self.starts(i, b"<?xml ")? {
             return Err(invalid(i));
         }
+        let t = i.saturating_add(2);
+        let te = self.name(t)?;
         let Some(e) = self.find(te, b"?>")? else { return Err(invalid(i)) };
         Ok(e.saturating_add(2))
     }
 
-    /// XML の宣言（文書の頭の `<?xml` のあとに空白）を読む。形は XML 1.0 §2.8 の XMLDecl（`version`、続けて空白を挟んで
+    /// XML の宣言（文書の頭の `<?xml` のあとに #x20）を読む。形は XML 1.0 §2.8 の XMLDecl（`version`、続けて空白を挟んで
     /// `encoding`・`standalone` をこの順に。値は引用符の中を何でも受ける）。
     fn xml_decl(&mut self, i: usize) -> Result<usize, Error> {
         let mut j = self.skip_space(i.saturating_add(5))?;
@@ -368,16 +369,9 @@ impl<'a, 'b> Lexer<'a, 'b> {
             match self.phase {
                 Phase::Done => return Ok(Event::Eof),
                 Phase::Prolog { doctype } => {
-                    // 文書の頭の `<?xml`：空白が続けば XML の宣言、続かなければ `?>` まで飛ばす（`<?xml?>` なども受ける。
-                    // roxmltree と同じ）
-                    if i == self.start_of_doc() && self.starts(i, b"<?xml")? {
-                        let after = self.at(i.saturating_add(5))?;
-                        self.i = if after.is_some_and(is_space) {
-                            self.xml_decl(i)?
-                        } else {
-                            let Some(e) = self.find(i.saturating_add(5), b"?>")? else { return Err(invalid(i)) };
-                            e.saturating_add(2)
-                        };
+                    // 文書の頭の `<?xml` ＋ #x20 は XML の宣言（ほかの空白が続くものは処理命令。roxmltree と同じ）
+                    if i == self.start_of_doc() && self.starts(i, b"<?xml ")? {
+                        self.i = self.xml_decl(i)?;
                         continue;
                     }
                     let j = self.skip_space(i)?;

@@ -1,0 +1,2 @@
+<!DOCTYPE svg [<!ATTLIST svg xmlns CDATA #FIXED "http://www.w3.org/2000/svg" a NMTOKENS " x  y "><!ATTLIST rect fill CDATA "green">]>
+<svg><rect id=" r "/><?xml	pi?></svg>

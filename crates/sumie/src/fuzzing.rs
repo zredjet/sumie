@@ -436,6 +436,11 @@ pub fn xml_parse(data: &[u8]) -> XmlOutcome {
 
 /// [`xml_parse`] の上限を変えたもの（試験で深さ・節の数の上限を広げる）。
 pub fn xml_parse_with(data: &[u8], limits: &crate::limits::Limits) -> XmlOutcome {
+    xml_parse_cancel(data, limits, &Never)
+}
+
+/// [`xml_parse_with`] に中止の印を渡すもの（中止の試験。両方の段で同じ印を見る）。
+pub fn xml_parse_cancel(data: &[u8], limits: &crate::limits::Limits, cancel: &dyn Cancel) -> XmlOutcome {
     let mut out = XmlOutcome {
         check: Check::Ok,
         nodes: None,
@@ -447,13 +452,17 @@ pub fn xml_parse_with(data: &[u8], limits: &crate::limits::Limits) -> XmlOutcome
         build_peak: 0,
         build_peak_estimate: 0,
     };
-    let est_budget = Budget::new(Stage::EstimateParse, limits.estimate_work, limits.estimate_bytes, &Never);
+    let est_budget = Budget::new(Stage::EstimateParse, limits.estimate_work, limits.estimate_bytes, cancel);
     let counts = match crate::xml::count(data, limits, &est_budget, Stage::EstimateParse) {
         Ok(c) => c,
         Err(e) => {
             out.error = Some(e);
             out.count_work = est_budget.work();
             out.count_peak = est_budget.peak();
+            // 誤りで止まった道でも、1 回の払いが中止を見る間隔を超えない
+            if est_budget.over_released() || est_budget.max_spend() >= CANCEL_INTERVAL {
+                out.check = Check::Violation("数える段の勘定が崩れた（誤りの道）");
+            }
             return out;
         }
     };
@@ -466,9 +475,17 @@ pub fn xml_parse_with(data: &[u8], limits: &crate::limits::Limits) -> XmlOutcome
     let (work, peak) = (counts.build_work(), counts.build_peak());
     out.build_estimate = work;
     out.build_peak_estimate = peak;
-    let budget = Budget::new(Stage::Parse, work, peak, &Never);
+    let budget = Budget::new(Stage::Parse, work, peak, cancel);
     let doc = match crate::xml::build(data, &counts, limits, &budget, Stage::Parse) {
         Ok(d) => d,
+        Err(Error::Cancelled) => {
+            out.error = Some(Error::Cancelled);
+            out.build_work = budget.work();
+            if budget.over_released() || budget.max_spend() >= CANCEL_INTERVAL {
+                out.check = Check::Violation("作る段の勘定が崩れた（中止の道）");
+            }
+            return out;
+        }
         Err(e) => {
             out.error = Some(e);
             // 数える段が通ったのに作る段が上限で止まるのは見積もりの不具合

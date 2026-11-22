@@ -100,13 +100,20 @@ fn namespaces() {
         "<svg xmlns:a=\"http://www.w3.org/XML/1998/namespace\"/>",
         "<svg xmlns=\"http://www.w3.org/XML/1998/namespace\"/>",
         "<svg xmlns:a=\"http://www.w3.org/2000/xmlns/\"/>",
-        "<svg xmlns:xmlns=\"urn:a\"/>",
+        // `xmlns:xmlns` は受けるが束ねない（使えば束ねていない接頭辞）
+        "<svg xmlns:xmlns=\"urn:a\"><xmlns:g/></svg>",
         "<svg xmlns:p=\"urn:a\" xmlns:p=\"urn:a\"/>",
         "<svg xmlns:=\"urn:a\"/>",
     ] {
         assert_eq!(reason(parse(bad)), Some(InvalidReason::Xml), "{bad}");
     }
     assert_eq!(b("<svg xmlns:xml=\"http://www.w3.org/XML/1998/namespace\"/>").unwrap(), [NS_NONE]);
+    assert_eq!(b("<svg xmlns:xmlns=\"urn:a\"/>").unwrap(), [NS_NONE]);
+    // 既定の名前空間を空にして取り消す
+    assert_eq!(
+        b(&format!("<svg {SVG}><g xmlns=\"\"><rect/></g><rect/></svg>")).unwrap(),
+        [NS_SVG, NS_NONE, NS_NONE, NS_SVG]
+    );
     // 空の URI に束ねた接頭辞は「そのほか」（roxmltree と同じ。名前空間のない属性とは重ならない）
     let src = "<svg xmlns:p=\"\" p:a=\"1\" a=\"2\"><p:x/></svg>";
     let doc = parse(src).unwrap();
@@ -166,10 +173,11 @@ fn dtd_unsupported_like_kura() {
     for v in ["<g/>", "&amp;", "%p;"] {
         assert_eq!(feature(parse(&s(&format!("<!ENTITY e \"{v}\">")))), Some(Feature::MarkupEntity), "{v}");
     }
-    // ELEMENT・ATTLIST・注釈・処理命令は読み飛ばす（ATTLIST の既定の値は当てない）
-    let ok = s("<!ELEMENT svg ANY><!ATTLIST svg fill CDATA \"green\" x CDATA '>'><!-- ] --><?pi ]?>");
+    // ELEMENT・注釈・処理命令は読み飛ばし、ATTLIST の既定の値は当てる（ADR-66。引用の中の `>`・`]` も読める）
+    let ok = s("<!ELEMENT svg ANY><!ATTLIST svg fill CDATA \"green\" x CDATA '>]'><!-- ] --><?pi ]?>");
     let doc = parse(&ok).unwrap();
-    assert!(doc.attrs_of(doc.node(0).unwrap()).is_empty());
+    let names: Vec<&[u8]> = doc.attrs_of(doc.node(0).unwrap()).iter().map(|a| a.local.of(ok.as_bytes())).collect();
+    assert_eq!(names, [b"fill".as_slice(), b"x"]);
 }
 
 #[test]
@@ -199,6 +207,13 @@ fn xml_space_is_inherited() {
     let doc = parse(&src).unwrap();
     let pres: Vec<bool> = doc.nodes.as_slice().iter().map(|n| n.flags & FLAG_PRESERVE != 0).collect();
     assert_eq!(pres, [true, true, true, true, false, false, false]);
+    // 揃えたあとの値で見る（文字の参照・実体）・知らない値は無いものとして親から受け継ぐ
+    let src = format!(
+        "<!DOCTYPE svg [<!ENTITY p \"preserve\">]><svg {SVG}><g xml:space=\"&#x70;reserve\"><t/></g><g xml:space=\"&p;\"/><g xml:space=\"preserve\"><g xml:space=\"Preserve\"/></g></svg>"
+    );
+    let doc = parse(&src).unwrap();
+    let pres: Vec<bool> = doc.nodes.as_slice().iter().map(|n| n.flags & FLAG_PRESERVE != 0).collect();
+    assert_eq!(pres, [false, true, true, true, true, true]);
 }
 
 #[test]
@@ -259,6 +274,10 @@ fn well_formedness() {
         "<!DOCTYPE svg SYSTEM><svg/>",
         "<!DOCTYPE svg [<!ENTITY e \"a\u{1}b\">]><svg>&e;</svg>",
         "<!DOCTYPE svg [<!ENTITY e \"a\u{FFFE}b\">]><svg>&e;</svg>",
+        // 実体の値の `]]>` を文字の中で展開する（roxmltree と同じに誤り）
+        "<!DOCTYPE svg [<!ENTITY e \"a]]>b\">]><svg>&e;</svg>",
+        "<svg><?xml x?></svg>",
+        "<!DOCTYPE svg [<?xml x?>]><svg/>",
     ] {
         assert_eq!(reason(parse(bad)), Some(InvalidReason::Xml), "{bad:?}");
     }
@@ -281,6 +300,18 @@ fn well_formedness() {
         "<?xml version=\"1.0\" encoding=\"latin1\" standalone=\"maybe\"?><svg/>",
         "\u{feff}<?xml version=\"1.0\"?><svg/>",
         "<svg><?XML x?><?xml-stylesheet a?></svg>",
+        // `<?xml` に #x20 が続かなければ、どこでも処理命令（roxmltree と同じ）
+        "<svg><?xml?></svg>",
+        "<svg><?xml\tx?></svg>",
+        "<svg><?xml\nx?></svg>",
+        "<svg/><?xml?>",
+        "<!DOCTYPE svg [<?xml?>]><svg/>",
+        "<!DOCTYPE svg [<?xml\tx?>]><svg/>",
+        "<?xml\n version=\"1.0\"\n standalone=\"no\" encoding=\"UTF-8\"?><svg/>",
+        "\u{feff}<?xml\tfoo?><svg/>",
+        "<?xml version=\"1.0\"?><?xml\tx?><svg/>",
+        // 実体の値の `]]>` は属性の中なら受ける
+        "<!DOCTYPE svg [<!ENTITY e \"a]]>b\">]><svg a=\"&e;\"/>",
         // DTD の宣言の中の文字は確かめない・実体の値の文字は属性の中では確かめない（roxmltree と同じ）
         "<!DOCTYPE svg [<!ATTLIST svg x CDATA \"1\u{1}\">]><svg/>",
         "<!DOCTYPE svg SYSTEM \"a\u{1}\"><svg/>",
@@ -397,5 +428,140 @@ fn all_three_byte_sequences() {
                 assert_eq!(o.check, Check::Ok, "{:?}", body);
             }
         }
+    }
+}
+
+/// 長い名前（要素名・接頭辞・実体の名前）でも、1 回の払いが中止を見る間隔を超えない（parse_with が見る）。
+#[test]
+fn long_names_are_paid_in_chunks() {
+    let n = "a".repeat(1_100_000);
+    for src in [
+        format!("<{n}></{n}>"),
+        format!("<svg xmlns:{n}=\"urn:x\"><{n}:g/></svg>"),
+        format!("<!DOCTYPE svg [<!ENTITY {n} \"x\">]><svg>&{n};</svg>"),
+        // 誤りの道（実体がない）
+        format!("<!DOCTYPE svg [<!ENTITY {n}b \"x\">]><svg>&{n};</svg>"),
+    ] {
+        let o = xml_parse_with(src.as_bytes(), &Limits::DEFAULT);
+        assert_eq!(o.check, Check::Ok, "{:?}", o.error);
+    }
+}
+
+/// 展開の上限は、展開する前に実体ごとに求めた長さで数え、超えた所で断る（読む手間を使い切る前に）。
+#[test]
+fn expansion_limit_is_checked_before_expanding() {
+    let a = "x".repeat(1 << 20);
+    for (refs, place) in [(300, "text"), (300, "attr"), (300, "xmlns")] {
+        let r = "&a;".repeat(refs);
+        let body = match place {
+            "text" => format!("<svg {SVG}><desc>{r}</desc></svg>"),
+            "attr" => format!("<svg {SVG} a=\"{r}\"/>"),
+            _ => format!("<svg xmlns=\"{r}\"/>"),
+        };
+        let src = format!("<!DOCTYPE svg [<!ENTITY a \"{a}\">]>{body}");
+        let o = xml_parse_with(src.as_bytes(), &Limits::DEFAULT);
+        assert_eq!(o.check, Check::Ok, "{place}");
+        match o.error {
+            Some(Error::Limit(l)) => assert_eq!(l.resource, Resource::Expanded, "{place}"),
+            e => panic!("{place}: {e:?}"),
+        }
+        // 前置き・字句・DTD の読み直し・実体の値の 2 回（属性用・文字用）で入力の約 5 倍。参照ごとには走査しない
+        // （走査すれば 300 × 1 MiB）
+        assert!(o.count_work < 6 * (src.len() as u64), "{place}: {}", o.count_work);
+    }
+    // 上限の内なら読め、xmlns の展開も展開の量に数える
+    let small = "x".repeat(100);
+    let src = format!("<!DOCTYPE svg [<!ENTITY a \"{small}\">]><svg xmlns=\"{}\"/>", "&a;".repeat(10));
+    let (_, counts) = parse_with(src.as_bytes(), &Limits::DEFAULT).unwrap();
+    assert!(counts.expanded >= src.len() as u64 + 1000 - 30);
+}
+
+/// 属性の中の実体の値の空白（字送り・改行・CRLF）は空白 1 つに揃える。文字の中では CRLF を LF に。
+#[test]
+fn entity_values_are_normalized() {
+    let src = format!("<!DOCTYPE svg [<!ENTITY e \"a\tb\r\nc\nd\re\">]><svg {SVG} a=\"&e;\">&e;</svg>");
+    let doc = parse(&src).unwrap();
+    let b = src.as_bytes();
+    let root = doc.node(0).unwrap();
+    assert_eq!(doc.attr(b, root, NS_NONE, b"a"), Some(b"a b c d e".as_slice()));
+    assert_eq!(doc.text(b, doc.node(root.first_child).unwrap()), b"a\tb\nc\nd\ne");
+}
+
+/// 途中で中止しても、印が立ってから決まった手間の内に止まり、勘定が崩れない。
+#[test]
+fn cancellation_stops_promptly() {
+    use crate::fuzzing::xml_parse_cancel;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    struct AfterCalls(AtomicU32);
+    impl crate::cancel::Cancel for AfterCalls {
+        fn cancelled(&self) -> bool {
+            self.0.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_err()
+        }
+    }
+    let a = "x".repeat(1 << 16);
+    let srcs = [
+        format!("<svg {SVG}>{}</svg>", "<g a=\"1\"/>".repeat(200_000)),
+        format!("<!DOCTYPE svg [<!ENTITY a \"{a}\">]><svg {SVG}><desc>{}</desc></svg>", "&a;".repeat(200)),
+        format!("<svg {SVG} a=\"{}\"/>", "&amp;".repeat(500_000)),
+    ];
+    let mut cancelled = 0;
+    for src in &srcs {
+        for calls in [0u32, 1, 3, 20] {
+            let c = AfterCalls(AtomicU32::new(calls));
+            let o = xml_parse_cancel(src.as_bytes(), &Limits::DEFAULT, &c);
+            assert_eq!(o.check, Check::Ok);
+            if o.error == Some(Error::Cancelled) {
+                cancelled += 1;
+                let work = if o.build_estimate == 0 { o.count_work } else { o.build_work };
+                assert!(work < (u64::from(calls) + 2) << 16, "{calls} 回：{work} 単位まで回った");
+            }
+        }
+    }
+    assert!(cancelled >= 6, "中止の道を通らなかった（{cancelled}）");
+}
+
+/// ATTLIST の既定の値を、書いていない属性に当てる（XML 1.0 §5.1・ADR-66）。CDATA でない型は空白を 1 つに揃える。
+#[test]
+fn attlist_defaults_are_applied() {
+    let attr = |src: &str, node: u32, name: &[u8]| -> Option<Vec<u8>> {
+        let doc = parse(src).unwrap();
+        doc.attr(src.as_bytes(), doc.node(node).unwrap(), NS_NONE, name).map(<[u8]>::to_vec)
+    };
+    let d = "<!DOCTYPE svg [<!ENTITY c \"blue\"><!ATTLIST rect fill CDATA \"green\" stroke CDATA \"&c;\" id ID #IMPLIED><!ATTLIST rect fill CDATA \"red\"><!ATTLIST g class NMTOKENS \" x  y \">]>";
+    let src = format!("{d}<svg {SVG}><rect/><rect fill=\"black\" id=\"  a   b \"/><g/><g class=\" p\tq \"/></svg>");
+    assert_eq!(attr(&src, 1, b"fill").as_deref(), Some(b"green".as_slice()));
+    assert_eq!(attr(&src, 1, b"stroke").as_deref(), Some(b"blue".as_slice()));
+    assert_eq!(attr(&src, 1, b"id"), None);
+    assert_eq!(attr(&src, 2, b"fill").as_deref(), Some(b"black".as_slice()));
+    assert_eq!(attr(&src, 2, b"id").as_deref(), Some(b"a b".as_slice()));
+    assert_eq!(attr(&src, 3, b"class").as_deref(), Some(b"x y".as_slice()));
+    assert_eq!(attr(&src, 4, b"class").as_deref(), Some(b"p q".as_slice()));
+    // 名前空間の宣言の既定（古い DTD の書き方）と xml:space の列挙の既定
+    let src = "<!DOCTYPE svg [<!ATTLIST svg xmlns CDATA #FIXED \"http://www.w3.org/2000/svg\"><!ATTLIST text xml:space (default|preserve) 'preserve'>]><svg><text/></svg>";
+    let doc = parse(src).unwrap();
+    assert_eq!(doc.nodes.as_slice().iter().map(|n| n.ns).collect::<Vec<_>>(), [NS_SVG, NS_SVG]);
+    assert_ne!(doc.node(1).unwrap().flags & FLAG_PRESERVE, 0);
+    assert_eq!(doc.attrs_of(doc.node(0).unwrap()).len(), 0);
+    // 壊れた宣言・壊れた既定の値は当てない（roxmltree は ATTLIST を読まずに受ける。NFR-10）
+    for broken in [
+        "<!DOCTYPE svg [<!ATTLIST rect fill CDATA \"&nope;\">]><svg><rect/></svg>",
+        "<!DOCTYPE svg [<!ATTLIST rect fill CDATA \"a<b\">]><svg><rect/></svg>",
+        "<!DOCTYPE svg [<!ATTLIST rect fill CDATA \"&#0;\">]><svg><rect/></svg>",
+        "<!DOCTYPE svg [<!ATTLIST rect fill CDAT \"x\">]><svg><rect/></svg>",
+    ] {
+        assert_eq!(attr(broken, 1, b"fill"), None, "{broken}");
+    }
+    // 既定の値で足した属性も重なりを確かめる（同じ URI の別の接頭辞）
+    let src = "<!DOCTYPE svg [<!ATTLIST svg b:x CDATA \"1\">]><svg xmlns:a=\"urn:x\" xmlns:b=\"http://www.w3.org/1999/xlink\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" xlink:x=\"2\"/>";
+    assert_eq!(reason(parse(src)), Some(InvalidReason::Xml));
+    // 既定の値の展開も展開の上限で数える
+    let a = "x".repeat(1 << 20);
+    let src = format!(
+        "<!DOCTYPE svg [<!ENTITY a \"{a}\"><!ATTLIST g v CDATA \"&a;&a;&a;&a;\">]><svg {SVG}>{}</svg>",
+        "<g/>".repeat(40)
+    );
+    match xml_parse_with(src.as_bytes(), &Limits::DEFAULT).error {
+        Some(Error::Limit(l)) => assert_eq!(l.resource, Resource::Expanded),
+        e => panic!("{e:?}"),
     }
 }
