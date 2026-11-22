@@ -10,10 +10,11 @@ use super::*;
 use crate::budget::Budget;
 use crate::cancel::Never;
 use crate::error::Stage;
+use crate::xml::lex::Span;
 
 fn tokens(src: &str) -> Vec<Token> {
     let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
-    let mut lex = Lexer::new(src.as_bytes(), &budget);
+    let mut lex = Lexer::over(src.as_bytes(), Span::new(0, src.len()), &budget);
     let mut out = Vec::new();
     loop {
         let t = lex.next().unwrap();
@@ -105,7 +106,7 @@ fn all_three_byte_sequences() {
             for &z in alphabet {
                 let s = [x, y, z];
                 let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
-                let mut lex = Lexer::new(&s, &budget);
+                let mut lex = Lexer::over(&s, Span::new(0, s.len()), &budget);
                 let mut n = 0;
                 while lex.next().unwrap().kind != Kind::Eof {
                     n += 1;
@@ -120,8 +121,42 @@ fn all_three_byte_sequences() {
 fn pays_in_chunks() {
     let src = format!("a{{fill:{}}}", "1".repeat(300_000));
     let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
-    let mut lex = Lexer::new(src.as_bytes(), &budget);
+    let mut lex = Lexer::over(src.as_bytes(), Span::new(0, src.len()), &budget);
     while lex.next().unwrap().kind != Kind::Eof {}
     assert!(budget.work() >= src.len() as u64);
     assert!(budget.max_spend() < crate::budget::CANCEL_INTERVAL);
+}
+
+/// 長い数は短い形に揃えて読み、値はもとの数と同じに丸まる（読む手間は字句の長さに比例しない）。
+#[test]
+fn long_numbers_round_like_short_ones() {
+    let value = |src: &str| {
+        let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+        let mut lex = Lexer::over(src.as_bytes(), Span::new(0, src.len()), &budget);
+        let t = lex.next().unwrap();
+        assert!(budget.max_spend() < crate::budget::CANCEL_INTERVAL);
+        (t.value, t.finite, t.kind)
+    };
+    let zeros = "0".repeat(100_000);
+    // 頭の 0・後ろの 0・小数の 0
+    assert_eq!(value(&format!("{zeros}1.5")).0, 1.5);
+    assert_eq!(value(&format!("1.5{zeros}")).0, 1.5);
+    assert_eq!(value(&format!("0.{zeros}1e100005")).0, 1e4);
+    assert_eq!(value(&format!("-1{zeros}e-100000")).0, -1.0);
+    // 指数の大きいもの
+    assert!(!value("1e99999999999999999999").1);
+    assert_eq!(value("1e-99999999999999999999").0, 0.0);
+    // 丸めの境目の近く：2^53 + 1 は偶数へ、そのあとに 0 でない桁があれば上へ（有効数字が 800 桁を越えるもの）
+    assert!(!value(&format!("9007199254740993{zeros}")).1);
+    let z = "0".repeat(2000);
+    assert_eq!(value(&format!("9007199254740993{z}e-2000")).0, 9007199254740992.0);
+    assert_eq!(value(&format!("9007199254740993{z}1e-2001")).0, 9007199254740994.0);
+    let near = format!("9007199254740993.{}1", "0".repeat(2000));
+    assert_eq!(value(&near).0, 9007199254740994.0);
+    let exact = format!("9007199254740993.{}", "0".repeat(2000));
+    assert_eq!(value(&exact).0, 9007199254740992.0);
+    // 長くても整数の形かと単位は変わらない
+    let v = value(&format!("{}px", "1".repeat(5000)));
+    assert_eq!(v.2, Kind::Dimension);
+    assert!(!v.1);
 }

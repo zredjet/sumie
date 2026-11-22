@@ -10,7 +10,7 @@
 
 use crate::budget::Budget;
 use crate::cost;
-use crate::css::decl::{Decl, parse_declarations};
+use crate::css::decl::{Decl, Item, parse_declarations};
 use crate::css::lex::Lexer;
 use crate::css::matcher::{MatchSink, match_rules};
 use crate::css::select::NONE;
@@ -167,26 +167,29 @@ pub(crate) fn cascade(
 ) -> Result<Styles, Error> {
     let budget = budget_ref(budget);
     let text = sheet.text.as_slice();
-    // 条件を照らし、規則ごとに当てるか
+    // 条件を照らす（外の条件まで含めて真か。外の条件は中の条件より前にあるので、順に 1 度ずつ）
     let nconds = sheet.conds.len();
     let mut cond_ok: MVec<'_, u8> = MVec::with_capacity(budget, nconds)?;
     for c in sheet.conds.as_slice() {
         budget.spend(cost::OP_STEP)?;
-        let ok = if c.kind == COND_MEDIA { media(text, c.text, env, budget)? } else { supports(text, c.text, budget)? };
+        let outer = c.parent == NONE || cond_ok.get(c.parent as usize).copied() == Some(1);
+        let ok = outer
+            && if c.kind == COND_MEDIA {
+                media(text, c.text, env, budget)?
+            } else {
+                supports(text, c.text, sheet.ns_table(c), budget)?
+            };
         cond_ok.push(u8::from(ok))?;
     }
+    // 規則ごとに当てるか
     let mut active: MVec<'_, u8> = MVec::with_capacity(budget, sheet.rules.len())?;
     for r in sheet.rules.as_slice() {
         budget.spend(cost::OP_STEP)?;
-        let mut c = r.cond;
-        let mut ok = true;
-        while c != NONE && ok {
-            budget.spend(cost::OP_STEP)?;
-            ok = cond_ok.get(c as usize).copied() == Some(1);
-            c = sheet.conds.as_slice().get(c as usize).map_or(NONE, |x| x.parent);
-        }
+        let ok = r.cond == NONE || cond_ok.get(r.cond as usize).copied() == Some(1);
         active.push(u8::from(ok))?;
     }
+    // 層の順位（真の条件の所で名前を書いた順）
+    let ranks = sheet.layer_ranks(cond_ok.as_slice(), budget)?;
     // 規則の宣言を 1 度だけ確かめる（宣言は規則の順に続いて並ぶ。規則の外の宣言はない）
     let mut warns: MVec<'_, Warn> = MVec::new(budget);
     let mut infos: MVec<'_, DeclInfo> = MVec::with_capacity(budget, sheet.decls.len())?;
@@ -211,6 +214,7 @@ pub(crate) fn cascade(
         input,
         sheet,
         infos: infos.as_slice(),
+        ranks: ranks.as_slice(),
         budget,
         slots: MVec::with_capacity(budget, PROPS.len())?,
         cur: NONE,
@@ -282,6 +286,8 @@ struct Out<'a, 'b> {
     input: &'a [u8],
     sheet: &'a Sheet,
     infos: &'a [DeclInfo],
+    /// まとめた層ごとの順位
+    ranks: &'a [u32],
     budget: &'b Budget<'b>,
     slots: MVec<'b, Slot>,
     /// 決めている要素（なければ NONE）
@@ -408,7 +414,10 @@ impl Out<'_, '_> {
         let budget = self.budget;
         let mut lex = Lexer::over(buf, value, budget);
         let mut list: MVec<'_, Decl> = MVec::new(budget);
-        parse_declarations(&mut lex, buf, false, budget, &mut |d| list.push(d))?;
+        parse_declarations(&mut lex, buf, false, budget, &mut |it| match it {
+            Item::Decl(d) => list.push(d),
+            Item::Nested => Ok(()),
+        })?;
         for (k, d) in list.as_slice().iter().enumerate() {
             budget.spend(cost::OP_STEP)?;
             let info = check_decl(buf, d, budget)?;
@@ -445,7 +454,13 @@ impl MatchSink for Out<'_, '_> {
     fn rule(&mut self, rule: u32, spec: u32) -> Result<(), Error> {
         let sheet = self.sheet;
         let Some(r) = sheet.rules.as_slice().get(rule as usize) else { return Ok(()) };
-        let rank = sheet.rank(r);
+        // 層のない規則は最も強い
+        let rank = if r.layer == NONE {
+            u32::MAX
+        } else {
+            let canon = sheet.layers.as_slice().get(r.layer as usize).map_or(NONE, |l| l.canon);
+            self.ranks.get(canon as usize).copied().unwrap_or(0)
+        };
         for k in r.decls.start..r.decls.end {
             self.budget.spend(cost::OP_STEP)?;
             let Some(info) = self.infos.get(k as usize).copied() else { continue };

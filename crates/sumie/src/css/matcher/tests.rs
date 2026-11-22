@@ -23,7 +23,14 @@ impl MatchSink for Collect<'_> {
         let n = self.doc.node(node).unwrap();
         let name = self
             .doc
-            .attr(self.input, n, NS_NONE, b"id")
+            .attr(
+                self.input,
+                n,
+                NS_NONE,
+                b"id",
+                &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never),
+            )
+            .unwrap()
             .map(|v| String::from_utf8_lossy(v).to_string())
             .unwrap_or_else(|| String::from_utf8_lossy(n.local.of(self.input)).to_string());
         self.out.push((name, Vec::new()));
@@ -157,4 +164,59 @@ fn many_rules_and_elements_are_bounded() {
     let out = run(&deep, "y g g g g g g rect {} g g g g g g rect {}");
     assert_eq!(hits(&out, 0), Vec::<String>::new());
     assert_eq!(hits(&out, 1), ["z"]);
+}
+
+/// 既定の名前空間は型のない複合にも効き、`:is()` などの中の右端の複合には効かない（Chrome と同じ）。
+#[test]
+fn default_namespace_on_compounds() {
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:x="urn:x"><x:g class="a"><rect id="r1"/></x:g><g class="a"><rect id="r2"/></g></svg>"##;
+    let css = "@namespace url(http://www.w3.org/2000/svg); .a > rect {} #r1 {} *|*:is(#r1) {} *|*:not(#r1) {}";
+    let out = run(svg, css);
+    assert_eq!(hits(&out, 0), ["r2"]);
+    assert_eq!(hits(&out, 1), ["r1"]);
+    assert_eq!(hits(&out, 2), ["r1"]);
+    assert!(!hits(&out, 3).contains(&"r1".to_string()));
+    let other = "@namespace url(urn:x); #r1 {} *|*:is(#r1) {}";
+    let out = run(svg, other);
+    assert!(hits(&out, 0).is_empty());
+    assert_eq!(hits(&out, 1), ["r1"]);
+}
+
+/// `:empty`：空の CDATA は子に数えない。空白の文字は数える（Chrome と同じ）。`:dir(ltr)` はすべてに当たる。
+#[test]
+fn empty_and_dir() {
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg"><g id="a"><![CDATA[]]></g><g id="b"> </g><g id="c"><![CDATA[ ]]></g><g id="d"/></svg>"##;
+    let out = run(svg, "g:empty {} g:dir(ltr) {} g:dir(rtl) {}");
+    assert_eq!(hits(&out, 0), ["a", "d"]);
+    assert_eq!(hits(&out, 1), ["a", "b", "c", "d"]);
+    assert!(hits(&out, 2).is_empty());
+}
+
+/// 複合ごと・属性ごとに払う：当てない複合の多い規則でも、手間は複合の数 × 要素の数より小さくならない。
+#[test]
+fn work_covers_compounds_and_attributes() {
+    let n = 300;
+    let css: String = format!("{} {{}}", vec![":hover"; n].join(" "));
+    let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\">{}</svg>", "<g/>".repeat(n));
+    let input = svg.as_bytes();
+    let b0 = Budget::new(Stage::EstimateParse, u64::MAX, u64::MAX, &Never);
+    let counts = crate::xml::count(input, &Limits::DEFAULT, &b0, Stage::EstimateParse).unwrap();
+    let b1 = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let doc = crate::xml::build(input, &counts, &Limits::DEFAULT, &b1, Stage::Parse).unwrap();
+    let b2 = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let mut sb = SheetBuilder::new(&b2);
+    sb.add(css.as_bytes(), None, 0).unwrap();
+    let sheet = sb.finish().unwrap();
+    let active = vec![1u8; sheet.rules.len()];
+    let b3 = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let mut c = Collect { doc: &doc, input, out: Vec::new() };
+    match_rules(&doc, input, &sheet, &active, &b3, &mut c).unwrap();
+    let elements = (n + 1) as u64;
+    assert!(b3.work() >= elements * n as u64 * cost::OP_STEP, "{}", b3.work());
+    // 属性の多い要素の :lang は、属性を 1 度だけ走査する
+    let attrs: String = (0..2000).map(|i| format!(" a{i}=\"\"")).collect();
+    let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\"{attrs} lang=\"en\">{}</svg>", "<g/>".repeat(100));
+    let css: String = (0..50).map(|_| ":lang(en) {}").collect();
+    let out = run(&svg, &css);
+    assert_eq!(hits(&out, 49).len(), 101);
 }

@@ -49,18 +49,20 @@ fn limits_refuse_in_both() {
 /// `<style>` の規則が当たり、条件・報告もまとまる。
 #[test]
 fn styles_and_report() {
-    let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\"><style type=\"TEXT/CSS\">rect { fill: red } @media (min-width: 60px) { rect { stroke: blue } } @import url(a.css); circle:bogus {}</style><style type=\"text/foo\">rect { opacity: .5 }</style><rect fill=\"nonsense\"/></svg>";
+    let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\"><style type=\"TEXT/CSS\">@import url(a\\29 .css); rect { fill: red } @media (min-width: 60px) { rect { stroke: blue } } @import url(b.css); circle:bogus {}</style><style type=\"text/foo\">rect { opacity: .5 }</style><rect fill=\"nonsense\"/></svg>";
     let doc = parse(svg, &ParseOptions::DEFAULT, &Never).unwrap();
     let rect = doc.xml().nodes.as_slice().iter().position(|n| n.local.of(svg) == b"rect").unwrap() as u32;
     let names: Vec<&[u8]> =
         doc.styles().of(rect).iter().map(|s| crate::style::props::prop(s.prop).unwrap().name).collect();
     assert_eq!(names, [b"fill".as_slice(), b"stroke"]);
     let kinds: Vec<_> = doc.report().warnings().map(|w| w.kind).collect();
-    // @import のあとの規則で壊れたセレクタ、属性の壊れた値
+    // 壊れたセレクタ、属性の壊れた値、規則のあとの @import（捨てる）
     assert!(kinds.contains(&crate::report::WarningKind::InvalidSelector));
     assert!(kinds.contains(&crate::report::WarningKind::InvalidValue));
+    assert!(kinds.contains(&crate::report::WarningKind::AtRule));
+    // href は escape を解いた形
     let unread: Vec<&[u8]> = doc.report().unread_refs().map(|u| u.href).collect();
-    assert_eq!(unread, [b"a.css".as_slice()]);
+    assert_eq!(unread, [b"a).css".as_slice()]);
 }
 
 #[test]

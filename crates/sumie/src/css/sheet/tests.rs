@@ -11,6 +11,28 @@ use crate::cancel::Never;
 use crate::css::select::{S_TYPE, Simple};
 use crate::error::Stage;
 
+/// 持ち続ける量の式（`Sheet::bytes` と同じ。まとめた層の表は層の節の数の容量で取る）。
+fn counts_bytes(c: &SheetCounts) -> u64 {
+    let m = |n: u64, size: usize| n.saturating_mul(size as u64);
+    [
+        c.text,
+        c.names,
+        m(c.rules, size_of::<Rule>()),
+        m(c.decls, size_of::<Decl>()),
+        m(c.selectors, size_of::<crate::css::select::Selector>()),
+        m(c.compounds, size_of::<crate::css::select::Compound>()),
+        m(c.simples, size_of::<crate::css::select::Simple>()),
+        m(c.conds, size_of::<Cond>()),
+        m(c.layers, size_of::<Layer>()),
+        m(c.layers, size_of::<u32>()),
+        m(c.ns, size_of::<NsDecl>()),
+        c.ns_names,
+        m(c.notes, size_of::<Note>()),
+    ]
+    .iter()
+    .sum()
+}
+
 fn sheet(sheets: &[(&str, Option<&str>)]) -> Sheet {
     let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
     // 数える段と同じに伸ばしながら読み、測った量で読み直して同じになることも確かめる
@@ -26,7 +48,7 @@ fn sheet(sheets: &[(&str, Option<&str>)]) -> Sheet {
     }
     assert_eq!(b.counts(), counts);
     let sh = b.finish().unwrap();
-    assert_eq!(sh.bytes(), counts.bytes());
+    assert_eq!(sh.bytes(), counts_bytes(&counts));
     assert!(budget2.max_spend() < crate::budget::CANCEL_INTERVAL);
     sh
 }
@@ -37,6 +59,13 @@ type Row = (String, Vec<(String, String, bool)>, Vec<String>, u32);
 fn rules(sh: &Sheet) -> Vec<Row> {
     let text = sh.text.as_slice();
     let names = sh.names.as_slice();
+    // 条件はどれも真として層の順位を決める
+    let budget = Box::leak(Box::new(Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never)));
+    let all = vec![1u8; sh.conds.len()];
+    let ranks = sh.layer_ranks(&all, budget).unwrap();
+    let rank = |r: &Rule| {
+        if r.layer == NONE { u32::MAX } else { ranks.as_slice()[sh.layers.as_slice()[r.layer as usize].canon as usize] }
+    };
     sh.rules
         .as_slice()
         .iter()
@@ -63,7 +92,7 @@ fn rules(sh: &Sheet) -> Vec<Row> {
                 conds.push(String::from_utf8_lossy(cond.text.of(text)).to_string());
                 c = cond.parent;
             }
-            (ty, decls, conds, sh.rank(r))
+            (ty, decls, conds, rank(r))
         })
         .collect()
 }
@@ -152,7 +181,7 @@ fn namespaces_and_other_at_rules() {
     let r = rules(&sh);
     // 規則のあとの @namespace は効かないので x|g は壊れたセレクタ
     assert_eq!(r.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["rect", "line", "circle"]);
-    let text = sh.text.as_slice();
+    let text = sh.names.as_slice();
     let unread: Vec<String> = sh
         .notes
         .as_slice()
@@ -185,4 +214,93 @@ fn all_three_byte_sequences() {
             }
         }
     }
+}
+
+/// 層の順は真の条件の所で名前を書いた順（偽の `@media` の中で初めて書いた名前は順に入らない。Chrome と同じ）。
+#[test]
+fn layer_order_follows_true_conditions() {
+    let sh = sheet(&[("@media print { @layer b; } @layer a { rect {} } @layer b { g {} }", None)]);
+    let budget = Box::leak(Box::new(Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never)));
+    let rank_of = |cond_ok: &[u8], ty: &str| {
+        let ranks = sh.layer_ranks(cond_ok, budget).unwrap();
+        let r = rules(&sh).iter().position(|x| x.0 == ty).unwrap();
+        let rule = sh.rules.as_slice()[r];
+        ranks.as_slice()[sh.layers.as_slice()[rule.layer as usize].canon as usize]
+    };
+    // print が偽：a、b の順
+    assert!(rank_of(&[0], "rect") < rank_of(&[0], "g"));
+    // print が真：b、a の順
+    assert!(rank_of(&[1], "g") < rank_of(&[1], "rect"));
+}
+
+/// 層の名前：escape を解いて比べる。空の項目・`.` の前後の空白・全体の言葉は壊れている。
+#[test]
+fn layer_names() {
+    // `\62` は b と同じ層
+    let sh = sheet(&[("@layer \\62, a; @layer a { rect {} } @layer b { g {} }", None)]);
+    let r = rules(&sh);
+    let rank = |ty: &str| r.iter().find(|x| x.0 == ty).unwrap().3;
+    assert!(rank("g") < rank("rect"));
+    for bad in
+        ["@layer b,,a;", "@layer a,;", "@layer ,a;", "@layer a .b;", "@layer a.;", "@layer initial;", "@layer a b;"]
+    {
+        let sh = sheet(&[(bad, None)]);
+        assert_eq!(sh.layers.len(), 0, "{bad}");
+        assert!(sh.notes.as_slice().iter().any(|n| n.kind == WarningKind::AtRule), "{bad}");
+    }
+    // 多くの層も、層の数 × log の手間で決める
+    let many: String = format!("@layer {};", (0..30000).map(|i| format!("a{i}")).collect::<Vec<_>>().join(","));
+    let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let mut b = SheetBuilder::new(&budget);
+    b.add(many.as_bytes(), None, 0).unwrap();
+    let sh = b.finish().unwrap();
+    let all: Vec<u8> = Vec::new();
+    sh.layer_ranks(&all, &budget).unwrap();
+    assert!(budget.work() < 40_000_000, "{}", budget.work());
+    assert!(budget.max_spend() < crate::budget::CANCEL_INTERVAL);
+}
+
+/// `@namespace`・`@import` を書ける所（壊れた規則と知らないアットルールは数えない。Chrome と同じ）。
+#[test]
+fn namespace_and_import_order() {
+    const NS: &str = "@namespace s url(http://www.w3.org/2000/svg); s|rect {}";
+    for (head, kept) in [
+        ("x!{} ", true),
+        ("@foo; ", true),
+        ("@layer a; ", true),
+        ("@import url(x.css); ", true),
+        ("@charset \"x\"; ", true),
+        ("@media all {} ", false),
+        ("@layer a {} ", false),
+        ("@font-face {} ", false),
+        ("g {} ", false),
+    ] {
+        let sh = sheet(&[(&format!("{head}{NS}"), None)]);
+        let n = rules(&sh).iter().filter(|x| x.0 == "rect").count();
+        assert_eq!(n == 1, kept, "{head}");
+    }
+    // 正しい規則と @namespace のあとの @import は読まない
+    let sh =
+        sheet(&[("@import url(a.css); @namespace url(urn:x); @import url(b.css); rect {} @import url(c.css);", None)]);
+    let names = sh.names.as_slice();
+    let unread: Vec<String> = sh
+        .notes
+        .as_slice()
+        .iter()
+        .filter(|n| n.unread != 0)
+        .map(|n| String::from_utf8_lossy(n.href.of(names)).to_string())
+        .collect();
+    assert_eq!(unread, ["a.css"]);
+}
+
+/// 当てないセレクタと入れ子の規則は警告する。
+#[test]
+fn unsupported_and_nested_warnings() {
+    let sh = sheet(&[("rect:has(a), g {} circle { x { } fill: red }", None)]);
+    let kinds: Vec<WarningKind> = sh.notes.as_slice().iter().map(|n| n.kind).collect();
+    assert_eq!(kinds, [WarningKind::UnsupportedSelector, WarningKind::NestedRule]);
+    // 当てる選択子のない規則も宣言は読む
+    let sh = sheet(&[("rect:has(a) { fill: red } g { fill: blue }", None)]);
+    assert_eq!(sh.rules.as_slice()[0].selector, NONE);
+    assert_eq!(sh.rules.len(), 2);
 }

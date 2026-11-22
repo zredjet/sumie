@@ -2,13 +2,15 @@
 //!
 //! - 前処理（§3.3）は読みながら行う：CR・FF・CRLF は改行、NUL は U+FFFD（解くとき）
 //! - escape は字句の範囲を決めるときに飛ばし、中身は [`decode`] で解く（escape も NUL もない中身は入力のまま読める）
-//! - 数は ASCII の部分を切り出して `str::parse::<f64>` で読む（正しく丸める。determinism.md §3）。有限でない数は
-//!   `finite` が偽（使う側が壊れた値として扱う。FR-ST-15）
+//! - 数は読みながら短い形（有効数字の上限と、落とした桁が 0 でないかの印、指数）に揃え、`str::parse::<f64>` で読む
+//!   （正しく丸める。determinism.md §3。長い数でも読む手間が字句の長さに比例しない）。有限でない数は `finite` が偽（使う側が
+//!   壊れた値として扱う。FR-ST-15）
 //! - 読むバイトは 1 バイト 1 単位で、読む前に塊ずつ払う（`ScanMeter`）。どの枝も 1 バイト以上進む（終わりでは `Eof`）
 
 use crate::budget::Budget;
 use crate::cost;
 use crate::error::Error;
+use crate::mem::MVec;
 use crate::xml::chars::decode as utf8_at;
 use crate::xml::lex::{ScanMeter, Span};
 
@@ -75,6 +77,11 @@ impl Token {
         }
     }
 
+    /// 塊を飛ばす積み上げの頭に入れる `{`（位置は使わない）。
+    pub(crate) const fn open_brace() -> Token {
+        Token::new(Kind::LBrace, 0, 0)
+    }
+
     /// delim の `c` か。
     pub(crate) fn is_delim(&self, c: u8) -> bool {
         self.kind == Kind::Delim && self.delim == u32::from(c)
@@ -119,21 +126,12 @@ pub(crate) struct Lexer<'a, 'b> {
 }
 
 impl<'a, 'b> Lexer<'a, 'b> {
-    pub(crate) fn new(s: &'a [u8], budget: &'b Budget<'b>) -> Lexer<'a, 'b> {
-        Lexer { s, i: 0, meter: ScanMeter::new(0, s.len()), budget }
-    }
-
     /// `s` の `range` の中だけを読む（字句の範囲は `s` の中の位置。範囲の外は終わりとして扱う）。
     pub(crate) fn over(s: &'a [u8], range: Span, budget: &'b Budget<'b>) -> Lexer<'a, 'b> {
         let end = (range.end as usize).min(s.len());
         let start = (range.start as usize).min(end);
         let s = s.get(..end).unwrap_or(&[]);
         Lexer { s, i: start, meter: ScanMeter::new(start, end), budget }
-    }
-
-    /// 今の位置。
-    pub(crate) fn pos(&self) -> usize {
-        self.i
     }
 
     /// `i` のバイト（字句を進めずに見る。払う）。
@@ -375,37 +373,51 @@ impl<'a, 'b> Lexer<'a, 'b> {
         }
     }
 
-    /// 数の字句（§4.3.3）。
+    /// 数の字句（§4.3.3）。数字は読みながら数え（[`NumScan`]）、長い数は短い形に揃えてから読む（`parse` の手間は決まった
+    /// 上限の内）。
     fn numeric(&mut self, i: usize) -> Result<Token, Error> {
         let mut j = i;
         let mut integer = true;
+        let mut d = NumScan::default();
+        let neg = self.at(j)? == Some(b'-');
         if matches!(self.at(j)?, Some(b'+' | b'-')) {
             j = j.saturating_add(1);
         }
-        while self.at(j)?.is_some_and(|b| b.is_ascii_digit()) {
+        while let Some(b) = self.at(j)?.filter(u8::is_ascii_digit) {
+            d.digit(b, j, false);
             j = j.saturating_add(1);
         }
         if self.at(j)? == Some(b'.') && self.at(j.saturating_add(1))?.is_some_and(|b| b.is_ascii_digit()) {
             integer = false;
-            j = j.saturating_add(2);
-            while self.at(j)?.is_some_and(|b| b.is_ascii_digit()) {
+            j = j.saturating_add(1);
+            while let Some(b) = self.at(j)?.filter(u8::is_ascii_digit) {
+                d.digit(b, j, true);
                 j = j.saturating_add(1);
             }
         }
         if matches!(self.at(j)?, Some(b'e' | b'E')) {
             let k = j.saturating_add(1);
-            let digits_at = if matches!(self.at(k)?, Some(b'+' | b'-')) { k.saturating_add(1) } else { k };
+            let sign = self.at(k)?;
+            let digits_at = if matches!(sign, Some(b'+' | b'-')) { k.saturating_add(1) } else { k };
             if self.at(digits_at)?.is_some_and(|b| b.is_ascii_digit()) {
                 integer = false;
+                d.exp_neg = sign == Some(b'-');
                 j = digits_at;
-                while self.at(j)?.is_some_and(|b| b.is_ascii_digit()) {
+                while let Some(b) = self.at(j)?.filter(u8::is_ascii_digit) {
+                    d.exp_digit(b);
                     j = j.saturating_add(1);
                 }
             }
         }
         let text = self.s.get(i..j).unwrap_or(&[]);
-        self.budget.spend_large(cost::number(text.len() as u64))?;
-        let value = core::str::from_utf8(text).ok().and_then(|t| t.parse::<f64>().ok()).unwrap_or(f64::NAN);
+        let value = if text.len() <= SHORT_NUMBER {
+            self.budget.spend(cost::number(text.len() as u64))?;
+            parse_f64(text)
+        } else {
+            self.budget.spend(cost::number(NUM_BUF as u64))?;
+            let v = d.long_value(self.s);
+            if neg { -v } else { v }
+        };
         let finite = value.is_finite();
         let mut t = if self.starts_ident(j)? {
             let (e, escaped) = self.skip_name(j)?;
@@ -507,6 +519,179 @@ impl<'a, 'b> Lexer<'a, 'b> {
                 Some(_) => j = j.saturating_add(1),
             }
         }
+    }
+}
+
+/// そのまま `str::parse::<f64>` に渡す数の字句の長さの上限（これより長い数は短い形に揃える）。
+const SHORT_NUMBER: usize = 64;
+/// 揃えた数で持つ有効数字の数。f64 の丸めの境目（隣り合う 2 つの f64 のちょうど中）は 10 進で 767 桁の内に収まるので、
+/// 800 桁と「落とした桁に 0 でないものがある」の印の 1 桁で、もとの数と同じに丸まる。
+const SIG: u64 = 800;
+/// 揃えた数の指数の上限（有効数字が 801 桁なので、これを越えればどれも 0 か ∞）。
+const EXP_CAP: i64 = 100_000;
+/// 読む指数の上限（小数の桁の数は入力の長さの内なので、これより大きい指数は、桁を合わせても `EXP_CAP` を越える）。
+const EXP_READ_CAP: i64 = 1 << 40;
+/// 揃えた数の置き場（数字・`e`・指数の符号と数字）。
+const NUM_BUF: usize = 832;
+
+/// 指数を ±`EXP_CAP` に収める（`Ord::clamp` は落ちうる口として禁じている）。
+const fn clamp_exp(e: i64) -> i64 {
+    if e > EXP_CAP {
+        EXP_CAP
+    } else if e < -EXP_CAP {
+        -EXP_CAP
+    } else {
+        e
+    }
+}
+
+fn parse_f64(text: &[u8]) -> f64 {
+    core::str::from_utf8(text).ok().and_then(|t| t.parse::<f64>().ok()).unwrap_or(f64::NAN)
+}
+
+/// 数の字句を読みながら数えたもの（値は `digits × 10^(exp - frac)`）。
+#[derive(Default)]
+struct NumScan {
+    /// 有効数字（頭の 0 を除いた桁）の数と、最後の 0 でない桁が何桁目か
+    n_sig: u64,
+    last_nonzero: u64,
+    /// 最初の有効数字の入力の位置
+    first_sig: usize,
+    /// 小数の部分の桁の数（頭の 0 も数える）
+    frac: u64,
+    /// 指数（`EXP_READ_CAP` で止める）
+    exp: i64,
+    exp_neg: bool,
+}
+
+impl NumScan {
+    fn digit(&mut self, b: u8, at: usize, frac: bool) {
+        if frac {
+            self.frac = self.frac.saturating_add(1);
+        }
+        if self.n_sig == 0 && b == b'0' {
+            return;
+        }
+        if self.n_sig == 0 {
+            self.first_sig = at;
+        }
+        self.n_sig = self.n_sig.saturating_add(1);
+        if b != b'0' {
+            self.last_nonzero = self.n_sig;
+        }
+    }
+
+    fn exp_digit(&mut self, b: u8) {
+        let v = self.exp.saturating_mul(10).saturating_add(i64::from(b.saturating_sub(b'0')));
+        self.exp = if v > EXP_READ_CAP { EXP_READ_CAP } else { v };
+    }
+
+    /// 長い数の値（符号は呼び手が付ける）：有効数字を `SIG` 桁まで写し、落とした桁に 0 でないものがあれば 1 桁足して、
+    /// 指数を合わせる。写すのは決まった桁数だけ（頭の 0 は飛ばして写さない）。
+    fn long_value(&self, s: &[u8]) -> f64 {
+        if self.n_sig == 0 {
+            return 0.0;
+        }
+        let mut out = [0u8; NUM_BUF];
+        let keep = if self.n_sig < SIG { self.n_sig } else { SIG };
+        let mut n = 0usize;
+        let mut k = self.first_sig;
+        // 有効数字の間には `.` が高々 1 つある
+        while (n as u64) < keep {
+            let Some(&b) = s.get(k) else { break };
+            k = k.saturating_add(1);
+            if b == b'.' {
+                continue;
+            }
+            if let Some(x) = out.get_mut(n) {
+                *x = b;
+            }
+            n = n.saturating_add(1);
+        }
+        let dropped = self.n_sig.saturating_sub(keep);
+        let sticky = self.last_nonzero > keep;
+        let mut shift: i64 = 0;
+        if sticky {
+            if let Some(x) = out.get_mut(n) {
+                *x = b'1';
+            }
+            n = n.saturating_add(1);
+            shift = -1;
+        }
+        let e = if self.exp_neg { self.exp.saturating_neg() } else { self.exp };
+        let frac = i64::try_from(self.frac).unwrap_or(i64::MAX);
+        let dropped = i64::try_from(dropped).unwrap_or(i64::MAX);
+        let e = e.saturating_sub(frac).saturating_add(dropped).saturating_add(shift);
+        let e = clamp_exp(e);
+        if let Some(x) = out.get_mut(n) {
+            *x = b'e';
+        }
+        n = n.saturating_add(1);
+        if e < 0 {
+            if let Some(x) = out.get_mut(n) {
+                *x = b'-';
+            }
+            n = n.saturating_add(1);
+        }
+        // 指数の 10 進（上の桁から。|e| ≤ EXP_CAP なので 6 桁まで）
+        let mag = e.unsigned_abs();
+        let mut started = false;
+        let mut p: u64 = 100_000;
+        while p > 0 {
+            let dgt = mag.checked_div(p).unwrap_or(0).checked_rem(10).unwrap_or(0);
+            if dgt != 0 || started || p == 1 {
+                started = true;
+                if let Some(x) = out.get_mut(n) {
+                    *x = b'0'.saturating_add(dgt as u8);
+                }
+                n = n.saturating_add(1);
+            }
+            p = p.checked_div(10).unwrap_or(0);
+        }
+        parse_f64(out.get(..n).unwrap_or(&[]))
+    }
+}
+
+/// 開きのかっこに対する閉じのかっこ（`{`・`[`・`(`・関数）。
+pub(crate) const fn closer(k: Kind) -> Option<Kind> {
+    match k {
+        Kind::LBrace => Some(Kind::RBrace),
+        Kind::LBracket => Some(Kind::RBracket),
+        Kind::LParen | Kind::Function => Some(Kind::RParen),
+        _ => None,
+    }
+}
+
+/// かっこの積み上げ（CSS Syntax §5.4.7・§5.4.8：成分の値は、開きのかっこから組の閉じのかっこまで。中の別の種類の閉じは
+/// ただの字句）。
+pub(crate) struct Nest<'b> {
+    stack: MVec<'b, u8>,
+}
+
+impl<'b> Nest<'b> {
+    pub(crate) fn new(budget: &'b Budget<'b>) -> Nest<'b> {
+        Nest { stack: MVec::new(budget) }
+    }
+
+    /// どのかっこの中でもないか。
+    pub(crate) fn top(&self) -> bool {
+        self.stack.is_empty()
+    }
+
+    /// 字句 `t` を積み上げに入れる（開きは積み、いちばん内の開きと組の閉じは降ろす。ほかの閉じはただの字句）。降ろして
+    /// どのかっこの中でもなくなったら真。
+    pub(crate) fn feed(&mut self, t: &Token) -> Result<bool, Error> {
+        if let Some(c) = closer(t.kind) {
+            self.stack.push(c as u8)?;
+        } else if self.stack.last().is_some_and(|&c| c == t.kind as u8) {
+            self.stack.pop();
+            return Ok(self.stack.is_empty());
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.stack.clear();
     }
 }
 

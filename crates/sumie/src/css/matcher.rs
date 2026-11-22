@@ -8,8 +8,10 @@
 //! - 後の兄弟：前の要素の兄弟のどれかで立った旗（深さごとの `later`）
 //!
 //! 複合は番号の順に決める（`:is()` などの中の選択子は外の複合より番号が小さいので、同じ要素で先に決まる）。要素ごとの
-//! 手間は「複合の数 ＋ 単純な選択子を照らす手間」で、後戻りがない。後ろの兄弟を見る擬似クラス（`:last-child` など）は、
-//! 照合の前に兄弟の数を数えておく。確保は（深さ ＋ 1）× 複合の数のビットの 3 組と、兄弟の数の表（使うときだけ）。
+//! 手間は「複合の数 ＋ 単純な選択子を照らす手間」で、後戻りがない。複合ごと・単純な選択子ごとに払い、属性を探す走査は
+//! 属性ごとに払う。要素の id・class・言語・`:link`・`:empty` は、使うときだけ要素ごとに 1 度だけ求める。後ろの兄弟を見る
+//! 擬似クラス（`:last-child` など）は、照合の前に兄弟の数を数えておく。確保は（深さ ＋ 1）× 複合の数のビットの 3 組と、
+//! 兄弟の数の表（使うときだけ）。
 //!
 //! 要素の名前空間は種類（SVG・XLink・XML・なし・そのほか）だけを持つので、`@namespace` の「そのほか」の URI は区別しない
 //! （ADR-66 (1)）。どの名前空間の要素も兄弟と親子に数える（照らしの `first-child-foreign`・`adjacent-foreign` と同じ）。
@@ -47,21 +49,104 @@ struct Sib {
 
 impl Plain for Sib {}
 
-/// どの構造の擬似クラスを使うか。
-fn uses(sheet: &Sheet) -> (bool, bool) {
-    let mut sib = false;
-    let mut ty = false;
+/// 照合に使う単純な選択子の種類。
+#[derive(Default, Clone, Copy)]
+struct Uses {
+    sib: bool,
+    ty: bool,
+    id: bool,
+    class: bool,
+    lang: bool,
+    link: bool,
+    empty: bool,
+}
+
+/// どの単純な選択子を使うか（単純な選択子ごとに払う）。
+fn uses(sheet: &Sheet, budget: &Budget<'_>) -> Result<Uses, Error> {
+    let mut u = Uses::default();
     for s in sheet.simples.as_slice() {
+        budget.spend(cost::OP_STEP)?;
         match s.kind {
-            S_LAST_CHILD | S_ONLY_CHILD | S_NTH_LAST_CHILD | S_NTH_CHILD | S_FIRST_CHILD => sib = true,
+            S_LAST_CHILD | S_ONLY_CHILD | S_NTH_LAST_CHILD | S_NTH_CHILD | S_FIRST_CHILD => u.sib = true,
             S_FIRST_OF_TYPE | S_LAST_OF_TYPE | S_ONLY_OF_TYPE | S_NTH_OF_TYPE | S_NTH_LAST_OF_TYPE => {
-                sib = true;
-                ty = true;
+                u.sib = true;
+                u.ty = true;
             }
+            S_ID => u.id = true,
+            S_CLASS => u.class = true,
+            S_LANG => u.lang = true,
+            S_LINK => u.link = true,
+            S_EMPTY => u.empty = true,
             _ => {}
         }
     }
-    (sib, ty)
+    Ok(u)
+}
+
+/// 要素ごとに 1 度だけ求めるもの（属性は `XmlDoc::attrs` の番号。なければ NONE）。
+#[derive(Clone, Copy)]
+struct Elem {
+    id: u32,
+    class: u32,
+    /// 言語の属性（自分か、受け継いだもの）
+    lang: u32,
+    link: bool,
+    empty: bool,
+}
+
+/// 要素の属性を 1 度だけ走査して（属性ごとに払う）、使うものを求める。`parent_lang` は親の言語の属性。
+fn elem_info(
+    doc: &XmlDoc,
+    input: &[u8],
+    n: &Node,
+    u: Uses,
+    parent_lang: u32,
+    budget: &Budget<'_>,
+) -> Result<Elem, Error> {
+    let mut e = Elem { id: NONE, class: NONE, lang: NONE, link: false, empty: false };
+    let mut xml_lang = NONE;
+    let mut plain_lang = NONE;
+    let mut href = false;
+    if u.id || u.class || u.lang || u.link {
+        for k in n.attrs.start..n.attrs.end {
+            budget.spend(cost::OP_STEP)?;
+            let Some(a) = doc.attrs.as_slice().get(k as usize) else { break };
+            let local = a.local.of(input);
+            match (a.ns, local) {
+                (NS_NONE, b"id") if e.id == NONE => e.id = k,
+                (NS_NONE, b"class") if e.class == NONE => e.class = k,
+                (NS_XML, b"lang") if xml_lang == NONE => xml_lang = k,
+                (NS_NONE, b"lang") if plain_lang == NONE => plain_lang = k,
+                (NS_NONE | NS_XLINK, b"href") => href = true,
+                _ => {}
+            }
+        }
+    }
+    // 言語：xml:lang、なければ名前空間のない lang、なければ親から
+    e.lang = if xml_lang != NONE {
+        xml_lang
+    } else if plain_lang != NONE {
+        plain_lang
+    } else {
+        parent_lang
+    };
+    e.link = u.link && href && n.ns == NS_SVG && n.local.of(input) == b"a";
+    if u.empty {
+        // 子の要素も、長さのある文字もない（注釈と処理命令は節にならない。空の CDATA は数えない。Chrome と同じ）
+        let mut empty = true;
+        let mut c = n.first_child;
+        while c != NONE {
+            budget.spend(cost::OP_STEP)?;
+            let Some(ch) = doc.node(c) else { break };
+            if ch.kind == KIND_ELEMENT || !doc.text(input, ch).is_empty() {
+                empty = false;
+                break;
+            }
+            c = ch.next_sibling;
+        }
+        e.empty = empty;
+    }
+    Ok(e)
 }
 
 /// 要素の兄弟の位置と数を数える（`with_type` なら同じ型（名前空間と局所名）の中の位置と数も）。
@@ -153,8 +238,8 @@ struct Level {
     node: u32,
     /// この深さで最後に見た要素の親（直前の兄弟か見分ける）
     last_parent: u32,
-    /// 言語（xml:lang か lang の値の範囲。受け継ぐ。なければ空で lang_set 0）
-    lang_node: u32,
+    /// 言語の属性（`XmlDoc::attrs` の番号。受け継ぐ。なければ NONE）
+    lang: u32,
     pad: u32,
 }
 
@@ -183,8 +268,8 @@ pub(crate) fn match_rules(
     let nodes = doc.nodes.as_slice();
     let ncomp = sheet.compounds.len();
     let words = ncomp.saturating_add(63).checked_div(64).unwrap_or(0);
-    let (use_sib, use_type) = uses(sheet);
-    let sib = if use_sib { Some(siblings(doc, input, use_type, budget)?) } else { None };
+    let u = uses(sheet, budget)?;
+    let sib = if u.sib { Some(siblings(doc, input, u.ty, budget)?) } else { None };
     // 深さの上限（行きがけの順に親の深さを積む）
     let mut max_depth = 0usize;
     {
@@ -211,7 +296,7 @@ pub(crate) fn match_rules(
     let mut newm: MVec<'_, u64> = MVec::with_capacity(budget, words)?;
     newm.resize_to(words, 0)?;
     let mut levels: MVec<'_, Level> = MVec::with_capacity(budget, max_depth.saturating_add(1))?;
-    levels.resize_to(max_depth.saturating_add(1), Level { node: NONE, last_parent: NONE, lang_node: NONE, pad: 0 })?;
+    levels.resize_to(max_depth.saturating_add(1), Level { node: NONE, last_parent: NONE, lang: NONE, pad: 0 })?;
     let mut path: MVec<'_, u32> = MVec::with_capacity(budget, max_depth.saturating_add(1))?;
     let ctx = Ctx { doc, input, sheet, sib: sib.as_ref().map(MVec::as_slice), budget };
     for (i, n) in nodes.iter().enumerate() {
@@ -232,16 +317,21 @@ pub(crate) fn match_rules(
             w.fill(0);
         }
         budget.spend(cost::fill((words as u64).saturating_mul(8)).saturating_mul(4))?;
-        // 言語：自分の xml:lang・lang か、親から受け継ぐ
-        let parent_lang = if d > 0 { levels.get(d.saturating_sub(1)).map_or(NONE, |l| l.lang_node) } else { NONE };
-        let lang_node = if lang_of(doc, input, n).is_some() { e } else { parent_lang };
-        // 旗を番号の順に決める
+        // 要素ごとに 1 度だけ求めるもの（言語は親から受け継ぐ）
+        let parent_lang = if d > 0 { levels.get(d.saturating_sub(1)).map_or(NONE, |l| l.lang) } else { NONE };
+        let info = elem_info(doc, input, n, u, parent_lang, budget)?;
+        // 旗を番号の順に決める（複合ごとに払う）
         if let Some(w) = newm.as_mut_slice().get_mut(..) {
             w.fill(0);
         }
         for k in 0..ncomp {
+            budget.spend(cost::OP_STEP)?;
             let Some(c) = sheet.compounds.as_slice().get(k) else { continue };
-            let ok = ctx.compound(e, n, c.first, lang_node, newm.as_slice())?;
+            // 型のない複合に効く既定の名前空間
+            if c.ns != NS_ANY && c.ns != n.ns {
+                continue;
+            }
+            let ok = ctx.compound(e, n, c.first, &info, newm.as_slice())?;
             if !ok {
                 continue;
             }
@@ -279,7 +369,7 @@ pub(crate) fn match_rules(
             }
         }
         if let Some(l) = levels.get_mut(d) {
-            *l = Level { node: e, last_parent: n.parent, lang_node, pad: 0 };
+            *l = Level { node: e, last_parent: n.parent, lang: info.lang, pad: 0 };
         }
         // 当たった規則を知らせる
         sink.element(e)?;
@@ -322,11 +412,6 @@ fn bit(v: &[u64], base: usize, k: usize) -> bool {
     v.get(base.saturating_add(w)).is_some_and(|x| x & m != 0)
 }
 
-/// 要素の言語の属性（xml:lang、なければ名前空間のない lang）の値。
-fn lang_of<'a>(doc: &'a XmlDoc, input: &'a [u8], n: &Node) -> Option<&'a [u8]> {
-    doc.attr(input, n, NS_XML, b"lang").or_else(|| doc.attr(input, n, NS_NONE, b"lang"))
-}
-
 struct Ctx<'a, 'b> {
     doc: &'a XmlDoc,
     input: &'a [u8],
@@ -336,17 +421,13 @@ struct Ctx<'a, 'b> {
 }
 
 impl Ctx<'_, '_> {
-    /// 名前のバイトを比べる手間。
-    fn pay(&self, bytes: usize) -> Result<(), Error> {
-        self.budget.spend_large(cost::copy(bytes as u64).saturating_add(cost::OP_STEP))
-    }
-
-    /// 複合の単純な選択子がすべて当たるか（`first` から `next` でたどる）。
-    fn compound(&self, e: u32, n: &Node, first: u32, lang_node: u32, newm: &[u64]) -> Result<bool, Error> {
+    /// 複合の単純な選択子がすべて当たるか（`first` から `next` でたどる。単純な選択子ごとに払う）。
+    fn compound(&self, e: u32, n: &Node, first: u32, info: &Elem, newm: &[u64]) -> Result<bool, Error> {
         let mut sp = first;
         while sp != NONE {
+            self.budget.spend(cost::OP_STEP)?;
             let Some(s) = self.sheet.simples.as_slice().get(sp as usize) else { return Ok(false) };
-            if !self.simple(e, n, s, lang_node, newm)? {
+            if !self.simple(e, n, s, info, newm)? {
                 return Ok(false);
             }
             sp = s.next;
@@ -358,24 +439,25 @@ impl Ctx<'_, '_> {
         s.a.of(self.sheet.names.as_slice())
     }
 
-    fn simple(&self, e: u32, n: &Node, s: &Simple, lang_node: u32, newm: &[u64]) -> Result<bool, Error> {
-        let doc = self.doc;
+    /// 属性の番号 `k` の値（NONE なら None）。
+    fn attr_value(&self, k: u32) -> Option<&[u8]> {
+        let a = self.doc.attrs.as_slice().get(k as usize)?;
+        Some(self.doc.value(self.input, a))
+    }
+
+    fn simple(&self, e: u32, n: &Node, s: &Simple, info: &Elem, newm: &[u64]) -> Result<bool, Error> {
         let input = self.input;
         let ns_ok = |ns: u8| s.ns == NS_ANY || s.ns == ns;
         let sib = || self.sib.and_then(|v| v.get(e as usize)).copied().unwrap_or_default();
         Ok(match s.kind {
             S_TYPE => ns_ok(n.ns) && bytes_eq(self.budget, n.local.of(input), self.name(s))?,
             S_UNIVERSAL => ns_ok(n.ns),
-            S_ID => {
-                self.pay(doc.attrs_of(n).len())?;
-                match doc.attr(input, n, NS_NONE, b"id") {
-                    Some(v) => bytes_eq(self.budget, v, self.name(s))?,
-                    None => false,
-                }
-            }
+            S_ID => match self.attr_value(info.id) {
+                Some(v) => bytes_eq(self.budget, v, self.name(s))?,
+                None => false,
+            },
             S_CLASS => {
-                self.pay(doc.attrs_of(n).len())?;
-                let v = doc.attr(input, n, NS_NONE, b"class").unwrap_or(&[]);
+                let v = self.attr_value(info.class).unwrap_or(&[]);
                 has_token(self.budget, v, self.name(s), false)?
             }
             S_ATTR => self.attr(n, s)?,
@@ -402,13 +484,8 @@ impl Ctx<'_, '_> {
                 nth(s.n_a, s.n_b, x.type_count.saturating_sub(x.type_index).saturating_add(1))
             }
             S_ROOT => n.parent == NONE,
-            S_EMPTY => n.first_child == NONE,
-            S_LINK => {
-                n.ns == NS_SVG
-                    && n.local.of(input) == b"a"
-                    && (doc.attr(input, n, NS_NONE, b"href").is_some()
-                        || doc.attr(input, n, NS_XLINK, b"href").is_some())
-            }
+            S_EMPTY => info.empty,
+            S_LINK => info.link,
             S_NOT | S_IS => {
                 let mut any = false;
                 let mut sel = s.list;
@@ -424,10 +501,8 @@ impl Ctx<'_, '_> {
                 if s.kind == S_NOT { !any } else { any }
             }
             S_LANG => {
-                let lang = doc.node(lang_node).and_then(|ln| lang_of(doc, input, ln)).unwrap_or(&[]);
-                let ranges = self.name(s);
-                self.pay(ranges.len().saturating_add(lang.len()))?;
-                !lang.is_empty() && ranges.split(|&c| c == b',').any(|r| lang_matches(lang, r))
+                let lang = self.attr_value(info.lang).unwrap_or(&[]);
+                !lang.is_empty() && lang_in_ranges(self.budget, lang, self.name(s))?
             }
             S_NEVER => false,
             _ => false,
@@ -521,17 +596,32 @@ fn nth(a: i32, b: i32, i: u32) -> bool {
     diff.checked_rem(a) == Some(0) && diff.checked_div(a).is_some_and(|q| q >= 0)
 }
 
-/// 言語 `lang` が範囲 `range`（小文字）に当たるか（同じか、`range` のあとが `-`。大文字小文字を問わない）。
-fn lang_matches(lang: &[u8], range: &[u8]) -> bool {
-    if range.is_empty() {
-        return false;
+/// 言語 `lang` が `,` で区切った範囲（小文字）のどれかに当たるか（同じか、範囲のあとが `-`。大文字小文字を問わない）。
+/// 範囲のバイトは塊ずつ払って読み、比べるバイトも払う。
+fn lang_in_ranges(budget: &Budget<'_>, lang: &[u8], ranges: &[u8]) -> Result<bool, Error> {
+    let mut meter = ScanMeter::new(0, ranges.len());
+    let mut start = 0usize;
+    for i in 0..=ranges.len() {
+        meter.pay(budget, i)?;
+        if ranges.get(i).is_some_and(|&c| c != b',') {
+            continue;
+        }
+        let r = ranges.get(start..i).unwrap_or(&[]);
+        start = i.saturating_add(1);
+        if r.is_empty() {
+            continue;
+        }
+        if r == b"*" {
+            return Ok(true);
+        }
+        if lang.len() >= r.len()
+            && (lang.len() == r.len() || lang.get(r.len()) == Some(&b'-'))
+            && bytes_eq_ignore_case(budget, lang.get(..r.len()).unwrap_or(&[]), r)?
+        {
+            return Ok(true);
+        }
     }
-    if range == b"*" {
-        return true;
-    }
-    lang.len() >= range.len()
-        && lang.get(..range.len()).is_some_and(|p| p.eq_ignore_ascii_case(range))
-        && (lang.len() == range.len() || lang.get(range.len()) == Some(&b'-'))
+    Ok(false)
 }
 
 #[cfg(test)]

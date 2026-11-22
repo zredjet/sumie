@@ -1,18 +1,21 @@
-//! セレクタ（Selectors Level 3 と Level 4 の一部。FR-ST-07・ADR-66 (1)）を読み、選択子・複合・単純な選択子の表に足す。
+//! セレクタ（Selectors Level 3 と Level 4 の一部。FR-ST-07・ADR-66 (1)・ADR-73）を読み、選択子・複合・単純な選択子の表に足す。
 //!
 //! - 表は番号でつなぐ（複合は左の複合を `prev`、単純な選択子は `next`、並びの選択子は `next` で指す）。足す順は「中の並び
 //!   が先」：`:is()` などの中の選択子と複合は、それを持つ外の複合より前に足すので、番号の順に照らせば中が先に決まる
-//! - `:is()`・`:where()` の並びは寛容（壊れた選択子だけを捨てる）。`:not()` と規則の並びは、1 つでも壊れていれば全体が壊れる
-//!   （壊れた中の並びは、外の寛容な並びまで上がって、その選択子を捨てる）
-//! - 当てない擬似クラス（`:hover` など）・擬似要素・`:has()`・`:nth-child(… of S)` は正しいセレクタとして読み、当たらない
-//!   印（`never`）を付ける
+//! - `:is()`・`:where()` の並びは寛容（壊れた選択子だけを捨てる）。`:not()`・`:has()`・`of S` と規則の並びは、1 つでも
+//!   壊れていれば全体が壊れる（壊れた中の並びは、外の寛容な並びまで上がって、その選択子を捨てる）
+//! - 当てない擬似クラス（`:hover` など）と擬似要素は正しいセレクタとして読み、当たらない印（`never`）を付ける。擬似要素は
+//!   いちばん外の並びにだけ書け、そのあとには利用者の動きの擬似クラス（`:hover` など）と決まった擬似要素だけが書ける
+//! - `:has()`・`:nth-child(… of S)` は中まで確かめて読むが当てず、それを含むいちばん外の選択子を捨てる（[`Parsed::unsupported`]。
+//!   当てないものを `:not()` で裏返して当てすぎないため）
+//! - 既定の名前空間（`@namespace` の接頭辞なし）は、型と `*` と、型のない複合（`:is()` などの中の右端の複合を除く）に効く
 //! - 再帰しない（入れ子の並びは明示の積み上げ）
 
 use crate::budget::Budget;
 use crate::cost;
-use crate::css::lex::{Kind, Lexer, Token, decode, decode_string, ident_is};
+use crate::css::lex::{Kind, Lexer, Nest, Token, decode, decode_string, ident_is};
 use crate::error::Error;
-use crate::mem::{MVec, Plain};
+use crate::mem::{MVec, Plain, bytes_cmp, lower_bound_try};
 use crate::xml::lex::Span;
 use crate::xml::{NS_NONE, NS_OTHER, NS_SVG, NS_XLINK, NS_XML};
 
@@ -89,7 +92,9 @@ pub(crate) struct Compound {
     /// 左の複合（なければ NONE）と、そのつながり
     pub(crate) prev: u32,
     pub(crate) comb: u8,
-    pub(crate) pad: [u8; 3],
+    /// 型のない複合に効く既定の名前空間（NS_ANY ならどれでも）
+    pub(crate) ns: u8,
+    pub(crate) pad: [u8; 2],
 }
 
 impl Plain for Compound {}
@@ -189,11 +194,10 @@ fn utf8(c: u32) -> ([u8; 4], usize) {
     }
 }
 
-/// `@namespace` の表（規則の並びごと）。
+/// `@namespace` の宣言（接頭辞は名前空間の名前の置き場の中。既定の名前空間は空）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct NsDecl {
-    /// 接頭辞（名前の置き場の中）。既定の名前空間は空
     pub(crate) prefix: Span,
     pub(crate) ns: u8,
     pub(crate) pad: [u8; 3],
@@ -210,6 +214,79 @@ pub(crate) fn ns_of_uri(uri: &[u8]) -> u8 {
         b"" => NS_NONE,
         _ => NS_OTHER,
     }
+}
+
+/// `@namespace` の表（`<style>` ごと）。宣言は接頭辞のバイトの順に並べ、同じ接頭辞は後の宣言だけを残す（[`ns_insert`]）。
+#[derive(Clone, Copy)]
+pub(crate) struct NsTable<'a> {
+    pub(crate) decls: &'a [NsDecl],
+    pub(crate) names: &'a [u8],
+}
+
+impl NsTable<'_> {
+    pub(crate) const EMPTY: NsTable<'static> = NsTable { decls: &[], names: &[] };
+
+    /// 既定の名前空間（なければどれでも）。空の接頭辞はいちばん前に並ぶ。
+    fn default_ns(&self) -> u8 {
+        self.decls.first().filter(|d| d.prefix.len() == 0).map_or(NS_ANY, |d| d.ns)
+    }
+
+    /// 接頭辞の字句 `t`（ident。escape を解いて比べる）の名前空間。宣言がなければ None。
+    fn lookup(&self, s: &[u8], t: &Token, budget: &Budget<'_>) -> Result<Option<u8>, Error> {
+        let i = lower_bound_try(self.decls, |d| Ok(cmp_name(budget, d.prefix.of(self.names), s, t)? == Less))?;
+        match self.decls.get(i) {
+            Some(d) if cmp_name(budget, d.prefix.of(self.names), s, t)? == core::cmp::Ordering::Equal => Ok(Some(d.ns)),
+            _ => Ok(None),
+        }
+    }
+}
+
+use core::cmp::Ordering::Less;
+
+/// `decls`（接頭辞の順）に宣言を足す。同じ接頭辞があれば置き換える（後の宣言が勝つ）。
+pub(crate) fn ns_insert(
+    decls: &mut MVec<'_, NsDecl>,
+    names: &[u8],
+    d: NsDecl,
+    budget: &Budget<'_>,
+) -> Result<(), Error> {
+    let key = d.prefix.of(names);
+    let list = decls.as_slice();
+    let i = lower_bound_try(list, |x| Ok(bytes_cmp(budget, x.prefix.of(names), key)? == Less))?;
+    if let Some(x) = list.get(i)
+        && bytes_cmp(budget, x.prefix.of(names), key)? == core::cmp::Ordering::Equal
+    {
+        if let Some(x) = decls.get_mut(i) {
+            *x = d;
+        }
+        return Ok(());
+    }
+    decls.insert(i, d)
+}
+
+/// 名前 `a`（UTF-8）と字句 `t` の中身（escape を解いたもの）を比べる。解く符号位置は塊ずつ払う。
+fn cmp_name(budget: &Budget<'_>, a: &[u8], s: &[u8], t: &Token) -> Result<core::cmp::Ordering, Error> {
+    if !t.escaped {
+        return bytes_cmp(budget, a, t.inner.of(s));
+    }
+    let mut k = 0usize;
+    let mut n = 0u32;
+    for c in decode(s, t.inner) {
+        n = n.wrapping_add(1);
+        if n.trailing_zeros() >= 6 {
+            budget.spend(cost::copy(64).saturating_add(1))?;
+        }
+        let (buf, len) = utf8(c);
+        let part = buf.get(..len).unwrap_or(&[]);
+        let w = a.get(k..k.saturating_add(len).min(a.len())).unwrap_or(&[]);
+        let o = w.cmp(part);
+        if o != core::cmp::Ordering::Equal {
+            return Ok(o);
+        }
+        k = k.saturating_add(len);
+    }
+    budget.spend(1)?;
+    Ok(a.len().cmp(&k))
 }
 
 /// 読みの失敗：セレクタが壊れた（規則・選択子を捨てる）か、勘定の誤り（そのまま返す）。
@@ -247,59 +324,86 @@ impl Spec {
         (self.a.min(1023) << 20) | (self.b.min(1023) << 10) | self.c.min(1023)
     }
 
-    fn unpack(p: u32) -> Spec {
-        Spec { a: (p >> 20) & 1023, b: (p >> 10) & 1023, c: p & 1023 }
-    }
-
     fn add(self, o: Spec) -> Spec {
         Spec { a: self.a.saturating_add(o.a), b: self.b.saturating_add(o.b), c: self.c.saturating_add(o.c) }
     }
 }
 
-/// 入れ子の並び（規則の並び・`:is()`・`:where()`・`:not()`）を読んでいる所。
+/// 擬似要素を読んだあと（そのあとに書けるもの）。
+const PE_NONE: u8 = 0;
+/// `::before`・`::after`（`::marker` と利用者の動きの擬似クラス）
+const PE_BEFORE_AFTER: u8 = 1;
+/// `::part()`（擬似要素と、構造でない擬似クラス）
+const PE_PART: u8 = 2;
+/// ほかの擬似要素（利用者の動きの擬似クラス）
+const PE_OTHER: u8 = 3;
+
+/// 入れ子の並び（規則の並び・`:is()`・`:where()`・`:not()`・`:has()`・`of S`）を読んでいる所。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct Frame {
-    /// この並びを持つ単純な選択子の種類（規則の並びは NONE の代わりに S_NEVER を使わず、`top` で見分ける）
+    /// この並びを閉じたときに外の複合に足す単純な選択子の種類
     kind: u8,
+    /// 規則の並び（いちばん外）
     top: bool,
     forgiving: bool,
     /// `:where()` は詳細度 0
     zero: bool,
+    /// 読むが当てない並び（`:has()`・`of S`）
+    opaque: bool,
+    /// 頭に結合子を書ける（`:has()`）
+    relative: bool,
+    /// `:has()` の中（`:has()` は入れ子にできない）
+    in_has: bool,
     first_sel: u32,
     last_sel: u32,
+    /// 読み終えた選択子の数（当てないものも数える）
+    count: u32,
     max_spec: Spec,
+    /// 並びの中に当てない選択子がある
+    any_unsupported: bool,
     /// 読んでいる選択子
     prev_compound: u32,
     pending_comb: u8,
     spec: Spec,
+    /// 読んでいる選択子が当てないものを含む
+    unsupported: bool,
     /// 読んでいる複合
     first_simple: u32,
     last_simple: u32,
     compound_empty: bool,
-    /// 複合に擬似要素を読んだ（そのあとに単純な選択子は書けない）
-    after_pseudo_element: bool,
+    /// 複合に型か `*` がある
+    has_type: bool,
+    /// 擬似要素を読んだあと（PE_*）
+    pe: u8,
     /// 読んでいる選択子が壊れた
     broken: bool,
 }
 
 impl Frame {
-    fn new(kind: u8, top: bool, forgiving: bool, zero: bool) -> Frame {
+    fn new(kind: u8, top: bool, forgiving: bool, zero: bool, in_has: bool) -> Frame {
         Frame {
             kind,
             top,
             forgiving,
             zero,
+            opaque: false,
+            relative: false,
+            in_has,
             first_sel: NONE,
             last_sel: NONE,
+            count: 0,
             max_spec: Spec::default(),
+            any_unsupported: false,
             prev_compound: NONE,
             pending_comb: COMB_NONE,
             spec: Spec::default(),
+            unsupported: false,
             first_simple: NONE,
             last_simple: NONE,
             compound_empty: true,
-            after_pseudo_element: false,
+            has_type: false,
+            pe: PE_NONE,
             broken: false,
         }
     }
@@ -309,6 +413,7 @@ impl Frame {
 struct Cursor<'l, 'a, 'b> {
     lex: &'l mut Lexer<'a, 'b>,
     peeked: Option<Token>,
+    nest: Nest<'b>,
 }
 
 impl Cursor<'_, '_, '_> {
@@ -337,172 +442,132 @@ impl Cursor<'_, '_, '_> {
         Ok(any)
     }
 
-    /// 深さ 0 の `,` か `)`（読まない）・終わりまで飛ばす。
+    /// 深さ 0 の `,` か `)`（読まない）・終わりまで飛ばす（かっこは種類ごとに組で）。
     fn skip_to_list_end(&mut self) -> Result<(), Error> {
-        let mut depth: u32 = 0;
+        self.nest.clear();
         loop {
             let t = self.peek()?;
             match t.kind {
                 Kind::Eof => return Ok(()),
-                Kind::Comma | Kind::RParen if depth == 0 => return Ok(()),
-                Kind::LParen | Kind::LBracket | Kind::LBrace | Kind::Function => depth = depth.saturating_add(1),
-                Kind::RParen | Kind::RBracket | Kind::RBrace => depth = depth.saturating_sub(1),
+                Kind::Comma | Kind::RParen if self.nest.top() => return Ok(()),
                 _ => {}
             }
+            self.nest.feed(&t)?;
             self.next()?;
         }
     }
 
-    /// 関数の中身を `)` まで読み飛ばし、中身の範囲（`)` の前まで）を返す。
+    /// 関数の中身を組の `)` まで読み飛ばし、中身の範囲（`)` の前まで）を返す（かっこは種類ごとに組で）。
     fn skip_function(&mut self) -> Result<Span, Error> {
         let start = self.peek()?.span.start;
         let mut end = start;
-        let mut depth: u32 = 0;
+        self.nest.clear();
         loop {
             let t = self.next()?;
             match t.kind {
                 Kind::Eof => return Ok(Span { start, end: t.span.start }),
-                Kind::RParen if depth == 0 => return Ok(Span { start, end }),
-                Kind::LParen | Kind::LBracket | Kind::LBrace | Kind::Function => depth = depth.saturating_add(1),
-                Kind::RParen | Kind::RBracket | Kind::RBrace => depth = depth.saturating_sub(1),
+                Kind::RParen if self.nest.top() => return Ok(Span { start, end }),
                 _ => {}
             }
+            self.nest.feed(&t)?;
             end = t.span.end;
         }
     }
 }
 
-/// 既定の名前空間（型と `*` に当てる。宣言がなければどれでも）。後の宣言が勝つ。
-fn default_ns(decls: &[NsDecl]) -> u8 {
-    decls.iter().rev().find(|d| d.prefix.len() == 0).map_or(NS_ANY, |d| d.ns)
+/// 読んだ選択子の並び。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Parsed {
+    /// 当てる最初の選択子（当てるものがなければ NONE）
+    pub(crate) first: u32,
+    /// 当てない選択子（`:has()`・`of S` を含む）を捨てた
+    pub(crate) unsupported: bool,
 }
 
-/// 接頭辞の名前空間（宣言のないものは None）。
-fn ns_lookup(decls: &[NsDecl], names: &[u8], s: &[u8], t: &Token) -> Option<u8> {
-    decls.iter().rev().find(|d| d.prefix.len() > 0 && name_eq(s, t, d.prefix.of(names))).map(|d| d.ns)
-}
-
-/// 字句の中身（解いたもの）が `want`（UTF-8）と同じか。
-fn name_eq(s: &[u8], t: &Token, want: &[u8]) -> bool {
-    if !t.escaped {
-        return t.inner.of(s) == want;
-    }
-    let mut k = 0usize;
-    for c in decode(s, t.inner) {
-        let (buf, n) = utf8(c);
-        let Some(part) = buf.get(..n) else { return false };
-        let Some(w) = want.get(k..k.saturating_add(n)) else { return false };
-        if w != part {
-            return false;
-        }
-        k = k.saturating_add(n);
-    }
-    k == want.len()
-}
-
-/// 選択子の並び `range` を読み、最初の選択子の番号を返す（壊れていれば None。表に足した分は捨てずに残る）。並びの
-/// 選択子は `next` でつなぐ。
+/// 選択子の並び `range` を読む（壊れていれば None。表に足した分は捨てずに残る）。並びの選択子は `next` でつなぐ。
 pub(crate) fn parse_selector_list(
     s: &[u8],
     range: Span,
-    ns: &[NsDecl],
+    ns: NsTable<'_>,
     t: &mut Tables<'_>,
     budget: &Budget<'_>,
-) -> Result<Option<u32>, Error> {
+) -> Result<Option<Parsed>, Error> {
     match parse_list(s, range, ns, t, budget) {
-        Ok(first) => Ok(Some(first)),
+        Ok(p) => Ok(Some(p)),
         Err(Fail::Bad) => Ok(None),
         Err(Fail::Stop(e)) => Err(e),
     }
 }
 
-fn parse_list(s: &[u8], range: Span, ns: &[NsDecl], t: &mut Tables<'_>, budget: &Budget<'_>) -> R<u32> {
-    let mut lex = Lexer::over(s, range, budget_ref(budget));
-    let mut cur = Cursor { lex: &mut lex, peeked: None };
-    let mut frames: MVec<'_, Frame> = MVec::new(budget_ref(budget));
-    frames.push(Frame::new(S_NEVER, true, false, false))?;
+fn parse_list(s: &[u8], range: Span, ns: NsTable<'_>, t: &mut Tables<'_>, budget: &Budget<'_>) -> R<Parsed> {
+    let budget = budget_ref(budget);
+    let default_ns = ns.default_ns();
+    let mut lex = Lexer::over(s, range, budget);
+    let mut cur = Cursor { lex: &mut lex, peeked: None, nest: Nest::new(budget) };
+    let mut frames: MVec<'_, Frame> = MVec::new(budget);
+    frames.push(Frame::new(S_NEVER, true, false, false, false))?;
     cur.skip_ws()?;
     loop {
         budget.spend(cost::OP_STEP)?;
         let tok = cur.peek()?;
         let depth = frames.len();
         let Some(mut f) = frames.last().copied() else { return Err(invalid()) };
-        match tok.kind {
-            Kind::Eof | Kind::RParen | Kind::Comma => {
-                if tok.kind != Kind::Eof {
-                    cur.next()?;
-                }
-                // 選択子を終える
-                if tok.kind == Kind::RParen && f.top {
-                    f.broken = true;
-                }
-                end_selector(&mut f, t)?;
-                if let Some(x) = frames.last_mut() {
-                    *x = f;
-                }
-                if f.broken && !f.forgiving {
-                    // 壊れた並び：外へ上げる
-                    if f.top {
-                        return Err(invalid());
-                    }
-                    if tok.kind == Kind::Comma {
-                        // 並びの残りを飛ばして閉じのかっこまで
-                        cur.skip_to_list_end()?;
-                        while cur.peek()?.kind == Kind::Comma {
-                            cur.next()?;
-                            cur.skip_to_list_end()?;
-                        }
-                        if cur.peek()?.kind == Kind::RParen {
-                            cur.next()?;
-                        }
-                    }
-                    frames.pop();
-                    if let Some(p) = frames.last_mut() {
-                        p.broken = true;
-                    }
-                    continue;
+        if matches!(tok.kind, Kind::Eof | Kind::RParen | Kind::Comma) {
+            if tok.kind != Kind::Eof {
+                cur.next()?;
+            }
+            // 選択子を終える
+            if tok.kind == Kind::RParen && f.top {
+                f.broken = true;
+            }
+            end_selector(&mut f, t, default_ns)?;
+            if let Some(x) = frames.last_mut() {
+                *x = f;
+            }
+            if f.broken && !f.forgiving {
+                // 壊れた並び：外へ上げる
+                if f.top {
+                    return Err(invalid());
                 }
                 if tok.kind == Kind::Comma {
-                    reset_selector(frames.last_mut());
-                    cur.skip_ws()?;
-                    continue;
-                }
-                // 並びの終わり
-                if f.top {
-                    if tok.kind != Kind::Eof || f.first_sel == NONE {
-                        return Err(invalid());
+                    // 並びの残りを飛ばして閉じのかっこまで
+                    cur.skip_to_list_end()?;
+                    while cur.peek()?.kind == Kind::Comma {
+                        cur.next()?;
+                        cur.skip_to_list_end()?;
                     }
-                    return Ok(f.first_sel);
+                    if cur.peek()?.kind == Kind::RParen {
+                        cur.next()?;
+                    }
                 }
                 frames.pop();
-                // 寛容な並びが空でも正しい（何にも当たらない）。外の複合に単純な選択子として足す
-                let mut simple = Simple::new(f.kind);
-                simple.list = f.first_sel;
-                if f.first_sel == NONE {
-                    simple.kind = if f.kind == S_NOT { S_IS } else { S_NEVER };
-                    if f.kind == S_NOT {
-                        // 空の :not() は壊れている
-                        if let Some(p) = frames.last_mut() {
-                            p.broken = true;
-                        }
-                        continue;
-                    }
-                }
-                let add = if f.zero { Spec::default() } else { f.max_spec };
                 if let Some(p) = frames.last_mut() {
-                    add_simple(p, t, simple)?;
-                    p.spec = p.spec.add(add);
+                    p.broken = true;
                 }
                 continue;
             }
-            _ => {}
+            if tok.kind == Kind::Comma {
+                reset_selector(frames.last_mut());
+                cur.skip_ws()?;
+                continue;
+            }
+            // 並びの終わり
+            if f.top {
+                if tok.kind != Kind::Eof || f.count == 0 {
+                    return Err(invalid());
+                }
+                return Ok(Parsed { first: f.first_sel, unsupported: f.any_unsupported });
+            }
+            frames.pop();
+            close_list(&f, t, frames.last_mut())?;
+            continue;
         }
         if f.broken {
             // 壊れた選択子の残りを飛ばす（寛容な並びなら次の `,` まで）
             cur.skip_to_list_end()?;
             continue;
         }
-        let r = step(&mut cur, s, &mut f, t, ns, &mut frames);
+        let r = step(&mut cur, s, &mut f, t, ns, default_ns, &mut frames);
         if let Some(x) = frames.get_mut(depth.saturating_sub(1)) {
             *x = f;
         }
@@ -518,12 +583,41 @@ fn parse_list(s: &[u8], range: Span, ns: &[NsDecl], t: &mut Tables<'_>, budget: 
     }
 }
 
+/// 閉じた入れ子の並び `f` を、外の複合 `p` の単純な選択子にする。
+fn close_list(f: &Frame, t: &mut Tables<'_>, p: Option<&mut Frame>) -> R<()> {
+    let Some(p) = p else { return Err(invalid()) };
+    if f.opaque || f.kind == S_NOT {
+        // `:has()`・`of S`・`:not()` の空の並びは壊れている
+        if f.count == 0 {
+            p.broken = true;
+            return Ok(());
+        }
+    }
+    let mut simple = Simple::new(f.kind);
+    simple.list = f.first_sel;
+    if f.opaque {
+        // 読むが当てない：外の選択子ごと捨てる
+        simple = Simple::new(S_NEVER);
+        p.unsupported = true;
+    } else if f.first_sel == NONE {
+        // 寛容な並びが空でも正しい（何にも当たらない）
+        simple.kind = S_NEVER;
+    }
+    if f.any_unsupported {
+        p.unsupported = true;
+    }
+    let add = if f.zero || f.opaque { Spec::default() } else { f.max_spec };
+    add_simple(p, t, simple, false)?;
+    p.spec = p.spec.add(add);
+    Ok(())
+}
+
 fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {
     b
 }
 
-/// 読んでいる選択子を終え、並びにつなぐ（壊れていれば捨てる）。
-fn end_selector(f: &mut Frame, t: &mut Tables<'_>) -> R<()> {
+/// 読んでいる選択子を終え、並びにつなぐ（壊れていれば捨てる。いちばん外の当てない選択子はつながない）。
+fn end_selector(f: &mut Frame, t: &mut Tables<'_>, default_ns: u8) -> R<()> {
     if f.broken {
         return Ok(());
     }
@@ -532,7 +626,15 @@ fn end_selector(f: &mut Frame, t: &mut Tables<'_>) -> R<()> {
         f.broken = true;
         return Ok(());
     }
-    let c = push_compound(f, t)?;
+    // 右端の複合：入れ子の並びの中では既定の名前空間が効かない（Selectors 4 §4.? の `:is()` などの決まり）
+    let c = push_compound(f, t, if f.top { default_ns } else { NS_ANY })?;
+    f.count = f.count.saturating_add(1);
+    if f.unsupported {
+        f.any_unsupported = true;
+        if f.top {
+            return Ok(());
+        }
+    }
     let id = t.selectors.len() as u32;
     t.selectors.push(Selector { subject: c, next: NONE, spec: f.spec.pack(), pad: 0 })?;
     if f.last_sel == NONE {
@@ -552,28 +654,39 @@ fn reset_selector(f: Option<&mut Frame>) {
         f.prev_compound = NONE;
         f.pending_comb = COMB_NONE;
         f.spec = Spec::default();
+        f.unsupported = false;
         f.first_simple = NONE;
         f.last_simple = NONE;
         f.compound_empty = true;
-        f.after_pseudo_element = false;
+        f.has_type = false;
+        f.pe = PE_NONE;
         f.broken = false;
     }
 }
 
-/// 読んでいる複合を表に足す。
-fn push_compound(f: &mut Frame, t: &mut Tables<'_>) -> R<u32> {
+/// 読んでいる複合を表に足す（型も `*` もない複合には `implied` の名前空間が効く）。
+fn push_compound(f: &mut Frame, t: &mut Tables<'_>, implied: u8) -> R<u32> {
     let id = t.compounds.len() as u32;
-    t.compounds.push(Compound { first: f.first_simple, prev: f.prev_compound, comb: f.pending_comb, pad: [0; 3] })?;
+    let ns = if f.has_type { NS_ANY } else { implied };
+    t.compounds.push(Compound {
+        first: f.first_simple,
+        prev: f.prev_compound,
+        comb: f.pending_comb,
+        ns,
+        pad: [0; 2],
+    })?;
     f.prev_compound = id;
     f.first_simple = NONE;
     f.last_simple = NONE;
     f.compound_empty = true;
-    f.after_pseudo_element = false;
+    f.has_type = false;
+    f.pe = PE_NONE;
     Ok(id)
 }
 
-fn add_simple(f: &mut Frame, t: &mut Tables<'_>, s: Simple) -> R<()> {
-    if f.after_pseudo_element && s.kind != S_NEVER {
+/// 単純な選択子を複合に足す（擬似要素のあとは `after_pe` のものだけ）。
+fn add_simple(f: &mut Frame, t: &mut Tables<'_>, s: Simple, after_pe: bool) -> R<()> {
+    if f.pe != PE_NONE && !after_pe {
         return Err(invalid());
     }
     let id = t.push_simple(s)?;
@@ -593,10 +706,11 @@ fn step(
     s: &[u8],
     f: &mut Frame,
     t: &mut Tables<'_>,
-    ns: &[NsDecl],
+    ns: NsTable<'_>,
+    default_ns: u8,
     frames: &mut MVec<'_, Frame>,
 ) -> R<()> {
-    let default_ns = default_ns(ns);
+    let budget = t.names.budget();
     let tok = cur.peek()?;
     // 結合子
     if tok.kind == Kind::Whitespace || tok.is_delim(b'>') || tok.is_delim(b'+') || tok.is_delim(b'~') {
@@ -619,10 +733,19 @@ fn step(
             cur.next()?;
             cur.skip_ws()?;
         }
-        if f.compound_empty {
+        if f.pe != PE_NONE {
+            // 擬似要素のあとに結合子は書けない
             return Err(invalid());
         }
-        push_compound(f, t)?;
+        if f.compound_empty {
+            // `:has()` の頭の結合子（`> a`）だけ書ける
+            if f.relative && f.prev_compound == NONE && f.pending_comb == COMB_NONE && comb != COMB_DESC {
+                f.pending_comb = comb;
+                return Ok(());
+            }
+            return Err(invalid());
+        }
+        push_compound(f, t, default_ns)?;
         f.pending_comb = comb;
         return Ok(());
     }
@@ -639,11 +762,7 @@ fn step(
             } else if cur.peek()?.is_delim(b'|') {
                 // `ns|E`・`*|E`（`|` のあとに空白は書けない）
                 cur.next()?;
-                let c = if tok.is_delim(b'*') {
-                    NS_ANY
-                } else {
-                    ns_lookup(ns, t.names.as_slice(), s, &tok).ok_or_else(invalid)?
-                };
+                let c = if tok.is_delim(b'*') { NS_ANY } else { ns.lookup(s, &tok, budget)?.ok_or_else(invalid)? };
                 (c, cur.next()?)
             } else {
                 (default_ns, tok)
@@ -661,13 +780,15 @@ fn step(
             } else {
                 return Err(invalid());
             };
-            add_simple(f, t, simple)
+            add_simple(f, t, simple, false)?;
+            f.has_type = true;
+            Ok(())
         }
         Kind::Hash if tok.flag => {
             let mut x = Simple::new(S_ID);
             x.a = t.push_name(decode(s, tok.inner), false)?;
             f.spec.a = f.spec.a.saturating_add(1);
-            add_simple(f, t, x)
+            add_simple(f, t, x, false)
         }
         Kind::Delim if tok.is_delim(b'.') => {
             let n = cur.next()?;
@@ -677,12 +798,12 @@ fn step(
             let mut x = Simple::new(S_CLASS);
             x.a = t.push_name(decode(s, n.inner), false)?;
             f.spec.b = f.spec.b.saturating_add(1);
-            add_simple(f, t, x)
+            add_simple(f, t, x, false)
         }
         Kind::LBracket => {
             let x = attribute(cur, s, t, ns)?;
             f.spec.b = f.spec.b.saturating_add(1);
-            add_simple(f, t, x)
+            add_simple(f, t, x, false)
         }
         Kind::Colon => pseudo(cur, s, f, t, frames),
         _ => Err(invalid()),
@@ -690,7 +811,8 @@ fn step(
 }
 
 /// 属性のセレクタ（`[` を読んだあと）。
-fn attribute(cur: &mut Cursor<'_, '_, '_>, s: &[u8], t: &mut Tables<'_>, ns: &[NsDecl]) -> R<Simple> {
+fn attribute(cur: &mut Cursor<'_, '_, '_>, s: &[u8], t: &mut Tables<'_>, ns: NsTable<'_>) -> R<Simple> {
+    let budget = t.names.budget();
     cur.skip_ws()?;
     let first = cur.next()?;
     let (ns_c, name_tok) = if first.is_delim(b'|') {
@@ -700,7 +822,7 @@ fn attribute(cur: &mut Cursor<'_, '_, '_>, s: &[u8], t: &mut Tables<'_>, ns: &[N
         let c = if first.is_delim(b'*') {
             NS_ANY
         } else if first.kind == Kind::Ident {
-            ns_lookup(ns, t.names.as_slice(), s, &first).ok_or_else(invalid)?
+            ns.lookup(s, &first, budget)?.ok_or_else(invalid)?
         } else {
             return Err(invalid());
         };
@@ -775,21 +897,53 @@ fn pseudo(
     t: &mut Tables<'_>,
     frames: &mut MVec<'_, Frame>,
 ) -> R<()> {
+    let budget = t.names.budget();
     let mut n = cur.next()?;
     let element = n.kind == Kind::Colon;
     if element {
         n = cur.next()?;
     }
     let is = |w: &[u8]| ident_is(s, n.inner, n.escaped, w);
+    let any = |list: &[&[u8]]| list.iter().any(|w| ident_is(s, n.inner, n.escaped, w));
+    let webkit = || n.inner.of(s).get(..8).is_some_and(|p| p.eq_ignore_ascii_case(b"-webkit-")) && !n.escaped;
+    let legacy = n.kind == Kind::Ident && any(LEGACY_PSEUDO_ELEMENTS);
+    if element || legacy {
+        // 擬似要素：いちばん外の並びにだけ書ける
+        let known = match n.kind {
+            Kind::Ident => any(PSEUDO_ELEMENTS) || webkit(),
+            Kind::Function => {
+                let ok = any(PSEUDO_ELEMENT_FUNCTIONS) || webkit();
+                cur.skip_function()?;
+                ok
+            }
+            _ => false,
+        };
+        if !known || !f.top {
+            return Err(invalid());
+        }
+        let follows = match f.pe {
+            PE_NONE => true,
+            PE_BEFORE_AFTER => n.kind == Kind::Ident && is(b"marker"),
+            PE_PART => true,
+            _ => false,
+        };
+        if !follows {
+            return Err(invalid());
+        }
+        let next_pe = if n.kind == Kind::Ident && (is(b"before") || is(b"after")) {
+            PE_BEFORE_AFTER
+        } else if n.kind == Kind::Function && is(b"part") {
+            PE_PART
+        } else {
+            PE_OTHER
+        };
+        f.spec.c = f.spec.c.saturating_add(1);
+        add_simple(f, t, Simple::new(S_NEVER), true)?;
+        f.pe = next_pe;
+        return Ok(());
+    }
     match n.kind {
         Kind::Ident => {
-            // 擬似要素（`::x` と、古い 1 つの `:` の 4 つ）
-            if element || is(b"before") || is(b"after") || is(b"first-line") || is(b"first-letter") {
-                f.spec.c = f.spec.c.saturating_add(1);
-                add_simple(f, t, Simple::new(S_NEVER))?;
-                f.after_pseudo_element = true;
-                return Ok(());
-            }
             let kind = if is(b"first-child") {
                 S_FIRST_CHILD
             } else if is(b"last-child") {
@@ -806,22 +960,31 @@ fn pseudo(
                 S_ROOT
             } else if is(b"empty") {
                 S_EMPTY
-            } else if is(b"link") || is(b"any-link") {
+            } else if is(b"link") || is(b"any-link") || is(b"-webkit-any-link") {
                 S_LINK
             } else if is(b"defined") {
                 S_UNIVERSAL
-            } else if DYNAMIC.iter().any(|w| is(w)) {
+            } else if any(DYNAMIC) {
                 S_NEVER
             } else {
                 return Err(invalid());
             };
+            // 擬似要素のあと：利用者の動きの擬似クラス（`::part()` のあとは構造でない擬似クラス）だけ
+            let after_pe = any(USER_ACTION) || (f.pe == PE_PART && kind == S_NEVER);
+            if f.pe != PE_NONE && !after_pe {
+                return Err(invalid());
+            }
             f.spec.b = f.spec.b.saturating_add(1);
             let mut x = Simple::new(kind);
             x.ns = NS_ANY;
-            add_simple(f, t, x)
+            add_simple(f, t, x, true)
         }
-        Kind::Function if !element => {
-            if is(b"not") || is(b"is") || is(b"where") || is(b"matches") || is(b"-webkit-any") {
+        Kind::Function => {
+            if f.pe != PE_NONE {
+                cur.skip_function()?;
+                return Err(invalid());
+            }
+            if is(b"not") || is(b"is") || is(b"where") || is(b"-webkit-any") {
                 let (kind, forgiving, zero) = if is(b"not") {
                     (S_NOT, false, false)
                 } else if is(b"where") {
@@ -830,7 +993,20 @@ fn pseudo(
                     (S_IS, true, false)
                 };
                 // 入れ子の並びを始める（外の複合の状態 `f` は、呼び手が外の段に書き戻す）
-                frames.push(Frame::new(kind, false, forgiving, zero))?;
+                frames.push(Frame::new(kind, false, forgiving, zero, f.in_has))?;
+                cur.skip_ws()?;
+                return Ok(());
+            }
+            if is(b"has") {
+                // `:has()` は入れ子にできない
+                if f.in_has {
+                    cur.skip_function()?;
+                    return Err(invalid());
+                }
+                let mut g = Frame::new(S_NEVER, false, false, false, true);
+                g.opaque = true;
+                g.relative = true;
+                frames.push(g)?;
                 cur.skip_ws()?;
                 return Ok(());
             }
@@ -846,16 +1022,34 @@ fn pseudo(
                 None
             };
             if let Some(kind) = nth {
-                let arg = cur.skip_function()?;
-                let (a, b, of) = parse_an_b(s, arg).ok_or_else(invalid)?;
-                if of && !matches!(kind, S_NTH_CHILD | S_NTH_LAST_CHILD) {
+                let Some((a, b)) = an_b(cur, s, budget)? else {
+                    cur.skip_function()?;
                     return Err(invalid());
-                }
-                let mut x = Simple::new(if of { S_NEVER } else { kind });
-                x.n_a = a;
-                x.n_b = b;
+                };
                 f.spec.b = f.spec.b.saturating_add(1);
-                return add_simple(f, t, x);
+                cur.skip_ws()?;
+                let p = cur.peek()?;
+                if p.kind == Kind::RParen {
+                    cur.next()?;
+                    let mut x = Simple::new(kind);
+                    x.n_a = a;
+                    x.n_b = b;
+                    return add_simple(f, t, x, false);
+                }
+                if p.kind == Kind::Ident
+                    && ident_is(s, p.inner, p.escaped, b"of")
+                    && matches!(kind, S_NTH_CHILD | S_NTH_LAST_CHILD)
+                {
+                    // `of S`：S を確かめて読むが当てない
+                    cur.next()?;
+                    let mut g = Frame::new(S_NEVER, false, false, false, f.in_has);
+                    g.opaque = true;
+                    frames.push(g)?;
+                    cur.skip_ws()?;
+                    return Ok(());
+                }
+                cur.skip_function()?;
+                return Err(invalid());
             }
             if is(b"lang") {
                 let arg = cur.skip_function()?;
@@ -863,29 +1057,88 @@ fn pseudo(
                 let mut x = Simple::new(S_LANG);
                 x.a = ranges;
                 f.spec.b = f.spec.b.saturating_add(1);
-                return add_simple(f, t, x);
+                return add_simple(f, t, x, false);
             }
-            if is(b"has") || is(b"host") || is(b"host-context") || is(b"state") || is(b"dir") {
-                // 正しいが当てない（:has は後ろを見る）
+            if is(b"dir") {
+                // SVG の要素の向きはいつも ltr（HTML の `dir` 属性を持たない）
+                cur.skip_ws()?;
+                let a = cur.peek()?;
+                let mut kind = S_NEVER;
+                if a.kind == Kind::Ident {
+                    cur.next()?;
+                    cur.skip_ws()?;
+                    if cur.peek()?.kind == Kind::RParen {
+                        cur.next()?;
+                        if ident_is(s, a.inner, a.escaped, b"ltr") {
+                            kind = S_UNIVERSAL;
+                        }
+                        f.spec.b = f.spec.b.saturating_add(1);
+                        return add_simple(f, t, Simple::new(kind), false);
+                    }
+                }
+                cur.skip_function()?;
+                return Err(invalid());
+            }
+            if any(NEVER_FUNCTIONS) {
+                // 正しいが当てない（引数は確かめない）
                 cur.skip_function()?;
                 f.spec.b = f.spec.b.saturating_add(1);
-                return add_simple(f, t, Simple::new(S_NEVER));
+                return add_simple(f, t, Simple::new(S_NEVER), false);
             }
-            Err(invalid())
-        }
-        Kind::Function if element => {
-            // `::part()`・`::slotted()` など
             cur.skip_function()?;
-            f.spec.c = f.spec.c.saturating_add(1);
-            add_simple(f, t, Simple::new(S_NEVER))?;
-            f.after_pseudo_element = true;
-            Ok(())
+            Err(invalid())
         }
         _ => Err(invalid()),
     }
 }
 
-/// 静止した絵では当たらない擬似クラス（正しい名前として受ける）。
+/// 1 つの `:` でも書ける昔の擬似要素。
+const LEGACY_PSEUDO_ELEMENTS: &[&[u8]] = &[b"before", b"after", b"first-line", b"first-letter"];
+
+/// 擬似要素（CSS Pseudo 4 などの仕様にあるもの。`::-webkit-*` も受ける。Chrome と同じ）。
+const PSEUDO_ELEMENTS: &[&[u8]] = &[
+    b"before",
+    b"after",
+    b"first-line",
+    b"first-letter",
+    b"marker",
+    b"placeholder",
+    b"selection",
+    b"target-text",
+    b"spelling-error",
+    b"grammar-error",
+    b"search-text",
+    b"file-selector-button",
+    b"backdrop",
+    b"cue",
+    b"details-content",
+    b"view-transition",
+    b"scroll-marker",
+    b"scroll-marker-group",
+    b"column",
+    b"checkmark",
+    b"picker-icon",
+];
+
+/// 関数の形の擬似要素。
+const PSEUDO_ELEMENT_FUNCTIONS: &[&[u8]] = &[
+    b"cue",
+    b"part",
+    b"slotted",
+    b"highlight",
+    b"view-transition-group",
+    b"view-transition-image-pair",
+    b"view-transition-old",
+    b"view-transition-new",
+    b"scroll-button",
+    b"picker",
+];
+
+/// 利用者の動きの擬似クラス（擬似要素のあとにも書ける。Selectors 4 §3.6.3）。
+const USER_ACTION: &[&[u8]] = &[b"hover", b"active", b"focus", b"focus-visible", b"focus-within"];
+
+/// 静止した絵では当たらない擬似クラス（正しい名前として受ける。Selectors 4 と HTML などの仕様にあるもの、Chrome が受ける
+/// `-webkit-` のもの）。
 const DYNAMIC: &[&[u8]] = &[
     b"hover",
     b"active",
@@ -894,7 +1147,8 @@ const DYNAMIC: &[&[u8]] = &[
     b"focus-visible",
     b"visited",
     b"target",
-    b"target-within",
+    b"target-current",
+    b"local-link",
     b"checked",
     b"disabled",
     b"enabled",
@@ -910,102 +1164,176 @@ const DYNAMIC: &[&[u8]] = &[
     b"read-write",
     b"placeholder-shown",
     b"autofill",
+    b"-webkit-autofill",
+    b"user-invalid",
+    b"user-valid",
     b"playing",
     b"paused",
+    b"seeking",
+    b"buffering",
+    b"stalled",
+    b"muted",
+    b"volume-locked",
     b"current",
     b"past",
     b"future",
     b"fullscreen",
+    b"-webkit-full-screen",
     b"modal",
     b"picture-in-picture",
-    b"user-invalid",
-    b"user-valid",
     b"popover-open",
+    b"open",
+    b"active-view-transition",
+    b"xr-overlay",
     b"host",
 ];
 
-/// An+B（CSS Syntax §6）と、`of S` が続くか。`arg` は関数の中身。
-fn parse_an_b(s: &[u8], arg: Span) -> Option<(i32, i32, bool)> {
-    let raw = arg.of(s);
-    // `of` の前まで（`of` は空白で区切られた ident）
-    let mut body = raw;
-    let mut of = false;
-    let mut k = 0usize;
-    while k.saturating_add(2) <= raw.len() {
-        let before_ws = k == 0 || raw.get(k.saturating_sub(1)).is_some_and(|b| is_ws(*b));
-        let w = raw.get(k..k.saturating_add(2)).unwrap_or(&[]);
-        let after = raw.get(k.saturating_add(2)).copied();
-        if before_ws && w.eq_ignore_ascii_case(b"of") && after.is_none_or(is_ws) && k > 0 {
-            body = raw.get(..k).unwrap_or(&[]);
-            of = true;
-            break;
+/// 正しいが当てない関数の擬似クラス（引数は確かめない）。
+const NEVER_FUNCTIONS: &[&[u8]] =
+    &[b"host", b"host-context", b"state", b"current", b"nth-col", b"nth-last-col", b"active-view-transition-type"];
+
+/// An+B の名前の形（`n`・`-n`・`n-`・`-n-`・`n-<数字>`・`-n-<数字>`）。
+struct NForm {
+    neg: bool,
+    dash: bool,
+    digits: Option<i32>,
+}
+
+/// 名前（ident か dimension の単位。escape を解く）を An+B の形として読む（`allow_neg` なら頭の `-` を許す）。
+fn n_form(s: &[u8], span: Span, allow_neg: bool, budget: &Budget<'_>) -> Result<Option<NForm>, Error> {
+    let mut it = decode(s, span);
+    let mut paid = 0u32;
+    let mut next = |budget: &Budget<'_>| -> Result<Option<u32>, Error> {
+        paid = paid.wrapping_add(1);
+        if paid.trailing_zeros() >= 6 {
+            budget.spend(cost::scan(64))?;
         }
-        k = k.saturating_add(1);
-    }
-    let body = trim_ws(body);
-    if body.eq_ignore_ascii_case(b"odd") {
-        return Some((2, 1, of));
-    }
-    if body.eq_ignore_ascii_case(b"even") {
-        return Some((2, 0, of));
-    }
-    let n_at = body.iter().position(|&b| b == b'n' || b == b'N');
-    let Some(n_at) = n_at else {
-        return parse_int(body, true).map(|b| (0, b, of));
+        Ok(it.next())
     };
-    let pre = body.get(..n_at).unwrap_or(&[]);
-    let a = match pre {
-        b"" | b"+" => 1,
-        b"-" => -1,
-        _ => parse_int(pre, true)?,
-    };
-    let rest = trim_ws(body.get(n_at.saturating_add(1)..).unwrap_or(&[]));
-    if rest.is_empty() {
-        return Some((a, 0, of));
+    budget.spend(cost::OP_STEP)?;
+    let mut c = next(budget)?;
+    let mut neg = false;
+    if allow_neg && c == Some(u32::from(b'-')) {
+        neg = true;
+        c = next(budget)?;
     }
-    let (sign, digits) = match rest.first() {
-        Some(b'+') => (1i64, trim_ws(rest.get(1..).unwrap_or(&[]))),
-        Some(b'-') => (-1i64, trim_ws(rest.get(1..).unwrap_or(&[]))),
-        _ => return None,
-    };
-    let v = parse_int(digits, false)?;
-    let b = clamp_i32(sign.saturating_mul(i64::from(v)));
-    Some((a, b, of))
-}
-
-const fn is_ws(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C)
-}
-
-fn trim_ws(mut s: &[u8]) -> &[u8] {
-    while let [first, rest @ ..] = s
-        && is_ws(*first)
-    {
-        s = rest;
+    if !matches!(c, Some(0x6E | 0x4E)) {
+        return Ok(None);
     }
-    while let [rest @ .., last] = s
-        && is_ws(*last)
-    {
-        s = rest;
+    c = next(budget)?;
+    let Some(dash) = c else { return Ok(Some(NForm { neg, dash: false, digits: None })) };
+    if dash != u32::from(b'-') {
+        return Ok(None);
     }
-    s
-}
-
-/// 10 進の整数（`signed` なら頭の `+`・`-` を許す）。i32 で止める。
-fn parse_int(s: &[u8], signed: bool) -> Option<i32> {
-    let (neg, digits) = match s.first() {
-        Some(b'+') if signed => (false, s.get(1..)?),
-        Some(b'-') if signed => (true, s.get(1..)?),
-        _ => (false, s),
-    };
-    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-        return None;
+    c = next(budget)?;
+    if c.is_none() {
+        return Ok(Some(NForm { neg, dash: true, digits: None }));
     }
     let mut v: i64 = 0;
-    for &d in digits {
-        v = v.saturating_mul(10).saturating_add(i64::from(d.saturating_sub(b'0')));
+    while let Some(d) = c {
+        if !(0x30..=0x39).contains(&d) {
+            return Ok(None);
+        }
+        v = v.saturating_mul(10).saturating_add(i64::from(d.saturating_sub(0x30)));
+        c = next(budget)?;
     }
-    Some(clamp_i32(if neg { v.saturating_neg() } else { v }))
+    Ok(Some(NForm { neg, dash: true, digits: Some(clamp_i32(v)) }))
+}
+
+/// 整数の数の字句の値（i32 で止める）。
+fn int_value(t: &Token) -> i32 {
+    let v = t.value;
+    if v >= 2_147_483_647.0 {
+        i32::MAX
+    } else if v <= -2_147_483_648.0 {
+        i32::MIN
+    } else {
+        v as i32
+    }
+}
+
+/// 整数の数の字句で、符号があるか（`signed`）・ないか。
+fn integer_with_sign(s: &[u8], t: &Token, signed: bool) -> bool {
+    t.kind == Kind::Number
+        && t.flag
+        && t.finite
+        && s.get(t.span.start as usize).is_some_and(|&b| matches!(b, b'+' | b'-')) == signed
+}
+
+/// An+B（CSS Syntax §6.2。字句の並びで読む。`n` の後ろの `-` は名前の一部）。読めなければ None（読めた所までは読んで
+/// いて、残りは呼び手が関数の終わりまで飛ばす。閉じのかっこは読まない）。
+fn an_b(cur: &mut Cursor<'_, '_, '_>, s: &[u8], budget: &Budget<'_>) -> Result<Option<(i32, i32)>, Error> {
+    cur.skip_ws()?;
+    let t = cur.peek()?;
+    let (a, form) = match t.kind {
+        Kind::Ident if ident_is(s, t.inner, t.escaped, b"odd") => {
+            cur.next()?;
+            return Ok(Some((2, 1)));
+        }
+        Kind::Ident if ident_is(s, t.inner, t.escaped, b"even") => {
+            cur.next()?;
+            return Ok(Some((2, 0)));
+        }
+        Kind::Ident => {
+            let Some(form) = n_form(s, t.inner, true, budget)? else { return Ok(None) };
+            cur.next()?;
+            (if form.neg { -1 } else { 1 }, form)
+        }
+        Kind::Delim if t.is_delim(b'+') => {
+            // `+n…`（`+` と名前の間に空白は書けない）
+            cur.next()?;
+            let u = cur.peek()?;
+            if u.kind != Kind::Ident {
+                return Ok(None);
+            }
+            let Some(form) = n_form(s, u.inner, false, budget)? else { return Ok(None) };
+            cur.next()?;
+            (1, form)
+        }
+        Kind::Number if t.flag && t.finite => {
+            cur.next()?;
+            return Ok(Some((0, int_value(&t))));
+        }
+        Kind::Dimension if t.flag && t.finite => {
+            let Some(form) = n_form(s, t.inner, false, budget)? else { return Ok(None) };
+            cur.next()?;
+            (int_value(&t), form)
+        }
+        _ => return Ok(None),
+    };
+    if let Some(d) = form.digits {
+        // `n-<数字>`
+        return Ok(Some((a, d.saturating_neg())));
+    }
+    if form.dash {
+        // `n- <符号のない整数>`
+        cur.skip_ws()?;
+        let u = cur.peek()?;
+        if !integer_with_sign(s, &u, false) {
+            return Ok(None);
+        }
+        cur.next()?;
+        return Ok(Some((a, int_value(&u).saturating_neg())));
+    }
+    // `n`、続けて `<符号つきの整数>` か `['+' | '-'] <符号のない整数>`
+    cur.skip_ws()?;
+    let p = cur.peek()?;
+    if integer_with_sign(s, &p, true) {
+        cur.next()?;
+        return Ok(Some((a, int_value(&p))));
+    }
+    if p.is_delim(b'+') || p.is_delim(b'-') {
+        cur.next()?;
+        cur.skip_ws()?;
+        let u = cur.peek()?;
+        if !integer_with_sign(s, &u, false) {
+            return Ok(None);
+        }
+        cur.next()?;
+        let b = int_value(&u);
+        return Ok(Some((a, if p.is_delim(b'-') { b.saturating_neg() } else { b })));
+    }
+    Ok(Some((a, 0)))
 }
 
 fn clamp_i32(v: i64) -> i32 {

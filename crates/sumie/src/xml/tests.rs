@@ -64,17 +64,47 @@ fn nodes_attrs_and_links() {
     let b = src.as_bytes();
     let root = doc.node(0).unwrap();
     assert_eq!(root.ns, NS_SVG);
-    assert_eq!(doc.attr(b, root, NS_NONE, b"width"), Some(b"10".as_slice()));
+    assert_eq!(
+        doc.attr(
+            b,
+            root,
+            NS_NONE,
+            b"width",
+            &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never)
+        )
+        .unwrap(),
+        Some(b"10".as_slice())
+    );
     // xmlns は属性に入れない
     assert_eq!(doc.attrs_of(root).len(), 1);
     let g = doc.node(root.first_child).unwrap();
-    assert_eq!(doc.attr(b, g, NS_NONE, b"id"), Some(b"a".as_slice()));
+    assert_eq!(
+        doc.attr(
+            b,
+            g,
+            NS_NONE,
+            b"id",
+            &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never)
+        )
+        .unwrap(),
+        Some(b"a".as_slice())
+    );
     let rect = doc.node(g.first_child).unwrap();
     let text = doc.node(rect.next_sibling).unwrap();
     assert_eq!(text.kind, KIND_TEXT);
     assert_eq!(doc.text(b, text), b"text");
     let circle = doc.node(text.next_sibling).unwrap();
-    assert_eq!(doc.attr(b, circle, NS_NONE, b"r"), Some(b"1".as_slice()));
+    assert_eq!(
+        doc.attr(
+            b,
+            circle,
+            NS_NONE,
+            b"r",
+            &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never)
+        )
+        .unwrap(),
+        Some(b"1".as_slice())
+    );
     assert_eq!(circle.next_sibling, NONE);
 }
 
@@ -88,8 +118,28 @@ fn namespaces() {
         format!("<svg {SVG} xmlns:xlink=\"http://www.w3.org/1999/xlink\"><use xlink:href=\"#a\" href=\"#b\"/></svg>");
     let doc = parse(&src).unwrap();
     let u = doc.node(1).unwrap();
-    assert_eq!(doc.attr(src.as_bytes(), u, NS_XLINK, b"href"), Some(b"#a".as_slice()));
-    assert_eq!(doc.attr(src.as_bytes(), u, NS_NONE, b"href"), Some(b"#b".as_slice()));
+    assert_eq!(
+        doc.attr(
+            src.as_bytes(),
+            u,
+            NS_XLINK,
+            b"href",
+            &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never)
+        )
+        .unwrap(),
+        Some(b"#a".as_slice())
+    );
+    assert_eq!(
+        doc.attr(
+            src.as_bytes(),
+            u,
+            NS_NONE,
+            b"href",
+            &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never)
+        )
+        .unwrap(),
+        Some(b"#b".as_slice())
+    );
     // 名前空間のない文書・xml の接頭辞
     assert_eq!(b("<svg><rect xml:space=\"preserve\"/></svg>").unwrap(), [NS_NONE, NS_NONE]);
     // 束ねていない接頭辞・xmlns の誤用
@@ -126,7 +176,17 @@ fn namespaces() {
     let src = format!("<:svg {SVG}><rect :width=\"1\"/></:svg>");
     let doc = parse(&src).unwrap();
     assert_eq!(names(&doc, &src), ["svg", "rect"]);
-    assert_eq!(doc.attr(src.as_bytes(), doc.node(1).unwrap(), NS_NONE, b"width"), Some(b"1".as_slice()));
+    assert_eq!(
+        doc.attr(
+            src.as_bytes(),
+            doc.node(1).unwrap(),
+            NS_NONE,
+            b"width",
+            &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never)
+        )
+        .unwrap(),
+        Some(b"1".as_slice())
+    );
     assert_eq!(reason(parse("<svg :a=\"1\" a=\"2\"/>")), Some(InvalidReason::Xml));
     // 閉じのタグも接頭辞と局所名で比べる・`:xmlns` は既定の名前空間の宣言
     for good in ["<svg></:svg>", "<:svg></svg>", "<:svg></:svg>"] {
@@ -155,7 +215,17 @@ fn entities_and_references() {
     let b = src.as_bytes();
     let svg = doc.node(0).unwrap();
     // 同じ名前は最初の宣言
-    assert_eq!(doc.attr(b, svg, NS_NONE, b"fill"), Some(b"#ff0000".as_slice()));
+    assert_eq!(
+        doc.attr(
+            b,
+            svg,
+            NS_NONE,
+            b"fill",
+            &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never)
+        )
+        .unwrap(),
+        Some(b"#ff0000".as_slice())
+    );
     assert_eq!(doc.text(b, doc.node(svg.first_child).unwrap()), b"<AB#ff0000");
     // 知らない実体・壊れた文字の参照・文書の文字でない参照
     assert_eq!(reason(parse(&format!("<svg {SVG}>&nope;</svg>"))), Some(InvalidReason::Xml));
@@ -186,9 +256,29 @@ fn normalization() {
     let doc = parse(&src).unwrap();
     let b = src.as_bytes();
     let svg = doc.node(0).unwrap();
-    assert_eq!(doc.attr(b, svg, NS_NONE, b"a"), Some(b"x y z w".as_slice()));
+    assert_eq!(
+        doc.attr(
+            b,
+            svg,
+            NS_NONE,
+            b"a",
+            &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never)
+        )
+        .unwrap(),
+        Some(b"x y z w".as_slice())
+    );
     // 文字の参照の改行は揃えない
-    assert_eq!(doc.attr(b, svg, NS_NONE, b"b"), Some(b"\n".as_slice()));
+    assert_eq!(
+        doc.attr(
+            b,
+            svg,
+            NS_NONE,
+            b"b",
+            &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never)
+        )
+        .unwrap(),
+        Some(b"\n".as_slice())
+    );
     let t = doc.node(svg.first_child).unwrap();
     assert_eq!(doc.text(b, t), b"a\nb\nc");
     let cd = doc.node(t.next_sibling).unwrap();
@@ -483,7 +573,17 @@ fn entity_values_are_normalized() {
     let doc = parse(&src).unwrap();
     let b = src.as_bytes();
     let root = doc.node(0).unwrap();
-    assert_eq!(doc.attr(b, root, NS_NONE, b"a"), Some(b"a b c d e".as_slice()));
+    assert_eq!(
+        doc.attr(
+            b,
+            root,
+            NS_NONE,
+            b"a",
+            &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never)
+        )
+        .unwrap(),
+        Some(b"a b c d e".as_slice())
+    );
     assert_eq!(doc.text(b, doc.node(root.first_child).unwrap()), b"a\tb\nc\nd\ne");
 }
 
@@ -525,7 +625,15 @@ fn cancellation_stops_promptly() {
 fn attlist_defaults_are_applied() {
     let attr = |src: &str, node: u32, name: &[u8]| -> Option<Vec<u8>> {
         let doc = parse(src).unwrap();
-        doc.attr(src.as_bytes(), doc.node(node).unwrap(), NS_NONE, name).map(<[u8]>::to_vec)
+        doc.attr(
+            src.as_bytes(),
+            doc.node(node).unwrap(),
+            NS_NONE,
+            name,
+            &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never),
+        )
+        .unwrap()
+        .map(<[u8]>::to_vec)
     };
     let d = "<!DOCTYPE svg [<!ENTITY c \"blue\"><!ATTLIST rect fill CDATA \"green\" stroke CDATA \"&c;\" id ID #IMPLIED><!ATTLIST rect fill CDATA \"red\"><!ATTLIST g class NMTOKENS \" x  y \">]>";
     let src = format!("{d}<svg {SVG}><rect/><rect fill=\"black\" id=\"  a   b \"/><g/><g class=\" p\tq \"/></svg>");
@@ -590,7 +698,17 @@ fn attlist_defaults_never_reject() {
     }
     let src = "<!DOCTYPE svg [<!ATTLIST svg a CDATA \"&nope;\"><!ATTLIST svg a CDATA \"x\">]><svg/>";
     let doc = parse(src).unwrap();
-    assert_eq!(doc.attr(src.as_bytes(), doc.node(0).unwrap(), NS_NONE, b"a"), Some(b"x".as_slice()));
+    assert_eq!(
+        doc.attr(
+            src.as_bytes(),
+            doc.node(0).unwrap(),
+            NS_NONE,
+            b"a",
+            &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never)
+        )
+        .unwrap(),
+        Some(b"x".as_slice())
+    );
 }
 
 /// 既定の値は要素に書かれていないので、値の全部を展開の量に数える（借りる値も）。1 つの大きな既定の値は、当てる要素が
@@ -655,7 +773,17 @@ fn token_attributes_with_entities() {
     );
     let (doc, counts) = parse_with(src.as_bytes(), &Limits::DEFAULT).unwrap();
     let want = vec!["x"; 1000].join(" ");
-    assert_eq!(doc.attr(src.as_bytes(), doc.node(1).unwrap(), NS_NONE, b"v"), Some(want.as_bytes()));
+    assert_eq!(
+        doc.attr(
+            src.as_bytes(),
+            doc.node(1).unwrap(),
+            NS_NONE,
+            b"v",
+            &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never)
+        )
+        .unwrap(),
+        Some(want.as_bytes())
+    );
     assert!(counts.walk_work < 10 * src.len() as u64, "{}", counts.walk_work);
     // 空白の並びと実体の頭・終わりの空白の組み合わせ
     for (v, want) in [
@@ -670,7 +798,18 @@ fn token_attributes_with_entities() {
             "<!DOCTYPE svg [<!ATTLIST g v NMTOKENS #IMPLIED><!ENTITY e \"  b  c  \"><!ENTITY s \"   \"><!ENTITY n \"\">]><svg {SVG}><g v=\"{v}\"/></svg>"
         );
         let doc = parse(&src).unwrap();
-        assert_eq!(doc.attr(src.as_bytes(), doc.node(1).unwrap(), NS_NONE, b"v"), Some(want.as_bytes()), "{v}");
+        assert_eq!(
+            doc.attr(
+                src.as_bytes(),
+                doc.node(1).unwrap(),
+                NS_NONE,
+                b"v",
+                &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never)
+            )
+            .unwrap(),
+            Some(want.as_bytes()),
+            "{v}"
+        );
     }
 }
 

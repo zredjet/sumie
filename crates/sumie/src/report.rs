@@ -25,6 +25,10 @@ pub enum WarningKind {
     ReferenceCycle,
     /// 壊れたセレクタ・閉じない規則（規則ごと捨てた。FR-ST-07）
     InvalidSelector,
+    /// 読むが当てないセレクタ（`:has()`・`:nth-child(… of S)`。それを含む選択子を当てない。FR-ST-07）
+    UnsupportedSelector,
+    /// 規則の中の入れ子の規則・アットルール（CSS Nesting。読まずに捨てた。ADR-66 (4)）
+    NestedRule,
 }
 
 impl Plain for WarningKind {}

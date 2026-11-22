@@ -139,7 +139,7 @@ fn each_style(
         if n.kind != KIND_ELEMENT || n.ns != NS_SVG || n.local.of(input) != b"style" {
             continue;
         }
-        if let Some(t) = doc.attr(input, n, NS_NONE, b"type") {
+        if let Some(t) = doc.attr(input, n, NS_NONE, b"type", budget)? {
             let t = trim(t);
             if !(t.is_empty() || t.eq_ignore_ascii_case(b"text/css")) {
                 continue;
@@ -155,7 +155,7 @@ fn each_style(
             }
             c = k.next_sibling;
         }
-        let media = doc.attr(input, n, NS_NONE, b"media");
+        let media = doc.attr(input, n, NS_NONE, b"media", budget)?;
         f(scratch.as_slice(), media, n.pos)?;
     }
     Ok(())
@@ -187,7 +187,7 @@ fn attribute_size(doc: &XmlDoc, input: &[u8], budget: &Budget<'_>) -> Result<Opt
     }
     let len = |name: &[u8]| -> Result<Option<Option<f64>>, Error> {
         // 外の None は属性がない、内の None は解けない長さ
-        let Some(a) = doc.attrs_of(root).iter().find(|a| a.ns == NS_NONE && a.local.of(input) == name) else {
+        let Some(a) = doc.find_attr(input, root, NS_NONE, name, budget)? else {
             return Ok(None);
         };
         let (buf, span) = attr_buf(doc, input, a);
@@ -198,7 +198,7 @@ fn attribute_size(doc: &XmlDoc, input: &[u8], budget: &Budget<'_>) -> Result<Opt
     };
     let w = len(b"width")?;
     let h = len(b"height")?;
-    let vb = match doc.attrs_of(root).iter().find(|a| a.ns == NS_NONE && a.local.of(input) == b"viewBox") {
+    let vb = match doc.find_attr(input, root, NS_NONE, b"viewBox", budget)? {
         Some(a) => {
             let (buf, span) = attr_buf(doc, input, a);
             view_box(buf, span, budget)?.filter(|v| v.w > 0.0 && v.h > 0.0)
@@ -223,12 +223,20 @@ fn attr_buf<'a>(doc: &'a XmlDoc, input: &'a [u8], a: &xml::Attr) -> (&'a [u8], S
 fn report(sheet: &Sheet, styles: &Styles, budget: &Budget<'_>) -> Result<Report, Error> {
     let budget = budget_ref(budget);
     let notes = sheet.notes.as_slice();
-    budget.spend_large(cost::scan(notes.len() as u64))?;
-    let unread = notes.iter().filter(|n| n.unread != 0).count();
-    let href_bytes = notes.iter().filter(|n| n.unread != 0).fold(0usize, |a, n| a.saturating_add(n.href.len()));
+    // 数える（覚えごとに払う）
+    let mut unread = 0usize;
+    let mut href_bytes = 0usize;
+    for n in notes {
+        budget.spend(cost::OP_STEP)?;
+        if n.unread != 0 {
+            unread = unread.saturating_add(1);
+            href_bytes = href_bytes.saturating_add(n.href.len());
+        }
+    }
     let warns = notes.len().saturating_sub(unread).saturating_add(styles.warnings.len());
     let mut r = ReportBuilder::with_capacity(budget, warns, unread, href_bytes)?;
-    let text = sheet.text.as_slice();
+    // 読まなかった参照の href は escape を解いて名前の置き場にある
+    let text = sheet.names.as_slice();
     for n in notes {
         budget.spend(cost::OP_STEP)?;
         if n.unread != 0 {

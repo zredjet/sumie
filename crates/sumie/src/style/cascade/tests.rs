@@ -37,7 +37,14 @@ fn run(svg: &str, css: &str) -> Vec<Row> {
             continue;
         }
         let id = doc
-            .attr(input, n, NS_NONE, b"id")
+            .attr(
+                input,
+                n,
+                NS_NONE,
+                b"id",
+                &crate::budget::Budget::new(crate::error::Stage::Parse, u64::MAX, u64::MAX, &crate::cancel::Never),
+            )
+            .unwrap()
             .map(|v| String::from_utf8_lossy(v).to_string())
             .unwrap_or_else(|| String::from_utf8_lossy(n.local.of(input)).to_string());
         let specs = st

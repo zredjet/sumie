@@ -132,9 +132,35 @@ impl XmlDoc {
         if n.flags & FLAG_IN_STORE != 0 { n.text.of(self.store.as_slice()) } else { n.text.of(input) }
     }
 
-    /// 名前空間 `ns` と局所名 `name` の属性の値。
-    pub(crate) fn attr<'a>(&'a self, input: &'a [u8], n: &Node, ns: u8, name: &[u8]) -> Option<&'a [u8]> {
-        self.attrs_of(n).iter().find(|a| a.ns == ns && a.local.of(input) == name).map(|a| self.value(input, a))
+    /// 名前空間 `ns` と局所名 `name` の属性（見た属性ごとに払う）。
+    pub(crate) fn find_attr<'a>(
+        &'a self,
+        input: &[u8],
+        n: &Node,
+        ns: u8,
+        name: &[u8],
+        budget: &Budget<'_>,
+    ) -> Result<Option<&'a Attr>, Error> {
+        for a in self.attrs_of(n) {
+            budget.spend(cost::OP_STEP)?;
+            // 名前は短い決まった名前なので、長さの違う名前はすぐに違うとわかる
+            if a.ns == ns && a.local.of(input) == name {
+                return Ok(Some(a));
+            }
+        }
+        Ok(None)
+    }
+
+    /// 名前空間 `ns` と局所名 `name` の属性の値（見た属性ごとに払う）。
+    pub(crate) fn attr<'a>(
+        &'a self,
+        input: &'a [u8],
+        n: &Node,
+        ns: u8,
+        name: &[u8],
+        budget: &Budget<'_>,
+    ) -> Result<Option<&'a [u8]>, Error> {
+        Ok(self.find_attr(input, n, ns, name, budget)?.map(|a| self.value(input, a)))
     }
 }
 

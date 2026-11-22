@@ -1,13 +1,19 @@
-//! 宣言の並び（CSS Syntax Level 3 §5.4.5「consume a list of declarations」）。規則の `{}` の中と `style` 属性の値に使う。
+//! 宣言の並び。規則の `{}` の中と `style` 属性の値に使う。
 //!
 //! - 宣言は `名前 : 値 [! important]`。名前は ident（大文字小文字を問わずに比べるのは使う側。ADR-66 (3)）
 //! - `!important` は値の終わりの `!` と ident `important`（大文字小文字を問わない。間に空白を許す）
-//! - 壊れた宣言は、深さ 0 の `;` まで飛ばす（かっこの中の `;` は区切りにしない）。アットルールは飛ばす
+//! - かっこは種類ごとに組で読む（`(`・`[`・`{`・関数。中の別の種類の閉じはただの字句。CSS Syntax §5.4.7）
+//! - 規則の中（CSS Syntax の「consume a block's contents」と CSS Nesting）：`:` のない名前や、名前でない字句で始まるものは
+//!   入れ子の規則として読み、最初の深さ 0 の `{…}` の塊までで終える。値に深さ 0 の `{…}` がある宣言（`--` で始まる名前の
+//!   ほか）も、その塊までの入れ子の規則。アットルールは `;` か `{…}` まで。入れ子の規則とアットルールは読まずに、知らせて
+//!   捨てる（ADR-66 (4)。[`Item::Nested`]）。深さ 0 の `;` だけで終わるものは壊れた宣言で、黙って捨てる
+//! - `style` 属性（CSS Syntax L3 の「consume a list of declarations」。Chrome と同じ）：入れ子の規則を読まず、壊れた宣言は
+//!   深さ 0 の `;` まで飛ばす。深さ 0 の `}` はただの字句。アットルールは `;` か `{…}` まで飛ばす
 //! - 値は空白を除いた範囲で返す（値を読むのは values の段。同じ字句で読み直す）
 
 use crate::budget::Budget;
 use crate::cost;
-use crate::css::lex::{Kind, Lexer, Token, ident_is};
+use crate::css::lex::{Kind, Lexer, Nest, Token, ident_is};
 use crate::error::Error;
 use crate::xml::lex::Span;
 
@@ -26,38 +32,82 @@ pub(crate) struct Decl {
 
 impl crate::mem::Plain for Decl {}
 
-impl Decl {
-    /// 名前が ASCII の `want`（小文字）と大文字小文字を問わず同じか。
-    pub(crate) fn is(&self, s: &[u8], want: &[u8]) -> bool {
-        ident_is(s, self.name, self.name_escaped != 0, want)
-    }
+/// 宣言の並びから知らせるもの。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Item {
+    Decl(Decl),
+    /// 読まずに捨てた入れ子の規則かアットルール（規則の中だけ）
+    Nested,
 }
 
-/// 深さ 0 の `;` か `}`（`stop_at_brace` のとき）・終わりまで飛ばす。かっこは組で飛ばす。止まった字句を返す（`;` は読む）。
-pub(crate) fn skip_to_semicolon(lex: &mut Lexer<'_, '_>, stop_at_brace: bool) -> Result<Token, Error> {
-    let mut depth: u32 = 0;
+/// 深さ 0 の `;`（読む）か、`}`（`stop_at_brace` のとき。読まない字句として返す）・終わりまで飛ばす。`first` は読んだ字句。
+fn skip_remnants(
+    lex: &mut Lexer<'_, '_>,
+    nest: &mut Nest<'_>,
+    first: Token,
+    stop_at_brace: bool,
+) -> Result<Token, Error> {
+    nest.clear();
+    let mut t = first;
     loop {
-        let t = lex.next()?;
-        match t.kind {
-            Kind::Eof => return Ok(t),
-            Kind::Semicolon if depth == 0 => return Ok(t),
-            Kind::RBrace if depth == 0 && stop_at_brace => return Ok(t),
-            Kind::LBrace | Kind::LBracket | Kind::LParen | Kind::Function => depth = depth.saturating_add(1),
-            Kind::RBrace | Kind::RBracket | Kind::RParen => depth = depth.saturating_sub(1),
-            _ => {}
+        if nest.top() {
+            match t.kind {
+                Kind::Eof | Kind::Semicolon => return Ok(t),
+                Kind::RBrace if stop_at_brace => return Ok(t),
+                _ => {}
+            }
+        } else if t.kind == Kind::Eof {
+            return Ok(t);
         }
+        nest.feed(&t)?;
+        t = lex.next()?;
     }
 }
 
-/// `lex` から宣言の並びを読み、宣言ごとに `f` を呼ぶ。`in_block` なら深さ 0 の `}` で止まり（読んだ `}` の字句を返す）、
-/// そうでなければ終わりまで読む（`style` 属性）。
+/// 入れ子の規則（`first` は読んだ字句）：深さ 0 の `{…}` の塊を読み終えたら None。深さ 0 の `;` で終われば（壊れた宣言）
+/// None。深さ 0 の `}`・終わりならその字句（並びの終わり）。塊を読んだかを `nested` に書く。
+fn skip_rule(
+    lex: &mut Lexer<'_, '_>,
+    nest: &mut Nest<'_>,
+    first: Token,
+    nested: &mut bool,
+) -> Result<Option<Token>, Error> {
+    nest.clear();
+    let mut t = first;
+    let mut in_block = false;
+    loop {
+        if t.kind == Kind::Eof {
+            *nested |= in_block;
+            return Ok(Some(t));
+        }
+        if nest.top() {
+            match t.kind {
+                Kind::Semicolon => return Ok(None),
+                Kind::RBrace => return Ok(Some(t)),
+                Kind::LBrace => in_block = true,
+                _ => {}
+            }
+        }
+        if nest.feed(&t)? && in_block {
+            // 深さ 0 の塊を閉じた
+            *nested = true;
+            return Ok(None);
+        }
+        t = lex.next()?;
+    }
+}
+
+/// `lex` から宣言の並びを読み、宣言ごと（と、規則の中で捨てた入れ子の規則ごと）に `f` を呼ぶ。`in_block` なら深さ 0 の
+/// `}` で止まり（読んだ `}` の字句を返す）、そうでなければ終わりまで読む（`style` 属性）。
 pub(crate) fn parse_declarations(
     lex: &mut Lexer<'_, '_>,
     s: &[u8],
     in_block: bool,
     budget: &Budget<'_>,
-    f: &mut dyn FnMut(Decl) -> Result<(), Error>,
+    f: &mut dyn FnMut(Item) -> Result<(), Error>,
 ) -> Result<Token, Error> {
+    let budget: &Budget<'_> = budget;
+    let mut nest = Nest::new(budget_ref(budget));
     loop {
         budget.spend(cost::OP_STEP)?;
         let t = lex.next()?;
@@ -66,40 +116,70 @@ pub(crate) fn parse_declarations(
             Kind::Eof => return Ok(t),
             Kind::RBrace if in_block => return Ok(t),
             Kind::AtKeyword => {
-                // アットルール（宣言の中には書けない）：`;` か `{…}` まで飛ばす
-                let mut depth: u32 = 0;
-                loop {
-                    let u = lex.next()?;
-                    match u.kind {
-                        Kind::Eof => return Ok(u),
-                        Kind::Semicolon if depth == 0 => break,
-                        Kind::RBrace if depth == 0 && in_block => return Ok(u),
-                        Kind::LBrace | Kind::LBracket | Kind::LParen | Kind::Function => {
-                            depth = depth.saturating_add(1);
-                        }
-                        Kind::RBrace | Kind::RBracket | Kind::RParen => {
-                            depth = depth.saturating_sub(1);
-                            if depth == 0 && u.kind == Kind::RBrace {
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
+                // アットルール：`;` か `{…}` まで（規則の中なら深さ 0 の `}` で並びが終わる）
+                let mut nested = false;
+                let u = lex.next()?;
+                let end = if in_block {
+                    skip_rule(lex, &mut nest, u, &mut nested)?
+                } else {
+                    skip_rule_attr(lex, &mut nest, u)?
+                };
+                if in_block {
+                    f(Item::Nested)?;
+                }
+                if let Some(e) = end {
+                    return Ok(e);
                 }
             }
             Kind::Ident => {
-                let end = declaration(lex, s, t, in_block, f)?;
+                if let Some(e) = declaration(lex, s, t, in_block, &mut nest, f)? {
+                    return Ok(e);
+                }
+            }
+            _ if in_block => {
+                let mut nested = false;
+                let end = skip_rule(lex, &mut nest, t, &mut nested)?;
+                if nested {
+                    f(Item::Nested)?;
+                }
                 if let Some(e) = end {
                     return Ok(e);
                 }
             }
             _ => {
-                let e = skip_to_semicolon(lex, in_block)?;
+                let e = skip_remnants(lex, &mut nest, t, false)?;
                 if e.kind != Kind::Semicolon {
                     return Ok(e);
                 }
             }
         }
+    }
+}
+
+fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {
+    b
+}
+
+/// `style` 属性の中のアットルール（`first` は名前の次の字句）：深さ 0 の `;` か `{…}` の塊まで。終わりならその字句。
+fn skip_rule_attr(lex: &mut Lexer<'_, '_>, nest: &mut Nest<'_>, first: Token) -> Result<Option<Token>, Error> {
+    nest.clear();
+    let mut t = first;
+    let mut in_block = false;
+    loop {
+        if t.kind == Kind::Eof {
+            return Ok(Some(t));
+        }
+        if nest.top() {
+            match t.kind {
+                Kind::Semicolon => return Ok(None),
+                Kind::LBrace => in_block = true,
+                _ => {}
+            }
+        }
+        if nest.feed(&t)? && in_block {
+            return Ok(None);
+        }
+        t = lex.next()?;
     }
 }
 
@@ -109,56 +189,74 @@ fn declaration(
     s: &[u8],
     name: Token,
     in_block: bool,
-    f: &mut dyn FnMut(Decl) -> Result<(), Error>,
+    nest: &mut Nest<'_>,
+    f: &mut dyn FnMut(Item) -> Result<(), Error>,
 ) -> Result<Option<Token>, Error> {
     let mut t = lex.next()?;
     while t.kind == Kind::Whitespace {
         t = lex.next()?;
     }
     if t.kind != Kind::Colon {
-        // `:` がない：壊れた宣言
-        if matches!(t.kind, Kind::Eof) || (in_block && t.kind == Kind::RBrace) {
-            return Ok(Some(t));
+        if in_block {
+            // `:` がない：入れ子の規則か壊れた宣言
+            let mut nested = false;
+            let end = skip_rule(lex, nest, t, &mut nested)?;
+            if nested {
+                f(Item::Nested)?;
+            }
+            return Ok(end);
         }
-        if t.kind == Kind::Semicolon {
-            return Ok(None);
-        }
-        let e = skip_to_semicolon(lex, in_block)?;
+        let e = skip_remnants(lex, nest, t, false)?;
         return Ok(if e.kind == Kind::Semicolon { None } else { Some(e) });
     }
-    // 値：深さ 0 の `;`・`}`・終わりまで。空白でない最後の 2 つの字句（`!` と `important`）を覚える
-    let mut depth: u32 = 0;
+    // 値：深さ 0 の `;`・`}`（規則の中）・終わりまで。空白でない字句の終わりの位置を後ろから 3 つ覚える（`!` と
+    // `important` の前の値の終わり）
+    let custom = name.inner.of(s).starts_with(b"--");
+    nest.clear();
     let mut first: Option<u32> = None;
-    // 空白でない字句の終わりの位置（最後・その前）と、最後の 2 つの字句
-    let mut last_end: u32 = 0;
+    // ends[0] は最後、ends[1] はその前、ends[2] はさらに前の空白でない字句の終わり
+    let mut ends: [u32; 3] = [0; 3];
+    let mut count = 0u32;
     let mut prev: Option<Token> = None;
     let mut last: Option<Token> = None;
+    let mut block = false;
     let stop = loop {
         let u = lex.next()?;
-        let end_here = match u.kind {
-            Kind::Eof => true,
-            Kind::Semicolon | Kind::RBrace if depth == 0 => u.kind == Kind::Semicolon || in_block,
-            _ => false,
-        };
-        if end_here {
+        if u.kind == Kind::Eof {
             break u;
         }
-        match u.kind {
-            Kind::LBrace | Kind::LBracket | Kind::LParen | Kind::Function => depth = depth.saturating_add(1),
-            Kind::RBrace | Kind::RBracket | Kind::RParen => depth = depth.saturating_sub(1),
-            _ => {}
+        if nest.top() {
+            match u.kind {
+                Kind::Semicolon => break u,
+                Kind::RBrace if in_block => break u,
+                Kind::LBrace if in_block && !custom => block = true,
+                _ => {}
+            }
+        }
+        let closed = nest.feed(&u)?;
+        if block && closed {
+            // 値に深さ 0 の `{…}` がある宣言は、その塊までの入れ子の規則（CSS Syntax「consume a declaration」と
+            // 「consume a qualified rule」）
+            f(Item::Nested)?;
+            return Ok(None);
         }
         if u.kind != Kind::Whitespace {
             if first.is_none() {
                 first = Some(u.span.start);
             }
-            last_end = u.span.end;
+            ends = [u.span.end, ends[0], ends[1]];
+            count = count.saturating_add(1);
             prev = last;
             last = Some(u);
         }
     };
-    let start = first.unwrap_or(last_end);
-    let mut value = Span { start, end: last_end.max(start) };
+    if block {
+        // 塊が閉じないまま終わった（入れ子の規則）
+        f(Item::Nested)?;
+        return Ok(Some(stop));
+    }
+    let start = first.unwrap_or(ends[0]);
+    let mut value = Span { start, end: ends[0].max(start) };
     let mut important = 0u8;
     if let (Some(p), Some(l)) = (prev, last)
         && p.is_delim(b'!')
@@ -166,16 +264,11 @@ fn declaration(
         && ident_is(s, l.inner, l.escaped, b"important")
     {
         important = 1;
-        // `!` の前の空白でない所まで
-        let mut e = p.span.start as usize;
-        while e > start as usize
-            && s.get(e.saturating_sub(1)).is_some_and(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C))
-        {
-            e = e.saturating_sub(1);
-        }
-        value = Span { start, end: (e as u32).max(start) };
+        // `!` の前の空白でない字句の終わりまで
+        let end = if count >= 3 { ends[2] } else { start };
+        value = Span { start, end: end.max(start) };
     }
-    f(Decl { name: name.inner, value, important, name_escaped: u8::from(name.escaped), pad: [0; 2] })?;
+    f(Item::Decl(Decl { name: name.inner, value, important, name_escaped: u8::from(name.escaped), pad: [0; 2] }))?;
     Ok(if stop.kind == Kind::Semicolon { None } else { Some(stop) })
 }
 

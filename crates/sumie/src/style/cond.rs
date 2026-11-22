@@ -10,7 +10,7 @@
 use crate::budget::Budget;
 use crate::cost;
 use crate::css::lex::{Kind, Lexer, Token, ident_is};
-use crate::css::select::{Tables, parse_selector_list};
+use crate::css::select::{NsTable, Tables, parse_selector_list};
 use crate::error::Error;
 use crate::mem::{MVec, Plain};
 use crate::style::ColorScheme;
@@ -152,7 +152,13 @@ type Leaf<'f> = &'f mut dyn FnMut(&mut Cur<'_, '_>, Span) -> Result<Tri, Error>;
 
 /// `not`・`and`・`or` とかっこの条件を読む（かっこの中身が条件か特徴かは `leaf` が見分ける前に、`(` のあとが `not`・`(` で
 /// 始まるかで決める）。
-fn condition(c: &mut Cur<'_, '_>, budget: &Budget<'_>, leaf: Leaf<'_>, stop_at_comma: bool) -> Result<Tri, Error> {
+fn condition(
+    c: &mut Cur<'_, '_>,
+    budget: &Budget<'_>,
+    leaf: Leaf<'_>,
+    ns: NsTable<'_>,
+    stop_at_comma: bool,
+) -> Result<Tri, Error> {
     let mut stack: MVec<'_, Frame> = MVec::new(budget_ref(budget));
     stack.push(Frame { acc: Tri::True, op: 0, negate: false, started: false, chain: 0, pad: [0; 3] })?;
     loop {
@@ -191,7 +197,7 @@ fn condition(c: &mut Cur<'_, '_>, budget: &Budget<'_>, leaf: Leaf<'_>, stop_at_c
                     // `selector(…)` などの関数（葉に渡す。知らない関数は分からない）
                     c.next()?;
                     let inner = c.skip_parens()?;
-                    Some(function_leaf(c.s, t, inner, budget)?)
+                    Some(function_leaf(c.s, t, inner, ns, budget)?)
                 }
                 _ => None,
             }
@@ -268,12 +274,12 @@ fn condition(c: &mut Cur<'_, '_>, budget: &Budget<'_>, leaf: Leaf<'_>, stop_at_c
 }
 
 /// `selector(…)` の葉（`@supports`）。ほかの関数は分からない。
-fn function_leaf(s: &[u8], f: Token, inner: Span, budget: &Budget<'_>) -> Result<Tri, Error> {
+fn function_leaf(s: &[u8], f: Token, inner: Span, ns: NsTable<'_>, budget: &Budget<'_>) -> Result<Tri, Error> {
     if !ident_is(s, f.inner, f.escaped, b"selector") {
         return Ok(Tri::Unknown);
     }
     let mut t = Tables::new(budget_ref(budget));
-    Ok(Tri::of(parse_selector_list(s, inner, &[], &mut t, budget)?.is_some()))
+    Ok(Tri::of(parse_selector_list(s, inner, ns, &mut t, budget)?.is_some()))
 }
 
 /// `@media` の問いの並び（`range` は字句の範囲）が真か。空の並びは真。
@@ -348,7 +354,7 @@ fn media_query(c: &mut Cur<'_, '_>, env: &Env, budget: &Budget<'_>) -> Result<Tr
         let n = c.peek()?;
         if n.kind == Kind::Ident && ident_is(c.s, n.inner, n.escaped, b"and") {
             c.next()?;
-            let rest = condition(c, budget, &mut leaf, true)?;
+            let rest = condition(c, budget, &mut leaf, NsTable::EMPTY, true)?;
             v = v.and(rest);
         } else if !matches!(n.kind, Kind::Eof | Kind::Comma) {
             return Ok(Tri::Unknown);
@@ -363,7 +369,7 @@ fn media_query(c: &mut Cur<'_, '_>, env: &Env, budget: &Budget<'_>) -> Result<Tr
             v
         });
     }
-    let v = condition(c, budget, &mut leaf, true)?;
+    let v = condition(c, budget, &mut leaf, NsTable::EMPTY, true)?;
     Ok(if v == Tri::Unknown { Tri::False } else { v })
 }
 
@@ -600,11 +606,11 @@ fn range_feature(s: &[u8], name: Token, op: u8, eq: bool, v: Token, flip: bool, 
 }
 
 /// `@supports` の条件が真か。
-pub(crate) fn supports(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<bool, Error> {
+pub(crate) fn supports(s: &[u8], range: Span, ns: NsTable<'_>, budget: &Budget<'_>) -> Result<bool, Error> {
     let budget = budget_ref(budget);
     let mut c = Cur { s, lex: Lexer::over(s, range, budget), peeked: None };
     let mut leaf = |cur: &mut Cur<'_, '_>, inner: Span| declaration_leaf(cur.s, inner, budget);
-    Ok(condition(&mut c, budget, &mut leaf, false)? == Tri::True)
+    Ok(condition(&mut c, budget, &mut leaf, ns, false)? == Tri::True)
 }
 
 /// `(名前: 値)` が sumie の読める宣言か。

@@ -62,7 +62,8 @@ fn media_queries() {
 #[test]
 fn supports_conditions() {
     let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
-    let sp = |q: &str| supports(q.as_bytes(), Span::new(0, q.len()), &budget).unwrap();
+    let sp =
+        |q: &str| supports(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap();
     assert!(sp("(fill: green)"));
     assert!(sp("(FILL: inherit)"));
     assert!(!sp("(fill: 1px)"));
