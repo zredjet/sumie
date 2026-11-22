@@ -4,6 +4,7 @@
 
 #![allow(dead_code, reason = "M1 の style の単位で、カスケードからプロパティの表と値の確かめを使う")]
 
+pub(crate) mod cond;
 pub(crate) mod props;
 pub(crate) mod valid;
 
