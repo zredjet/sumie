@@ -29,9 +29,9 @@
 CC BY 4.0（https://creativecommons.org/licenses/by/4.0/）で使う。変えていない（取ったバイト列のまま。`MANIFEST.jsonl` の
 BLAKE3 と git の blob）。
 
-Wikimedia Commons の秀逸なベクター画像（パブリックドメイン・CC0・CC BY だけ。git の外の予定）は、取りに行ったところ
-Wikimedia が自動の取り出しを 429（取りすぎ）で断ったので、M0 では取っていない（`corpus fetch-real --only
-commons-featured-vector` は 1 分に 20 件まで・やり直しつきで取る。ADR-59 (3)）。
+Wikimedia Commons の秀逸なベクター画像は、Wikimedia が自動の取り出しを 429（取りすぎ）で断ったうえ、6 つの集まりで代わりが
+足りるので使わない（ADR-59 (3)・ADR-63 (2)。取りに行く道具も消した）。編集ソフトの書き出しの書き方（DOCTYPE・実体・名前空間）は、
+Kura のファズのコーパス（読むだけ。写さない）で照らす。
 
 自作の試験の SVG は `tests/svg/`（コミットする）。
 
@@ -54,8 +54,7 @@ commons-featured-vector` は 1 分に 20 件まで・やり直しつきで取る
 # resvg の試験（rev 68b14c4c3bcc と SHA-256 は道具の定数。取ったアーカイブを照らしてから写す。--archive <取ったもの> も使える）
 cargo run -p sumie-tools --release -- corpus import-resvg
 cargo run -p sumie-tools --release -- corpus index
-# 実例の SVG（rev は道具の定数。git の blob の SHA-1 を照らしてから写す。集まりの名前を指して 1 つずつ。
-# Commons（commons-featured-vector）は名前で指したときだけ取る。M0 では取っていない。ADR-59 (3)）
+# 実例の SVG（rev は道具の定数。git の blob の SHA-1 を照らしてから写す。--only で集まりを 1 つずつ。ADR-59）
 cargo run -p sumie-tools --release -- corpus fetch-real --only fluent-emoji-color   # fluent-emoji-flat・twemoji・flag-icons・bootstrap-icons・tabler-icons も同じ
 # W3C の試験（git の外）
 cargo run -p sumie-tools --release -- corpus fetch-w3c

@@ -58,7 +58,8 @@
   resvg 単体の時間・確保のピークを測る（ADR-19・ADR-35）。→ architecture.md §10（ADR-57 (3)・ADR-58 (2)）
 - [x] Kura の側に、照合の集まりを Kura の今の `SvgCodec` に通した「断る／描く」の一覧を作ってもらうよう、ユーザーに頼む
   （働き手を通さず、プロセスの中の `SvgCodec` で。このリポジトリからは Kura で cargo を走らせない。一覧は Kura の rev つきで
-  `corpus/` の中に置く。NFR-10。依頼文は `corpus/kura-request.md`。M0 の終わりの時点で一覧は未着）。Kura の手元の SVG（Kura の働き手の実測に使った 1,439 件）の置き場所をユーザーに聞き、git の
+  `corpus/` の中に置く。NFR-10。依頼文は `corpus/kura-request.md`。M0 の終わりの時点で一覧は未着。のちに依頼を取り下げ、
+  NFR-10 は Kura の設定の resvg と照らす（ADR-63 (1)））。Kura の手元の SVG（Kura の働き手の実測に使った 1,439 件）の置き場所をユーザーに聞き、git の
   外で Kura の `SvgCodec` と sumie の両方に通して「描く／断る」と大きさの一致を照らす仕組みを作る（結果の一覧だけを残す。
   ライセンスでコミットできないため）。→ 仕組みは `kura-compat` で作った。1,439 件は消えていて使えないので、代わりに実例の
   SVG 1,241 件を `corpus/real/` に取り込んだ（ADR-58 (3)・ADR-59）
@@ -86,14 +87,14 @@
 - [ ] `style`：プロパティの表・カスケード・継承・`currentColor`・em・ex
 - [ ] `doc`：ID の表・参照（保守的な辺。受け継ぐ参照と use の文脈）・輪・展開の数・`switch`・`tref`・大きさ
 - [ ] `estimate_parse`（本文を 1 度だけ字句に分けて数える）・`estimate_build`（文字を除く）・`Report` の骨組み
-- [ ] Kura の一覧が届いていたら、`kura-compat` で resvg（Kura の設定）の大きさと照らし（一覧の写し方の誤りを見つける）、sumie の
-  `parse`・`pixel_size`・形の結果を並べる（`corpus/kura-request.md`）
+- [ ] NFR-10 の照らし（ADR-63 (1)）：照合の集まりで、Kura の設定の resvg が読めるもの（大きさが出るもの）を sumie の `parse` が
+  断らないこと・大きさが同じこと（`sumie-tools sizes`）。外れるものは一覧にして承認を得る
 - [ ] 大きさを中身で決める文書（ADR-58 (1)）：`Document::size`・`pixel_size` の型（「木が要る」の返し方）と、外接矩形の細かい
   規則（線の太さを含まない・片方だけある幅と高さ・%）を resvg と照らして決める（例：resvg の試験の `structure/svg/no-size`
   は 199 × 199・`tests/svg/m0/no-size.svg` は 50 × 50・W3C の `struct-frag-01`・`04`）
 - [ ] M1 で resvg と照らして決める項目を確かめ、decisions.md に追記する：同じ id の扱い・`requiredFeatures`・輪の参照の扱い・
   大きさの端（0・負・1 未満・%）・CSS のセレクタとアットルールの範囲・XML の整形式の厳しさ（roxmltree が受けるもの）・ATTLIST の
-  既定の属性値を当てないこと（XML 1.0 §5.1 と違うが roxmltree と同じ）・`Document::needs` の `<image>` の判定を Kura の一覧と照らす
+  既定の属性値を当てないこと（XML 1.0 §5.1 と違うが roxmltree と同じ）・`Document::needs` の `<image>` の判定を usvg が実際に解いた `<image>` と照らす（ADR-63 (1)）
 - [ ] ファズの対象：`xml`・`dtd`・`css`・`values`・`document`
 - [ ] `sumie-tools` に計算した値の照合（usvg 0.48.1 の木と、節の数・変形・塗り・不透明度などを比べる）
 
@@ -220,8 +221,8 @@ pattern・clipPath・mask の中身にして 3,000 回参照）を上限の内�
 ## M7　Kura に入れる仕上げ
 
 - [ ] 手間の係数の校正のし直し（1 単位 ≈ 1 ns。各マイルストーンの仮の校正をまとめ直す）と上限の既定値の校正
-- [ ] Kura の一覧（照合の集まりと実例の SVG を Kura の `SvgCodec` に通したもの。`corpus/kura-request.md`）で、NFR-10・A-02 を
-  `kura-compat` で照らす（Kura の手元の SVG は消えたので、実例の SVG で代える。ADR-58 (3)・ADR-59）
+- [ ] NFR-10・A-02 を、Kura の設定の resvg と照らす（照合の集まりと実例の SVG。Kura の側の一覧は取り下げた。ADR-58 (3)・ADR-59・
+  ADR-63 (1)）
 - [ ] 版の凍結（`sumie-render/1`）とゴールデンの凍結（以後は追記だけ）
 - [ ] 性能の計測と目標の確認（ADR-19）
 - [ ] resvg との差の記録（`docs/differences.md`）

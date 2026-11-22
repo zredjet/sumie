@@ -118,8 +118,8 @@ pub struct StyleDefaults<'a> {         // 既定は const の StyleDefaults::USV
 }
 
 impl<'s> Document<'s> {
-    pub fn size(&self) -> Size;                         // ユーザー単位の幅・高さ（中身で決まる文書は「木が要る」。下の注）
-    pub fn pixel_size(&self, scale: f64) -> Result<PixelSize, Error>;
+    pub fn size(&self) -> Option<Size>;                 // ユーザー単位の幅・高さ（None は中身で決まる＝木が要る。ADR-63 (3)）
+    pub fn pixel_size(&self, scale: f64) -> Result<Option<PixelSize>, Error>;
     pub fn needs(&self) -> Needs;                       // 文字があるか・描く木に入りうる <image> の種類（§3.1）
     pub fn report(&self) -> &Report;                    // この段までの警告・読まなかった参照
     pub fn estimate_build(&self, res: &Resources<'_>, cancel: &dyn Cancel) -> Result<Estimate, Error>;
@@ -209,12 +209,12 @@ Kura の「形」（値を描かずに大きさなどを読む。今の Kura は
 `Plan::estimate_region` は `RenderEstimate.render` を超えない（Kura がタイルで描いても形の約束が保てる。試験で確かめる）。
 大きさだけなら `parse` → `pixel_size` で足りる。ただし viewBox も幅・高さもない（か %）文書は、usvg と同じく中身の外接矩形の
 右下を大きさにする（FR-OUT-01・ADR-58 (1)）ので、木を作るまで大きさが決まらない。`Document::size`・`pixel_size` はそれを
-「中身で決まる（木が要る）」と返す形にし（型は M1 の計画で決める）、大きさは `Tree::size`・`pixel_size` から読む。Kura の形は
+「中身で決まる（木が要る）」として `None` を返し（ADR-63 (3)）、大きさは `Tree::size`・`pixel_size` から読む。Kura の形は
 もともと木まで作るので、Kura の側の手間は変わらない。
 
 `Document::needs` の画像は「描く木に入りうる `<image>`」：参照の辺（§4.3）でたどれるものを保守的に数え、参照されない `defs`・
 `display: none` の部分木・通らない `switch` の枝の中のものは除く（今の Kura は usvg が実際に解いた `<image>` だけで断るので、
-これらは描ける。M1 で Kura の一覧と照らす）。文字は要素の有無で決める（Kura と同じ）。
+これらは描ける。M1 で usvg が実際に解いた `<image>` と照らす。ADR-63 (1)）。文字は要素の有無で決める（Kura と同じ）。
 
 | 誤り | 決まる段 |
 |---|---|
@@ -549,7 +549,7 @@ M0 にあるのは `oracle`・`compare`・`bench`（と子の `bench-one`）・`
 | `oracle chrome` | `/Applications/Google Chrome.app` のヘッドレスで描く（決めた描き方は下の「Chrome の描き方」。Chrome の版を記録）。PNG はストレートなので、決めた式で乗算済みに直す |
 | `compare` | 2 つの描画の差を乗算済みの RGBA8 で測る（ADR-15 の基準）・差の画像・一覧の HTML |
 | `corpus` | 照合の集まりの取り込み（出どころ・版・ライセンス・ダイジェストの一覧。resvg の試験・W3C・実例の SVG。ADR-21・ADR-59）と、使っている機能での分類（マイルストーンごとの範囲を選ぶ） |
-| `kura-compat` | Kura の側の「描く／断る」と大きさの一覧（`corpus/kura-request.md`）と照らす（NFR-10。ADR-62 (4)） |
+| `kura-compat` | Kura の側の「描く／断る」と大きさの一覧（`corpus/kura-request.md`）と照らす（ADR-62 (4)。依頼は取り下げたので、一覧が届いたときに使う。ADR-63 (1)） |
 | `oracle-lock` | 照合の相手の依存の閉包の版と checksum を Kura の Cargo.lock と照らして記録する（ADR-57 (1)・ADR-60 (5)） |
 | `gen-disallowed`・`check-lint-probe` | ライブラリの禁じる口の一覧を std の文書から作る・それが本当に拾われるかを試しのクレートで確かめる（ADR-49） |
 | `gen-heavy` | 重い入力の生成（下の表）。種と引数を固定し、作った入力のダイジェストを記録する |
