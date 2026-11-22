@@ -41,6 +41,14 @@ pub(crate) enum Kind {
     Spacing,
     /// `line-height`（`normal`・数・長さか割合）
     LineHeight,
+    /// `font-style`（`normal`・`italic`・`oblique <角度>?`）
+    FontStyle,
+    /// `font-stretch`（言葉か負でない割合）
+    FontStretch,
+    /// `display`（CSS Display 3 の 1 つ・2 つの言葉の書き方）
+    Display,
+    /// `overflow`（1 つか 2 つの言葉）
+    Overflow,
     /// `font` のまとめ（カスケードで長い名前に分ける）
     Font,
     /// `baseline`・`sub`・`super` か長さか割合
@@ -87,7 +95,7 @@ const LINECAP: &[&[u8]] = &[b"butt", b"round", b"square"];
 const LINEJOIN: &[&[u8]] = &[b"miter", b"miter-clip", b"round", b"bevel", b"arcs"];
 const RULE: &[&[u8]] = &[b"nonzero", b"evenodd"];
 const VISIBILITY: &[&[u8]] = &[b"visible", b"hidden", b"collapse"];
-const DISPLAY: &[&[u8]] = &[
+pub(crate) const DISPLAY: &[&[u8]] = &[
     b"inline",
     b"block",
     b"none",
@@ -111,7 +119,7 @@ const DISPLAY: &[&[u8]] = &[
     b"contents",
     b"flow-root",
 ];
-const OVERFLOW: &[&[u8]] = &[b"visible", b"hidden", b"scroll", b"auto", b"clip"];
+pub(crate) const OVERFLOW: &[&[u8]] = &[b"visible", b"hidden", b"scroll", b"auto", b"clip", b"overlay"];
 const RENDERING: &[&[u8]] = &[b"auto", b"optimizespeed", b"crispedges", b"geometricprecision"];
 const COLOR_RENDERING: &[&[u8]] = &[b"auto", b"optimizespeed", b"optimizequality"];
 const TEXT_RENDERING: &[&[u8]] = &[b"auto", b"optimizespeed", b"optimizelegibility", b"geometricprecision"];
@@ -157,8 +165,7 @@ const WRITING_MODE: &[&[u8]] = &[
     b"tb-rl",
 ];
 const DIRECTION: &[&[u8]] = &[b"ltr", b"rtl"];
-const FONT_STYLE: &[&[u8]] = &[b"normal", b"italic", b"oblique"];
-const FONT_STRETCH: &[&[u8]] = &[
+pub(crate) const FONT_STRETCH: &[&[u8]] = &[
     b"normal",
     b"ultra-condensed",
     b"extra-condensed",
@@ -235,7 +242,7 @@ pub(crate) const PROPS: &[Prop] = &[
     pu(b"cy", false, true, Kind::Length),
     p(b"d", false, true, Kind::Path),
     p(b"direction", true, true, Kind::Keywords(DIRECTION)),
-    p(b"display", false, true, Kind::Keywords(DISPLAY)),
+    p(b"display", false, true, Kind::Display),
     p(b"dominant-baseline", true, true, Kind::Keywords(DOMINANT)),
     p(b"enable-background", false, true, Kind::Raw),
     p(b"fill", true, true, Kind::Paint),
@@ -250,8 +257,8 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"font-kerning", true, false, Kind::Keywords(FONT_KERNING)),
     p(b"font-size", true, true, Kind::FontSize),
     p(b"font-size-adjust", true, true, Kind::Raw),
-    p(b"font-stretch", true, true, Kind::Keywords(FONT_STRETCH)),
-    p(b"font-style", true, true, Kind::Keywords(FONT_STYLE)),
+    p(b"font-stretch", true, true, Kind::FontStretch),
+    p(b"font-style", true, true, Kind::FontStyle),
     p(b"font-variant", true, true, Kind::Raw),
     p(b"font-variation-settings", true, false, Kind::Raw),
     p(b"font-weight", true, true, Kind::FontWeight),
@@ -272,7 +279,7 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"mask-type", false, true, Kind::Keywords(MASK_TYPE)),
     p(b"mix-blend-mode", false, false, Kind::Keywords(BLEND)),
     p(b"opacity", false, true, Kind::Opacity),
-    p(b"overflow", false, true, Kind::Keywords(OVERFLOW)),
+    p(b"overflow", false, true, Kind::Overflow),
     p(b"paint-order", true, true, Kind::PaintOrder),
     p(b"pointer-events", true, true, Kind::Keywords(POINTER_EVENTS)),
     pu(b"r", false, true, Kind::LengthNonNeg),

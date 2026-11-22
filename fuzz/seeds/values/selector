@@ -1,0 +1,1 @@
+selector(rect:is(.a, #b) > g) and (not (foo)) or ((fill: red) and (stroke: blue))

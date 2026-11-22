@@ -656,7 +656,11 @@ pub fn values_parse(data: &[u8]) -> Check {
     let run = |viewport: bool| -> Result<[bool; 12], Error> {
         let b = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
         let cx = Ctx { attr, unitless: attr || p.unitless, viewport };
-        let env = Env { color_scheme: crate::style::ColorScheme::Light, size: viewport.then_some((100.0, 50.0)) };
+        let env = Env {
+            color_scheme: crate::style::ColorScheme::Light,
+            size: viewport.then_some((100.0, 50.0)),
+            font_size: 12.0,
+        };
         let out = [
             wide(text, range, &b)?.is_some(),
             valid(p.kind, text, range, cx, &b)?,

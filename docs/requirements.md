@@ -101,7 +101,7 @@
 |---|---|---|
 | FR-PT-01 | M | 塗り：`none`・色・`url(#id)`（あとに代わりの色を付けられる）・`currentColor`・`context-fill`・`context-stroke`（marker の中。SVG 2） |
 | FR-PT-02 | M | 色：SVG の 147 の名前・`#rgb`・`#rgba`・`#rrggbb`・`#rrggbbaa`・`rgb()`・`rgba()`・`hsl()`・`hsla()`・`transparent`。CSS Color 4 の `/` の α と `hwb()` も読む。システムの色は読まない。`lab()`・`oklch()` などは M1 では読まずに警告し、照らしてから決める（ADR-66 (4)） |
-| FR-PT-03 | M | `fill-rule`・`fill-opacity`・`stroke-opacity`・`stroke-width`・`stroke-linecap`・`stroke-linejoin`（`miter`・`round`・`bevel`・`miter-clip`・`arcs` は resvg と同じ扱い）・`stroke-miterlimit`・`stroke-dasharray`（奇数個は 2 度並べる・% ・負や合計 0 は実線）・`stroke-dashoffset` |
+| FR-PT-03 | M | `fill-rule`・`fill-opacity`・`stroke-opacity`・`stroke-width`・`stroke-linecap`・`stroke-linejoin`（`miter`・`round`・`bevel`・`miter-clip`・`arcs` は resvg と同じ扱い）・`stroke-miterlimit`（負だけが壊れた値。1 未満は継ぎ目がいつも bevel。ADR-76）・`stroke-dasharray`（奇数個は 2 度並べる・% ・負や合計 0 は実線）・`stroke-dashoffset` |
 | FR-PT-04 | M | `paint-order`・`vector-effect: non-scaling-stroke`・`shape-rendering`（`crispEdges` は反エイリアスなし。`optimizeSpeed` は resvg と同じ扱い。M2 で照らす） |
 | FR-PT-05 | M | `linearGradient`・`radialGradient`：`gradientUnits`・`gradientTransform`・`spreadMethod`（pad・reflect・repeat）・`href` の鎖での属性と stop の受け継ぎ（輪は FR-CO-05）・焦点（`fx`・`fy`・SVG 2 の `fr`）・stop の offset の切り詰めと単調化・`stop-color`・`stop-opacity`。stop が 1 つなら単色、0 なら塗らない。stop が多くても・同じ offset が多くても、画素ごとの仕事は stop の数に比例しない（Kura の S2・S3） |
 | FR-PT-06 | M | `pattern`：`patternUnits`・`patternContentUnits`・`patternTransform`・`viewBox`・`preserveAspectRatio`・`x`・`y`・`width`・`height`・`href` の鎖での受け継ぎ・入れ子の pattern |

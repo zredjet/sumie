@@ -1,6 +1,6 @@
 //! 種つきの変異の試験（CLAUDE.md・architecture.md §9）。種と回数を固定し、`sumie-testkit` の ChaCha8 で作った入力を
 //! ファズの入り口（`sumie::fuzzing`）に通して、不変の条件・panic しないこと・ヒープの山 ≤ 数えた山を確かめる。
-//! 段ごとのパーサーの対象：XML（M1 の xml・dtd）。
+//! 段ごとのパーサーの対象：M1 の xml・dtd・css・values・document（読む段の全体）。
 
 #![allow(
     clippy::unwrap_used,
@@ -311,11 +311,40 @@ fn css_survives_seeded_mutations() {
     assert!(ok > 500 && err > 10, "読めた {ok}・読めない {err}");
 }
 
+/// 値の目印の字句（CSS の目印に足す）。
+const VALUE_DICT: &[&[u8]] = &[
+    b"not ",
+    b" and ",
+    b" or ",
+    b"deg",
+    b"turn",
+    b"/",
+    b"none",
+    b"inherit",
+    b"hsl(",
+    b"rgb(",
+    b"hwb(",
+    b"matrix(",
+    b"translate(",
+    b"rotate(",
+    b"#",
+    b"%",
+    b"em",
+    b"vw",
+    b"(min-width: ",
+    b"(aspect-ratio: 1/2)",
+    b"selector(",
+    b"normal",
+    b"oblique",
+    b"!important",
+];
+
 #[test]
 fn values_survive_seeded_mutations() {
     let seeds = fuzz_seeds("values");
     let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
-    for (n, case) in cases(0x5eed_0008, 4000, &refs, CSS_DICT, 512).iter().enumerate() {
+    let dict: Vec<&[u8]> = CSS_DICT.iter().chain(VALUE_DICT).copied().collect();
+    for (n, case) in cases(0x5eed_0008, 4000, &refs, &dict, 512).iter().enumerate() {
         let (out, heap) = measure(|| values_parse(case));
         assert_eq!(out, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
         assert_eq!(heap.current, 0, "{n} 件目：返していない確保");

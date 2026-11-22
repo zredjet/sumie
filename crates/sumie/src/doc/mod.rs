@@ -154,7 +154,11 @@ fn pipeline<'s>(svg: &'s [u8], opts: &ParseOptions<'_>, budget: &Budget<'_>) -> 
     let sheet = read_sheets(&doc, svg, budget)?;
     // `@media` と vw などに使う大きさは既定の文字の大きさで解く（根の文字の大きさは `@media` に依りうる。ADR-74 (7)）
     let media_size = size_rule(&doc, svg, opts.style.font_size, budget)?;
-    let env = Env { color_scheme: opts.style.color_scheme, size: media_size.known().map(|s| (s.width, s.height)) };
+    let env = Env {
+        color_scheme: opts.style.color_scheme,
+        size: media_size.known().map(|s| (s.width, s.height)),
+        font_size: opts.style.font_size,
+    };
     let styles = cascade(&doc, svg, &sheet, &env, budget)?;
     // 文書の大きさの em などは根の要素の文字の大きさで解く（usvg と同じ）
     let root_font = root_font_size(&doc, svg, &sheet, &styles, opts.style.font_size, budget)?;

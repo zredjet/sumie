@@ -81,7 +81,8 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
         Kind::Length => len_of(&mut v, cx)?.is_some(),
         Kind::LengthNonNeg => len_of(&mut v, cx)?.is_some_and(|l| l.value >= 0.0),
         Kind::LengthAuto => v.eat_ident(b"auto")? || len_of(&mut v, cx)?.is_some_and(|l| l.value >= 0.0),
-        Kind::MiterLimit => v.number()?.is_some_and(|n| n >= 1.0),
+        // 負だけが壊れた値（0 以上 1 未満は継ぎ目がいつも bevel になる。SVG 2・Chrome と同じ）
+        Kind::MiterLimit => v.number()?.is_some_and(|n| n >= 0.0),
         Kind::Keywords(list) => {
             let t = v.next()?;
             t.kind == Tk::Ident && list.iter().any(|w| ident_is(s, t.inner, t.escaped, w))
@@ -119,6 +120,35 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
         Kind::FontSize => font_size(&mut v, cx)?,
         Kind::FontWeight => font_weight(&mut v)?,
         Kind::LineHeight => line_height(&mut v, cx)?,
+        Kind::FontStyle => font_style(&mut v)?,
+        Kind::FontStretch => {
+            let t = v.next()?;
+            match t.kind {
+                Tk::Ident => {
+                    ident_is(s, t.inner, t.escaped, b"normal")
+                        || crate::style::props::FONT_STRETCH.iter().any(|w| ident_is(s, t.inner, t.escaped, w))
+                }
+                Tk::Percentage => t.finite && t.value >= 0.0,
+                _ => false,
+            }
+        }
+        Kind::Display => display(&mut v, budget)?,
+        Kind::Overflow => {
+            let mut n = 0u32;
+            let mut ok = true;
+            while !v.at_end()? {
+                let t = v.next()?;
+                n = n.saturating_add(1);
+                if n > 2
+                    || t.kind != Tk::Ident
+                    || !crate::style::props::OVERFLOW.iter().any(|w| ident_is(s, t.inner, t.escaped, w))
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            ok && n > 0
+        }
         Kind::Spacing => v.eat_ident(b"normal")? || len_of(&mut v, cx)?.is_some(),
         Kind::BaselineShift => {
             v.eat_ident(b"baseline")? || v.eat_ident(b"sub")? || v.eat_ident(b"super")? || len_of(&mut v, cx)?.is_some()
@@ -170,7 +200,7 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
                     b"saturate",
                     b"sepia",
                 ];
-                functions_or_urls(&mut v, FNS)?
+                functions_or_urls(&mut v, FNS, cx)?
             }
         }
         Kind::ClipPath => {
@@ -190,23 +220,27 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
                 if url(&mut v)? {
                     true
                 } else {
+                    // 形の関数と箱の言葉を、それぞれ高々 1 つ（順は問わない）
+                    let (mut shape, mut boxed) = (0u32, 0u32);
                     let mut ok = true;
-                    let mut any = false;
                     while !v.at_end()? {
                         let t = v.next()?;
                         match t.kind {
                             Tk::Function if FNS.iter().any(|w| ident_is(s, t.inner, t.escaped, w)) => {
-                                skip_args(&mut v)?;
+                                shape = shape.saturating_add(1);
+                                ok &= skip_args(&mut v, cx)?;
                             }
-                            Tk::Ident if BOXES.iter().any(|w| ident_is(s, t.inner, t.escaped, w)) => {}
-                            _ => {
-                                ok = false;
-                                break;
+                            Tk::Ident if BOXES.iter().any(|w| ident_is(s, t.inner, t.escaped, w)) => {
+                                boxed = boxed.saturating_add(1);
                             }
+                            _ => ok = false,
                         }
-                        any = true;
+                        if !ok || shape > 1 || boxed > 1 {
+                            ok = false;
+                            break;
+                        }
                     }
-                    ok && any
+                    ok && shape.saturating_add(boxed) > 0
                 }
             }
         }
@@ -217,8 +251,9 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
             } else {
                 let t = v.next()?;
                 if t.kind == Tk::Function && ident_is(s, t.inner, t.escaped, b"path") {
+                    // 値の終わりで閉じない関数は閉じたものとする（CSS Syntax）
                     let a = v.next()?;
-                    a.kind == Tk::Str && v.next()?.kind == Tk::RParen
+                    a.kind == Tk::Str && matches!(v.next()?.kind, Tk::RParen | Tk::Eof)
                 } else {
                     false
                 }
@@ -250,20 +285,27 @@ fn url(v: &mut Values<'_, '_>) -> Result<bool, Error> {
         Tk::Function if ident_is(v.s, t.inner, t.escaped, b"url") => {
             v.next()?;
             let a = v.next()?;
-            Ok(a.kind == Tk::Str && v.next()?.kind == Tk::RParen)
+            Ok(a.kind == Tk::Str && matches!(v.next()?.kind, Tk::RParen | Tk::Eof))
         }
         _ => Ok(false),
     }
 }
 
-/// 関数の引数を組の `)` まで飛ばす（かっこは種類ごとに組で）。
-fn skip_args(v: &mut Values<'_, '_>) -> Result<(), Error> {
+/// 関数の引数を組の `)` まで飛ばす（かっこは種類ごとに組で）。大きさの決まらない文書で表示の領域の単位があれば偽。
+fn skip_args(v: &mut Values<'_, '_>, cx: Ctx) -> Result<bool, Error> {
     let mut nest = crate::css::lex::Nest::new(v.budget());
+    let mut ok = true;
     loop {
         let t = v.next()?;
         match t.kind {
-            Tk::Eof => return Ok(()),
-            Tk::RParen if nest.top() => return Ok(()),
+            Tk::Eof => return Ok(ok),
+            Tk::RParen if nest.top() => return Ok(ok),
+            Tk::Dimension if !cx.viewport => {
+                let is = |w: &[u8]| ident_is(v.s, t.inner, t.escaped, w);
+                if is(b"vw") || is(b"vh") || is(b"vmin") || is(b"vmax") || is(b"vi") || is(b"vb") {
+                    ok = false;
+                }
+            }
             _ => {}
         }
         nest.feed(&t)?;
@@ -271,7 +313,7 @@ fn skip_args(v: &mut Values<'_, '_>) -> Result<(), Error> {
 }
 
 /// `url()` か、決まった名前の関数の並び（1 つ以上）。
-fn functions_or_urls(v: &mut Values<'_, '_>, fns: &[&[u8]]) -> Result<bool, Error> {
+fn functions_or_urls(v: &mut Values<'_, '_>, fns: &[&[u8]], cx: Ctx) -> Result<bool, Error> {
     let mut any = false;
     while !v.at_end()? {
         if url(v)? {
@@ -280,13 +322,76 @@ fn functions_or_urls(v: &mut Values<'_, '_>, fns: &[&[u8]]) -> Result<bool, Erro
         }
         let t = v.next()?;
         if t.kind == Tk::Function && fns.iter().any(|w| ident_is(v.s, t.inner, t.escaped, w)) {
-            skip_args(v)?;
+            if !skip_args(v, cx)? {
+                return Ok(false);
+            }
             any = true;
         } else {
             return Ok(false);
         }
     }
     Ok(any)
+}
+
+/// `font-style`：`normal`・`italic`・`oblique <角度 -90deg〜90deg>?`（CSS Fonts 4 §2.4）。
+fn font_style(v: &mut Values<'_, '_>) -> Result<bool, Error> {
+    if v.eat_ident(b"normal")? || v.eat_ident(b"italic")? {
+        return Ok(true);
+    }
+    if !v.eat_ident(b"oblique")? {
+        return Ok(false);
+    }
+    if v.peek()?.kind == Tk::Dimension {
+        return Ok(v.angle(false)?.is_some_and(|a| (-90.0..=90.0).contains(&a)));
+    }
+    Ok(true)
+}
+
+/// `display`（CSS Display 3）：昔の 1 つの言葉か、外の言葉・中の言葉（・`list-item`）を 1 つずつ順を問わずに。
+fn display(v: &mut Values<'_, '_>, budget: &Budget<'_>) -> Result<bool, Error> {
+    const OUTSIDE: &[&[u8]] = &[b"block", b"inline", b"run-in"];
+    const INSIDE: &[&[u8]] = &[b"flow", b"flow-root", b"table", b"flex", b"grid", b"ruby", b"math"];
+    const SINGLE: &[&[u8]] =
+        &[b"ruby", b"ruby-base", b"ruby-text", b"ruby-base-container", b"ruby-text-container", b"math", b"flow"];
+    let s = v.s;
+    let first = v.peek()?;
+    if first.kind != Tk::Ident {
+        return Ok(false);
+    }
+    // 1 つの言葉
+    let one = |t: &crate::css::lex::Token| {
+        crate::style::props::DISPLAY.iter().chain(SINGLE).any(|w| ident_is(s, t.inner, t.escaped, w))
+    };
+    let (mut outside, mut inside, mut item) = (false, None::<bool>, false);
+    let mut n = 0u32;
+    let mut single = false;
+    while !v.at_end()? {
+        budget.spend(crate::cost::OP_STEP)?;
+        let t = v.next()?;
+        if t.kind != Tk::Ident {
+            return Ok(false);
+        }
+        n = n.saturating_add(1);
+        let is = |w: &[u8]| ident_is(s, t.inner, t.escaped, w);
+        if n == 1 && one(&t) {
+            single = true;
+        }
+        if OUTSIDE.iter().any(|w| is(w)) && !outside {
+            outside = true;
+        } else if INSIDE.iter().any(|w| is(w)) && inside.is_none() {
+            inside = Some(is(b"flow") || is(b"flow-root"));
+        } else if is(b"list-item") && !item {
+            item = true;
+        } else if n > 1 || !single {
+            return Ok(false);
+        }
+    }
+    Ok(match n {
+        1 => single || outside || inside.is_some() || item,
+        // list-item と組む中の言葉は flow か flow-root だけ。list-item なしは 2 つまで
+        2 | 3 => (item && inside.is_none_or(|f| f)) || (!item && n == 2 && outside && inside.is_some()),
+        _ => false,
+    })
 }
 
 /// 書体の名前に使えない言葉（CSS の全体の言葉と `default`。CSS Fonts 4 §2.1）。
@@ -334,6 +439,7 @@ fn font_family(v: &mut Values<'_, '_>, budget: &Budget<'_>) -> Result<bool, Erro
 
 /// 文字の大きさの言葉。
 const FONT_SIZE_WORDS: &[&[u8]] = &[
+    b"math",
     b"xx-small",
     b"x-small",
     b"small",
@@ -482,8 +588,11 @@ pub(crate) fn font_parts(s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) ->
             let mut span = t.span;
             if is(b"oblique") {
                 let a = v.peek()?;
-                if a.kind == Tk::Dimension && v.angle(false)?.is_some() {
-                    span.end = a.span.end;
+                if a.kind == Tk::Dimension {
+                    match v.angle(false)? {
+                        Some(d) if (-90.0..=90.0).contains(&d) => span.end = a.span.end,
+                        _ => return Ok(None),
+                    }
                 }
             }
             p.style = Some(span);

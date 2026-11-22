@@ -156,3 +156,22 @@ fn media_size_follows_attribute_rules() {
     let rect = doc.xml().nodes.as_slice().iter().position(|n| n.local.of(svg) == b"rect").unwrap() as u32;
     assert_eq!(doc.styles().of(rect).len(), 1);
 }
+
+/// `<style media>` は `@media` と同じに照らす。
+#[test]
+fn style_media_attribute() {
+    let applied = |media: &str| {
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\"><style media=\"{media}\">rect {{ fill: red }}</style><rect/></svg>"
+        );
+        let doc = parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+        let rect =
+            doc.xml().nodes.as_slice().iter().position(|n| n.local.of(svg.as_bytes()) == b"rect").unwrap() as u32;
+        !doc.styles().of(rect).is_empty()
+    };
+    assert!(applied("screen"));
+    assert!(applied("all and (min-width: 50px)"));
+    assert!(!applied("print"));
+    assert!(!applied("(min-width: 200px)"));
+    assert!(applied(""));
+}

@@ -6,7 +6,7 @@ use crate::error::Stage;
 
 fn m(q: &str, size: Option<(f64, f64)>, scheme: ColorScheme) -> bool {
     let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
-    let env = Env { color_scheme: scheme, size };
+    let env = Env { color_scheme: scheme, size, font_size: 16.0 };
     media(q.as_bytes(), Span::new(0, q.len()), &env, &budget).unwrap()
 }
 
@@ -142,4 +142,43 @@ fn supports_selector_and_custom_properties() {
     assert!(!sp("selector(rect, a)"));
     assert!(!sp("selector(:has(a))"));
     assert!(sp("not selector(:has(a))"));
+}
+
+/// かっこの中が条件として読めなければ、そのかっこは知らない形として続ける（Media Queries 4・CSS Conditional 3）。言葉の
+/// 特徴の知らない値は分からない。長さの単位は初期の文字の大きさと表示の領域で解く。
+#[test]
+fn general_enclosed_and_feature_values() {
+    let s = Some((100.0, 50.0));
+    let l = ColorScheme::Light;
+    for (q, want) in [
+        ("(not foo) or (min-width: 1px)", true),
+        ("((color) foo) or (color)", true),
+        ("not (prefers-color-scheme: bogus)", false),
+        ("not (orientation: bogus)", false),
+        ("(prefers-color-scheme: light)", true),
+        ("(min-width: 12ex)", true),
+        ("(min-width: 13ex)", false),
+        ("(width: 100vw)", true),
+        ("(height: 100vh)", true),
+        ("(overflow-block: scroll)", true),
+        ("(-webkit-min-device-pixel-ratio: 1)", true),
+        ("(not (color)) or (color)", true),
+    ] {
+        assert_eq!(m(q, s, l), want, "{q}");
+    }
+    let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let sp =
+        |q: &str| supports(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap();
+    assert!(sp("(not foo) or (fill: red)"));
+    assert!(!sp("(fill: red;)"));
+}
+
+/// `not` の先読みは同じ字句の口で行い、`not` の長い並びでも手間は長さに比例する。
+#[test]
+fn many_not_queries_stay_linear() {
+    let q = format!("{} screen", "not a,".repeat(20_000));
+    let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let env = Env { color_scheme: ColorScheme::Light, size: None, font_size: 16.0 };
+    assert!(media(q.as_bytes(), Span::new(0, q.len()), &env, &budget).unwrap());
+    assert!(budget.work() < 40 * q.len() as u64, "{}", budget.work());
 }

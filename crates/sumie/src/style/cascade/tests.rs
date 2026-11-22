@@ -27,7 +27,7 @@ fn run(svg: &str, css: &str) -> Vec<Row> {
     sb.add(css.as_bytes(), None, 0).unwrap();
     let sheet = sb.finish().unwrap();
     let b3 = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
-    let env = Env { color_scheme: ColorScheme::Light, size: Some((100.0, 100.0)) };
+    let env = Env { color_scheme: ColorScheme::Light, size: Some((100.0, 100.0)), font_size: 12.0 };
     let st = cascade(&doc, input, &sheet, &env, &b3).unwrap();
     assert!(b3.max_spend() < crate::budget::CANCEL_INTERVAL);
     assert_eq!(st.index.len(), doc.nodes.len() + 1);
@@ -196,7 +196,7 @@ fn viewport_units_and_unitless_css() {
     let doc = crate::xml::build(input, &counts, &Limits::DEFAULT, &b0, Stage::Parse).unwrap();
     let sb = SheetBuilder::new(&b0);
     let sheet = sb.finish().unwrap();
-    let env = Env { color_scheme: ColorScheme::Light, size: None };
+    let env = Env { color_scheme: ColorScheme::Light, size: None, font_size: 12.0 };
     let st = cascade(&doc, input, &sheet, &env, &b0).unwrap();
     // どちらも属性の width が勝ち、警告が 2 つ
     for node in [1u32, 2] {
@@ -207,4 +207,33 @@ fn viewport_units_and_unitless_css() {
     assert_eq!(st.warnings.len(), 2);
     let out = run(&svg, "");
     assert_eq!(get(&out, "r", "width"), Some("10vw"));
+}
+
+/// use・symbol・入れ子の svg の width・height は CSS のプロパティにしない（外側の svg・rect は読む）。`font` の長い値は
+/// 宣言ごとに 1 度だけ分ける。
+#[test]
+fn geometry_width_height_and_font_once() {
+    let svg = format!(
+        "<svg {SVG} id=\"o\" width=\"10\"><use id=\"u\" width=\"10\"/><svg id=\"n\" width=\"30\"/><rect id=\"r\" width=\"5\"/></svg>"
+    );
+    let out = run(&svg, "use, svg, rect { width: 50px }");
+    assert_eq!(get(&out, "u", "width"), None);
+    assert_eq!(get(&out, "n", "width"), None);
+    assert_eq!(get(&out, "o", "width"), Some("50px"));
+    assert_eq!(get(&out, "r", "width"), Some("50px"));
+    // 長い font の値を多くの要素に当てても、手間は要素の数に比例する
+    let fams = vec!["a"; 2000].join(",");
+    let svg = format!("<svg {SVG}>{}</svg>", "<text/>".repeat(2000));
+    let input = svg.as_bytes();
+    let b = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    let counts = crate::xml::count(input, &Limits::DEFAULT, &b, Stage::Parse).unwrap();
+    let doc = crate::xml::build(input, &counts, &Limits::DEFAULT, &b, Stage::Parse).unwrap();
+    let mut sb = SheetBuilder::new(&b);
+    let css = format!("text {{ font: 12px {fams} }}");
+    sb.add(css.as_bytes(), None, 0).unwrap();
+    let sheet = sb.finish().unwrap();
+    let env = Env { color_scheme: ColorScheme::Light, size: None, font_size: 12.0 };
+    let b3 = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
+    cascade(&doc, input, &sheet, &env, &b3).unwrap();
+    assert!(b3.work() < 20_000_000, "{}", b3.work());
 }

@@ -723,7 +723,9 @@ pub(crate) fn transform_attr(s: &[u8], range: Span, budget: &Budget<'_>) -> Resu
     }
     let mut v = Values::new(s, range, budget);
     let mut m = Transform::IDENTITY;
-    if v.eat_ident(b"none")? {
+    let t = v.peek()?;
+    if t.kind == Kind::Ident && !t.escaped && t.inner.of(s) == b"none" {
+        v.next()?;
         return Ok(if v.at_end()? { Some(m) } else { None });
     }
     let mut first = true;
@@ -859,7 +861,8 @@ pub(crate) fn transform_css_valid(s: &[u8], range: Span, viewport: bool, budget:
         };
         let mut n = 0usize;
         loop {
-            if v.eat(Kind::RParen)? {
+            // 値の終わりで閉じない関数は閉じたものとする（CSS Syntax。Chrome と同じ）
+            if v.eat(Kind::RParen)? || v.at_end()? {
                 break;
             }
             if n >= max || (n > 0 && !v.eat(Kind::Comma)?) {

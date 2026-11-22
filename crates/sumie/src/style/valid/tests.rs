@@ -26,7 +26,8 @@ fn values_by_property() {
         ("stroke-width", &["2", "2px", "10%", "0"], &["-1", "auto"]),
         // CSS の width・font-size・letter-spacing・transform-origin は単位のない数を受けない（Chrome と同じ）
         ("width", &["auto", "0", "5em", "10px"], &["-5", "10"]),
-        ("stroke-miterlimit", &["4", "1"], &["0.5", "4px"]),
+        // 負だけが壊れた値（0〜1 は継ぎ目がいつも bevel。SVG 2・Chrome と同じ）
+        ("stroke-miterlimit", &["4", "1", "0.5", "0"], &["-1", "4px"]),
         ("stroke-linecap", &["round", "SQUARE"], &["rounded", "round round"]),
         ("display", &["none", "inline", "contents"], &["hidden"]),
         ("marker-start", &["none", "url(#m)", "url(\"#m\")"], &["#m", "url(#m) none"]),
@@ -36,7 +37,7 @@ fn values_by_property() {
             &["Times New Roman, serif", "'A B', \"C\"", "default x"],
             &["a,", ",a", "1px", "'a' b", "a, inherit", "default"],
         ),
-        ("font-size", &["medium", "12px", "1.5em", "larger"], &["-1px", "big", "12"]),
+        ("font-size", &["medium", "12px", "1.5em", "larger", "math"], &["-1px", "big", "12"]),
         ("font-weight", &["bold", "100", "950"], &["0", "1001", "heavy"]),
         ("letter-spacing", &["normal", "2px", "-1px"], &["wide", "-1"]),
         ("stroke-width", &["2", "2px"], &["-2"]),
@@ -44,7 +45,29 @@ fn values_by_property() {
         ("line-height", &["normal", "1.5", "12px", "150%"], &["-1", "a"]),
         ("color-rendering", &["optimizeQuality", "auto"], &["crispEdges"]),
         ("stroke-linejoin", &["arcs", "miter-clip", "round"], &["rounded"]),
-        ("display", &["run-in", "inline"], &["compact", "marker"]),
+        (
+            "display",
+            &[
+                "run-in",
+                "inline",
+                "inline flex",
+                "block flow",
+                "flow-root list-item",
+                "list-item block",
+                "ruby",
+                "math",
+                "table-row",
+            ],
+            &["compact", "marker", "block inline", "flex grid", "list-item flex", "none block", "inline block flow"],
+        ),
+        ("overflow", &["hidden", "auto clip", "overlay"], &["hidden auto scroll", "wrap"]),
+        ("font-style", &["oblique 10deg", "italic", "oblique"], &["oblique 100deg", "oblique 10px"]),
+        ("font-stretch", &["50%", "condensed", "normal"], &["-5%", "narrower"]),
+        (
+            "clip-path",
+            &["circle(5px) fill-box", "view-box inset(1px)"],
+            &["circle(5px) circle(5px)", "fill-box view-box"],
+        ),
         ("alignment-baseline", &["middle"], &["top", "center", "bottom"]),
         (
             "font",
@@ -119,4 +142,10 @@ fn attributes_and_viewport() {
     assert!(!check("width", "10vw", false, false));
     assert!(!check("x", "5vmin", true, false));
     assert!(!check("font", "1vh serif", false, false));
+    // 関数の引数の vw も大きさの決まらない文書では壊れた値
+    assert!(!check("clip-path", "circle(10vw)", false, false));
+    assert!(check("clip-path", "circle(10vw)", false, true));
+    // 値の終わりで閉じない関数は閉じたもの（Chrome と同じ）
+    assert!(check("transform", "translate(10px", false, true));
+    assert!(check("marker-start", "url(\"#m\"", false, true));
 }

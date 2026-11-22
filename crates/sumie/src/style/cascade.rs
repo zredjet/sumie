@@ -94,7 +94,50 @@ struct DeclInfo {
     prop: u16,
     wide: u8,
     ok: u8,
+    /// `font` のまとめの長い名前の範囲（`fonts` の番号。ほかは NONE）
+    font: u32,
 }
+
+/// `font` のまとめを長い名前に分けた範囲（宣言ごとに 1 度だけ求める）。順は FONT_LONGHANDS の初めの 7 つ。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct FontRec {
+    spans: [Span; 7],
+    /// 書いた長い名前のビット
+    present: u8,
+    pad: [u8; 3],
+}
+
+impl Plain for FontRec {}
+
+impl FontRec {
+    fn of(p: &crate::style::valid::FontParts) -> FontRec {
+        let parts = [p.style, p.variant, p.weight, p.stretch, p.size, p.line_height, p.family];
+        let mut r = FontRec::default();
+        for (k, x) in parts.iter().enumerate() {
+            if let (Some(sp), Some(slot)) = (x, r.spans.get_mut(k)) {
+                *slot = *sp;
+                r.present |= 1u8.checked_shl(k as u32).unwrap_or(0);
+            }
+        }
+        r
+    }
+}
+
+/// `font` が決める長い名前（初めの 7 つは FontRec の順。残りは `font` が初期の値にするもの）。
+const FONT_LONGHANDS: [&[u8]; 11] = [
+    b"font-style",
+    b"font-variant",
+    b"font-weight",
+    b"font-stretch",
+    b"font-size",
+    b"line-height",
+    b"font-family",
+    b"font-size-adjust",
+    b"font-kerning",
+    b"font-feature-settings",
+    b"font-variation-settings",
+];
 
 impl Plain for DeclInfo {}
 
@@ -158,11 +201,12 @@ fn animation(local: &[u8]) -> bool {
     matches!(local, b"animate" | b"animateMotion" | b"animateTransform" | b"animateColor" | b"set" | b"discard")
 }
 
-/// 幾何のプロパティのプレゼンテーション属性を、この要素で読むか。
-fn geometry_ok(local: &[u8], name: &[u8]) -> bool {
+/// 幾何のプロパティのプレゼンテーション属性を、この要素で読むか（`outer` は外側の svg か）。use・symbol・入れ子の svg の
+/// width・height は XML の属性で、CSS のプロパティにしない（SVG 2 の geometry・Chrome と同じ。木を作る段が属性として読む）。
+fn geometry_ok(local: &[u8], name: &[u8], outer: bool) -> bool {
     match name {
         b"x" | b"y" => matches!(local, b"rect" | b"image" | b"foreignObject" | b"svg" | b"use" | b"symbol"),
-        b"width" | b"height" => matches!(local, b"rect" | b"image" | b"foreignObject" | b"svg" | b"use" | b"symbol"),
+        b"width" | b"height" => matches!(local, b"rect" | b"image" | b"foreignObject") || (outer && local == b"svg"),
         b"r" => local == b"circle",
         b"cx" | b"cy" => matches!(local, b"circle" | b"ellipse"),
         b"rx" | b"ry" => matches!(local, b"rect" | b"ellipse"),
@@ -209,14 +253,29 @@ pub(crate) fn cascade(
     // 規則の宣言を 1 度だけ確かめる（宣言は規則の順に続いて並ぶ。規則の外の宣言はない）
     let mut warns: MVec<'_, Warn> = MVec::new(budget);
     let mut infos: MVec<'_, DeclInfo> = MVec::with_capacity(budget, sheet.decls.len())?;
-    infos.resize_to(sheet.decls.len(), DeclInfo { prop: u16::MAX, wide: 0, ok: 0 })?;
-    for r in sheet.rules.as_slice() {
+    infos.resize_to(sheet.decls.len(), DeclInfo { prop: u16::MAX, wide: 0, ok: 0, font: NONE })?;
+    let mut fonts: MVec<'_, FontRec> = MVec::new(budget);
+    let font_id = lookup(b"font", false);
+    for (ri, r) in sheet.rules.as_slice().iter().enumerate() {
+        // 当たらない規則（条件が偽）の宣言は確かめない（警告も出さない）
+        if active.get(ri).copied().unwrap_or(0) == 0 {
+            budget.spend(cost::OP_STEP)?;
+            continue;
+        }
         for k in r.decls.start..r.decls.end {
             budget.spend(cost::OP_STEP)?;
             let Some(d) = sheet.decls.as_slice().get(k as usize) else { continue };
-            let info = check_decl(text, d, viewport, budget)?;
+            let mut info = check_decl(text, d, viewport, budget)?;
             if info.prop != u16::MAX && info.ok == 0 {
                 warns.push(Warn { pos: r.pos, kind: WarningKind::InvalidValue, pad: 0 })?;
+            }
+            // `font` のまとめは長い名前の範囲を 1 度だけ求める
+            if Some(info.prop) == font_id && info.ok != 0 && info.wide == WIDE_NONE {
+                let cx = Ctx { attr: false, unitless: false, viewport };
+                if let Some(p) = font_parts(text, d.value, cx, budget)? {
+                    info.font = fonts.len() as u32;
+                    fonts.push(FontRec::of(&p))?;
+                }
             }
             if let Some(x) = infos.get_mut(k as usize) {
                 *x = info;
@@ -230,6 +289,7 @@ pub(crate) fn cascade(
         input,
         sheet,
         infos: infos.as_slice(),
+        fonts: fonts.as_slice(),
         ranks: ranks.as_slice(),
         viewport,
         budget,
@@ -282,7 +342,9 @@ pub(crate) fn decl_prop(text: &[u8], d: &Decl, budget: &Budget<'_>) -> Result<Op
 
 /// 宣言の名前と値を確かめる（知らない名前は prop が u16::MAX）。
 fn check_decl(text: &[u8], d: &Decl, viewport: bool, budget: &Budget<'_>) -> Result<DeclInfo, Error> {
-    let Some(id) = decl_prop(text, d, budget)? else { return Ok(DeclInfo { prop: u16::MAX, wide: 0, ok: 0 }) };
+    let Some(id) = decl_prop(text, d, budget)? else {
+        return Ok(DeclInfo { prop: u16::MAX, wide: 0, ok: 0, font: NONE });
+    };
     let w = wide(text, d.value, budget)?;
     let ok = match (w, prop(id)) {
         (Some(_), _) => true,
@@ -292,7 +354,7 @@ fn check_decl(text: &[u8], d: &Decl, viewport: bool, budget: &Budget<'_>) -> Res
         }
         (None, None) => false,
     };
-    Ok(DeclInfo { prop: id, wide: wide_code(w), ok: u8::from(ok) })
+    Ok(DeclInfo { prop: id, wide: wide_code(w), ok: u8::from(ok), font: NONE })
 }
 
 impl Slot {
@@ -323,6 +385,8 @@ struct Out<'a, 'b> {
     input: &'a [u8],
     sheet: &'a Sheet,
     infos: &'a [DeclInfo],
+    /// `font` の宣言の長い名前の範囲
+    fonts: &'a [FontRec],
     /// まとめた層ごとの順位
     ranks: &'a [u32],
     /// 表示の領域の単位を読めるか
@@ -345,7 +409,7 @@ impl Out<'_, '_> {
 
     /// 候補を置く（強ければ入れ替える）。まとめのプロパティ（`marker`・`font`）は長い名前に分ける。`revert-layer` は
     /// 候補にしない（弱い宣言に戻す）。
-    fn offer(&mut self, prop: PropertyId, key: Key, spec: Specified) -> Result<(), Error> {
+    fn offer(&mut self, prop: PropertyId, key: Key, spec: Specified, font: Option<FontRec>) -> Result<(), Error> {
         self.budget.spend(cost::OP_STEP)?;
         if spec.wide == WIDE_REVERT_LAYER {
             return Ok(());
@@ -360,50 +424,41 @@ impl Out<'_, '_> {
             return Ok(());
         }
         if name == b"font" {
-            return self.offer_font(key, spec);
+            return self.offer_font(key, spec, font);
+        }
+        // use・symbol・入れ子の svg の width・height は CSS のプロパティでない（木を作る段が属性として読む）
+        if (name == b"width" || name == b"height")
+            && let Some(n) = self.node()
+            && let local = n.local.of(self.input)
+            && (local == b"use" || local == b"symbol" || (local == b"svg" && n.parent != NONE))
+        {
+            return Ok(());
         }
         self.put(prop, key, spec)
     }
 
-    /// `font` を長い名前に分ける（書いていない長い名前と、`font` が初期の値にするほかの長い名前は `initial`）。
-    fn offer_font(&mut self, key: Key, spec: Specified) -> Result<(), Error> {
-        let buf = match spec.src {
-            SRC_SHEET => self.sheet.text.as_slice(),
-            SRC_STORE => self.doc.store.as_slice(),
-            _ => self.input,
-        };
-        let parts = if spec.wide == WIDE_NONE {
-            let cx = Ctx { attr: false, unitless: false, viewport: self.viewport };
-            match font_parts(buf, spec.value, cx, self.budget)? {
-                Some(p) => Some(p),
+    /// `font` を長い名前に分ける（書いていない長い名前と、`font` が初期の値にするほかの長い名前は `initial`）。長い名前の
+    /// 範囲は宣言ごとに 1 度だけ求めたもの（`font`）。全体の言葉（`font: inherit` など）は、長い名前もみな同じ言葉。
+    fn offer_font(&mut self, key: Key, spec: Specified, font: Option<FontRec>) -> Result<(), Error> {
+        let rec = if spec.wide == WIDE_NONE {
+            match font {
+                Some(r) => Some(r),
                 None => return Ok(()),
             }
         } else {
             None
         };
-        let longhands: [(&[u8], Option<Span>); 11] = {
-            let p = parts.unwrap_or_default();
-            [
-                (b"font-style", p.style),
-                (b"font-variant", p.variant),
-                (b"font-weight", p.weight),
-                (b"font-stretch", p.stretch),
-                (b"font-size", p.size),
-                (b"line-height", p.line_height),
-                (b"font-family", p.family),
-                (b"font-size-adjust", None),
-                (b"font-kerning", None),
-                (b"font-feature-settings", None),
-                (b"font-variation-settings", None),
-            ]
-        };
-        for (name, part) in longhands {
+        for (k, name) in FONT_LONGHANDS.iter().enumerate() {
+            self.budget.spend(cost::OP_STEP)?;
             let Some(id) = lookup(name, false) else { continue };
-            let s = match (parts, part) {
-                // `font: inherit` などは長い名前もみな同じ言葉
-                (None, _) => Specified { prop: id, ..spec },
-                (Some(_), Some(range)) => Specified { prop: id, value: range, wide: WIDE_NONE, ..spec },
-                (Some(_), None) => Specified { prop: id, value: Span::default(), wide: WIDE_INITIAL, ..spec },
+            let s = match rec {
+                None => Specified { prop: id, ..spec },
+                Some(r) => {
+                    match r.spans.get(k).filter(|_| k < 7 && r.present & 1u8.checked_shl(k as u32).unwrap_or(0) != 0) {
+                        Some(&range) => Specified { prop: id, value: range, wide: WIDE_NONE, ..spec },
+                        None => Specified { prop: id, value: Span::default(), wide: WIDE_INITIAL, ..spec },
+                    }
+                }
             };
             self.put(id, key, s)?;
         }
@@ -487,7 +542,11 @@ impl Out<'_, '_> {
             let id = if name == b"transform" { lookup(b"transform", false) } else { lookup(name, false) };
             let Some(id) = id else { continue };
             let Some(p) = prop(id) else { continue };
-            if !(p.attr || name == b"transform") || !geometry_ok(local, name) || (name == b"fill" && animation(local)) {
+            let outer = n.parent == NONE;
+            if !(p.attr || name == b"transform")
+                || !geometry_ok(local, name, outer)
+                || (name == b"fill" && animation(local))
+            {
                 continue;
             }
             let w = wide(buf, a.value, self.budget)?;
@@ -505,7 +564,7 @@ impl Out<'_, '_> {
                 wide: wide_code(w),
                 pad: [0; 3],
             };
-            self.offer(id, Key { tier: 0, idx: k as u32, ..Key::default() }, spec)?;
+            self.offer(id, Key { tier: 0, idx: k as u32, ..Key::default() }, spec, None)?;
         }
         Ok(())
     }
@@ -538,7 +597,14 @@ impl Out<'_, '_> {
                 wide: info.wide,
                 pad: [0; 3],
             };
-            self.offer(info.prop, Key { tier, idx: k as u32, ..Key::default() }, spec)?;
+            // `style` 属性の `font` は、その宣言の長い名前の範囲をここで求める
+            let font = if lookup(b"font", false) == Some(info.prop) && info.wide == WIDE_NONE {
+                let cx = Ctx { attr: false, unitless: false, viewport: self.viewport };
+                font_parts(buf, d.value, cx, budget)?.map(|p| FontRec::of(&p))
+            } else {
+                None
+            };
+            self.offer(info.prop, Key { tier, idx: k as u32, ..Key::default() }, spec, font)?;
         }
         Ok(())
     }
@@ -585,7 +651,8 @@ impl MatchSink for Out<'_, '_> {
                 wide: info.wide,
                 pad: [0; 3],
             };
-            self.offer(info.prop, key, s)?;
+            let font = self.fonts.get(info.font as usize).copied();
+            self.offer(info.prop, key, s, font)?;
         }
         Ok(())
     }
