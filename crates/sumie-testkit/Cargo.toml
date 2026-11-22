@@ -1,0 +1,26 @@
+[package]
+name = "sumie-testkit"
+description = "sumie の試験の共通の道具（自前の ChaCha8・種つきの変異・集まりの読み込み・確保を数える確保器の包み）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# 確保を数える確保器（allocation-counter）を #[global_allocator] にする（ADR-31 (4)）。ライブラリの試験だけが入れる。
+# ファズ・道具には入れない（libFuzzer の確保の見張りと重ねない）
+count-alloc = ["dep:allocation-counter"]
+
+[dependencies]
+# スレッドごとに数える確保器（クレートの中で #[global_allocator] を置く。試験に unsafe を書かずに済む。ADR-46）
+allocation-counter = { version = "=0.8.1", optional = true }
+
+[dev-dependencies]
+# 自前の ChaCha8 の出力を照らすだけ
+rand_chacha = "=0.9.0"
+rand_core = "=0.9.3"
+
+# workspace の lints は受け継がない（ゆるい道具。ADR-43 (11)）
+[lints.rust]
+unsafe_code = "forbid"
