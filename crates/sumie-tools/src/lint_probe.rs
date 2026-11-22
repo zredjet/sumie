@@ -16,7 +16,8 @@ pub fn run(_args: &[String]) -> Result<(), String> {
         Path::new(env!("CARGO_MANIFEST_DIR")).parent().and_then(Path::parent).ok_or("workspace の根が見つからない")?;
     let probe = root.join("scripts/lint-probe");
     let out = Command::new("cargo")
-        .args(["clippy", "--quiet", "--message-format=short", "--manifest-path"])
+        // 色の印を混ぜない（CI の CARGO_TERM_COLOR=always で「warning:」の文字が切れて、警告を拾いそこねた）
+        .args(["clippy", "--quiet", "--color=never", "--message-format=short", "--manifest-path"])
         .arg(probe.join("Cargo.toml"))
         .env("CLIPPY_CONF_DIR", root.join("crates/sumie"))
         .env("CARGO_TARGET_DIR", root.join("target/lint-probe"))
