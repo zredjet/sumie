@@ -22,45 +22,47 @@
 
 ## M0　土台
 
-- [ ] `git init`・workspace（`crates/sumie`・`crates/sumie-testkit`・`crates/sumie-tools`・`fuzz/`。`[workspace.lints]` を受け継ぐのは
+- [x] `git init`・workspace（`crates/sumie`・`crates/sumie-testkit`・`crates/sumie-tools`・`fuzz/`。`[workspace.lints]` を受け継ぐのは
   `crates/sumie` だけ）・`rust-toolchain.toml`・`publish = false`・
   ライセンスのファイル・`.gitignore`
-- [ ] lint：`#![forbid(unsafe_code)]`、`[workspace.lints]`（CLAUDE.md の一覧）、`crates/sumie/clippy.toml`（厳しい規則。道具には
+- [x] lint：`#![forbid(unsafe_code)]`、`[workspace.lints]`（CLAUDE.md の一覧）、`crates/sumie/clippy.toml`（厳しい規則。道具には
   別のゆるい設定）。禁じる口の一覧は、std の文書の Panics の節と確保する口から機械的に作る。`disallowed-macros` で `assert!`・
   `debug_assert!` を拾えるかを試験で確かめ、拾えなければ `tests/rules.rs` の走査に回す。結合テストの頭で `allow` する口を決める
-- [ ] `tests/rules.rs`（src の走査：`cfg(target_*)`・`std::arch`・`cfg(debug_assertions)`・`[features]`・`mul_add`・`mem` の外での
+- [x] `tests/rules.rs`（src の走査：`cfg(target_*)`・`std::arch`・`cfg(debug_assertions)`・`[features]`・`mul_add`・`mem` の外での
   確保・`MVec` に入れる型が `repr(C)` か基本の型か・モジュールの層の向き・自分の名前を呼ぶ関数（再帰））。禁じる口の一覧の
   観点に、LLVM に並べ替えを許す浮動小数の口（`algebraic_*` など。1.99.0 で stable かを確かめる）と `std::process::abort` も入れる
-- [ ] `crates/sumie-testkit`（自前の ChaCha8・種つきの変異・照合の集まりの読み込み・確保を数える確保器の包み）
-- [ ] 基礎のモジュールの骨組み：`math`（libm の包み・`max`・`min`・`clamp`・`powi`）・`budget`・`cost`・`mem`（`MVec`・
+- [x] `crates/sumie-testkit`（自前の ChaCha8・種つきの変異・照合の集まりの読み込み・確保を数える確保器の包み）
+- [x] 基礎のモジュールの骨組み：`math`（libm の包み・`max`・`min`・`clamp`・`powi`）・`budget`・`cost`・`mem`（`MVec`・
   `SortedVec`・`SortedMap`・`stable_sort`。捨てるときに `Budget` へ返す）・`Cancel`・`Error`
-- [ ] 確保を数える確保器（dev 依存のクレートを選ぶ）と、ヒープの増え ≤ `Budget` の数えた量を確かめる試験の仕組み（ADR-31。
+- [x] 確保を数える確保器（dev 依存のクレートを選ぶ）と、ヒープの増え ≤ `Budget` の数えた量を確かめる試験の仕組み（ADR-31。
   libtest の雑音を避けるため `harness = false` で 1 本ずつ回すか、スレッドごとに数える確保器を選ぶ）
-- [ ] ゴールデンの仕組み（形式・BLAKE3・`scripts/check-goldens-append-only.sh`）
-- [ ] ファズの仕組み（`fuzz/` の独立の workspace と最初の対象の雛形）と、種つきの変異のテストの道具（自前の ChaCha8）
-- [ ] 小さいスタック（128 KiB）のスレッドで試験を回す道具
-- [ ] `sumie-tools`：`oracle resvg`・`oracle chrome`・`compare`・`bench`・`corpus`・`gen-heavy` の骨組み
-- [ ] 試験の集まりの取り込み（ライセンスを確かめ、写しを許すものだけを出どころ・版・ライセンスの写しとともに。取り込む前に一覧を見せて承認を得る。ADR-21）
-- [ ] CI（GitHub Actions：`ubuntu-latest`・`ubuntu-24.04-arm`・`macos-15`（arm64）。非公開のリポジトリで arm の Linux が使えるかを確かめる。ADR-22）と
-  手元の全チェック `scripts/verify.sh`
-- [ ] Kura と同じ resvg（`raster-images` なし）で、sbix の絵文字（Apple Color Emoji）がどう描かれるか（代わりのフォントとして
-  選ばれるか・仮の輪郭を描くか）を確かめ、絵文字の書体の数え方をユーザーに決めてもらう（ADR-14 (5)・ADR-40）
-- [ ] 非公開のリポジトリで `ubuntu-24.04-arm` が使えるか・含まれる分の時間で足りるかを確かめ、足りないときの手（QEMU の上で
-  回す・公開にする・有料の分）を相談する（ADR-22・ADR-35）
-- [ ] 取り込みの前提を確かめる：同じ package の 2 つの git の rev を別名の依存で入れた小さなクレートが Cargo で組めるか・
-  Kura の CI が非公開のリポジトリの git の依存を取れるか（鍵の置き方）（ADR-18・ADR-35）
-- [ ] `gen-heavy` の入力（地図風の線 30 万区間・地図風の形・遅い入力 S1〜S5・S7・互換の例 S6・展開の爆弾）の引数を決めて
+- [x] ゴールデンの仕組み（形式・BLAKE3・`scripts/check-goldens-append-only.sh`）
+- [x] ファズの仕組み（`fuzz/` の独立の workspace と最初の対象の雛形）と、種つきの変異のテストの道具（自前の ChaCha8）
+- [x] 小さいスタック（128 KiB）のスレッドで試験を回す道具
+- [x] `sumie-tools`：`oracle resvg`・`oracle chrome`・`compare`・`bench`・`corpus`・`gen-heavy` の骨組み
+- [x] 試験の集まりの取り込み（ライセンスを確かめ、写しを許すものだけを出どころ・版・ライセンスの写しとともに。取り込む前に一覧を見せて承認を得る。ADR-21）
+- [x] CI（GitHub Actions：`ubuntu-latest`・`ubuntu-24.04-arm`・`macos-15`（arm64）。非公開のリポジトリで arm の Linux が使えるかを確かめる。ADR-22）と
+  手元の全チェック `scripts/verify.sh`。→ リポジトリを公開にして 3 つのターゲットで回した（ADR-54）
+- [x] Kura と同じ resvg（`raster-images` なし）で、sbix の絵文字（Apple Color Emoji）がどう描かれるか（代わりのフォントとして
+  選ばれるか・仮の輪郭を描くか）を確かめ、絵文字の書体の数え方をユーザーに決めてもらう（ADR-14 (5)・ADR-40）。→ resvg は
+  Apple Color Emoji を選んで何も描かない。(a) 字ごとに数える（ADR-56 (2)）
+- [x] 非公開のリポジトリで `ubuntu-24.04-arm` が使えるか・含まれる分の時間で足りるかを確かめ、足りないときの手（QEMU の上で
+  回す・公開にする・有料の分）を相談する（ADR-22・ADR-35）。→ 公開のリポジトリにした（ADR-54）
+- [x] 取り込みの前提を確かめる：同じ package の 2 つの git の rev を別名の依存で入れた小さなクレートが Cargo で組めるか・
+  Kura の CI が非公開のリポジトリの git の依存を取れるか（鍵の置き方）（ADR-18・ADR-35）。→ 別名の依存で組めた。公開に
+  したので鍵は要らない（ADR-53・ADR-54）
+- [x] `gen-heavy` の入力（地図風の線 30 万区間・地図風の形・遅い入力 S1〜S5・S7・互換の例 S6・展開の爆弾）の引数を決めて
   architecture.md §10 に追記し、
-  resvg 単体の時間・確保のピークを測る（ADR-19・ADR-35）
-- [ ] Kura の側に、照合の集まりを Kura の今の `SvgCodec` に通した「断る／描く」の一覧を作ってもらうよう、ユーザーに頼む
+  resvg 単体の時間・確保のピークを測る（ADR-19・ADR-35）。→ architecture.md §10（ADR-57 (3)・ADR-58 (2)）
+- [x] Kura の側に、照合の集まりを Kura の今の `SvgCodec` に通した「断る／描く」の一覧を作ってもらうよう、ユーザーに頼む
   （働き手を通さず、プロセスの中の `SvgCodec` で。このリポジトリからは Kura で cargo を走らせない。一覧は Kura の rev つきで
   `corpus/` の横に置く。NFR-10）。Kura の手元の SVG（Kura の働き手の実測に使った 1,439 件）の置き場所をユーザーに聞き、git の
   外で Kura の `SvgCodec` と sumie の両方に通して「描く／断る」と大きさの一致を照らす仕組みを作る（結果の一覧だけを残す。
   ライセンスでコミットできないため）。→ 仕組みは `kura-compat` で作った。1,439 件は消えていて使えないので、代わりに実例の
   SVG 1,241 件を `corpus/real/` に取り込んだ（ADR-58 (3)・ADR-59）
-- [ ] `oracle resvg` は Kura と同じ usvg の設定（総称の書体 Times・Helvetica・Apple Chancery・Papyrus・Courier、フォントを名前の
+- [x] `oracle resvg` は Kura と同じ usvg の設定（総称の書体 Times・Helvetica・Apple Chancery・Papyrus・Courier、フォントを名前の
   順に登録、languages、`default_size`）で描く。`oracle chrome` の透明の背景（`--default-background-color=00000000` など）と窓の
-  大きさを決めて architecture.md §10 に追記する
+  大きさを決めて architecture.md §10 に追記する。→ Kura の Cargo.lock に依存の版も揃えた（ADR-52・ADR-57・ADR-60）
 
 **完了条件**：`scripts/verify.sh` が通る／Linux でも `cargo test` が通る／`cargo tree -e normal,build -p sumie` が `libm` だけ／
 照合の集まりを resvg と Chrome で描いて、差の一覧の HTML が出る／resvg と Chrome の差の分布を測り、ADR-15 の基準の値を

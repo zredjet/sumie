@@ -619,7 +619,9 @@ Kura の試験の入力（`SLOW_SHAPE`・`SLOW_DECODE`・`nested_pattern_clones_
 照合の集まり（resvg の試験 1,739 件。文字のある 422 件はシステムのフォント）：描けたのは 1,736 件（読めない 3 件：大きさが
 不正 2・UTF-8 でない 1）。1 件の時間は中央 0.13 ms・90% 0.77 ms・99% 3.2 ms・最大 850 ms（`filters/feMorphology/huge-radius`）・
 合計 1.51 秒。確保の山は中央 184 KB・90% 605 KB・99% 1.08 MB・最大 12.2 MB（`filters/filter/huge-region`）。S1〜S4・S7 は
-Kura の記録と同じ程度の時間になり、Kura の性質を持つ入力だと確かめられた。地図風の線と S5 は Kura の元の入力と違う
+Kura の記録と同じ程度の時間になり、Kura の性質を持つ入力だと確かめられた。実例の SVG（1,241 件。ADR-59）：すべて描けた。1 件の時間は
+中央 0.05 ms・90% 1.2 ms・99% 3.8 ms・最大 11.3 ms・合計 0.50 秒、確保の山は中央 18 KB・90% 1.3 MB・99% 5.4 MB・最大 6.0 MB
+（倍率 1）。地図風の線と S5 は Kura の元の入力と違う
 （ADR-58 (2)。NFR-07 の約束は同じ入力の resvg 単体との比で見る）。
 
 **M0 の照合の分布**（resvg 0.48.1（Kura の設定）と Chrome 157.0.8103.79（`--disable-gpu`）、Apple M4 Max。`sumie-tools compare`。
