@@ -777,6 +777,7 @@ pub struct DocOutcome {
 /// - 2 つの誤りが同じ（D2）・見積もりが通れば読める・手間・山・持ち続ける量が見積もりと同じ（ADR-70）
 /// - 1 回の払いが中止の間隔を超えず、返しすぎない
 /// - 上限を見積もりのちょうどにすれば読め、1 少なくすれば `estimate_parse` と `parse` が同じ `Limit` を返す
+/// - 読めた文書の計算した値のたどり（`doc::walk`）が誤りを返さず、払いが崩れない（確保は `peak` に入れる）
 pub fn document_parse(data: &[u8]) -> DocOutcome {
     document_parse_cancel(data, &Never)
 }
@@ -805,6 +806,20 @@ pub fn document_parse_cancel(data: &[u8], cancel: &dyn Cancel) -> DocOutcome {
                 out.check = Check::Violation("parse の手間か山が見積もりと違う");
                 return out;
             }
+            // 計算した値のたどり（木を作る段の前の部分。払いを確かめ、確保をヒープの山と照らす山に入れる）
+            let wb = Budget::new(Stage::Build, u64::MAX, u64::MAX, cancel);
+            match crate::doc::walk::walk(&d, &wb, &mut |_| Ok(())) {
+                Ok(()) | Err(Error::Cancelled) => {}
+                Err(_) => {
+                    out.check = Check::Violation("計算した値のたどりが誤りを返した");
+                    return out;
+                }
+            }
+            if wb.over_released() || wb.max_spend() >= CANCEL_INTERVAL {
+                out.check = Check::Violation("計算した値のたどりの勘定が崩れた");
+                return out;
+            }
+            out.peak = out.peak.max(d.held_bytes().saturating_add(wb.peak()));
             e
         }
         (_, Err(Error::Cancelled)) | (Err(Error::Cancelled), _) => return out,
@@ -853,4 +868,99 @@ pub fn document_parse_cancel(data: &[u8], cancel: &dyn Cancel) -> DocOutcome {
         }
     }
     out
+}
+
+/// 計算した値の照合（`sumie-tools values`。ADR-63 (5)）に渡す 1 つの要素。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ComputedItem<'a> {
+    /// 節の番号と、親の要素の節の番号
+    pub node: u32,
+    pub parent: Option<u32>,
+    /// 局所名と、SVG の名前空間か
+    pub local: &'a [u8],
+    pub svg: bool,
+    /// `id` 属性の値
+    pub id: Option<&'a [u8]>,
+    /// 描く木に入る
+    pub rendered: bool,
+    /// 根からの変形 `[a, b, c, d, e, f]`（解けなければ `ctm_known` が偽）
+    pub ctm: [f64; 6],
+    pub ctm_known: bool,
+    pub opacity: f64,
+    pub fill: UsedPaint<'a>,
+    pub fill_opacity: f64,
+    pub stroke: UsedPaint<'a>,
+    pub stroke_opacity: f64,
+    pub stroke_width: f64,
+    /// `visibility` が `visible`
+    pub visible: bool,
+}
+
+/// 使う塗り（[`ComputedItem`]）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UsedPaint<'a> {
+    None,
+    /// sRGB の r・g・b（0〜255）と α（0〜1）
+    Color([f32; 4]),
+    /// 塗りの参照先の局所名と id
+    Server {
+        local: &'a [u8],
+        id: &'a [u8],
+    },
+    /// 参照の輪で取り除いた
+    Cut,
+    ContextFill,
+    ContextStroke,
+}
+
+/// 文書の要素を行きがけの順にたどり、計算した値を `f` に渡す（`doc::walk`）。
+pub fn computed_values(d: &crate::Document<'_>, f: &mut dyn FnMut(&ComputedItem<'_>)) -> Result<(), Error> {
+    use crate::doc::walk::{Used, used_paint, walk};
+    let budget = Budget::new(Stage::Build, u64::MAX, u64::MAX, &Never);
+    let doc = d.xml();
+    let input = d.input();
+    let attr_id = |n: u32| -> Result<Option<&[u8]>, Error> {
+        match doc.node(n) {
+            Some(x) => doc.attr(input, x, crate::xml::NS_NONE, b"id", &budget),
+            None => Ok(None),
+        }
+    };
+    walk(d, &budget, &mut |v| {
+        let Some(n) = doc.node(v.node) else { return Ok(()) };
+        let c = &v.computed;
+        let conv = |u: Used| -> Result<UsedPaint<'_>, Error> {
+            Ok(match u {
+                Used::None => UsedPaint::None,
+                Used::Color(x) => UsedPaint::Color([x.r, x.g, x.b, x.a]),
+                Used::Server(t) => UsedPaint::Server {
+                    local: doc.node(t).map_or(&[][..], |x| x.local.of(input)),
+                    id: attr_id(t)?.unwrap_or(&[]),
+                },
+                Used::Cut => UsedPaint::Cut,
+                Used::ContextFill => UsedPaint::ContextFill,
+                Used::ContextStroke => UsedPaint::ContextStroke,
+            })
+        };
+        let fill = conv(used_paint(d, v.node, &c.fill, true, c.color, &budget)?)?;
+        let stroke = conv(used_paint(d, v.node, &c.stroke, false, c.color, &budget)?)?;
+        let t = v.ctm;
+        f(&ComputedItem {
+            node: v.node,
+            parent: (v.parent != crate::xml::NONE).then_some(v.parent),
+            local: n.local.of(input),
+            svg: n.ns == crate::xml::NS_SVG,
+            id: attr_id(v.node)?,
+            rendered: v.rendered,
+            ctm: [t.a, t.b, t.c, t.d, t.e, t.f],
+            ctm_known: v.ctm_known,
+            opacity: c.opacity,
+            fill,
+            fill_opacity: c.fill_opacity,
+            stroke,
+            stroke_opacity: c.stroke_opacity,
+            stroke_width: c.stroke_width,
+            visible: c.visibility == crate::style::computed::VISIBLE,
+        });
+        Ok(())
+    })
 }

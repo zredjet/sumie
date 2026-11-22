@@ -292,7 +292,10 @@ Kura の「形」（値を描かずに大きさなどを読む。今の Kura は
 - `@media`・`@supports`・`<style media>` の条件は css が読むだけで、style の段が照らす（設定 `ParseOptions` とプロパティの表が
   そこにある。ADR-68 (4)）
 - 要素ごとの指定の値は `(PropertyId, 値)` の並べた `MVec`。計算した値は全要素には持たず、木を作る段で行きがけの順に
-  たどりながら「深さごとの計算した値」の積み上げで求める
+  たどりながら「深さごとの計算した値」の積み上げで求める。1 つの要素の計算した値は `style::computed::compute`（親の計算
+  した値と指定の値から。`currentColor` は計算した値でも `currentColor` のまま受け継ぎ、使うときに要素の `color` で解く。
+  長さは要素の文字の大きさ・最も近い表示の領域・文書の大きさで解く）、文書の木のたどり方（根からの変形・表示の領域・
+  描く木に入るか）は `doc::walk`（M1 は照合の道具と試験から使い、M2 で use の展開を足して木を作る段が使う）
 - 継承の文脈：use の中身だけは use の文脈で継承する。pattern・marker・clipPath・mask・symbol（use から参照されたときを除く）・
   filter の中身は、参照した要素でなく、自分の祖先から継承する（SVG の規則）
 
@@ -576,7 +579,7 @@ Unicode の表は、`sumie-tools` の `gen-unicode` が Unicode の文字のデ�
 ## 10. 照合と試験の道具（sumie-tools）
 
 M0 にあるのは `oracle`・`compare`・`bench`（と子の `bench-one`）・`corpus`（`import-resvg`・`resvg-source`・`fetch-w3c`・
-`fetch-real`・`index`）・`gen-heavy`・`kura-compat`・`oracle-lock`・`gen-disallowed`・`check-lint-probe`。M1 で `probe`・`wellformed`・`latency`・`sizes`
+`fetch-real`・`index`）・`gen-heavy`・`kura-compat`・`oracle-lock`・`gen-disallowed`・`check-lint-probe`。M1 で `probe`・`wellformed`・`latency`・`sizes`・`values`
 を足した。「（M2 から）」などの印のものはまだない。
 
 | 道具 | すること |
@@ -588,6 +591,7 @@ M0 にあるのは `oracle`・`compare`・`bench`（と子の `bench-one`）・`
 | `corpus` | 照合の集まりの取り込み（出どころ・版・ライセンス・ダイジェストの一覧。resvg の試験・W3C・実例の SVG。ADR-21・ADR-59）と、使っている機能での分類（マイルストーンごとの範囲を選ぶ） |
 | `probe` | M1 の範囲を決める照らし：CSS のセレクタ・アットルール・カスケード・SVG 2 の属性・値の書き方・大きさの端の小さな SVG を `tests/svg/m1-probe/` に書き、resvg と Chrome で描いて、決めた点の色で「効く・効かない」を表にする（`README.md`。ADR-64） |
 | `wellformed` | XML の整形式の照らし：照合の集まり・Kura のファズのコーパス（`--kura-fuzz <dir>`。読むだけで、名前は BLAKE3 にする）・変異（`--mutate N`）・端の例を、roxmltree（usvg が外に出しているもの）と sumie の XML の段（`sumie::fuzzing::xml_parse`）の両方で読み、受ける・断るの食い違いと、どちらも読む文書の木（名前空間・名前・属性・文字。`sumie::fuzzing::xml_tree`。ATTLIST のある文書は比べない）の違いを `local/wellformed/`（`summary.md`・`result.jsonl`・食い違った入力の `diff/`）に書く（FR-IN-04・ADR-65） |
+| `values` | 計算した値の照らし（ADR-63 (5)）：照合の集まりを Kura の設定の usvg の木と sumie の `fuzzing::computed_values` で読み、id のある要素（id がどちらにも 1 つだけのもの）ごとに、描く木に入るか・根からの変形・塗り・線（塗り・不透明度・太さ）・不透明度・表示を比べる。図形は usvg の path と、群は usvg の群と比べ、図形の不透明度は最も近い id のある祖先までの積で比べる（usvg は図形の上に名前のない群を作る）。`local/values/`（`summary.md`・`result.jsonl`）に書く。`--dump <in.svg>` で 1 つの文書の両方を並べる |
 | `sizes` | 受ける・断ると大きさの照らし：照合の集まりを Kura の設定の resvg と sumie の `parse` で読み、`Document::size`・`pixel_size(1)` を resvg の木の大きさと比べる（同じ・中身で決まる（M2 から比べる）・違う・sumie が断る・resvg が断る）。`local/sizes/`（`summary.md`・`result.jsonl`）に書く（FR-OUT-02・NFR-10） |
 | `latency` | 敵対的な入力（レビューで見つかった、払わない長いループや 2 乗の形を集めたもの。`--scale N` で大きくする）を `sumie::parse` に通し、手間・実時間・1 単位あたりの実時間・中止の印を読む間の実時間の最大を表にする（FR-LIM-04・FR-LIM-05・NFR-05・NFR-06。M7 の校正の資料にもする） |
 | `kura-compat` | Kura の側の「描く／断る」と大きさの一覧（`corpus/kura-request.md`）と照らす（ADR-62 (4)。依頼は取り下げたので、一覧が届いたときに使う。ADR-63 (1)） |

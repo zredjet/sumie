@@ -229,3 +229,19 @@ fn view_box_and_aspect() {
         assert_eq!(ar(bad), None, "{bad}");
     }
 }
+
+/// viewBox の変形（SVG 2 §8.2）：揃え方・meet・slice・none。
+#[test]
+fn view_box_transforms() {
+    let vb = ViewBox { x: 10.0, y: 0.0, w: 20.0, h: 10.0 };
+    let t = |a: Align, slice: bool| view_box_transform(&vb, Aspect { align: a, slice }, 100.0, 100.0).unwrap();
+    // meet：小さい方の倍率（5）で、真ん中に揃える（縦に 50 の余り）
+    assert_eq!(t(Align::XMidYMid, false), Transform { a: 5.0, b: 0.0, c: 0.0, d: 5.0, e: -50.0, f: 25.0 });
+    assert_eq!(t(Align::XMinYMax, false), Transform { a: 5.0, b: 0.0, c: 0.0, d: 5.0, e: -50.0, f: 50.0 });
+    // slice：大きい方の倍率（10）で、横にはみ出す（-100 の余り）
+    assert_eq!(t(Align::XMaxYMin, true), Transform { a: 10.0, b: 0.0, c: 0.0, d: 10.0, e: -200.0, f: 0.0 });
+    // none：縦横べつの倍率
+    assert_eq!(t(Align::None, false), Transform { a: 5.0, b: 0.0, c: 0.0, d: 10.0, e: -50.0, f: 0.0 });
+    // 幅か高さが 0 の viewBox は描かない
+    assert_eq!(view_box_transform(&ViewBox { w: 0.0, ..vb }, Aspect::DEFAULT, 1.0, 1.0), None);
+}

@@ -178,7 +178,7 @@ impl Transform {
         }
     }
 
-    fn finite(&self) -> bool {
+    pub(crate) fn finite(&self) -> bool {
         [self.a, self.b, self.c, self.d, self.e, self.f].iter().all(|v| v.is_finite())
     }
 }
@@ -816,15 +816,29 @@ fn has_byte(s: &[u8], range: Span, b: u8, budget: &Budget<'_>) -> Result<bool, E
 }
 
 /// CSS の `transform` プロパティの形が正しいか（CSS Transforms 1・2 の 2 次元の関数。長さはどの単位も受け、行列にするのは
-/// 木を作る段で文脈を使って行う。`viewport` が偽なら vw などの単位は壊れた値）。3 次元の関数は読まない（壊れた値。ADR-74）。
+/// [`transform_css`] で文脈を使って行う。`viewport` が偽なら vw などの単位は壊れた値）。3 次元の関数は読まない（壊れた値。
+/// ADR-74）。
 pub(crate) fn transform_css_valid(s: &[u8], range: Span, viewport: bool, budget: &Budget<'_>) -> Result<bool, Error> {
+    Ok(transform_css(s, range, viewport, &mut |_, _| Some(0.0), budget)?.is_some())
+}
+
+/// CSS の `transform` プロパティを行列にする。長さと割合は `resolve`（長さ, 横の向きか）でユーザー単位に解く（割合は参照の
+/// 箱の幅か高さに対して）。形が壊れていれば None、形は正しいが解けない長さがあれば `Some((_, false))`（行列は解けない長さを
+/// 0 にしたもの）。行列が有限かは呼び手が見る（形の正しさに入れない）。
+pub(crate) fn transform_css(
+    s: &[u8],
+    range: Span,
+    viewport: bool,
+    resolve: &mut dyn FnMut(Length, bool) -> Option<f64>,
+    budget: &Budget<'_>,
+) -> Result<Option<(Transform, bool)>, Error> {
     let budget = budget_ref(budget);
     let mut v = Values::new(s, range, budget);
     if v.eat_ident(b"none")? {
-        return v.at_end();
+        return Ok(v.at_end()?.then_some((Transform::IDENTITY, true)));
     }
     if v.at_end()? {
-        return Ok(false);
+        return Ok(None);
     }
     #[derive(Clone, Copy, PartialEq)]
     enum Arg {
@@ -835,30 +849,43 @@ pub(crate) fn transform_css_valid(s: &[u8], range: Span, viewport: bool, budget:
         NumPct,
         Num,
     }
+    let mut m = Transform::IDENTITY;
+    let mut resolved = true;
     while !v.at_end()? {
         budget.spend(cost::OP_STEP)?;
         let f = v.next()?;
         if f.kind != Kind::Function {
-            return Ok(false);
+            return Ok(None);
         }
         let is = |w: &[u8]| ident_is(s, f.inner, f.escaped, w);
-        let (kind, min, max) = if is(b"matrix") {
-            (Arg::Num, 6usize, 6usize)
+        // 関数の番号：0 matrix、1 translate、2 translateX、3 translateY、4 scale、5 scaleX、6 scaleY、7 rotate、
+        // 8 skewX、9 skewY、10 skew
+        let (func, kind, min, max) = if is(b"matrix") {
+            (0u8, Arg::Num, 6usize, 6usize)
         } else if is(b"translate") {
-            (Arg::Lp, 1, 2)
-        } else if is(b"translatex") || is(b"translatey") {
-            (Arg::Lp, 1, 1)
+            (1, Arg::Lp, 1, 2)
+        } else if is(b"translatex") {
+            (2, Arg::Lp, 1, 1)
+        } else if is(b"translatey") {
+            (3, Arg::Lp, 1, 1)
         } else if is(b"scale") {
-            (Arg::NumPct, 1, 2)
-        } else if is(b"scalex") || is(b"scaley") {
-            (Arg::NumPct, 1, 1)
-        } else if is(b"rotate") || is(b"rotatez") || is(b"skewx") || is(b"skewy") {
-            (Arg::Ang, 1, 1)
+            (4, Arg::NumPct, 1, 2)
+        } else if is(b"scalex") {
+            (5, Arg::NumPct, 1, 1)
+        } else if is(b"scaley") {
+            (6, Arg::NumPct, 1, 1)
+        } else if is(b"rotate") || is(b"rotatez") {
+            (7, Arg::Ang, 1, 1)
+        } else if is(b"skewx") {
+            (8, Arg::Ang, 1, 1)
+        } else if is(b"skewy") {
+            (9, Arg::Ang, 1, 1)
         } else if is(b"skew") {
-            (Arg::Ang, 1, 2)
+            (10, Arg::Ang, 1, 2)
         } else {
-            return Ok(false);
+            return Ok(None);
         };
+        let mut a = [0.0f64; 6];
         let mut n = 0usize;
         loop {
             // 値の終わりで閉じない関数は閉じたものとする（CSS Syntax。Chrome と同じ）
@@ -866,31 +893,103 @@ pub(crate) fn transform_css_valid(s: &[u8], range: Span, viewport: bool, budget:
                 break;
             }
             if n >= max || (n > 0 && !v.eat(Kind::Comma)?) {
-                return Ok(false);
+                return Ok(None);
             }
-            let ok = match kind {
-                Arg::Num => v.number()?.is_some(),
-                Arg::Ang => v.angle(false)?.is_some(),
+            let x = match kind {
+                Arg::Num => v.number()?,
+                Arg::Ang => v.angle(false)?,
                 Arg::NumPct => {
                     let t = v.peek()?;
-                    let ok = t.finite && matches!(t.kind, Kind::Number | Kind::Percentage);
-                    if ok {
+                    if t.finite && matches!(t.kind, Kind::Number | Kind::Percentage) {
                         v.next()?;
+                        Some(if t.kind == Kind::Percentage { t.value / 100.0 } else { t.value })
+                    } else {
+                        None
                     }
-                    ok
                 }
-                Arg::Lp => v.length(false)?.is_some_and(|l| viewport || !l.unit.viewport()),
+                Arg::Lp => match v.length(false)?.filter(|l| viewport || !l.unit.viewport()) {
+                    Some(l) => {
+                        // translate の 2 つめと translateY は縦の向き
+                        let horizontal = !(func == 3 || (func == 1 && n == 1));
+                        match resolve(l, horizontal) {
+                            Some(x) => Some(x),
+                            None => {
+                                resolved = false;
+                                Some(0.0)
+                            }
+                        }
+                    }
+                    None => None,
+                },
             };
-            if !ok {
-                return Ok(false);
+            let Some(x) = x else { return Ok(None) };
+            if let Some(slot) = a.get_mut(n) {
+                *slot = x;
             }
             n = n.saturating_add(1);
         }
         if n < min {
-            return Ok(false);
+            return Ok(None);
         }
+        let [a0, a1, a2, a3, a4, a5] = a;
+        let tan = |deg: f64| math::tan(deg * math::DEG_TO_RAD);
+        let t = match func {
+            0 => Transform { a: a0, b: a1, c: a2, d: a3, e: a4, f: a5 },
+            1 => Transform { e: a0, f: if n > 1 { a1 } else { 0.0 }, ..Transform::IDENTITY },
+            2 => Transform { e: a0, ..Transform::IDENTITY },
+            3 => Transform { f: a0, ..Transform::IDENTITY },
+            4 => Transform { a: a0, d: if n > 1 { a1 } else { a0 }, ..Transform::IDENTITY },
+            5 => Transform { a: a0, ..Transform::IDENTITY },
+            6 => Transform { d: a0, ..Transform::IDENTITY },
+            7 => rotate(a0, None),
+            8 => Transform { c: tan(a0), ..Transform::IDENTITY },
+            9 => Transform { b: tan(a0), ..Transform::IDENTITY },
+            _ => Transform { c: tan(a0), b: if n > 1 { tan(a1) } else { 0.0 }, ..Transform::IDENTITY },
+        };
+        m = m.then(&t);
     }
-    Ok(true)
+    Ok(Some((m, resolved)))
+}
+
+/// 表示の領域の `w` × `h` に `viewBox` を合わせる変形（SVG 2 §8.2 の「表示の領域の同じ変形」。表示の領域の原点は 0, 0。
+/// 呼び手が x・y の平行移動を前に掛ける）。viewBox の幅か高さが 0 なら None（描かない）。
+pub(crate) fn view_box_transform(vb: &ViewBox, aspect: Aspect, w: f64, h: f64) -> Option<Transform> {
+    if vb.w <= 0.0 || vb.h <= 0.0 {
+        return None;
+    }
+    let (mut sx, mut sy) = (w / vb.w, h / vb.h);
+    if aspect.align != Align::None {
+        let k = if aspect.slice { math::max(sx, sy) } else { math::min(sx, sy) };
+        sx = k;
+        sy = k;
+    }
+    let mut tx = -vb.x * sx;
+    let mut ty = -vb.y * sy;
+    let (xpart, ypart) = match aspect.align {
+        Align::None | Align::XMinYMin => (0u8, 0u8),
+        Align::XMidYMin => (1, 0),
+        Align::XMaxYMin => (2, 0),
+        Align::XMinYMid => (0, 1),
+        Align::XMidYMid => (1, 1),
+        Align::XMaxYMid => (2, 1),
+        Align::XMinYMax => (0, 2),
+        Align::XMidYMax => (1, 2),
+        Align::XMaxYMax => (2, 2),
+    };
+    let room_x = w - vb.w * sx;
+    let room_y = h - vb.h * sy;
+    match xpart {
+        1 => tx += room_x / 2.0,
+        2 => tx += room_x,
+        _ => {}
+    }
+    match ypart {
+        1 => ty += room_y / 2.0,
+        2 => ty += room_y,
+        _ => {}
+    }
+    let t = Transform { a: sx, b: 0.0, c: 0.0, d: sy, e: tx, f: ty };
+    t.finite().then_some(t)
 }
 
 fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {

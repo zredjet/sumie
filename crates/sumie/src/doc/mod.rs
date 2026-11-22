@@ -10,6 +10,7 @@ pub(crate) mod ids;
 pub(crate) mod needs;
 pub(crate) mod refs;
 pub(crate) mod size;
+pub(crate) mod walk;
 
 use crate::budget::{Budget, Estimate};
 use crate::cancel::Cancel;
@@ -43,6 +44,8 @@ pub struct Document<'s> {
     needs: Needs,
     size: SizeRule,
     limits: Limits,
+    /// 既定の文字の大きさ（`StyleDefaults::font_size`。計算した値の `medium` と根の要素の親の文字の大きさ）
+    font_size: f64,
     report: Report,
 }
 
@@ -201,7 +204,19 @@ fn pipeline<'s>(svg: &'s [u8], opts: &ParseOptions<'_>, budget: &Budget<'_>) -> 
     let refs = refs::build(&doc, svg, &sheet, &styles, &ids, opts.style.languages, budget)?;
     let needs = needs::needs(&doc, svg, &sheet, &styles, &refs, budget)?;
     let report = report(&doc, svg, &sheet, &styles, &refs, budget)?;
-    Ok(Document { input: svg, xml: doc, sheet, styles, ids, refs, needs, size, limits: opts.limits, report })
+    Ok(Document {
+        input: svg,
+        xml: doc,
+        sheet,
+        styles,
+        ids,
+        refs,
+        needs,
+        size,
+        limits: opts.limits,
+        font_size: opts.style.font_size,
+        report,
+    })
 }
 
 /// 根の要素の文字の大きさ（px）。指定の値が長さか割合ならそれ（em・ex・% は既定の文字の大きさに対して）、ほか（言葉・

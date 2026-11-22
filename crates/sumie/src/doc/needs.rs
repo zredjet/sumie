@@ -31,7 +31,7 @@ pub struct Needs {
 }
 
 /// 知っている要素（知らない要素は子ごと描かない。FR-ST-02）。
-fn known(local: &[u8]) -> bool {
+pub(crate) fn known(local: &[u8]) -> bool {
     not_rendered(local)
         || matches!(
             local,
