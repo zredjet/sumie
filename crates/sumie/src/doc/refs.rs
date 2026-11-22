@@ -417,7 +417,8 @@ fn attr_buf<'a>(doc: &'a XmlDoc, input: &'a [u8], a: &xml::Attr) -> (&'a [u8], S
     }
 }
 
-/// `switch` が選ぶ子（描く要素。`desc`・`title` などは選ばず、隠しもしない）。
+/// `switch` が選ぶ子（描く要素。`desc`・`title` などは選ばず、隠しもしない）。`foreignObject` は描かないので選ばない
+/// （draw.io の書き出しの代わりの中身を描く。resvg と同じ。ADR-78 (6)）。
 fn switch_candidate(local: &[u8]) -> bool {
     matches!(
         local,
@@ -427,7 +428,6 @@ fn switch_candidate(local: &[u8]) -> bool {
             | b"image"
             | b"text"
             | b"switch"
-            | b"foreignObject"
             | b"rect"
             | b"circle"
             | b"ellipse"

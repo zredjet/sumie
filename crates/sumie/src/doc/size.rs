@@ -112,23 +112,22 @@ pub(crate) fn size_rule(doc: &XmlDoc, input: &[u8], font_size: f64, budget: &Bud
     Ok(SizeRule::Known(Size { width: size.0, height: size.1 }))
 }
 
-/// 画素の大きさ（倍率を掛けて切り上げる。10.5 は 11・0.3 は 1）。倍率が有限で正でないか、画素の数が u32 を超えれば
-/// `Invalid`（`Argument`）。
+/// 画素の大きさ（倍率を掛けたものを f32 にしてから四捨五入する。0.5 は遠い側・最小 1。resvg の `to_int_size` と同じ。
+/// ADR-78 (5)）。倍率が有限で正でないか、画素の数が u32 を超えれば `Invalid`（`Argument`）。
 pub(crate) fn pixel_size(size: Size, scale: f64) -> Result<PixelSize, Error> {
     let arg = || Error::Invalid(Invalid { reason: InvalidReason::Argument, position: None });
     if !(scale.is_finite() && scale > 0.0) {
         return Err(arg());
     }
     let px = |v: f64| -> Result<u32, Error> {
-        let x = (v * scale).ceil();
-        if !(x.is_finite() && x >= 1.0 && x <= f64::from(u32::MAX)) {
-            // 0 より大きく 1 未満は 1 にする
-            if x.is_finite() && x > 0.0 && x < 1.0 {
-                return Ok(1);
-            }
+        // f32 にしてから丸める（resvg は大きさを f32 で持つ）
+        let x = f64::from(((v * scale) as f32).round());
+        let positive = v * scale > 0.0;
+        if !(x.is_finite() && x <= f64::from(u32::MAX) && positive) {
             return Err(arg());
         }
-        Ok(x as u32)
+        // 0 より大きく 0.5 未満は 1 にする
+        Ok(if x < 1.0 { 1 } else { x as u32 })
     };
     Ok(PixelSize { width: px(size.width)?, height: px(size.height)? })
 }

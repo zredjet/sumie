@@ -582,7 +582,9 @@ pub fn xml_tree(data: &[u8], f: &mut dyn FnMut(TreeItem<'_>)) -> bool {
     for (i, n) in nodes.iter().enumerate() {
         let d = depth.get(i).copied().unwrap_or(0);
         if n.kind == crate::xml::KIND_ELEMENT {
-            f(TreeItem::Element { depth: d, ns: ns_name(n.ns), local: n.local.of(data) });
+            // 名前空間のない根の svg の文書で SVG にした要素は、XML の名前空間としてはなし（ADR-78 (2)）
+            let ns = if n.flags & crate::xml::FLAG_IMPLIED_SVG != 0 { crate::xml::NS_NONE } else { n.ns };
+            f(TreeItem::Element { depth: d, ns: ns_name(ns), local: n.local.of(data) });
             for a in doc.attrs_of(n) {
                 if a.ns == crate::xml::NS_XMLNS {
                     continue;

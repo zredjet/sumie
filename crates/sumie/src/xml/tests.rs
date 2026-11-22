@@ -110,7 +110,7 @@ fn nodes_attrs_and_links() {
 
 #[test]
 fn namespaces() {
-    let b = |s: &str| parse(s).map(|d| d.nodes.as_slice().iter().map(|n| n.ns).collect::<Vec<_>>());
+    let b = |s: &str| parse(s).map(|d| d.nodes.as_slice().iter().map(xml_ns).collect::<Vec<_>>());
     // 接頭辞つきの SVG・既定の名前空間の入れ子・XLink
     let src = "<s:svg xmlns:s=\"http://www.w3.org/2000/svg\"><s:rect/><x xmlns=\"urn:x\"><y/></x></s:svg>";
     assert_eq!(b(src).unwrap(), [NS_SVG, NS_SVG, NS_OTHER, NS_OTHER]);
@@ -167,7 +167,7 @@ fn namespaces() {
     // 空の URI に束ねた接頭辞は「そのほか」（roxmltree と同じ。名前空間のない属性とは重ならない）
     let src = "<svg xmlns:p=\"\" p:a=\"1\" a=\"2\"><p:x/></svg>";
     let doc = parse(src).unwrap();
-    assert_eq!(doc.nodes.as_slice().iter().map(|n| n.ns).collect::<Vec<_>>(), [NS_NONE, NS_OTHER]);
+    assert_eq!(doc.nodes.as_slice().iter().map(xml_ns).collect::<Vec<_>>(), [NS_NONE, NS_OTHER]);
     assert_eq!(doc.attrs_of(doc.node(0).unwrap()).iter().map(|a| a.ns).collect::<Vec<_>>(), [NS_OTHER, NS_NONE]);
     // 既定の名前空間の宣言の重なりは最初のもの
     assert_eq!(b(&format!("<svg {SVG} xmlns=\"urn:a\"><g/></svg>")).unwrap(), [NS_SVG, NS_SVG]);
@@ -647,7 +647,7 @@ fn attlist_defaults_are_applied() {
     // 名前空間の宣言の既定（古い DTD の書き方）と xml:space の列挙の既定
     let src = "<!DOCTYPE svg [<!ATTLIST svg xmlns CDATA #FIXED \"http://www.w3.org/2000/svg\"><!ATTLIST text xml:space (default|preserve) 'preserve'>]><svg><text/></svg>";
     let doc = parse(src).unwrap();
-    assert_eq!(doc.nodes.as_slice().iter().map(|n| n.ns).collect::<Vec<_>>(), [NS_SVG, NS_SVG]);
+    assert_eq!(doc.nodes.as_slice().iter().map(xml_ns).collect::<Vec<_>>(), [NS_SVG, NS_SVG]);
     assert_ne!(doc.node(1).unwrap().flags & FLAG_PRESERVE, 0);
     assert_eq!(doc.attrs_of(doc.node(0).unwrap()).len(), 0);
     // 壊れた宣言・壊れた既定の値は当てない（roxmltree は ATTLIST を読まずに受ける。NFR-10）
@@ -835,11 +835,11 @@ fn dtd_declarations_are_read_as_units() {
 /// `xmlns:xml` の重なりは受ける。
 #[test]
 fn prefixed_xmlns_and_repeated_xml_declarations() {
-    let b = |s: &str| parse(s).map(|d| d.nodes.as_slice().iter().map(|n| n.ns).collect::<Vec<_>>());
+    let b = |s: &str| parse(s).map(|d| d.nodes.as_slice().iter().map(xml_ns).collect::<Vec<_>>());
     assert_eq!(b("<svg b:xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>").unwrap(), [NS_SVG, NS_SVG]);
     let src = "<svg xmlns:a=\"urn:a\" a:xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>";
     let doc = parse(src).unwrap();
-    assert_eq!(doc.nodes.as_slice().iter().map(|n| n.ns).collect::<Vec<_>>(), [NS_NONE, NS_NONE]);
+    assert_eq!(doc.nodes.as_slice().iter().map(xml_ns).collect::<Vec<_>>(), [NS_NONE, NS_NONE]);
     assert_eq!(doc.attrs_of(doc.node(0).unwrap()).len(), 1);
     let x = "xmlns:xml=\"http://www.w3.org/XML/1998/namespace\"";
     assert!(parse(&format!("<svg {x} {x}/>")).is_ok());
@@ -867,7 +867,7 @@ fn long_names_in_sorts_are_paid_as_compared() {
 /// `b:xmlns` と `xmlns` は文書の順に最初のものが既定の名前空間（roxmltree と同じ）。
 #[test]
 fn prefixed_xmlns_from_defaults_and_order() {
-    let ns = |s: &str| parse(s).map(|d| d.nodes.as_slice().iter().map(|n| n.ns).collect::<Vec<_>>());
+    let ns = |s: &str| parse(s).map(|d| d.nodes.as_slice().iter().map(xml_ns).collect::<Vec<_>>());
     for uri in ["http://www.w3.org/XML/1998/namespace", "http://www.w3.org/2000/xmlns/", "http://www.w3.org/2000/svg"] {
         let src = format!("<!DOCTYPE svg [<!ATTLIST svg b:xmlns CDATA \"{uri}\">]><svg/>");
         assert_eq!(ns(&src).unwrap(), [NS_NONE], "{uri}");
@@ -906,4 +906,34 @@ fn attlist_literal_chars_and_small_expansion_limit() {
             "{src}"
         );
     }
+}
+
+/// XML の名前空間（名前空間のない根の svg の文書で SVG にした要素は、XML としては名前空間なし。ADR-78 (2)）。
+fn xml_ns(n: &Node) -> u8 {
+    if n.flags & FLAG_IMPLIED_SVG != 0 { NS_NONE } else { n.ns }
+}
+
+/// 名前空間のない根の svg の文書は、既定の名前空間の宣言のない要素を SVG の要素にして印を付ける（ADR-78 (2)）。
+#[test]
+fn implied_svg_namespace() {
+    let ns = |s: &str| {
+        parse(s)
+            .unwrap()
+            .nodes
+            .as_slice()
+            .iter()
+            .filter(|n| n.kind == KIND_ELEMENT)
+            .map(|n| (n.ns, n.flags & FLAG_IMPLIED_SVG != 0))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ns("<svg><rect/><g xmlns=\"\"><rect/></g><x:a xmlns:x=\"urn:x\"/></svg>"),
+        [(NS_SVG, true), (NS_SVG, true), (NS_NONE, false), (NS_NONE, false), (NS_OTHER, false)]
+    );
+    assert_eq!(ns("<svg xmlns=\"\"><rect/></svg>"), [(NS_NONE, false), (NS_NONE, false)]);
+    assert_eq!(ns("<foo><svg/></foo>"), [(NS_NONE, false), (NS_NONE, false)]);
+    assert_eq!(
+        ns("<svg xmlns=\"http://www.w3.org/2000/svg\"><rect xmlns=\"\"/></svg>"),
+        [(NS_SVG, false), (NS_NONE, false)]
+    );
 }

@@ -8,8 +8,8 @@
 //!   100%。属性だけを読む）と viewBox
 //! - 描く木に入るか：SVG の名前空間の知っている要素で、子を描く入れ物（svg・g・a・switch と文字の要素）の子であり、描かない
 //!   入れ物（defs など）の中でなく、条件が偽・switch で選ばれない要素の部分木（refs の `hidden`）でなく、`display: none` の
-//!   部分木の中でない。変形が逆にできない（行列式が 0）要素と、幅か高さが 0 以下の入れ子の svg は、部分木ごと描かない
-//!   （CSS Transforms 1 §6・SVG 2 §8.2）
+//!   部分木の中でない。変形が逆にできない（行列式が 0）要素と、幅か高さが 0 以下の入れ子の svg と、幅か高さが 0 の viewBox
+//!   の svg（根なら文書の全体）は、部分木ごと描かない（CSS Transforms 1 §6・SVG 2 §8.2。ADR-78 (7)）
 
 use crate::budget::Budget;
 use crate::cost;
@@ -91,16 +91,26 @@ pub(crate) fn walk(
     base.root_font = c0.font_size;
     base.root_line = c0.line_height;
     // 根の viewBox の変形と、子の表示の領域
+    // 幅か高さが 0 の viewBox の根は描かない（大きさは viewBox がないものとして決める。ADR-78 (7)）
+    let mut root_drawn = true;
     let (root_ctm, root_vp) = match (size, view_box_of(doc, input, root, budget)?) {
         (Some((w, h)), Some((vb, aspect))) => match view_box_transform(&vb, aspect, w, h) {
             Some(t) => (t, Some((vb.w, vb.h))),
-            None => (Transform::IDENTITY, size),
+            None => {
+                root_drawn = false;
+                (Transform::IDENTITY, size)
+            }
         },
+        (None, Some((vb, _))) if vb.w <= 0.0 || vb.h <= 0.0 => {
+            root_drawn = false;
+            (Transform::IDENTITY, size)
+        }
         _ => (Transform::IDENTITY, size),
     };
     let hidden = d.refs.hidden.as_slice();
     let is_hidden = |i: u32| hidden.get(i as usize).copied() == Some(1);
-    let root_ok = root.ns == NS_SVG && root.local.of(input) == b"svg" && c0.display_none == 0 && !is_hidden(0);
+    let root_ok =
+        root.ns == NS_SVG && root.local.of(input) == b"svg" && c0.display_none == 0 && !is_hidden(0) && root_drawn;
     f(&WalkItem { node: 0, parent: NONE, computed: c0, ctm: Transform::IDENTITY, ctm_known: true, rendered: root_ok })?;
     let mut stack: MVec<'_, Frame> = MVec::new(budget);
     let (vp_w, vp_h, has_vp) = match root_vp {
@@ -253,11 +263,12 @@ fn attr_len(
     Ok(resolve(l, c.font_size, c.line_height, base, axis))
 }
 
-/// 要素の `viewBox`（幅か高さが 0 以下のものは None）と `preserveAspectRatio`。
+/// 要素の `viewBox`（負の幅・高さの壊れたものは None。幅か高さが 0 のものは返し、呼び手が描かない）と
+/// `preserveAspectRatio`。
 fn view_box_of(doc: &XmlDoc, input: &[u8], n: &Node, budget: &Budget<'_>) -> Result<Option<(ViewBox, Aspect)>, Error> {
     let budget = budget_ref(budget);
     let Some(v) = doc.attr(input, n, NS_NONE, b"viewBox", budget)? else { return Ok(None) };
-    let Some(vb) = values::view_box(v, Span::new(0, v.len()), budget)?.filter(|vb| vb.w > 0.0 && vb.h > 0.0) else {
+    let Some(vb) = values::view_box(v, Span::new(0, v.len()), budget)? else {
         return Ok(None);
     };
     let aspect = match doc.attr(input, n, NS_NONE, b"preserveAspectRatio", budget)? {

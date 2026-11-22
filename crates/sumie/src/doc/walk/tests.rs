@@ -177,3 +177,43 @@ fn paint_servers_and_fallbacks() {
     // 輪で取り除いた塗り
     assert_eq!(get(&rows, "self").2, Used::Cut);
 }
+
+/// 根の要素が名前空間のない `svg` の文書は、名前空間のない要素を SVG の要素として読む（usvg と同じ。ADR-78 (2)）。
+#[test]
+fn namespace_less_root_svg_is_svg() {
+    let rows = run(
+        r##"<svg width="20" height="10" viewBox="0 0 10 5"><style>#a{fill:red}</style><rect id="a" width="5" height="5"/><g id="g" fill="#00ff00"><rect id="b"/></g><g xmlns=""><rect id="c"/></g></svg>"##,
+    );
+    assert!(get(&rows, "a").1.rendered && get(&rows, "b").1.rendered);
+    assert_eq!(get(&rows, "a").2, Used::Color(Color { r: 255.0, g: 0.0, b: 0.0, a: 1.0 }));
+    assert_eq!(get(&rows, "b").2, Used::Color(Color { r: 0.0, g: 255.0, b: 0.0, a: 1.0 }));
+    ctm_is(get(&rows, "a"), [2.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
+    // xmlns="" を書いた部分木は名前空間なしのまま（描かない）
+    assert!(!get(&rows, "c").1.rendered);
+    // 根に xmlns="" を書いた文書・根が svg でない文書は名前空間なし
+    for doc in [
+        r#"<svg xmlns="" width="10" height="10"><rect id="d"/></svg>"#,
+        r#"<foo><svg width="10" height="10"><rect id="d"/></svg></foo>"#,
+    ] {
+        let rows = run(doc);
+        assert!(!get(&rows, "d").1.rendered, "{doc}");
+    }
+    // 大きさも読む
+    let d = crate::doc::parse(b"<svg width=\"20\" height=\"10\"/>", &ParseOptions::DEFAULT, &Never).unwrap();
+    assert_eq!(d.size().map(|s| (s.width, s.height)), Some((20.0, 10.0)));
+}
+
+/// 幅か高さが 0 の viewBox の svg は描かない（大きさは viewBox がないものとして決める。ADR-78 (7)）。
+#[test]
+fn zero_view_box_is_not_drawn() {
+    let rows = run(&format!(
+        r##"<svg {X} width="10" height="10"><svg id="s" viewBox="0 0 0 10"><rect id="in"/></svg><rect id="out"/></svg>"##
+    ));
+    assert!(!get(&rows, "s").1.rendered && !get(&rows, "in").1.rendered);
+    assert!(get(&rows, "out").1.rendered);
+    let src = format!(r##"<svg {X} id="root" width="10" height="10" viewBox="0 0 10 0"><rect id="r"/></svg>"##);
+    let rows = run(&src);
+    assert!(!get(&rows, "root").1.rendered && !get(&rows, "r").1.rendered);
+    let d = crate::doc::parse(src.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+    assert_eq!(d.size().map(|s| (s.width, s.height)), Some((10.0, 10.0)));
+}

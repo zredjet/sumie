@@ -72,7 +72,7 @@ impl<'s> Document<'s> {
         self.size.known()
     }
 
-    /// 倍率 `scale` で描くときの画素の大きさ（切り上げる）。`None` は [`Document::size`] と同じ。倍率が有限で正でないか、
+    /// 倍率 `scale` で描くときの画素の大きさ（f32 にしてから四捨五入・最小 1。resvg と同じ。ADR-78 (5)）。`None` は [`Document::size`] と同じ。倍率が有限で正でないか、
     /// 画素の数が u32 を超えれば `Invalid`（`Argument`）。
     pub fn pixel_size(&self, scale: f64) -> Result<Option<PixelSize>, Error> {
         match self.size.known() {

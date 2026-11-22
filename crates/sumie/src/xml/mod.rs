@@ -54,6 +54,9 @@ pub(crate) const FLAG_IN_STORE: u8 = 1;
 pub(crate) const FLAG_PRESERVE: u8 = 2;
 /// 節の印：CDATA の文字。
 pub(crate) const FLAG_CDATA: u8 = 4;
+/// 節の印：名前空間のない根の `svg` の文書で、既定の名前空間の宣言のないまま SVG の名前空間にした要素（ADR-78 (2)。
+/// XML の名前空間としてはなし。照らしの木は名前空間なしとして知らせる）。
+pub(crate) const FLAG_IMPLIED_SVG: u8 = 8;
 
 /// 節（要素か文字）。
 #[repr(C)]
@@ -350,7 +353,15 @@ impl RawAttr {
 
 /// 歩きの事象を受ける側（数える段と作る段）。
 trait Sink {
-    fn element(&mut self, ns: u8, local: Span, pos: u32, preserve: bool, parent: u32) -> Result<u32, Error>;
+    fn element(
+        &mut self,
+        ns: u8,
+        local: Span,
+        pos: u32,
+        preserve: bool,
+        parent: u32,
+        implied: bool,
+    ) -> Result<u32, Error>;
     fn attr(&mut self, w: &Walk<'_, '_>, a: &RawAttr) -> Result<(), Error>;
     fn element_done(&mut self, node: u32, attrs_start: u64) -> Result<(), Error>;
     fn text(&mut self, w: &Walk<'_, '_>, raw: Span, cdata: bool, parent: u32, preserve: bool) -> Result<u32, Error>;
@@ -855,6 +866,8 @@ fn walk<'b>(
         stage,
     };
     let mut open: MVec<'b, Open> = MVec::new(budget);
+    // 根の要素が既定の名前空間の宣言のない `svg` か（ADR-78 (2)：usvg と同じに、名前空間のない要素を SVG の要素として読む）
+    let mut implied_svg = false;
     let mut bindings: MVec<'b, Binding> = MVec::new(budget);
     let mut raw: MVec<'b, RawAttr> = MVec::new(budget);
     let mut uri: MVec<'b, u8> = MVec::new(budget);
@@ -1059,7 +1072,29 @@ fn walk<'b>(
                 };
                 // 要素の名前空間
                 let (eprefix, elocal) = split_qname(b, qname, budget)?;
-                let Some(ens) = resolve(eprefix, true, &bindings)? else { return Err(xml_err(pos as usize)) };
+                let Some(mut ens) = resolve(eprefix, true, &bindings)? else { return Err(xml_err(pos as usize)) };
+                // 接頭辞のない要素で、既定の名前空間の宣言（`xmlns=""` を含む）がどこにもなければ、根が `svg` の文書では
+                // SVG の要素にする
+                let mut implied = false;
+                if eprefix.is_none() && ens == NS_NONE {
+                    let mut bound = false;
+                    for k in 0..bindings.len() {
+                        budget.spend(cost::OP_STEP)?;
+                        if bindings.get(k).is_some_and(|bd| bd.prefix.len() == 0) {
+                            bound = true;
+                            break;
+                        }
+                    }
+                    if !bound {
+                        if open.is_empty() {
+                            implied_svg = elocal.of(b) == b"svg";
+                        }
+                        if implied_svg {
+                            ens = NS_SVG;
+                            implied = true;
+                        }
+                    }
+                }
                 // 属性の名前空間（既定の値で足した属性の接頭辞が束ねていなければ、その属性だけを捨てる）
                 for k in 0..raw.len() {
                     budget.spend(cost::OP_STEP)?;
@@ -1101,7 +1136,7 @@ fn walk<'b>(
                     }
                 }
                 let parent_node = parent.map_or(NONE, |p| p.node);
-                let node = sink.element(ens, elocal, pos, preserve, parent_node)?;
+                let node = sink.element(ens, elocal, pos, preserve, parent_node, implied)?;
                 if let Some(p) = open.last_mut() {
                     sink.link(p.node, p.last_child, node);
                     p.last_child = node;
@@ -1326,7 +1361,15 @@ impl CountSink {
 }
 
 impl Sink for CountSink {
-    fn element(&mut self, _ns: u8, _local: Span, _pos: u32, _preserve: bool, _parent: u32) -> Result<u32, Error> {
+    fn element(
+        &mut self,
+        _ns: u8,
+        _local: Span,
+        _pos: u32,
+        _preserve: bool,
+        _parent: u32,
+        _implied: bool,
+    ) -> Result<u32, Error> {
         let id = self.nodes;
         self.nodes = self.nodes.saturating_add(1);
         self.elements = self.elements.saturating_add(1);
@@ -1382,12 +1425,20 @@ impl BuildSink<'_> {
 }
 
 impl Sink for BuildSink<'_> {
-    fn element(&mut self, ns: u8, local: Span, pos: u32, preserve: bool, parent: u32) -> Result<u32, Error> {
+    fn element(
+        &mut self,
+        ns: u8,
+        local: Span,
+        pos: u32,
+        preserve: bool,
+        parent: u32,
+        implied: bool,
+    ) -> Result<u32, Error> {
         let id = u32::try_from(self.nodes.len()).unwrap_or(NONE);
         self.nodes.push(Node {
             kind: KIND_ELEMENT,
             ns,
-            flags: if preserve { FLAG_PRESERVE } else { 0 },
+            flags: (if preserve { FLAG_PRESERVE } else { 0 }) | (if implied { FLAG_IMPLIED_SVG } else { 0 }),
             pad: 0,
             parent,
             first_child: NONE,

@@ -125,3 +125,13 @@ fn switch_and_conditions() {
     );
     assert_eq!(hidden, ["fr", "late", "ext", "g", "inner"]);
 }
+
+/// switch は foreignObject を選ばない（draw.io の書き出しの代わりの中身。ADR-78 (6)）。
+#[test]
+fn switch_skips_foreign_object() {
+    let (_, hidden, _, _) = run(
+        r##"<switch><foreignObject id="fo" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><p xmlns="http://www.w3.org/1999/xhtml">x</p></foreignObject><text id="t">x</text><rect id="r"/></switch>"##,
+    );
+    assert!(!hidden.contains(&"t".to_string()), "{hidden:?}");
+    assert!(hidden.contains(&"r".to_string()), "{hidden:?}");
+}

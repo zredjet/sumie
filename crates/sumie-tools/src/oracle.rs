@@ -2,7 +2,7 @@
 //!
 //! - resvg 0.48.1（Kura と同じ feature：text だけ）を、Kura と同じ usvg の設定で描く：外の資源を読まない
 //!   （`resources_dir: None`、画像の参照はすべて読まない）、ほかは `usvg::Options::default()`（既定の書体 Times New Roman・
-//!   12・languages ["en"]・dpi 96）。大きさは Kura と同じく `tree.size().to_int_size()`（切り上げ）。viewBox がなく幅・高さが
+//!   12・languages ["en"]・dpi 96）。大きさは Kura と同じく `tree.size().to_int_size()`（f32 の四捨五入・最小 1。ADR-78 (5)）。viewBox がなく幅・高さが
 //!   ない（か %）の文書は、usvg 0.48.1 は中身の外接矩形の右下を大きさにする（`width`・`height` のない 50 × 50 の rect は
 //!   50 × 50。100 × 100 ではない）。フォントは Kura と同じく `/System/Library/Fonts` とその `Supplemental` の ttf・otf・ttc
 //!   を、道の名前の順に登録し、総称の書体は Times・Helvetica・Apple Chancery・Papyrus・Courier
@@ -175,14 +175,14 @@ impl Resvg {
         (tree.size().width(), tree.size().height())
     }
 
-    /// 描く（倍率 `scale`。大きさは幅・高さ × 倍率の切り上げ）。
+    /// 描く（倍率 `scale`。大きさは幅・高さ × 倍率の四捨五入・最小 1。sumie の `pixel_size` と同じ。ADR-78 (5)）。
     pub fn render(&self, svg: &[u8], scale: f32) -> Result<ResvgOut, String> {
         let tree = self.tree(svg)?;
         let (w, h) = if scale == 1.0 {
             Resvg::size(&tree)
         } else {
             let s = tree.size();
-            ((s.width() * scale).ceil() as u32, (s.height() * scale).ceil() as u32)
+            ((s.width() * scale).round().max(1.0) as u32, (s.height() * scale).round().max(1.0) as u32)
         };
         let mut pixmap = tiny_skia::Pixmap::new(w.max(1), h.max(1)).ok_or("画素の領域を作れない")?;
         resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
