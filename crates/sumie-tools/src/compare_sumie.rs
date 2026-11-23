@@ -66,21 +66,68 @@ const fn edge(path: &'static str, reason: &'static str, sc: f64, sr: f64) -> Kno
     Known { path, reason, sc_max: sc + 0.005, sr_max: sr + 0.005, flat_max: 2, big_max: 0 }
 }
 
+/// 決めた規則による差の 1 件（平らな所の差と大きな差の画素も、認めたときの値まで）。
+const fn rule(path: &'static str, reason: &'static str, sc: f64, sr: f64, flat: u8, big: u64) -> Known {
+    let sc_max = if sc + 0.005 > 1.0 { 1.0 } else { sc + 0.005 };
+    Known { path, reason, sc_max, sr_max: sr + 0.005, flat_max: flat, big_max: big }
+}
+
 /// 既知の差（ADR-101 (5)・ADR-103）。ここにない不具合の候補が 1 つでもあれば、M2 の合否は不合格。
 const KNOWN: &[Known] = &[
     edge("real/flag-icons/flags/4x3/bt.svg", THIN, 0.03289, 0.02898),
     edge("real/flag-icons/flags/4x3/eac.svg", THIN, 0.02525, 0.02461),
     edge("real/flag-icons/flags/4x3/ec.svg", THIN, 0.02629, 0.02144),
-    edge("real/flag-icons/flags/4x3/va.svg", THIN, 0.02007, 0.02014),
+    edge("real/tabler-icons/icons/outline/brand-doctrine.svg", THICK, 0.02105, 0.02002),
     edge("real/tabler-icons/icons/outline/creative-commons-off.svg", THICK, 0.02737, 0.02411),
     edge("real/tabler-icons/icons/outline/fish-off.svg", THICK, 0.02028, 0.02058),
     edge("real/tabler-icons/icons/outline/om.svg", THICK, 0.02471, 0.02437),
     edge("real/tabler-icons/icons/outline/rainbow-off.svg", THICK, 0.02137, 0.02025),
     edge("real/tabler-icons/icons/outline/square-rounded-chevrons-up.svg", THICK, 0.02075, 0.02079),
     edge("real/tabler-icons/icons/outline/storm.svg", THICK, 0.02589, 0.02542),
-    edge("real/tabler-icons/icons/outline/wash-dry-3.svg", THICK, 0.02008, 0.02135),
     edge("real/tabler-icons/icons/outline/world-map-off.svg", THICK, 0.02473, 0.02278),
+    rule("resvg/tests/painting/stroke/control-points-clamping-1.svg", CLAMP, 0.00428, 0.01232, 0, 20),
+    rule("resvg/tests/structure/svg/no-size.svg", SIZE, 0.57903, 0.0, 255, 91237),
+    rule("tests/svg/m1-probe/size/width-only.svg", SIZE, 0.43333, 0.0, 255, 1296),
+    rule("tests/svg/m1-probe/size/height-only.svg", SIZE, 0.6, 0.0, 255, 1740),
+    rule("tests/svg/m1-probe/size/percent.svg", SIZE, 0.26667, 0.0, 128, 778),
+    rule("tests/svg/m1-probe/size/fraction.svg", FRACTION, 1.0, 0.0, 0, 50),
+    rule("tests/svg/m1-probe/size/em.svg", DEFAULTS, 0.21, 0.0, 255, 1186),
+    rule("tests/svg/m1-probe/system-language.svg", DEFAULTS, 1.0, 0.0, 255, 10000),
+    rule("tests/svg/m1-probe/has.svg", HAS, 1.0, 0.0, 255, 10000),
+    rule("resvg/tests/painting/stroke-dasharray/even-count.svg", DASH, 0.00983, 0.01020, 0, 2),
+    rule("resvg/tests/painting/stroke-dasharray/odd-count.svg", DASH, 0.01303, 0.01337, 0, 2),
+    rule("resvg/tests/painting/stroke-dasharray/on-a-circle.svg", DASH, 0.01107, 0.01080, 0, 4),
+    rule("resvg/tests/painting/stroke-dasharray/ws-separator.svg", DASH, 0.01287, 0.01317, 0, 2),
+    rule("resvg/tests/painting/stroke-dashoffset/default.svg", DASH, 0.01287, 0.01317, 0, 2),
+    rule("resvg/tests/painting/stroke-dashoffset/em-units.svg", DASH, 0.01287, 0.01317, 0, 2),
+    rule("resvg/tests/painting/stroke-dashoffset/negative-value.svg", DASH, 0.01298, 0.01323, 0, 4),
+    rule("resvg/tests/painting/stroke-dashoffset/px-units.svg", DASH, 0.01298, 0.01323, 0, 4),
+    rule("resvg/tests/shapes/rect/ch-values.svg", FONT_UNITS, 0.35340, 0.51850, 255, 13420),
+    rule("resvg/tests/shapes/rect/ex-values.svg", FONT_UNITS, 0.15040, 0.00375, 255, 5571),
+    rule("resvg/tests/shapes/rect/lh-values.svg", FONT_UNITS, 0.07850, 0.65617, 255, 3117),
+    rule("resvg/tests/shapes/rect/rlh-values.svg", FONT_UNITS, 0.07850, 0.65617, 255, 3117),
+    rule("tests/svg/m2-probe/thin-strokes.svg", THIN_PROBE, 0.03790, 0.03290, 0, 0),
 ];
+
+/// 曲線の上の破線の境（ユーザーの判断。ADR-103）。
+const DASH: &str = "ADR-103：曲線の上の破線の境の位置（Skia は粗い平坦化で長さを測るので、境が 0.5 画素ほど先にずれる。sumie は描く平坦化で測る。太い線の端の数画素）";
+/// フォントの寸法に依る単位（ユーザーの判断。ADR-103）。
+const FONT_UNITS: &str = "ADR-103：ex・ch・lh・rlh はフォントなしの既定（0.5em・1.2）で解く（Chrome は書体の寸法。M5 でフォントから解く）";
+/// 細い線の試し（ADR-97 (2)）。
+const THIN_PROBE: &str = "ADR-97 (2)：細い線を描く座標系の 1 画素の線を太さの α で描く（Skia の細い線の反エイリアスと縁の画素が違う）";
+
+/// 寄せた制御点（ADR-101 (6)）。
+const CLAMP: &str =
+    "ADR-101 (6)：制御点が端点にごく近い曲線の継ぎ目（Skia は寄せた制御点を除いて向きを決める。方式の差）";
+/// 大きさの規則（FR-OUT-01）。
+const SIZE: &str = "FR-OUT-01・ADR-58 (1)・ADR-64 (8)：大きさは usvg の規則（幅か高さが欠ける・% なら中身の外接矩形。Chrome は書いた幅と既定の大きさ）";
+/// 1 に満たない大きさ（ADR-78 (5)）。
+const FRACTION: &str = "FR-OUT-01・ADR-78 (5)：画素の大きさは四捨五入で最小 1（Chrome は 0.3 の幅を引き伸ばす）";
+/// 環境で決まる既定の値（ADR-66）。
+const DEFAULTS: &str =
+    "ADR-66：環境で決まる値は決めた既定（文字の大きさ 12・言語 en。usvg と同じ。Chrome は 16 と機械の言語）";
+/// :has()（ADR-66 (1)・ADR-73 (4)）。
+const HAS: &str = "ADR-66 (1)・ADR-73 (4)：`:has()` は正しいセレクタとして読むが当てない（警告。Chrome は当てる）";
 
 /// 曲線の太い線の縁（ADR-97 (3)）。
 const THICK: &str = "ADR-97 (3)・ADR-101 (5)：曲線の太い線の縁の反エイリアス（外れた画素はすべて縁の半端な画素。4 倍で描いて縮めた絵に sumie がいちばん近い）";
@@ -334,7 +381,7 @@ fn load_cache(dirs: &[PathBuf]) -> Result<BTreeMap<String, Vec<Cached>>, String>
 }
 
 /// sumie で描いた結果。
-enum Drawn {
+pub(crate) enum Drawn {
     Image(Rgba),
     /// まだ描かない・描かない機能（外す）
     Excluded(String),
@@ -343,7 +390,7 @@ enum Drawn {
 }
 
 /// sumie で描く（倍率 `k`）。
-fn render_sumie(svg: &[u8], k: u32) -> Drawn {
+pub(crate) fn render_sumie(svg: &[u8], k: u32) -> Drawn {
     let refused = |e: String| {
         if EXPECTED_REFUSALS.iter().any(|x| e.contains(x)) {
             Drawn::Excluded(format!("例外の断り（ADR-78 (4)）：{e}"))
