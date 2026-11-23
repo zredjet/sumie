@@ -211,6 +211,13 @@ fn dashes_split_by_length() {
     assert_eq!(p[0][0], Point::new(0.0, 4.0));
     assert_eq!(p[0][1], Point::new(0.0, 0.0));
     assert_eq!(*p[0].last().unwrap(), Point::new(0.0, 5.0));
+    // 最後の部分がちょうど始めの点で終われば（隙間 0 の破線）つながない：始めの角もほかの角と同じく継ぎ目を作らない（Chrome
+    // と同じ。resvg はつなぐ。tests/painting/stroke-dasharray/n-0）
+    // （境が角ごとに 2 つずつ進まずに続いても、残りを実線にしない）
+    let p = pieces(&sq, true, &[10.0, 0.0], 0.0);
+    assert_eq!(p.len(), 4, "{p:?}");
+    assert!(p.iter().all(|s| s.windows(2).all(|w| w[0].x == w[1].x || w[0].y == w[1].y)), "{p:?}");
+    assert_eq!(p.iter().filter(|s| s.len() > 1 && s[0] == Point::new(0.0, 0.0)).count(), 1);
     // 頭が隙間ならつながない
     let p = pieces(&sq, true, &[5.0, 5.0], 5.0);
     assert!(p.iter().all(|s| s[0] != Point::new(0.0, 0.0) || s.len() > 1));

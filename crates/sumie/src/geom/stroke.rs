@@ -920,6 +920,11 @@ pub(crate) fn dash_polyline(
             idx = ring_next(idx, n);
             remain = dashes.dashes.get(idx).copied().unwrap_or(0.0);
         }
+        // 区間の残りを進んだら、進まない境の数えを戻す（隙間 0 の破線で境が角ごとに 2 つずつ進まずに続いても、区間を
+        // またいで溜めない）
+        if seg > t0 {
+            stall = 0;
+        }
         remain -= seg - t0;
         if on {
             budget.spend(cost::OUTLINE_POINT)?;
@@ -936,7 +941,9 @@ pub(crate) fn dash_polyline(
     }
     if on && buf.len() > 1 {
         buf.end_dir = if closed { tangent(np.saturating_sub(1), 1.0)? } else { tangent(np.saturating_sub(2), 1.0)? };
-        if hold_head && !head.is_empty() {
+        // 最後の部分が終わりの点でちょうど終わる（残りが 0）なら、最初の部分につながない（境が角に当たるほかの所と同じく
+        // 継ぎ目を作らない。Chrome と同じ。resvg はつなぐ。tests/painting/stroke-dasharray/n-0）
+        if hold_head && !head.is_empty() && remain > 0.0 {
             // 最後の部分（始めの点で終わる）に最初の部分をつなぐ（始めの点を 2 度入れない）
             buf.append_from(head.view(), 1, budget)?;
             buf.end_dir = head.end_dir;

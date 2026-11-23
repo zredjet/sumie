@@ -801,6 +801,26 @@ fn dash_pieces_keep_curve_sides_at_corners() {
     }
 }
 
+/// 太さ 1 画素以下の細い線の継ぎ目は bevel（Skia の細い線は区間ごとに描いて継ぎ目を作らない。Chrome・resvg と同じ。
+/// tests/painting/context/in-use の星の鋭い角で、miter の先が頂点の 1 画素上まで出て α 153 だった。ADR-103）。太い線は
+/// 書いたとおりの miter。
+#[test]
+fn thin_strokes_have_no_miter_tips() {
+    let star = |w: &mut PathWriter<'_, '_>| {
+        w.move_to(Point::new(100.0, 15.0)).unwrap();
+        for (x, y) in [(150.0, 175.0), (20.0, 75.0), (180.0, 75.0), (50.0, 175.0)] {
+            w.line_to(Point::new(x, y)).unwrap();
+        }
+        w.close().unwrap();
+    };
+    let (w, _, px) = draw(&stroked(star, 1.0, JOIN_MITER, CAP_BUTT, &[]), 1.0);
+    let alpha = |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+    assert!(alpha(99, 14) < 32 && alpha(100, 14) < 32, "{} {}", alpha(99, 14), alpha(100, 14));
+    assert!(alpha(99, 16) > 128 || alpha(100, 16) > 128);
+    let (w, _, px) = draw(&stroked(star, 2.0, JOIN_MITER, CAP_BUTT, &[]), 1.0);
+    assert!(px[((13 * w + 100) * 4 + 3) as usize] > 128, "太い線の miter の先");
+}
+
 /// non-scaling の線の滑らかなつなぎ目は描く座標系の接線で決める（単位 2 の 5 回目のレビュー）：縦に 60 倍する変形の下で、
 /// まっすぐな 3 次曲線のあとの線分のつなぎ目は、ユーザー単位では 1.15° でも描く座標系では 50° の角なので、指定の miter で
 /// 作る（同じ形を線分で書いたものと同じ画素。Chrome・resvg と同じ）。

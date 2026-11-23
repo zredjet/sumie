@@ -669,10 +669,13 @@ pub(crate) struct StrokeMode {
     pub(crate) dash_unit: f64,
     /// 外形を作る座標系から描く座標系への最大の倍率
     pub(crate) sigma: f64,
+    /// 細い線（描く座標系の 1 画素の線を太さの α で描く）。継ぎ目は bevel にする（Skia の細い線は区間ごとに描いて継ぎ目を
+    /// 作らないので、鋭い角に miter の先が出ない。Chrome・resvg と同じ。ADR-103）
+    pub(crate) hair: bool,
 }
 
 /// 節の線の形を決める（`t` は描く座標系への変形）。描く座標系の太さが 1 画素以下の反エイリアスの線は、描く座標系の 1 画素の
-/// 線を太さ（2 つの軸の太さの平均）の α で描く（Chrome・resvg の細い線と同じ。ADR-97 (2)）。細い線の破線の長さは、変形の
+/// 線を太さ（2 つの軸の太さの平均）の α で、継ぎ目を bevel にして描く（Chrome・resvg の細い線と同じ。ADR-97 (2)・ADR-103）。細い線の破線の長さは、変形の
 /// 面積の倍の平方根（相似の変形なら倍率そのもの）で描く座標系の長さにする。
 pub(crate) fn stroke_mode(n: &PathNode, t: &Transform, scale: f64) -> StrokeMode {
     let w = n.stroke_width;
@@ -680,17 +683,24 @@ pub(crate) fn stroke_mode(n: &PathNode, t: &Transform, scale: f64) -> StrokeMode
     if n.flags & NON_SCALING != 0 {
         let wd = w * scale;
         if aa && wd <= 1.0 {
-            return StrokeMode { device: true, half: 0.5, alpha: wd, dash_unit: scale, sigma: 1.0 };
+            return StrokeMode { device: true, half: 0.5, alpha: wd, dash_unit: scale, sigma: 1.0, hair: true };
         }
-        return StrokeMode { device: true, half: wd / 2.0, alpha: 1.0, dash_unit: scale, sigma: 1.0 };
+        return StrokeMode { device: true, half: wd / 2.0, alpha: 1.0, dash_unit: scale, sigma: 1.0, hair: false };
     }
     let len0 = math::hypot(t.a * w, t.b * w);
     let len1 = math::hypot(t.c * w, t.d * w);
     if aa && len0 <= 1.0 && len1 <= 1.0 {
         let geo = t.det().abs().sqrt();
-        return StrokeMode { device: true, half: 0.5, alpha: (len0 + len1) / 2.0, dash_unit: geo, sigma: 1.0 };
+        return StrokeMode {
+            device: true,
+            half: 0.5,
+            alpha: (len0 + len1) / 2.0,
+            dash_unit: geo,
+            sigma: 1.0,
+            hair: true,
+        };
     }
-    StrokeMode { device: false, half: w / 2.0, alpha: 1.0, dash_unit: 1.0, sigma: t.max_scale() }
+    StrokeMode { device: false, half: w / 2.0, alpha: 1.0, dash_unit: 1.0, sigma: t.max_scale(), hair: false }
 }
 
 /// 節の線のペン（太さの半分は線を作る座標系。`mode` は [`stroke_mode`]）。
@@ -701,6 +711,7 @@ fn pen_of(n: &PathNode, t: &Transform, mode: &StrokeMode, q: Quality) -> Pen {
         _ => Cap::Butt,
     };
     let join = match n.join {
+        _ if mode.hair => Join::Bevel,
         JOIN_ROUND => Join::Round,
         JOIN_BEVEL => Join::Bevel,
         _ => Join::Miter,
