@@ -15,12 +15,12 @@ architecture.md §9）。種は `seeds/<対象>/`（コミットする）、育�
 | `path` | パスのデータと `points` の読み（`values::path`）と平坦化（`geom::flatten`）。頭の 1 バイトで読む口（パスのデータか `points`）と変形を選ぶ。置き場に書く量が入力の 1 バイトあたり `cost::PATH_GEOMETRY_BYTES` 以下・1 回の払い・同じ入力で同じ結果・平坦化の点の数が分ける数の和（見積もりと同じ式）・点が区間の厳密な外接矩形の中 | `sumie::fuzzing::path_ops` |
 | `stroke` | 線の外形と破線（`geom::stroke`）。頭の 4 バイトで端・継ぎ目・太さ・miterlimit・破線と位相を選び、残りをパスのデータとして読む。1 回の払い・同じ入力で同じ結果・点ごとに払う（手間 ≥ 平坦化の点の数）・有限な入力の外形の点が有限 | `sumie::fuzzing::stroke_ops` |
 | `tree` | 木を作る段（`Document::estimate_build`・`build`）。木を作る手間の上限を 2²⁴ にして読む。見積もりが断れば `build` も同じ誤りで断る（D2・architecture.md §3.1）。見積もりが通れば、見積もり ≥ 実際（手間・確保の山・持ち続ける量）・1 回の払い・返しすぎ・同じ入力で同じ木か同じ断り・上限か中止で断らない・見積もりの上限で作っても同じ木。数えた山（生きている段の結果と走る段の山の和の最大）を返し、`crates/sumie/tests/mutate.rs` がヒープの山と照らす | `sumie::fuzzing::build_ops` |
-| `render` | 描く段まで（`Tree::estimate`・`plan`・`Plan::render_region`・`estimate_region`）。頭の 4 バイトで倍率と範囲を選び、残りを SVG として読む（256 × 256 以内のキャンバス。計画と描く手間の上限は 2²³）。見積もりが断れば計画も同じ誤りで断る・見積もりが通れば計画と描画が上限で断らない（描く段は範囲の見積もりを Budget の上限にして描き、`Limit` は見積もりの下回りとして落とす。ADR-100 (3)）・計画の持ち続ける量 ≤ 見積もり・計画を 2 度作っても辺が同じ・範囲の見積もり（手間と一時の量）が全体を超えない・範囲の描画が全体の同じ矩形とビット単位で同じ・同じ入力で同じ画素。数えた山を返す（`tree` と同じ） | `sumie::fuzzing::render_ops` |
-| `render_gen` | 構造から組み立てた SVG（`sumie_testkit::svg_gen`。バイト列を選択の並びに読み替え、必ず整った SVG を書き出す。要素・属性・値は ADR-100 (3) (b)）を `render` と同じに確かめる。頭の 4 バイトは倍率と範囲。`crates/sumie/tests/mutate.rs` の `generated_documents_render` が同じ生成器で種を固定して流す（描く段の終わりまで届く割合 8 割以上） | `sumie::fuzzing::render_ops` ＋ `sumie_testkit::svg_gen::svg` |
+| `render` | 木を作る段から描く段まで（`estimate_build`・`build`・`Tree::estimate`・`plan`・`Plan::render_region`・`estimate_region`）。頭の 4 バイトで倍率と範囲を選び、残りを SVG として読む（256 × 256 以内のキャンバス。木を作る手間の上限は 2²⁴、計画と描く手間は 2²³、見積もりの段は 2²¹：既定と同じく見積もりの段がいちばん小さい）。見積もりが断れば次の段も同じ誤りで断る・見積もりが通れば次の段が上限か中止で断らない（描く段は範囲の見積もりを Budget の上限にして描き、`Limit` は見積もりの下回りとして落とす。ADR-100 (3)）・段ごとに手間・確保の山・持ち続ける量 ≤ 見積もり、1 回の払いが中止の間隔を超えない、返しすぎない・計画を 2 度作っても辺と勘定が同じ・範囲の見積もりが全体を超えない・範囲の描画が全体の同じ矩形とビット単位で同じ・同じ入力で同じ画素。数えた山（段ごとの実際の山）と届き具合（描いた・線・破線）を返す | `sumie::fuzzing::render_ops` |
+| `render_gen` | 構造から組み立てた SVG（`sumie_testkit::svg_gen`。バイト列を選択の並びに読み替え、必ず整った SVG を書き出す。要素・属性・値は ADR-100 (3) (b)）を `render`・`tree`・`document` と同じに確かめる。頭の 4 バイトは倍率と範囲。`crates/sumie/tests/mutate.rs` の `generated_documents_render` が同じ生成器で `seeds/render_gen` と種を固定した入力を流す（描く段の終わりまで届く割合 8 割以上、描いた・線・破線が 4 割・3 割・2 割以上） | `sumie::fuzzing::render_ops`・`build_ops`・`document_parse` ＋ `sumie_testkit::svg_gen::svg` |
 
 種は `crates/sumie/tests/mutate.rs` の `MEM_SEEDS` と同じにする（試験 `fuzz_seeds_match_mem_seeds` が照らす）。
-`xml`・`dtd`・`css`・`values`・`document`・`path`・`stroke`・`tree`・`render` の種は `crates/sumie/tests/mutate.rs` の種つきの変異の試験も使う（`dtd` は DTD の、`css` は
-CSS の目印の字句で変異させる）。libFuzzer の既定の長さ（4096 バイト）
+`xml`・`dtd`・`css`・`values`・`document`・`path`・`stroke`・`tree`・`render`・`render_gen` の種は `crates/sumie/tests/mutate.rs` の種つきの変異の試験も使う（`dtd` は DTD の、`css` は
+CSS の目印の字句で変異させる）。`tree`・`render`・`render_gen` の種は、上限を狙って安全に断る種として名前を挙げたもの（`TREE_UNREACHED`・`RENDER_UNREACHED`。いまは無い）を除いて、確かめの終わりまで届く。libFuzzer の既定の長さ（4096 バイト）
 では、長い名前・大きな実体のような長い入力の場合に届かないので、それは `crates/sumie/src/xml/tests.rs` の試験が受け持つ。
 Kura のファズのコーパス（`/Users/redjet/aruma/repos/zredjet/kura/fuzz/corpus/decode_svg/`。
 約 8,000 件。読むだけ）は SVG の対象の種に使う（ADR-21。写さずに、読む場所として渡す）。
@@ -46,8 +46,22 @@ cargo fuzz run mem_ops seeds/mem_ops -- -runs=0
 ```bash
 scripts/fuzz-corpus.sh
 cd fuzz
-cargo fuzz run render_gen corpus/render_gen seeds/render_gen -- -max_total_time=3600 -rss_limit_mb=4096 -timeout=20
+mkdir -p corpus/render_gen
+cargo fuzz run render_gen corpus/render_gen seeds/render_gen -- -max_len=2048 -max_total_time=3600 -rss_limit_mb=4096 -timeout=20
 cargo fuzz run render corpus/render seeds/render -- -dict=dict/svg.dict -max_total_time=3600 -rss_limit_mb=4096 -timeout=20
+cargo fuzz run tree corpus/tree seeds/tree -- -dict=dict/svg.dict -max_total_time=3600 -rss_limit_mb=4096 -timeout=20
+```
+
+`render_gen` の入力は生成器の選択の並びなので、2 KiB を超えても文書は大きくならない（`-max_len=2048`）。
+
+回したあとは届き具合を測る（ADR-100 (3) (e)）。育ったコーパスで描く段の終わりまで届いた件数と、描いた・線・破線のある件数を
+数える試験と、行の覆い（`cargo fuzz coverage`。llvm-tools の部品が要る：`rustup component add llvm-tools-preview` を
+fuzz の nightly に入れる。取り込みは手で行う）：
+
+```bash
+cargo test -p sumie --release --test mutate -- --ignored corpus_reach --nocapture
+cd fuzz
+cargo fuzz coverage render corpus/render
 ```
 
 `cargo fuzz` の既定（debug-assertions と overflow-checks が入る）で回し、示しそこなったあふれを panic として見つける

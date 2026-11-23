@@ -15,6 +15,8 @@ use std::fmt::Write as _;
 struct Src<'a> {
     d: &'a [u8],
     i: usize,
+    /// キャンバスの大きさ（座標と大きさをこれに合わせる。描く段まで届き、画素を描く文書の割合を保つ）
+    span: f64,
 }
 
 impl Src<'_> {
@@ -64,22 +66,38 @@ const EXTREME: &[&str] = &[
     "2147483647",
 ];
 
-/// キャンバスの中ほどの座標（0〜128 の半分刻み）か、まれに極端な数。
+/// キャンバスの中の座標（キャンバスの −5%〜105%）か、まれに極端な数。
 fn coord(s: &mut Src<'_>) -> String {
-    if s.chance(12) {
+    if s.chance(6) {
         return s.pick(EXTREME).to_string();
     }
-    let b = s.byte();
-    let v = f64::from(b) * 0.5;
-    if s.chance(64) { format!("{}", -v) } else { format!("{v}") }
+    let v = (f64::from(s.byte()) / 255.0 * 1.1 - 0.05) * s.span;
+    format!("{}", (v * 4.0).round() / 4.0)
 }
 
-/// 正の大きさ（線の太さ・半径など）。
+/// 曲線の制御点（極端な数をさらにまれに。キャンバスにまたがる巨大な曲線は見積もりを上限まで回して遅い）。
+fn control(s: &mut Src<'_>) -> String {
+    if s.chance(2) {
+        return s.pick(EXTREME).to_string();
+    }
+    let v = (f64::from(s.byte()) / 255.0 * 1.4 - 0.2) * s.span;
+    format!("{}", (v * 4.0).round() / 4.0)
+}
+
+/// 正の大きさ（線の太さ・半径など。キャンバスの 1/2 まで）。
 fn size(s: &mut Src<'_>) -> String {
-    match s.below(8) {
+    match s.below(10) {
         0 => s.pick(&["0", "0.3", "0.5", "0.8", "1"]).to_string(),
-        1 => s.pick(EXTREME).to_string(),
-        _ => format!("{}", f64::from(s.byte() % 64) * 0.5 + 0.5),
+        1 if s.chance(64) => s.pick(EXTREME).to_string(),
+        _ => format!("{}", ((f64::from(s.byte()) / 255.0 * 0.5 * s.span) * 4.0).round() / 4.0 + 0.25),
+    }
+}
+
+/// 線の太さ（細い線から、キャンバスの 1/5 まで）。
+fn stroke_width(s: &mut Src<'_>) -> String {
+    match s.below(6) {
+        0 => s.pick(&["0.3", "0.5", "0.8", "1"]).to_string(),
+        _ => format!("{}", ((f64::from(s.byte()) / 255.0 * 0.2 * s.span) * 4.0).round() / 4.0 + 0.5),
     }
 }
 
@@ -98,7 +116,7 @@ fn color(s: &mut Src<'_>) -> String {
         3 => format!("rgb({},{},{})", s.byte(), s.byte(), s.byte()),
         4 => "transparent".to_string(),
         // まだ描かない（グラデーションの参照）か、壊れた参照の代わりの色
-        5 if s.chance(32) => "url(#i0) red".to_string(),
+        5 if s.chance(24) => s.pick(&["url(#grad)", "url(#i0) red", "url(#none) blue"]).to_string(),
         _ => s.pick(&["black", "red", "green", "blue", "lime", "navy", "purple", "orange", "#808080"]).to_string(),
     }
 }
@@ -114,7 +132,19 @@ fn transform(s: &mut Src<'_>) -> String {
             4 => format!("rotate({} {} {})", s.pick(&["30", "90", "-45"]), coord(s), coord(s)),
             5 => format!("skewX({})", s.pick(&["30", "-45", "89.9", "10"])),
             6 => format!("skewY({})", s.pick(&["30", "-60", "1"])),
-            _ => format!("matrix({} {} {} {} {} {})", coord(s), coord(s), coord(s), coord(s), coord(s), coord(s)),
+            _ => {
+                let scale = ["1", "0.5", "2", "-1", "0.25", "4", "1e-6", "-0.5"];
+                let shear = ["0", "0", "0.2", "-0.3", "1", "-1"];
+                format!(
+                    "matrix({} {} {} {} {} {})",
+                    s.pick(&scale),
+                    s.pick(&shear),
+                    s.pick(&shear),
+                    s.pick(&scale),
+                    coord(s),
+                    coord(s)
+                )
+            }
         };
         t.push_str(&part);
         t.push(' ');
@@ -199,8 +229,10 @@ fn path_data(s: &mut Src<'_>) -> String {
         let args = match cmd {
             "H" | "h" | "V" | "v" => coord(s),
             "L" | "l" | "T" | "t" | "M" | "m" => format!("{} {}", coord(s), coord(s)),
-            "C" | "c" => (0..6).map(|_| coord(s)).collect::<Vec<_>>().join(" "),
-            "S" | "s" | "Q" | "q" => (0..4).map(|_| coord(s)).collect::<Vec<_>>().join(" "),
+            "C" | "c" => (0..6).map(|k| if k < 4 { control(s) } else { coord(s) }).collect::<Vec<_>>().join(" "),
+            "S" | "s" | "Q" | "q" => {
+                (0..4).map(|k| if k < 2 { control(s) } else { coord(s) }).collect::<Vec<_>>().join(" ")
+            }
             "A" | "a" => format!(
                 "{} {} {} {} {} {} {}",
                 size(s),
@@ -251,7 +283,33 @@ impl Gen<'_, '_> {
             let t = transform(self.s);
             self.attr("transform", &t);
         }
-        let props = paint_props(self.s);
+        let mut props = paint_props(self.s);
+        // 図形のおよそ半分に線（色と太さ）を付け、線があれば破線を高い割合で（描く段の線と破線まで届かせる）
+        if shape && self.s.chance(128) {
+            let mut put = |n: &str, v: String| {
+                props.retain(|(m, _)| m != n);
+                props.push((n.to_string(), v));
+            };
+            let c = self.s.pick(&["black", "red", "navy", "#0a0", "rgb(200,100,0)"]).to_string();
+            put("stroke", c);
+            put("stroke-width", stroke_width(self.s));
+            if self.s.chance(140) {
+                let d = (0..1 + self.s.below(4))
+                    .map(|_| format!("{}", f64::from(1 + self.s.byte() % 24) * 0.5))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                put("stroke-dasharray", d);
+                if self.s.chance(100) {
+                    put("stroke-dashoffset", coord(self.s));
+                }
+            }
+            if self.s.chance(100) {
+                let j = self.s.pick(&["round", "bevel", "miter"]).to_string();
+                put("stroke-linejoin", j);
+                let c = self.s.pick(&["round", "square", "butt"]).to_string();
+                put("stroke-linecap", c);
+            }
+        }
         if self.s.chance(64) {
             let decls: Vec<String> = props.iter().map(|(n, v)| format!("{n}: {v}")).collect();
             self.attr("style", &decls.join("; "));
@@ -333,7 +391,8 @@ impl Gen<'_, '_> {
             0..=5 => self.shape(),
             6 if self.ids > 0 => {
                 let target = self.s.below(self.ids + 1);
-                let _ = write!(self.out, "<use href=\"#i{target}\"");
+                let href = if self.s.chance(64) { "xlink:href" } else { "href" };
+                let _ = write!(self.out, "<use {href}=\"#i{target}\"");
                 for a in ["x", "y"] {
                     let v = length(self.s);
                     self.attr(a, &v);
@@ -362,6 +421,11 @@ impl Gen<'_, '_> {
                 if self.s.chance(160) {
                     let vb = format!("{} {} {} {}", coord(self.s), coord(self.s), size(self.s), size(self.s));
                     self.attr("viewBox", &vb);
+                    if self.s.chance(100) {
+                        let par =
+                            self.s.pick(&["none", "xMidYMid meet", "xMinYMax slice", "xMaxYMin meet"]).to_string();
+                        self.attr("preserveAspectRatio", &par);
+                    }
                 }
                 // 見えない overflow の入れ子の svg・symbol はまだ描かない（NotYet）ので、たいていは visible
                 let o = if self.s.chance(24) {
@@ -401,13 +465,26 @@ impl Gen<'_, '_> {
 
 /// バイト列から、整った SVG のバイト列を作る（キャンバスは 128 × 128 以内）。
 pub fn svg(data: &[u8]) -> Vec<u8> {
-    let mut src = Src { d: data, i: 0 };
+    let mut src = Src { d: data, i: 0, span: 100.0 };
     let mut g = Gen { s: &mut src, ids: 0, count: 0, out: String::new() };
-    let w = g.s.pick(&["16", "32", "64", "100", "128", "50", "20"]).to_string();
-    let h = g.s.pick(&["16", "32", "64", "100", "128", "40", "25"]).to_string();
-    let _ = write!(g.out, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\"");
+    let wn = *[16u32, 32, 64, 100, 128, 50, 20].get(g.s.below(7)).unwrap_or(&64);
+    let hn = *[16u32, 32, 64, 100, 128, 40, 25].get(g.s.below(7)).unwrap_or(&64);
+    g.s.span = f64::from(wn.max(hn));
+    // 根の大きさ：たいていは px、まれに % か書かない（viewBox か中身で決まる大きさ。ADR-58）
+    let size_attrs = match g.s.below(10) {
+        0 => String::new(),
+        1 => " width=\"100%\" height=\"100%\"".to_string(),
+        _ => format!(" width=\"{wn}\" height=\"{hn}\""),
+    };
+    let _ = write!(
+        g.out,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\"{size_attrs}"
+    );
     if g.s.chance(100) {
-        let vb = format!("{} {} {} {}", coord(g.s), coord(g.s), size(g.s), size(g.s));
+        // 原点は 0 の近く、大きさはキャンバスの 0.5〜2 倍（中身がキャンバスに入るように）
+        let k = *[0.5f64, 1.0, 1.0, 2.0].get(g.s.below(4)).unwrap_or(&1.0);
+        let (ox, oy) = (f64::from(g.s.byte() % 9) - 4.0, f64::from(g.s.byte() % 9) - 4.0);
+        let vb = format!("{ox} {oy} {} {}", f64::from(wn) * k, f64::from(hn) * k);
         g.attr("viewBox", &vb);
         let par = g.s.pick(&["none", "xMidYMid meet", "xMinYMax slice", "xMaxYMin meet"]).to_string();
         g.attr("preserveAspectRatio", &par);
@@ -418,6 +495,12 @@ pub fn svg(data: &[u8]) -> Vec<u8> {
         g.attr("style", &style);
     }
     g.out.push('>');
+    if g.s.chance(24) {
+        // まだ描かない塗り（グラデーション）の参照先
+        g.out.push_str(
+            "<defs><linearGradient id=\"grad\"><stop offset=\"0\" stop-color=\"red\"/></linearGradient></defs>",
+        );
+    }
     if g.s.chance(64) {
         g.out.push_str("<style>");
         for _ in 0..1 + g.s.below(3) {

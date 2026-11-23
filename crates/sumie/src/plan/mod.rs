@@ -723,7 +723,7 @@ fn drawable(n: &PathNode, scale: f64) -> Option<Transform> {
 }
 
 /// 線の外形の点の外への広がり（線を作る座標系の太さの半分の倍）。
-fn reach_factor(pen: &Pen) -> f64 {
+pub(crate) fn reach_factor(pen: &Pen) -> f64 {
     let mut f: f64 = 1.0;
     if pen.join == Join::Miter && pen.miter_limit > f {
         f = pen.miter_limit;
@@ -1162,10 +1162,39 @@ impl Tree {
     }
 
     pub(crate) fn plan_with(&self, opts: &RenderOptions, q: Quality, cancel: &dyn Cancel) -> Result<Plan, Error> {
+        self.plan_watch(opts, q, cancel, &mut crate::doc::Watch::default())
+    }
+
+    /// [`Tree::plan`] と同じに作り、計画の段の勘定の見張りの値（手間・確保の山・1 回の払い・返しすぎ）を `watch` に書く
+    /// （試験とファズが実際の山で照らす）。
+    pub(crate) fn plan_watch(
+        &self,
+        opts: &RenderOptions,
+        q: Quality,
+        cancel: &dyn Cancel,
+        watch: &mut crate::doc::Watch,
+    ) -> Result<Plan, Error> {
         // 見積もりが上限と比べる（超えれば Limit）
         let (est, px, tot) = self.estimate_with(opts, q, cancel)?;
         let budget = Budget::new(Stage::Plan, est.plan.work, est.plan.peak_bytes, cancel);
-        let b = &budget;
+        let r = self.plan_in(&budget, px, tot, opts, q);
+        watch.work = budget.work();
+        watch.peak = budget.peak();
+        watch.max_spend = budget.max_spend();
+        watch.over_released = budget.over_released();
+        r
+    }
+
+    /// 計画の本体（`budget` は見積もりを上限にしたもの）。
+    fn plan_in(
+        &self,
+        budget: &Budget<'_>,
+        px: PixelSize,
+        tot: Totals,
+        opts: &RenderOptions,
+        q: Quality,
+    ) -> Result<Plan, Error> {
+        let b = budget_ref(budget);
         let canvas = PixelBox { x0: 0, y0: 0, x1: i64::from(px.width), y1: i64::from(px.height) };
         let cap = |n: u64| usize::try_from(n).map_err(|_| b.too_large());
         let mut edges: MVec<'_, Edge> = MVec::with_capacity(b, cap(tot.edges)?)?;

@@ -131,10 +131,15 @@ fn math_ops_survive_seeded_mutations() {
 
 /// fuzz/seeds/<対象> の種を読む（道の名前の順）。
 fn fuzz_seeds(target: &str) -> Vec<Vec<u8>> {
+    named_fuzz_seeds(target).into_iter().map(|(_, b)| b).collect()
+}
+
+/// fuzz/seeds/<対象> の種を、ファイルの名前つきで読む（道の名前の順）。
+fn named_fuzz_seeds(target: &str) -> Vec<(String, Vec<u8>)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds").join(target);
     let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
     files.sort();
-    files.iter().map(|p| std::fs::read(p).unwrap()).collect()
+    files.iter().map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(p).unwrap())).collect()
 }
 
 /// XML の目印の字句（変異で差し込む）。
@@ -484,9 +489,17 @@ const SHAPE_DICT: &[&[u8]] = &[
 ];
 
 /// 種そのものと、構造を保つ変異（`n` 件）と、構造も壊す変異（`n / 4` 件）を通す。届いた件数（確かめの終わりまで行った
-/// 件）と全体の件数を返す。
-fn stage_cases(target: &str, seed: u64, n: usize, run: fn(&[u8]) -> StageOutcome) -> (usize, usize) {
-    let seeds = fuzz_seeds(target);
+/// 件）と全体の件数を返す。種は、`unreached` に名前を挙げたもの（上限を狙って作った種で、見積もりが安全に断る）だけが
+/// 届かず、ほかはすべて確かめの終わりまで届く（ファズの作り直しの 1 回目のレビュー）。
+fn stage_cases(
+    target: &str,
+    seed: u64,
+    n: usize,
+    unreached: &[&str],
+    run: fn(&[u8]) -> StageOutcome,
+) -> (usize, usize) {
+    let named = named_fuzz_seeds(target);
+    let seeds: Vec<Vec<u8>> = named.iter().map(|(_, b)| b.clone()).collect();
     let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
     let mut all: Vec<Vec<u8>> = seeds.clone();
     all.extend(value_cases(seed, n, &refs, SHAPE_DICT, 4096));
@@ -501,28 +514,33 @@ fn stage_cases(target: &str, seed: u64, n: usize, run: fn(&[u8]) -> StageOutcome
         }
     }
     let mut reached = 0usize;
-    let mut seeds_reached = 0usize;
+    let mut seeds_unreached: Vec<&str> = Vec::new();
     for (i, case) in all.iter().enumerate() {
         let (out, heap) = measure(|| run(case));
         assert_eq!(out.check, Check::Ok, "{target} {i} 件目 {:?}", String::from_utf8_lossy(case));
         assert_heap_within(&heap, out.counted_peak, 0, &format!("{target} {i} 件目"));
         assert_eq!(heap.current, 0, "{target} {i} 件目：返していない確保");
-        if i < seeds.len() {
-            seeds_reached += usize::from(out.reached);
+        if let Some((name, _)) = named.get(i).filter(|_| !out.reached) {
+            seeds_unreached.push(name);
         }
         reached += usize::from(out.reached);
     }
-    // 種は 8 割以上が確かめの終わりまで届く（上限を狙った種は、見積もりが安全に断る）
-    assert!(seeds_reached * 10 >= seeds.len() * 8, "{target} の種で届いたのは {seeds_reached}/{}", seeds.len());
+    assert_eq!(seeds_unreached, unreached, "{target} の種で確かめの終わりまで届かないもの");
     eprintln!("{target}：届いた件 {reached}/{}", all.len());
     (reached, all.len())
 }
+
+/// 木を作る段の種のうち、確かめの終わりまで届かないもの（見積もりか作る段が安全に断る種）。
+const TREE_UNREACHED: &[&str] = &[];
+
+/// 描く段の種のうち、確かめの終わりまで届かないもの（見積もりが上限で安全に断る種）。
+const RENDER_UNREACHED: &[&str] = &[];
 
 /// 木を作る段（`fuzzing::build_ops`）の種と種つきの変異：見積もり ≥ 実際・勘定・同じ結果・断りが見積もりと同じ・
 /// ヒープの山 ≤ 数えた山・返していない確保がないこと。
 #[test]
 fn build_survives_seeded_mutations() {
-    let (reached, n) = stage_cases("tree", 0x5eed_000b, 2000, build_ops);
+    let (reached, n) = stage_cases("tree", 0x5eed_000b, 2000, TREE_UNREACHED, build_ops);
     assert!(reached * 2 > n, "木まで届いた件 {reached}/{n}");
 }
 
@@ -530,7 +548,7 @@ fn build_survives_seeded_mutations() {
 /// 返していない確保がないこと。
 #[test]
 fn render_survives_seeded_mutations() {
-    let (reached, n) = stage_cases("render", 0x5eed_000c, 600, render_ops);
+    let (reached, n) = stage_cases("render", 0x5eed_000c, 600, RENDER_UNREACHED, render_ops);
     assert!(reached * 2 > n, "描く段の終わりまで届いた件 {reached}/{n}");
 }
 
@@ -568,27 +586,90 @@ fn fuzz_found_inputs() {
     }
 }
 
-/// 構造から組み立てた SVG（`sumie_testkit::svg_gen`。ファズの `render_gen` と同じ生成器）を、描く段まで通す（ADR-100 (3)
-/// (c)）：形の約束・範囲の一致・同じ画素・描く段が範囲の見積もりの上限で断らない・ヒープの山 ≤ 数えた山。描く段の終わり
-/// まで届いた割合が 8 割以上（生成器が届く文書を作っているか）。
+/// 構造から組み立てた SVG（`sumie_testkit::svg_gen`。ファズの `render_gen` と同じ生成器）を、読む段・木を作る段・描く段
+/// まで通す（ADR-100 (3) (c)）：形の約束・範囲の一致・同じ画素・段ごとの見積もり ≥ 実際・ヒープの山 ≤ 数えた山。生成器が
+/// 届く文書を作っているかも確かめる：描く段の終わりまで届いた割合が 8 割以上、画素を描いた・線がある・破線があるものが
+/// それぞれ 4 割・3 割・2 割以上（ファズの作り直しの 1 回目のレビュー）。fuzz/seeds/render_gen の種も通す。
 #[test]
 fn generated_documents_render() {
     let mut rng = sumie_testkit::chacha::ChaCha::from_u64(0x5eed_0010);
-    let n = 200usize;
-    let mut reached = 0usize;
-    for i in 0..n {
+    let mut inputs: Vec<Vec<u8>> = fuzz_seeds("render_gen");
+    let seeds = inputs.len();
+    for _ in 0..240 {
         let len = 64 + (rng.next_u32() as usize % 960);
         let mut bytes = vec![0u8; len];
         rng.fill(&mut bytes);
-        let (head, rest) = bytes.split_at(4);
+        inputs.push(bytes);
+    }
+    let n = inputs.len();
+    let (mut reached, mut drew, mut stroked, mut dashed) = (0usize, 0usize, 0usize, 0usize);
+    for (i, bytes) in inputs.iter().enumerate() {
+        // ファズの render_gen と同じ組み立て（頭の 4 バイトは倍率と範囲）
+        let (head, rest) = bytes.split_at(bytes.len().min(4));
         let mut data = head.to_vec();
-        data.extend_from_slice(&sumie_testkit::svg_gen::svg(rest));
+        data.resize(4, 0);
+        let svg = sumie_testkit::svg_gen::svg(rest);
+        data.extend_from_slice(&svg);
         let (out, heap) = measure(|| render_ops(&data));
-        assert_eq!(out.check, Check::Ok, "{i} 件目 {:?}", String::from_utf8_lossy(&data[4..]));
+        assert_eq!(out.check, Check::Ok, "{i} 件目 {:?}", String::from_utf8_lossy(&svg));
         assert_heap_within(&heap, out.counted_peak, 0, &format!("生成 {i} 件目"));
         assert_eq!(heap.current, 0, "生成 {i} 件目：返していない確保");
+        let (b, heap) = measure(|| build_ops(&svg));
+        assert_eq!(b.check, Check::Ok, "木 {i} 件目 {:?}", String::from_utf8_lossy(&svg));
+        assert_heap_within(&heap, b.counted_peak, 0, &format!("生成の木 {i} 件目"));
+        let (doc, heap) = measure(|| document_parse(&svg));
+        assert_eq!(doc.check, Check::Ok, "文書 {i} 件目 {:?}", String::from_utf8_lossy(&svg));
+        assert_heap_within(&heap, doc.peak, 0, &format!("生成の文書 {i} 件目"));
+        assert!(i >= seeds || out.reached, "fuzz/seeds/render_gen の {i} 件目が描く段の終わりまで届かない");
         reached += usize::from(out.reached);
+        drew += usize::from(out.drew);
+        stroked += usize::from(out.stroked);
+        dashed += usize::from(out.dashed);
     }
-    eprintln!("生成：描く段の終わりまで届いた件 {reached}/{n}");
+    eprintln!("生成：届いた {reached}・描いた {drew}・線 {stroked}・破線 {dashed} / {n}");
     assert!(reached * 10 >= n * 8, "描く段の終わりまで届いた件 {reached}/{n}");
+    assert!(drew * 10 >= n * 4, "画素を描いた件 {drew}/{n}");
+    assert!(stroked * 10 >= n * 3, "線のある件 {stroked}/{n}");
+    assert!(dashed * 10 >= n * 2, "破線のある件 {dashed}/{n}");
+}
+
+/// 育ったコーパス（git の外の `fuzz/corpus/<対象>`）を流し、確かめが崩れないことと、届き具合（描く段の終わりまで届いた・
+/// 画素を描いた・線がある・破線がある件数）を数えて出す（ADR-100 (3) (e)。長く回したあとに手で流す：
+/// `cargo test -p sumie --release --test mutate -- --ignored corpus_reach --nocapture`）。
+#[test]
+#[ignore = "git の外のコーパスを読む（手で流す）"]
+fn corpus_reach() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus");
+    for target in ["render", "render_gen", "tree"] {
+        let Ok(rd) = std::fs::read_dir(root.join(target)) else {
+            eprintln!("{target}：コーパスがない");
+            continue;
+        };
+        let mut files: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+        files.sort();
+        let (mut reached, mut drew, mut stroked, mut dashed) = (0usize, 0usize, 0usize, 0usize);
+        for f in &files {
+            let bytes = std::fs::read(f).unwrap();
+            let out = match target {
+                "tree" => build_ops(&bytes),
+                "render" => render_ops(&bytes),
+                _ => {
+                    let (head, rest) = bytes.split_at(bytes.len().min(4));
+                    let mut input = head.to_vec();
+                    input.resize(4, 0);
+                    input.extend_from_slice(&sumie_testkit::svg_gen::svg(rest));
+                    render_ops(&input)
+                }
+            };
+            assert_eq!(out.check, Check::Ok, "{}", f.display());
+            reached += usize::from(out.reached);
+            drew += usize::from(out.drew);
+            stroked += usize::from(out.stroked);
+            dashed += usize::from(out.dashed);
+        }
+        eprintln!(
+            "{target}：{} 件・届いた {reached}・描いた {drew}・線 {stroked}・破線 {dashed}（描く段の印は render の対象だけ）",
+            files.len()
+        );
+    }
 }

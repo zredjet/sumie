@@ -108,6 +108,17 @@ impl Plan {
 
     /// 範囲を描く（出力は範囲の大きさ）。全体の描画の同じ矩形とビット単位で同じ（ADR-13）。
     pub fn render_region(&self, rect: PixelRect, out: &mut PixmapMut<'_>, cancel: &dyn Cancel) -> Result<(), Error> {
+        self.render_region_watch(rect, out, cancel, &mut crate::doc::Watch::default())
+    }
+
+    /// [`Plan::render_region`] と同じに描き、描く段の勘定の見張りの値を `watch` に書く（試験とファズが実際の山で照らす）。
+    pub(crate) fn render_region_watch(
+        &self,
+        rect: PixelRect,
+        out: &mut PixmapMut<'_>,
+        cancel: &dyn Cancel,
+        watch: &mut crate::doc::Watch,
+    ) -> Result<(), Error> {
         let r = self.region(rect)?;
         if out.width != rect.width || out.height != rect.height {
             return Err(argument());
@@ -125,6 +136,17 @@ impl Plan {
             ));
         }
         let budget = Budget::new(Stage::Render, est.work, est.peak_bytes, cancel);
+        let res = self.render_in(&budget, r, out);
+        watch.work = budget.work();
+        watch.peak = budget.peak();
+        watch.max_spend = budget.max_spend();
+        watch.over_released = budget.over_released();
+        res
+    }
+
+    /// 描く段の本体（`budget` は範囲の見積もりを上限にしたもの）。
+    fn render_in(&self, budget: &Budget<'_>, r: PixelBox, out: &mut PixmapMut<'_>) -> Result<(), Error> {
+        let budget = budget_of(budget);
         // 出力を透明にする（行ごとに、塊に分けて払う）
         let row_len = (out.width as usize).saturating_mul(4);
         let step = crate::budget::chunk_len(1).saturating_mul(cost::FILL_BYTES_PER_UNIT as usize);
@@ -163,7 +185,7 @@ impl Plan {
         }
         let width = usize::try_from(r.width()).map_err(|_| argument())?;
         let max_edges = usize::try_from(self.max_item_edges).map_err(|_| budget.too_large())?;
-        let mut scan = Scan::new(r.x0, width, max_edges, &budget)?;
+        let mut scan = Scan::new(r.x0, width, max_edges, budget)?;
         for it in self.items.as_slice() {
             budget.spend(cost::OP_STEP)?;
             let b = it.pixel_box().intersect(&r);
@@ -175,12 +197,12 @@ impl Plan {
             let data = &mut *out.data;
 
             fill_region(
-                self.region_edges(it, &b, &budget)?,
+                self.region_edges(it, &b, budget)?,
                 it.fill_rule(),
                 it.aa != 0,
                 b,
                 &mut scan,
-                &budget,
+                budget,
                 &mut |x, y, len, cov| {
                     let a = coverage_alpha(cov);
                     if a == 0 {
@@ -227,4 +249,8 @@ impl Tree {
         let rect = PixelRect { x: 0, y: 0, width: plan.width, height: plan.height };
         plan.render_region(rect, out, cancel)
     }
+}
+
+fn budget_of<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {
+    b
 }
