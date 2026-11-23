@@ -69,9 +69,10 @@ pub(crate) struct DrawItem {
     pub(crate) edges: [u32; 2],
     /// 画素の外接矩形（キャンバスの中。x0・y0・x1・y1）
     pub(crate) bbox: [i64; 4],
-    /// セルの数と、辺が行にかかる数の上限（どの範囲でも）
+    /// セルの数と、辺が行にかかる数と、副走査線の交わりの数の上限（どの範囲でも）
     pub(crate) cells: u64,
     pub(crate) edge_rows: u64,
+    pub(crate) crossings: u64,
     /// 乗算済みの色
     pub(crate) color: [u8; 4],
     /// 塗りの規則（0 非ゼロ・1 偶奇）と反エイリアス（1 あり）
@@ -809,33 +810,37 @@ pub(crate) use cost::{
 };
 
 /// 描く手間の上限（項目 1 つ。行・辺の行・セル・掃く幅と塗る画素）。
-fn render_work(rows: u64, width: u64, edges: u64, cells: u64, edge_rows: u64) -> u64 {
+fn render_work(rows: u64, width: u64, edges: u64, cells: u64, edge_rows: u64, crossings: u64) -> u64 {
     rows.saturating_mul(row_work(width))
         .saturating_add(edges.saturating_mul(EDGE_START_WORK))
-        .saturating_add(edge_rows.saturating_mul(EDGE_ROW_WORK.saturating_add(cost::SUB_EDGE_ROW_WORK)))
+        .saturating_add(edge_rows.saturating_mul(EDGE_ROW_WORK))
+        .saturating_add(crossings.saturating_mul(cost::SUB_CROSS_WORK))
         .saturating_add(cells.saturating_mul(cost::RASTER_CELL))
 }
 
 /// 辺の行とセルの数の上限：辺の長さの和 `l`（描く座標系）からの式と、節の画素の箱（`rows` 行・`width` 列）で抑えた式の
 /// 小さい方（描く段は箱の行の中だけを回り、1 本の辺の 1 行のセルは幅 ＋ 3 以下。巨大な図形でキャンバスの外の長さに
 /// 比例させない。単位 1・2 のレビュー）。計画が項目ごとに数える上限（[`item_bounds`]）は、辺ごとにこの両方より小さい。
-fn raster_bounds(l: f64, e: u64, rows: u64, width: u64) -> (u64, u64) {
+/// 副走査線の交わりの数の上限は、辺ごとに「4 × 縦の差 ＋ 1」（縦の差の和は長さ以下）と「4 × 行の数」の小さい方（ADR-104）。
+fn raster_bounds(l: f64, e: u64, rows: u64, width: u64) -> (u64, u64, u64) {
     let by_len_rows = up(l).saturating_add(e.saturating_mul(2));
     let by_box_rows = e.saturating_mul(rows.saturating_add(2));
     let edge_rows = by_len_rows.min(by_box_rows);
     let by_len_cells = up(1.5 * l).saturating_add(e.saturating_mul(CELLS_PER_EDGE));
     let by_box_cells = by_box_rows.saturating_mul(width.saturating_add(3));
-    (edge_rows, by_len_cells.min(by_box_cells))
+    let subs = cost::SUB_ROWS as u64;
+    let crossings = up(l).saturating_mul(subs).saturating_add(e).min(edge_rows.saturating_mul(subs));
+    (edge_rows, by_len_cells.min(by_box_cells), crossings)
 }
 
 /// 項目の辺 1 本の、行とセルの数の上限（辺を項目の画素の矩形 `bbox` の行で切った部分だけ：その部分の行の数と、x（矩形の
 /// 列の左右 1 列の外で切る）と y の差の画素の数 ＋ 4 か、行の数 × (幅 ＋ 3) の小さい方。矩形の行にかからない辺は 0。描く段は
 /// 矩形の行の中だけを回る）。
-pub(crate) fn item_bounds(e: &Edge, bbox: &PixelBox) -> (u64, u64) {
+pub(crate) fn item_bounds(e: &Edge, bbox: &PixelBox) -> (u64, u64, u64) {
     let ya = i64::from(e.y0).max(bbox.y0.saturating_mul(ONE));
     let yb = i64::from(e.y1).min(bbox.y1.saturating_mul(ONE));
     if ya >= yb {
-        return (0, 0);
+        return (0, 0, 0);
     }
     // x は矩形の列の左に 1・右に 1 を足した所で切る（描く段は範囲の左の外を 1 列にまとめ、右の外を落とす。
     // `raster::RowCells::cells_bound`。巨大な辺の、矩形の横の外の長さを数えない）
@@ -851,7 +856,10 @@ pub(crate) fn item_bounds(e: &Edge, bbox: &PixelBox) -> (u64, u64) {
     let cells = px(dx.saturating_add(dy))
         .saturating_add(CELLS_PER_EDGE)
         .min(rows_in.saturating_mul(bbox.width().saturating_add(3)));
-    (rows, cells)
+    // 副走査線の交わり：縦の差の 4 倍 ＋ 1 と、行の数 × 4 の小さい方（ADR-104）
+    let subs = cost::SUB_ROWS as u64;
+    let crossings = px(dy.saturating_mul(subs)).saturating_add(1).min(rows.saturating_mul(subs));
+    (rows, cells, crossings)
 }
 
 /// 節の見積もり（閉じた式）。
@@ -920,7 +928,7 @@ fn bound_node(
         // 描く段の行とセル：行の帯にかかる辺だけ（区間と暗黙の閉じの帯の中の長さ）
         // 続く閉じは帯の点を数えても辺を作らないので、辺の数を超えない
         let e_band = c.pts_band.saturating_add(c.subpaths).saturating_mul(split).min(e);
-        let (edge_rows, cells) = raster_bounds(c.len_dev_band, e_band, rows, width);
+        let (edge_rows, cells, crossings) = raster_bounds(c.len_dev_band, e_band, rows, width);
         out.plan_work = out
             .plan_work
             .saturating_add(c.points.saturating_mul(cost::FLATTEN_POINT.saturating_add(POINT_WORK)))
@@ -933,7 +941,7 @@ fn bound_node(
         out.max_item_edges = out.max_item_edges.max(e);
         out.render_work = out
             .render_work
-            .saturating_add(render_work(rows, width, e, cells, edge_rows))
+            .saturating_add(render_work(rows, width, e, cells, edge_rows, crossings))
             .saturating_add(region_search(e));
         out.region_self = out.region_self.saturating_add(cost::OP_STEP.saturating_add(region_search(e)));
     }
@@ -1030,7 +1038,7 @@ fn bound_node(
                 + (pieces_n as f64) * piece_len
                 + round_len
                 + curve_corner_len);
-        let (edge_rows, cells) = raster_bounds(l_dev, e_band, rows, width);
+        let (edge_rows, cells, crossings) = raster_bounds(l_dev, e_band, rows, width);
         // pathLength の長さを測る平坦化（計画と同じ条件：破線の並びがあり pathLength がある）
         let passes: u64 = if !dashes.is_empty() && n.path_length > 0.0 { 2 } else { 1 };
         // 破線の部分の点（区間の境の 2 つと、部分の中の頂点）と、まとめる写し（部分ごとに端の 2 つ）
@@ -1081,7 +1089,7 @@ fn bound_node(
         out.max_item_edges = out.max_item_edges.max(e);
         out.render_work = out
             .render_work
-            .saturating_add(render_work(rows, width, e, cells, edge_rows))
+            .saturating_add(render_work(rows, width, e, cells, edge_rows, crossings))
             .saturating_add(region_search(e));
         out.region_self = out.region_self.saturating_add(cost::OP_STEP.saturating_add(region_search(e)));
     }
@@ -1314,12 +1322,13 @@ impl Tree {
                 let slice = edges.as_mut_slice().get_mut(start..end).unwrap_or(&mut []);
                 stable_sort(b, slice, |x, y| x.y0 < y.y0)?;
                 // 範囲の見積もりの行とセルの上限（辺ごと。項目の矩形の中の行だけ。払う）
-                let (mut cells, mut rows) = (0u64, 0u64);
+                let (mut cells, mut rows, mut crossings) = (0u64, 0u64, 0u64);
                 for e in edges.as_slice().get(start..end).unwrap_or(&[]) {
                     b.spend(cost::OP_STEP)?;
-                    let (r, c) = item_bounds(e, &bbox);
+                    let (r, c, x) = item_bounds(e, &bbox);
                     cells = cells.saturating_add(c);
                     rows = rows.saturating_add(r);
+                    crossings = crossings.saturating_add(x);
                 }
                 let count = end.saturating_sub(start) as u64;
                 max_item = max_item.max(count);
@@ -1335,6 +1344,7 @@ impl Tree {
                     bbox: [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
                     cells,
                     edge_rows: rows,
+                    crossings,
                     color: crate::paint::premultiply(color),
                     rule,
                     aa,
@@ -1368,13 +1378,13 @@ impl Tree {
 /// 項目を選ぶ）。範囲の見積もりも同じ式。
 pub(crate) fn render_frame(width: u64, height: u64, max_item_edges: u64, items: u64) -> (u64, u64) {
     let clear = height.saturating_mul(cost::fill(width.saturating_mul(4)).saturating_add(cost::OP_STEP));
-    // 行の置き場：セル（cover と area）と、副走査線の列の欄（8 バイト × 副走査線の数）とつながりの頭（ADR-103）
-    let subs = cost::SUB_ROWS as u64;
+    // 行の置き場：セル（cover と area）と、副走査線の列の欄・印・つながりの頭（ADR-103・ADR-104）
     let row_bytes = width.saturating_add(1).saturating_mul(16);
-    let sub_bytes = width.saturating_add(1).saturating_mul(subs.saturating_mul(8).saturating_add(4));
-    // 行にかかる辺の番号と、副走査線の交わりの並び（16 バイト）。列の欄に列ごとのつながりの頭（4 バイト）
-    let crosses = max_item_edges.saturating_mul(subs);
-    let edge_bytes = max_item_edges.saturating_mul(4).saturating_add(crosses.saturating_mul(16));
+    let sub_bytes = width.saturating_add(1).saturating_mul(crate::raster::SUB_COLUMN_BYTES);
+    // 行にかかる辺の番号と、欄に入らない副走査線の交わりの並び
+    let crosses = crate::raster::sub_cross_capacity(width, max_item_edges);
+    let edge_bytes =
+        max_item_edges.saturating_mul(4).saturating_add(crosses.saturating_mul(crate::raster::SUB_CROSS_BYTES));
     let work = clear
         .saturating_add(cost::fill(row_bytes.saturating_add(sub_bytes)))
         .saturating_add(items.saturating_mul(cost::OP_STEP))

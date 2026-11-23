@@ -67,31 +67,33 @@ impl Plan {
             // 範囲の行にかかりうる辺だけ（2 分の探索で選ぶ）の、範囲の行の中の行とセルの上限（§6.1）。全体の範囲なら計画が
             // 項目ごとに数えた上限と同じ
             let edges = if b == it.pixel_box() { self.edges_of(it) } else { self.region_edges(it, &b, &budget)? };
-            let (cells, rows, started, skipped) = if b == it.pixel_box() {
-                (it.cells, it.edge_rows, edges.len() as u64, 0u64)
+            let (cells, rows, crossings, started, skipped) = if b == it.pixel_box() {
+                (it.cells, it.edge_rows, it.crossings, edges.len() as u64, 0u64)
             } else {
                 // 範囲の右の外の辺は足さない（描く段と同じ判定。`raster::skips_right`）
                 let right = b.x1.saturating_mul(crate::raster::ONE);
-                let (mut cells, mut rows, mut started, mut skipped) = (0u64, 0u64, 0u64, 0u64);
+                let (mut cells, mut rows, mut crossings, mut started, mut skipped) = (0u64, 0u64, 0u64, 0u64, 0u64);
                 for e in edges {
                     budget.spend(cost::OP_STEP)?;
                     if crate::raster::skips_right(e, right) {
                         skipped = skipped.saturating_add(1);
                         continue;
                     }
-                    let (er, ec) = crate::plan::item_bounds(e, &b);
+                    let (er, ec, ex) = crate::plan::item_bounds(e, &b);
                     cells = cells.saturating_add(ec);
                     rows = rows.saturating_add(er);
+                    crossings = crossings.saturating_add(ex);
                     started = started.saturating_add(1);
                 }
-                (cells, rows, started, skipped)
+                (cells, rows, crossings, started, skipped)
             };
-            // 副走査線の手間（ADR-103）
+            // 副走査線の手間は交わりの数で（ADR-103・ADR-104）
             work = work
                 .saturating_add(b.height().saturating_mul(crate::plan::row_work(b.width())))
                 .saturating_add(started.saturating_mul(crate::plan::EDGE_START_WORK))
                 .saturating_add(skipped.saturating_mul(cost::OP_STEP))
-                .saturating_add(rows.saturating_mul(crate::plan::EDGE_ROW_WORK.saturating_add(cost::SUB_EDGE_ROW_WORK)))
+                .saturating_add(rows.saturating_mul(crate::plan::EDGE_ROW_WORK))
+                .saturating_add(crossings.saturating_mul(cost::SUB_CROSS_WORK))
                 .saturating_add(cells.saturating_mul(cost::RASTER_CELL))
                 .saturating_add(crate::plan::region_search(u64::from(it.edges[1])));
         }

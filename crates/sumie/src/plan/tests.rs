@@ -328,7 +328,7 @@ fn bad_arguments() {
 #[test]
 fn layouts_and_threads() {
     assert_eq!(size_of::<Edge>(), 20);
-    assert_eq!(size_of::<DrawItem>(), 72);
+    assert_eq!(size_of::<DrawItem>(), 80);
     assert_eq!(size_of::<crate::tree::PathNode>(), 240);
     fn send_sync<T: Send + Sync>() {}
     send_sync::<Plan>();
