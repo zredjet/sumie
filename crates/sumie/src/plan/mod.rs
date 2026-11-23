@@ -744,6 +744,7 @@ fn pen_of(n: &PathNode, t: &Transform, mode: &StrokeMode, q: Quality) -> Pen {
         miter_limit: n.miter_limit,
         scale: if mode.device { 1.0 } else { t.max_scale() },
         tol: q.tol,
+        major: mode.hair,
     }
 }
 

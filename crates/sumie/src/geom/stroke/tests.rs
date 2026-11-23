@@ -57,7 +57,7 @@ fn cross(a: Point, b: Point, q: Point) -> f64 {
 }
 
 fn pen(cap: Cap, join: Join) -> Pen {
-    Pen { half: 1.0, cap, join, miter_limit: 4.0, scale: 50.0, tol: 0.1 }
+    Pen { half: 1.0, cap, join, miter_limit: 4.0, scale: 50.0, tol: 0.1, major: false }
 }
 
 fn stroke(pts: &[(f64, f64)], closed: bool, pen: &Pen) -> Loops {
@@ -316,7 +316,8 @@ fn whole_closed_dash_is_closed() {
 /// ちょうどの折り返し（外積 0）の round の継ぎ目は、半円を 1 度だけ出す（単位 1 の 2 回目のレビュー）。
 #[test]
 fn exact_reversal_makes_one_round_join() {
-    let pen = Pen { half: 20.0, cap: Cap::Butt, join: Join::Round, miter_limit: 4.0, scale: 1.0, tol: 0.25 };
+    let pen =
+        Pen { half: 20.0, cap: Cap::Butt, join: Join::Round, miter_limit: 4.0, scale: 1.0, tol: 0.25, major: false };
     let count = |pts: &[(f64, f64)]| {
         let budget = nb();
         let mut scratch = PolyBuf::new(&budget);

@@ -122,7 +122,9 @@ pub(crate) fn clip_x(a: Point, b: Point, lo: f64, hi: f64) -> Option<(Point, Poi
 }
 
 /// 描く座標系の線分を、決まった箱で切って固定小数の辺にし `out` に足す。有限でない点は足さない（呼び手が描かないと決める）。
-/// y は箱で切り、x は箱の境で分けて、右の外の部分は捨て、左の外の部分は箱の左の縁の縦の辺にする（左から足す被覆を保つ）。
+/// y は箱で切り、x は箱の境で分けて、外の部分は箱の左右の縁の縦の辺にする（左の外は左から足す被覆を保ち、右の外は項目の
+/// 矩形を右へ広げる：右の外を捨てると、箱の右へ延びる図形のキャンバスの中の部分が描かれなかった。単位 1 の 9 回目の
+/// レビュー）。
 pub(crate) fn push_segment(a: Point, b: Point, out: &mut MVec<'_, Edge>) -> Result<(), Error> {
     if !a.finite() || !b.finite() || a.y == b.y {
         return Ok(());
@@ -153,9 +155,8 @@ pub(crate) fn push_segment(a: Point, b: Point, out: &mut MVec<'_, Edge>) -> Resu
         }
         let mid = (u.x + v.x) / 2.0;
         if mid > BOX {
-            continue;
-        }
-        if mid < -BOX {
+            push_fixed(out, Point::new(BOX, u.y), Point::new(BOX, v.y))?;
+        } else if mid < -BOX {
             push_fixed(out, Point::new(-BOX, u.y), Point::new(-BOX, v.y))?;
         } else {
             push_fixed(out, u, v)?;
@@ -444,6 +445,13 @@ impl<'a> Payer<'a> {
         Ok(())
     }
 
+    /// 塊を半分にする（同じループで別の Payer と前払いを持つとき、中止の印を読む間を間隔の 2 倍の内に保つ。単位 2 の
+    /// 7 回目のレビュー）。
+    pub(crate) fn halved(mut self) -> Payer<'a> {
+        self.chunk = (self.chunk / 2).max(1);
+        self
+    }
+
     /// `n` 回る（[`Payer::step`] を `n` 回）。
     pub(crate) fn steps(&mut self, n: u64) -> Result<(), Error> {
         for _ in 0..n {
@@ -592,14 +600,9 @@ impl<'b> SubRows<'b> {
     }
 
     /// 辺 `e` と行 `row` の副走査線の交わりを欄に入れる（範囲の右の外は捨て、左の外は左の 1 列に入れる）。欄に入らない
-    /// 交わりを並びに足すときは払う。
-    fn add_edge(
-        &mut self,
-        cells: &RowCells<'_>,
-        e: &Edge,
-        row: i64,
-        budget: &crate::budget::Budget<'_>,
-    ) -> Result<(), Error> {
+    /// 交わりを並びに足す手間は `MVec::push` が払う（[`crate::cost::SUB_PUSH`] と同じ額。2 度払わない：単位 2 の 7 回目の
+    /// レビュー）。
+    fn add_edge(&mut self, cells: &RowCells<'_>, e: &Edge, row: i64) -> Result<(), Error> {
         let ry0 = row.saturating_mul(ONE);
         let dir: i8 = if e.dir > 0 { 1 } else { -1 };
         for s in 0..SUB_ROWS {
@@ -632,7 +635,6 @@ impl<'b> SubRows<'b> {
                 // 副走査線 1 本の交わりが上限を超えた：この画素は面積の被覆のまま（並びには足さない）
                 continue;
             }
-            budget.spend(cost_push())?;
             let at = u32::try_from(self.cross.len()).unwrap_or(NO_CROSS);
             let next = self.head.get(idx).copied().unwrap_or(NO_CROSS);
             self.cross.push(SubCross { x: x32, next, s: s as u8, dir, pad: [0; 6] })?;
@@ -647,15 +649,24 @@ impl<'b> SubRows<'b> {
         self.mark.get(idx).is_some_and(|&m| m != 0)
     }
 
+    /// 印の付いた列 `idx` を掃く手間の上限（[`SubRows::sweep_column`] の前に払う）：副走査線ごとに 1 と、交わり m 個
+    /// （SUB_MAX_CROSS まで）の集めと差し込み m ＋ m²、列の巻き数の足しと幅の確かめ。交わり 1 つにつき
+    /// [`crate::cost::SUB_SWEEP`] の内（列は交わりを 1 つ以上持つ）。
+    fn column_bound(&self, idx: usize) -> u64 {
+        let base = idx.saturating_mul(SUB_ROWS);
+        (0..SUB_ROWS).fold(TWO_SUB_ROWS, |acc, s| {
+            let m = self.cells.get(base.saturating_add(s)).map_or(0, |c| u64::from(c.n).min(SUB_MAX_CROSS as u64));
+            acc.saturating_add(1).saturating_add(m).saturating_add(m.saturating_mul(m))
+        })
+    }
+
     /// 印の付いた列 `idx` を掃く：副走査線ごとの交わりを x の順に並べ、画素の中の巻き数の幅が規則の線形な区間の外なら、
     /// 副走査線ごとに規則を当てた被覆（0〜`FULL`。列の左の境は `left`）。区間の内か、副走査線 1 本の交わりが
     /// [`SUB_MAX_CROSS`] を超えれば None（呼び手は面積の被覆）。左の境の巻き数 `w` に列の向きを足し、欄を空にする。
-    /// 回った数（交わりの数 ＋ 副走査線の数）を返す。
-    fn sweep_column(&mut self, idx: usize, left: i64, w: &mut [i64; SUB_ROWS], rule: FillRule) -> (Option<i64>, u64) {
+    fn sweep_column(&mut self, idx: usize, left: i64, w: &mut [i64; SUB_ROWS], rule: FillRule) -> Option<i64> {
         let mut buf = [[(0i64, 0i8); SUB_MAX_CROSS]; SUB_ROWS];
         let mut cnt = [0usize; SUB_ROWS];
         let mut full = false;
-        let mut steps = SUB_ROWS as u64;
         let base = idx.saturating_mul(SUB_ROWS);
         // 差し込み（x の順。同じ x は向きの順）
         let insert = |row: &mut [(i64, i8); SUB_MAX_CROSS], n: &mut usize, item: (i64, i8)| {
@@ -687,7 +698,6 @@ impl<'b> SubRows<'b> {
         }
         let mut k = self.head.get(idx).copied().unwrap_or(NO_CROSS);
         while let Some(c) = self.cross.get(k as usize) {
-            steps = steps.saturating_add(1);
             let s = usize::from(c.s);
             if let (Some(row), Some(n)) = (buf.get_mut(s), cnt.get_mut(s))
                 && *n < SUB_MAX_CROSS
@@ -702,8 +712,6 @@ impl<'b> SubRows<'b> {
         let (mut lo, mut hi) = (i64::MAX, i64::MIN);
         let mut total = 0i64;
         for ((&ws, row), &n) in w.iter().zip(buf.iter()).zip(cnt.iter()) {
-            // 差し込みは交わりの数の 2 乗まで
-            steps = steps.saturating_add(n.saturating_mul(n) as u64);
             let (mut wc, mut xp) = (ws, left);
             lo = lo.min(wc);
             hi = hi.max(wc);
@@ -731,9 +739,9 @@ impl<'b> SubRows<'b> {
             *h = NO_CROSS;
         }
         if full || affine(lo, hi, rule) {
-            return (None, steps);
+            return None;
         }
-        (Some(total.saturating_mul(FULL).checked_div(ONE.saturating_mul(SUB_ROWS as i64)).unwrap_or(0)), steps)
+        Some(total.saturating_mul(FULL).checked_div(ONE.saturating_mul(SUB_ROWS as i64)).unwrap_or(0))
     }
 
     /// 交わりのない画素が、左の境の巻き数 `w` だけで規則の線形な区間をまたぐなら、副走査線ごとに規則を当てた被覆。
@@ -749,11 +757,6 @@ impl<'b> SubRows<'b> {
 
 /// 交わりのある列ごとの、副走査線の巻き数の足しと幅の確かめ（2 × 副走査線の数）。
 const TWO_SUB_ROWS: u64 = 2 * SUB_ROWS as u64;
-
-/// 欄に入らない交わりを並びに足す手間。
-const fn cost_push() -> u64 {
-    crate::cost::SUB_PUSH
-}
 
 /// 巻き数の幅 `lo..=hi` で、面積の被覆（平均に規則を当てる）が副走査線ごとに規則を当てたものと同じか（規則が線形な区間の内）。
 fn affine(lo: i64, hi: i64, rule: FillRule) -> bool {
@@ -862,7 +865,7 @@ pub(crate) fn fill_region(
                 scan.cells.add_edge(e, row, &mut pay)?;
                 // 副走査線の交わりを欄に入れる（交わりの数だけ払う。掃く・空にする手間は掃きながら払う。ADR-103・ADR-104）
                 budget.spend(SubRows::crossings(e, row).saturating_mul(cost::SUB_CROSS))?;
-                scan.subs.add_edge(&scan.cells, e, row, budget)?;
+                scan.subs.add_edge(&scan.cells, e, row)?;
             } else {
                 budget.spend(cost::RASTER_CELL)?;
                 scan.cells.add_edge_center(e, row);
@@ -888,7 +891,7 @@ pub(crate) fn fill_region(
             };
             // 副走査線ごとの左の境の巻き数と、交わりのない画素がそれだけで区間をまたぐか（またげばその被覆。ADR-103）。
             // 交わりのある列の手間は掃きながら塊ごとに払う（交わり 1 つにつき SUB_SWEEP まで。ADR-104）
-            let mut spay = Payer::new(budget, scan.subs.count.saturating_mul(cost::SUB_SWEEP), cost::SUB_STEP);
+            let mut spay = Payer::new(budget, scan.subs.count.saturating_mul(cost::SUB_SWEEP), cost::SUB_STEP).halved();
             let mut w = [0i64; SUB_ROWS];
             let mut uniform: Option<i64> = None;
             for idx in lo..=hi {
@@ -898,8 +901,9 @@ pub(crate) fn fill_region(
                 let marked = aa && scan.subs.marked(idx);
                 let col = x0.saturating_add(i64::try_from(idx).unwrap_or(0)).saturating_sub(1);
                 let cov = if marked {
-                    let (exact, steps) = scan.subs.sweep_column(idx, col.saturating_mul(ONE), &mut w, rule);
-                    spay.steps(steps.saturating_add(TWO_SUB_ROWS))?;
+                    // 回る前に上限を払う（後払いにしない。単位 2 の 7 回目のレビュー）
+                    spay.steps(scan.subs.column_bound(idx))?;
+                    let exact = scan.subs.sweep_column(idx, col.saturating_mul(ONE), &mut w, rule);
                     uniform = SubRows::uniform(&w, rule);
                     if idx == 0 { 0 } else { exact.unwrap_or_else(|| value(acc, a)) }
                 } else if idx == 0 {

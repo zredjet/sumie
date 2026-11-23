@@ -933,3 +933,136 @@ fn overlapping_edges_follow_the_rule_per_subrow() {
     };
     assert_eq!(line(true), line(false), "なぞり返した線の縁");
 }
+
+/// 範囲 `r`（右半分・下半分・真ん中）を、範囲の見積もりを上限にして描ける（断らない）。
+fn draws_regions(t: &Tree, scale: f64) {
+    let plan = t.plan(&RenderOptions { scale, ..RenderOptions::DEFAULT }, &Never).unwrap();
+    let (w, h) = (plan.width, plan.height);
+    for r in [
+        PixelRect { x: w / 2, y: 0, width: w - w / 2, height: h },
+        PixelRect { x: 0, y: h / 2, width: w, height: h - h / 2 },
+        PixelRect { x: w / 4, y: h / 4, width: (w / 2).max(1), height: (h / 2).max(1) },
+    ] {
+        let mut part = vec![0u8; (r.width * r.height * 4) as usize];
+        let mut out = PixmapMut::new(&mut part, r.width, r.height, (r.width * 4) as usize).unwrap();
+        plan.render_region(r, &mut out, &Never).unwrap();
+    }
+}
+
+/// 単位 2 の 7 回目のレビュー：同じ矩形を何度も書いたパスと、細い縦線の密な格子を、見積もりを上限にして全体と範囲で描ける
+/// （欄に入らない副走査線の交わりの push を 2 度払い、5 度書いた矩形で断っていた）。2〜8 度書いた矩形の縦の縁は 1 度の
+/// ときと同じ濃さ（欄と並びを使う厳密な被覆）。9 度以上は面積の被覆に戻る（断らない）。
+#[test]
+fn many_crossings_stay_within_the_estimate() {
+    let copies = |n: usize| {
+        let mut b = Builder::new();
+        b.add(
+            |w| {
+                for _ in 0..n {
+                    rect(w, 10.3, 10.2, 20.0, 80.0, 0.0, 0.0).unwrap();
+                }
+            },
+            |node| {
+                node.flags = HAS_FILL;
+                node.fill = GREEN;
+            },
+        );
+        b.tree(50.0, 100.0)
+    };
+    let edges = |t: &Tree| {
+        let (w, _, px) = draw(t, 1.0);
+        (px[((50 * w + 10) * 4 + 3) as usize], px[((50 * w + 30) * 4 + 3) as usize])
+    };
+    let one = edges(&copies(1));
+    for n in [2, 4, 5, 6, 8] {
+        assert_eq!(edges(&copies(n)), one, "{n} 度書いた矩形");
+    }
+    for n in [5, 6, 9, 12] {
+        let t = copies(n);
+        let _ = edges(&t);
+        for scale in [0.5, 1.0, 3.0] {
+            draws_regions(&t, scale);
+        }
+    }
+    // 0.25 画素おきの幅 0.1 の縦線 200 本（1 画素に 4 本：列の欄に 8 つの交わり）
+    let mut b = Builder::new();
+    b.add(
+        |w| {
+            for i in 0..200 {
+                rect(w, 10.0 + i as f64 * 0.25, 10.0, 0.1, 80.0, 0.0, 0.0).unwrap();
+            }
+        },
+        |node| {
+            node.flags = HAS_FILL;
+            node.fill = GREEN;
+        },
+    );
+    let hatch = b.tree(80.0, 100.0);
+    let _ = draw(&hatch, 1.0);
+    for scale in [0.5, 1.0, 2.0] {
+        draws_regions(&hatch, scale);
+    }
+}
+
+/// 重ならない細い楔は面積の被覆のまま（左と右の縁が同じ画素を横切っても、巻き数の幅は規則の線形な区間の内。単位 2 の
+/// 6 回目のレビュー：Chrome は 13・7）。
+#[test]
+fn thin_wedges_keep_the_area_coverage() {
+    let mut b = Builder::new();
+    b.add(
+        |w| {
+            w.move_to(Point::new(50.0, 50.0)).unwrap();
+            w.line_to(Point::new(190.0, 40.3)).unwrap();
+            w.line_to(Point::new(190.0, 41.0)).unwrap();
+            w.close().unwrap();
+        },
+        |node| {
+            node.flags = HAS_FILL;
+            node.fill = GREEN;
+        },
+    );
+    let (w, _, px) = draw(&b.tree(200.0, 100.0), 1.0);
+    let alpha = |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+    assert!((10..=15).contains(&alpha(59, 49)), "{}", alpha(59, 49));
+    assert!((5..=9).contains(&alpha(55, 49)), "{}", alpha(55, 49));
+}
+
+/// Chrome が枠で描く細い rect は本当の太さで描く（太さ 0.5 の縁 x = 10.3 は列 10 に半分、列 9 に入らない。1 画素の線 × α
+/// なら列 9 に 26・列 10 に 102。ADR-104 (4)(c)）。
+#[test]
+fn thin_rect_frames_use_the_true_width() {
+    let mut b = Builder::new();
+    b.add(
+        |w| rect(w, 10.3, 10.3, 30.0, 30.0, 0.0, 0.0).unwrap(),
+        |node| {
+            node.flags = HAS_STROKE;
+            node.stroke = GREEN;
+            node.stroke_width = 0.5;
+            node.shape = crate::tree::SHAPE_RECT;
+        },
+    );
+    let (w, _, px) = draw(&b.tree(50.0, 50.0), 1.0);
+    let alpha = |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+    assert_eq!((alpha(9, 25), alpha(10, 25)), (0, 128));
+}
+
+/// 決まった箱（±2²² 画素）の右の外へ延びる図形も、キャンバスの中の部分を描く（右の外の部分は箱の右の縁の縦の辺にする。
+/// 単位 1 の 9 回目のレビュー：項目の矩形が残った左の辺で止まり、何も描かなかった）。
+#[test]
+fn shapes_beyond_the_right_of_the_box_are_drawn() {
+    for (x, wd) in [(-100.0, 5_000_000.0), (-10_000_000.0, 20_000_000.0)] {
+        let mut b = Builder::new();
+        b.add(
+            |w| rect(w, x, 20.0, wd, 20.0, 0.0, 0.0).unwrap(),
+            |node| {
+                node.flags = HAS_FILL;
+                node.fill = GREEN;
+            },
+        );
+        let t = b.tree(60.0, 60.0);
+        let (w, _, px) = draw(&t, 1.0);
+        assert_eq!(px[((30 * w + 30) * 4 + 3) as usize], 255, "{x} {wd}");
+        assert_eq!(px[((30 * w + 59) * 4 + 3) as usize], 255, "{x} {wd}");
+        draws_regions(&t, 1.0);
+    }
+}

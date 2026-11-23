@@ -1172,7 +1172,7 @@ pub fn stroke_ops(data: &[u8]) -> Check {
             crate::values::path::path_data(text, &mut w, &b)?;
         }
         // 計画と同じ許し（ADR-97 (1)）と、計画と同じ部分パスの集め方（滑らかな点の印とつなぎ目の判定を含む）
-        let pen = Pen { half, cap, join, miter_limit: limit, scale: 1.0, tol: 0.1 };
+        let pen = Pen { half, cap, join, miter_limit: limit, scale: 1.0, tol: 0.1, major: false };
         let dashes = Dashes::new(dash, offset, &b)?;
         let mut poly = PolyBuf::new(&b);
         let mut scratch = PolyBuf::new(&b);

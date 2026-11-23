@@ -195,9 +195,17 @@ pub(crate) struct Pen {
     pub(crate) scale: f64,
     /// 許容の誤差（画素）
     pub(crate) tol: f64,
+    /// 細い線（Skia の細い線と同じく、区間の主軸の方向に太さ 2 × `half` の帯。区間ごとに垂直の太さを変える。ユーザーの
+    /// 判断。ADR-105）。継ぎ目は [`Join::None`]
+    pub(crate) major: bool,
 }
 
 impl Pen {
+    /// 向き `d`（単位の長さ）の区間の、垂直の太さの半分（細い線は主軸の方向に `half`：`half × max(|dx|, |dy|)`）。
+    fn half_for(&self, d: Point) -> f64 {
+        if self.major { self.half * math::max(d.x.abs(), d.y.abs()) } else { self.half }
+    }
+
     /// 角 `angle`（ラジアン）の円弧を分ける数（1 以上）。平坦化の弧と同じ式（`⌈|θ| √(r / (8 tol))⌉`）。
     pub(crate) fn round_pieces(&self, angle: f64) -> u64 {
         let r = self.half * self.scale;
@@ -482,7 +490,7 @@ pub(crate) fn stroke_polyline(
         .or_else(|| curve_end_dir(view, true))
         .or_else(|| direction(first, second))
         .unwrap_or(Point::new(1.0, 0.0));
-    e.point(add(first, normal(d0), pen.half))?;
+    e.point(add(first, normal(d0), pen.half_for(d0)))?;
     for i in 1..n.saturating_sub(1) {
         let (Some(&a), Some(&p), Some(&b)) = (v.get(ring_prev(i, n)), v.get(i), v.get(ring_next(i, n))) else {
             continue;
@@ -533,12 +541,22 @@ fn vertex(
     e.budget.spend(cost::OP_STEP)?;
     let (Some(d1), Some(d2)) = (direction(a, p), direction(p, b)) else { return Ok(()) };
     let (n1, n2) = (normal(d1), normal(d2));
-    let end_in = add(p, n1, pen.half);
-    let start_out = add(p, n2, pen.half);
+    let end_in = add(p, n1, pen.half_for(d1));
+    let start_out = add(p, n2, pen.half_for(d2));
     // 曲がる向き：外積が負なら左が外側（y が下向きの座標で、左の縁が外）
     let cross = d1.x * d2.y - d1.y * d2.x;
     let dot = d1.x * d2.x + d1.y * d2.y;
-    if cross > 0.0 {
+    if cross > 0.0 && pen.major {
+        // 細い線は区間ごとに太さが違うので、内側の縁の 2 本の線の交わる点を一般の式で求める（両側の区間の半分の長さの
+        // 内に収まれば、その 1 点にする）
+        let (bx, by) = (start_out.x - end_in.x, start_out.y - end_in.y);
+        let t = (bx * d2.y - by * d2.x) / cross;
+        let s = (bx * d1.y - by * d1.x) / cross;
+        let room = 0.5 * math::min(seg_len(a, p), seg_len(p, b));
+        if t.is_finite() && s.is_finite() && t <= 0.0 && -t <= room && s >= 0.0 && s <= room {
+            return e.point(Point::new(end_in.x + d1.x * t, end_in.y + d1.y * t));
+        }
+    } else if cross > 0.0 {
         // 左は内側：両側の縁の線の交わる点（内側の miter の点）が、両側の区間の半分の長さの内に収まれば、その 1 点にする
         // （頂点を通すと縁の近くに巻き数 2 の重なりができ、面積の被覆が縁の画素を濃くする。隣の頂点の点とも交わらない）
         let k = pen.half * cross / (1.0 + dot);
@@ -615,11 +633,19 @@ fn vertex(
 /// 点 `p` で向き `d` に終わる端（左の縁の点から右の縁の点まで）。
 fn cap(e: &mut Emit<'_, '_>, pen: &Pen, p: Point, d: Point) -> Result<(), Error> {
     let n = normal(d);
-    let left = add(p, n, pen.half);
-    let right = add(p, n, -pen.half);
+    let h = pen.half_for(d);
+    let left = add(p, n, h);
+    let right = add(p, n, -h);
     match pen.cap {
         Cap::Butt => {
             e.point(left)?;
+            e.point(right)
+        }
+        // 細い線の round と square の端は、端を太さの半分だけ延ばす（Skia の細い線と同じ）
+        Cap::Square | Cap::Round if pen.major => {
+            e.point(left)?;
+            e.point(add(left, d, pen.half))?;
+            e.point(add(right, d, pen.half))?;
             e.point(right)
         }
         Cap::Square => {
