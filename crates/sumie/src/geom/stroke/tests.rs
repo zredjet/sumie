@@ -10,7 +10,6 @@
 use super::*;
 use crate::cancel::Never;
 use crate::error::Stage;
-use crate::mem::MVec;
 
 /// 輪を集める。
 #[derive(Default)]
@@ -63,10 +62,10 @@ fn pen(cap: Cap, join: Join) -> Pen {
 
 fn stroke(pts: &[(f64, f64)], closed: bool, pen: &Pen) -> Loops {
     let budget = Budget::new(Stage::Plan, u64::MAX, u64::MAX, &Never);
-    let mut scratch = MVec::new(&budget);
+    let mut scratch = PolyBuf::new(&budget);
     let mut out = Loops::default();
     let v: Vec<Point> = pts.iter().map(|&(x, y)| Point::new(x, y)).collect();
-    stroke_polyline(&v, closed, pen, &mut scratch, &budget, &mut { u64::MAX }, &mut out).unwrap();
+    stroke_polyline(Poly::corners(&v), closed, pen, &mut scratch, &budget, &mut { u64::MAX }, &mut out).unwrap();
     out
 }
 
@@ -167,13 +166,13 @@ fn pieces(pts: &[(f64, f64)], closed: bool, dashes: &[f64], offset: f64) -> Vec<
 /// 破線の部分と、閉じた線として描くか。
 fn pieces_closed(pts: &[(f64, f64)], closed: bool, dashes: &[f64], offset: f64) -> Vec<(Vec<Point>, bool)> {
     let budget = Budget::new(Stage::Plan, u64::MAX, u64::MAX, &Never);
-    let mut buf = MVec::new(&budget);
-    let mut head = MVec::new(&budget);
+    let mut buf = PolyBuf::new(&budget);
+    let mut head = PolyBuf::new(&budget);
     let v: Vec<Point> = pts.iter().map(|&(x, y)| Point::new(x, y)).collect();
     let d = Dashes::new(dashes, offset, &budget).unwrap().unwrap();
     let mut out = Vec::new();
-    dash_polyline(&v, closed, &d, &mut buf, &mut head, &budget, None, &mut |s, c| {
-        out.push((s.to_vec(), c));
+    dash_polyline(Poly::corners(&v), closed, &d, &mut buf, &mut head, &budget, None, &mut |s, c| {
+        out.push((s.pts.to_vec(), c));
         Ok(())
     })
     .unwrap();
@@ -241,18 +240,26 @@ fn every_point_is_paid() {
     let n = 50_000usize;
     let v: Vec<Point> = (0..n).map(|i| Point::new(i as f64, (i % 2) as f64)).collect();
     let budget = Budget::new(Stage::Plan, u64::MAX, u64::MAX, &Never);
-    let mut buf = MVec::new(&budget);
-    let mut head = MVec::new(&budget);
+    let mut buf = PolyBuf::new(&budget);
+    let mut head = PolyBuf::new(&budget);
     let d = Dashes::new(&[1.0, 1e30], 0.0, &budget).unwrap().unwrap();
-    dash_polyline(&v, false, &d, &mut buf, &mut head, &budget, None, &mut |_, _| Ok(())).unwrap();
+    dash_polyline(Poly::corners(&v), false, &d, &mut buf, &mut head, &budget, None, &mut |_, _| Ok(())).unwrap();
     assert!(budget.work() >= n as u64 * crate::cost::OP_STEP, "{}", budget.work());
     assert!(budget.max_spend() < crate::budget::CANCEL_INTERVAL);
     let same: Vec<Point> = vec![Point::new(1.0, 1.0); n];
     let budget = Budget::new(Stage::Plan, u64::MAX, u64::MAX, &Never);
-    let mut scratch = MVec::new(&budget);
+    let mut scratch = PolyBuf::new(&budget);
     let mut out = Loops::default();
-    stroke_polyline(&same, false, &pen(Cap::Round, Join::Round), &mut scratch, &budget, &mut { u64::MAX }, &mut out)
-        .unwrap();
+    stroke_polyline(
+        Poly::corners(&same),
+        false,
+        &pen(Cap::Round, Join::Round),
+        &mut scratch,
+        &budget,
+        &mut { u64::MAX },
+        &mut out,
+    )
+    .unwrap();
     assert!(budget.work() >= n as u64 * crate::cost::OP_STEP, "{}", budget.work());
 }
 
@@ -263,16 +270,16 @@ fn huge_differences() {
     let s = stroke(&far, false, &pen(Cap::Butt, Join::Miter));
     assert!(!s.0.is_empty());
     let budget = Budget::new(Stage::Plan, 1 << 24, u64::MAX, &Never);
-    let mut buf = MVec::new(&budget);
-    let mut head = MVec::new(&budget);
+    let mut buf = PolyBuf::new(&budget);
+    let mut head = PolyBuf::new(&budget);
     let v: Vec<Point> = far.iter().map(|&(x, y)| Point::new(x, y)).collect();
     let d = Dashes::new(&[1.0, 1.0], 0.0, &budget).unwrap().unwrap();
-    dash_polyline(&v, false, &d, &mut buf, &mut head, &budget, None, &mut |_, _| Ok(())).unwrap();
+    dash_polyline(Poly::corners(&v), false, &d, &mut buf, &mut head, &budget, None, &mut |_, _| Ok(())).unwrap();
     // 区間に比べて細かすぎる破線は境が多すぎるので、手間の上限で止まる（見積もりが先に断る）
     let v = [Point::new(1e17, 0.0), Point::new(2e17, 0.0)];
     let d = Dashes::new(&[1.0, 1.0], 0.0, &budget).unwrap().unwrap();
     let budget = Budget::new(Stage::Plan, 1 << 24, u64::MAX, &Never);
-    let r = dash_polyline(&v, false, &d, &mut buf, &mut head, &budget, None, &mut |_, _| Ok(()));
+    let r = dash_polyline(Poly::corners(&v), false, &d, &mut buf, &mut head, &budget, None, &mut |_, _| Ok(()));
     assert!(matches!(r, Err(Error::Limit(_))));
 }
 
@@ -294,10 +301,10 @@ fn exact_reversal_makes_one_round_join() {
     let pen = Pen { half: 20.0, cap: Cap::Butt, join: Join::Round, miter_limit: 4.0, scale: 1.0, tol: 0.25 };
     let count = |pts: &[(f64, f64)]| {
         let budget = nb();
-        let mut scratch = MVec::new(&budget);
+        let mut scratch = PolyBuf::new(&budget);
         let v: Vec<Point> = pts.iter().map(|&(x, y)| Point::new(x, y)).collect();
         let mut sink = Loops::default();
-        stroke_polyline(&v, false, &pen, &mut scratch, &budget, &mut { u64::MAX }, &mut sink).unwrap();
+        stroke_polyline(Poly::corners(&v), false, &pen, &mut scratch, &budget, &mut { u64::MAX }, &mut sink).unwrap();
         sink.0.iter().map(Vec::len).sum::<usize>()
     };
     let half_circle = pen.round_pieces(core::f64::consts::PI) as usize;
@@ -305,10 +312,10 @@ fn exact_reversal_makes_one_round_join() {
     let folded = count(&[(20.0, 100.0), (180.0, 100.0), (20.0, 100.0)]);
     // 折り返しても塗る所は線分と同じ（先の半円を含む）
     let budget = nb();
-    let mut scratch = MVec::new(&budget);
+    let mut scratch = PolyBuf::new(&budget);
     let v = [Point::new(20.0, 100.0), Point::new(180.0, 100.0), Point::new(20.0, 100.0)];
     let mut l = Loops::default();
-    stroke_polyline(&v, false, &pen, &mut scratch, &budget, &mut { u64::MAX }, &mut l).unwrap();
+    stroke_polyline(Poly::corners(&v), false, &pen, &mut scratch, &budget, &mut { u64::MAX }, &mut l).unwrap();
     assert!(l.inside(195.0, 100.0) && l.inside(100.0, 115.0) && l.inside(100.0, 85.0) && !l.inside(10.0, 100.0));
     // 折り返しの頂点：前へ回る縁は円弧、後ろへ回る縁は頂点を通す 3 点
     assert!(folded <= straight + half_circle + 8, "{folded} {straight} {half_circle}");

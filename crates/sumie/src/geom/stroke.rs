@@ -18,6 +18,91 @@ use crate::budget::{Budget, chunk_len};
 use crate::cost;
 use crate::error::Error;
 use crate::math;
+use crate::mem::MVec;
+
+/// 折れ線（点と、点が曲線の内側の点（平坦化で分けた点。滑らかな点）かの印）。印の並びが短ければ、足りない点は角。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Poly<'a> {
+    pub(crate) pts: &'a [Point],
+    pub(crate) smooth: &'a [u8],
+}
+
+impl<'a> Poly<'a> {
+    /// どの点も角の折れ線。
+    pub(crate) fn corners(pts: &'a [Point]) -> Poly<'a> {
+        Poly { pts, smooth: &[] }
+    }
+
+    fn smooth_at(&self, i: usize) -> bool {
+        self.smooth.get(i).is_some_and(|&s| s != 0)
+    }
+}
+
+/// 折れ線の置き場（点と印を並べて持つ）。
+pub(crate) struct PolyBuf<'b> {
+    pub(crate) pts: MVec<'b, Point>,
+    pub(crate) smooth: MVec<'b, u8>,
+}
+
+impl<'b> PolyBuf<'b> {
+    pub(crate) fn new(budget: &'b Budget<'b>) -> PolyBuf<'b> {
+        PolyBuf { pts: MVec::new(budget), smooth: MVec::new(budget) }
+    }
+
+    pub(crate) fn with_capacity(budget: &'b Budget<'b>, n: usize) -> Result<PolyBuf<'b>, Error> {
+        Ok(PolyBuf { pts: MVec::with_capacity(budget, n)?, smooth: MVec::with_capacity(budget, n)? })
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.pts.clear();
+        self.smooth.clear();
+    }
+
+    pub(crate) fn push(&mut self, p: Point, smooth: bool) -> Result<(), Error> {
+        self.pts.push(p)?;
+        self.smooth.push(u8::from(smooth))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.pts.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pts.is_empty()
+    }
+
+    fn truncate(&mut self, n: usize) {
+        self.pts.truncate(n);
+        self.smooth.truncate(n);
+    }
+
+    /// 最後の点の印を変える（曲線の終わりの点は角）。
+    pub(crate) fn set_last_smooth(&mut self, smooth: bool) {
+        if let Some(s) = self.smooth.last_mut() {
+            *s = u8::from(smooth);
+        }
+    }
+
+    /// 始めの点の印を変える（閉じた部分パスの始めのつなぎ目）。
+    pub(crate) fn set_first_smooth(&mut self, smooth: bool) {
+        if let Some(s) = self.smooth.get_mut(0) {
+            *s = u8::from(smooth);
+        }
+    }
+
+    pub(crate) fn view(&self) -> Poly<'_> {
+        Poly { pts: self.pts.as_slice(), smooth: self.smooth.as_slice() }
+    }
+
+    /// 別の折れ線の `skip` 番目からを後ろに足す（点ごとに払う）。
+    fn append_from(&mut self, other: Poly<'_>, skip: usize, budget: &Budget<'_>) -> Result<(), Error> {
+        for (i, &p) in other.pts.iter().enumerate().skip(skip) {
+            budget.spend(cost::OP_STEP)?;
+            self.push(p, other.smooth_at(i))?;
+        }
+        Ok(())
+    }
+}
 
 /// 端の形。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,13 +235,18 @@ impl Emit<'_, '_> {
     }
 }
 
-/// 続く同じ点をまとめた折れ線の点を `out` に入れ直す（`out` は呼び手の置き場）。
-fn dedup(pts: &[Point], out: &mut crate::mem::MVec<'_, Point>, budget: &Budget<'_>) -> Result<(), Error> {
+/// 続く同じ点をまとめた折れ線を `out` に入れ直す（`out` は呼び手の置き場。まとめた点は、どれかが角なら角）。
+fn dedup(line: Poly<'_>, out: &mut PolyBuf<'_>, budget: &Budget<'_>) -> Result<(), Error> {
     out.clear();
-    for &p in pts {
+    for (i, &p) in line.pts.iter().enumerate() {
         budget.spend(cost::OP_STEP)?;
-        if out.last() != Some(&p) {
-            out.push(p)?;
+        let smooth = line.smooth_at(i);
+        if out.pts.last() == Some(&p) {
+            if !smooth {
+                out.set_last_smooth(false);
+            }
+        } else {
+            out.push(p, smooth)?;
         }
     }
     Ok(())
@@ -164,25 +254,27 @@ fn dedup(pts: &[Point], out: &mut crate::mem::MVec<'_, Point>, budget: &Budget<'
 
 /// 1 本の部分パスの折れ線 `pts`（`closed` なら閉じる）の外形の輪を `sink` に渡す。`scratch` は点をまとめる置き場。
 pub(crate) fn stroke_polyline(
-    pts: &[Point],
+    line: Poly<'_>,
     closed: bool,
     pen: &Pen,
-    scratch: &mut crate::mem::MVec<'_, Point>,
+    scratch: &mut PolyBuf<'_>,
     budget: &Budget<'_>,
     round_left: &mut u64,
     sink: &mut dyn LoopSink,
 ) -> Result<(), Error> {
     let budget = budget_ref(budget);
+    let pts = line.pts;
     if pts.is_empty() || (pts.len() == 1 && !closed) {
         return Ok(());
     }
-    dedup(pts, scratch, budget)?;
-    // 閉じた折れ線の終わりが始めと同じなら 1 つにする
-    if closed && scratch.len() > 1 && scratch.last() == scratch.as_slice().first() {
+    dedup(line, scratch, budget)?;
+    // 閉じた折れ線の終わりが始めと同じなら 1 つにする（始めの点は角）
+    if closed && scratch.len() > 1 && scratch.pts.last() == scratch.pts.as_slice().first() {
         let n = scratch.len().saturating_sub(1);
         scratch.truncate(n);
     }
-    let v = scratch.as_slice();
+    let view = scratch.view();
+    let v = view.pts;
     let mut e = Emit { sink, budget, round_left };
     if v.len() == 1 {
         return zero_length(&mut e, pen, v.first().copied().unwrap_or(Point::new(0.0, 0.0)));
@@ -199,7 +291,7 @@ pub(crate) fn stroke_polyline(
                 let (back, ahead) = (ring_prev(i, n), ring_next(i, n));
                 let (a, b) = if forward { (back, ahead) } else { (ahead, back) };
                 let (Some(&p), Some(&a), Some(&b)) = (v.get(i), v.get(a), v.get(b)) else { continue };
-                vertex(&mut e, pen, a, p, b, forward)?;
+                vertex(&mut e, pen, a, p, b, forward, view.smooth_at(i))?;
             }
         }
         return Ok(());
@@ -217,7 +309,7 @@ pub(crate) fn stroke_polyline(
         let (Some(&a), Some(&p), Some(&b)) = (v.get(ring_prev(i, n)), v.get(i), v.get(ring_next(i, n))) else {
             continue;
         };
-        vertex(&mut e, pen, a, p, b, true)?;
+        vertex(&mut e, pen, a, p, b, true, view.smooth_at(i))?;
     }
     let dn = direction(before_last, last).unwrap_or(d0);
     cap(&mut e, pen, last, dn)?;
@@ -225,7 +317,7 @@ pub(crate) fn stroke_polyline(
         let (Some(&a), Some(&p), Some(&b)) = (v.get(ring_next(i, n)), v.get(i), v.get(ring_prev(i, n))) else {
             continue;
         };
-        vertex(&mut e, pen, a, p, b, false)?;
+        vertex(&mut e, pen, a, p, b, false, view.smooth_at(i))?;
     }
     cap(&mut e, pen, first, Point::new(-d0.x, -d0.y))?;
     Ok(())
@@ -244,7 +336,15 @@ fn ring_next(i: usize, n: usize) -> usize {
 /// 頂点 `p`（前の点 `a`・次の点 `b`）の左の縁の点：入る区間の終わりの縁・継ぎ目・出る区間の始めの縁。ちょうどの折り返し
 /// （外積 0・内積が負）は左右のどちらも外側に見えるので、前へ回る縁（`forward`）だけを外側にし、後ろへ回る縁は内側として
 /// 頂点を通す（継ぎ目を 2 度作らない。塗る所は同じ。単位 1 の 2 回目のレビュー）。
-fn vertex(e: &mut Emit<'_, '_>, pen: &Pen, a: Point, p: Point, b: Point, forward: bool) -> Result<(), Error> {
+fn vertex(
+    e: &mut Emit<'_, '_>,
+    pen: &Pen,
+    a: Point,
+    p: Point,
+    b: Point,
+    forward: bool,
+    smooth: bool,
+) -> Result<(), Error> {
     e.budget.spend(cost::OP_STEP)?;
     let (Some(d1), Some(d2)) = (direction(a, p), direction(p, b)) else { return Ok(()) };
     let (n1, n2) = (normal(d1), normal(d2));
@@ -264,6 +364,12 @@ fn vertex(e: &mut Emit<'_, '_>, pen: &Pen, a: Point, p: Point, b: Point, forward
         }
     }
     e.point(end_in)?;
+    if cross > 0.0 && smooth {
+        // 曲線の内側の点で交わる点が区間に収まらない（曲がりの半径が太さの半分より小さい）：頂点を通さずに縁の点どうしを
+        // つなぐ（縁は曲線を写したものになり、折り返した所の巻き数で中に穴が残る。Chrome・resvg（Skia）は曲線の縁を曲線の
+        // まま写すので同じ。ADR-99 (2)）
+        return e.point(start_out);
+    }
     if cross > 0.0 || (cross == 0.0 && dot < 0.0 && !forward) {
         // 左は内側で交わる点が区間に収まらない（鋭い折れ・短い区間）：頂点を通す
         e.point(p)?;
@@ -401,7 +507,7 @@ impl<'a> Dashes<'a> {
 }
 
 /// 破線の部分を受け取る口（部分の折れ線と、閉じた線として描くか）。
-pub(crate) type PieceFn<'f> = &'f mut dyn FnMut(&[Point], bool) -> Result<(), Error>;
+pub(crate) type PieceFn<'f> = &'f mut dyn FnMut(Poly<'_>, bool) -> Result<(), Error>;
 
 /// 区間 a → b のうち見える所（区間の割合の範囲。見えなければ None）を返す口。見えない所の破線は作らないので、境を周期ごとに
 /// 算術で飛ばす（ADR-30 (4)。単位 1 の 4 回目のレビュー）。
@@ -413,15 +519,16 @@ pub(crate) type VisibleFn<'f> = &'f dyn Fn(Point, Point) -> Option<(f64, f64)>;
 /// 小さすぎる）、その部分パスの残りを分けない。
 #[allow(clippy::too_many_arguments, reason = "置き場を分けて渡す")]
 pub(crate) fn dash_polyline(
-    pts: &[Point],
+    line: Poly<'_>,
     closed: bool,
     dashes: &Dashes<'_>,
-    buf: &mut crate::mem::MVec<'_, Point>,
-    head: &mut crate::mem::MVec<'_, Point>,
+    buf: &mut PolyBuf<'_>,
+    head: &mut PolyBuf<'_>,
     budget: &Budget<'_>,
     visible: Option<VisibleFn<'_>>,
     piece: PieceFn<'_>,
 ) -> Result<(), Error> {
+    let pts = line.pts;
     let Some(&first) = pts.first() else { return Ok(()) };
     if closed {
         let mut all_same = true;
@@ -446,7 +553,7 @@ pub(crate) fn dash_polyline(
     head.clear();
     buf.clear();
     if on {
-        buf.push(first)?;
+        buf.push(first, line.smooth_at(0))?;
     }
     let count = if closed { pts.len() } else { pts.len().saturating_sub(1) };
     // 境の足し算が進まない（今の位置に比べて値が小さすぎる）ときは長さ 0 の部分と同じに切り替えて続け、並びを 1 周しても
@@ -494,7 +601,7 @@ pub(crate) fn dash_polyline(
                     if on {
                         let u = t0 / seg;
                         buf.clear();
-                        buf.push(Point::new(a.x + dx * u, a.y + dy * u))?;
+                        buf.push(Point::new(a.x + dx * u, a.y + dy * u), false)?;
                     }
                     if seg - t0 <= remain {
                         break;
@@ -514,7 +621,7 @@ pub(crate) fn dash_polyline(
                     let at = Point::new(a.x + dx * u, a.y + dy * u);
                     if on_sum_positive && !on {
                         buf.clear();
-                        buf.push(at)?;
+                        buf.push(at, false)?;
                     } else if !on_sum_positive {
                         buf.clear();
                     }
@@ -527,17 +634,17 @@ pub(crate) fn dash_polyline(
             let u = t0 / seg;
             let at = Point::new(a.x + dx * u, a.y + dy * u);
             if on {
-                buf.push(at)?;
+                buf.push(at, false)?;
                 if holding {
-                    head.append_slice(buf.as_slice())?;
+                    head.append_from(buf.view(), 0, budget)?;
                     holding = false;
                 } else {
-                    piece(buf.as_slice(), false)?;
+                    piece(buf.view(), false)?;
                 }
                 buf.clear();
             } else {
                 buf.clear();
-                buf.push(at)?;
+                buf.push(at, false)?;
             }
             on = !on;
             idx = ring_next(idx, n);
@@ -546,30 +653,27 @@ pub(crate) fn dash_polyline(
         remain -= seg - t0;
         if on {
             budget.spend(cost::OUTLINE_POINT)?;
-            buf.push(b)?;
+            buf.push(b, line.smooth_at(ring_next(k, pts.len())))?;
         }
     }
     if holding {
         // 最初の部分が終わらなかった（閉じた部分パスの全体が線）：閉じた線として描く（始めの角も継ぎ目。ADR-92 (1)・
         // Chrome と同じ。単位 1 の 2 回目のレビュー）
         if buf.len() > 1 {
-            piece(buf.as_slice(), true)?;
+            piece(buf.view(), true)?;
         }
         return Ok(());
     }
     if on && buf.len() > 1 {
         if hold_head && !head.is_empty() {
             // 最後の部分（始めの点で終わる）に最初の部分をつなぐ（始めの点を 2 度入れない）
-            for &p in head.as_slice().iter().skip(1) {
-                budget.spend(cost::OP_STEP)?;
-                buf.push(p)?;
-            }
+            buf.append_from(head.view(), 1, budget)?;
             head.clear();
         }
-        piece(buf.as_slice(), false)?;
+        piece(buf.view(), false)?;
     }
     if !head.is_empty() {
-        piece(head.as_slice(), false)?;
+        piece(head.view(), false)?;
     }
     Ok(())
 }

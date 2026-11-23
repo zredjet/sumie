@@ -565,6 +565,42 @@ pub(crate) fn ellipse(w: &mut PathWriter<'_, '_>, cx: f64, cy: f64, rx: f64, ry:
     w.close()
 }
 
+/// 区間の始めと終わりの接線の向き（長さ 0 の向きは使わない：3 次曲線は次の制御点へ。なければ None）。
+pub(crate) fn seg_tangents(seg: &PathSeg) -> Option<(Point, Point)> {
+    let d = |a: Point, b: Point| Point::new(b.x - a.x, b.y - a.y);
+    let first_nonzero = |v: &[Point]| v.iter().copied().find(|p| p.x != 0.0 || p.y != 0.0);
+    match *seg {
+        PathSeg::Move(_) => None,
+        PathSeg::Line(a, b) | PathSeg::Close(a, b) => {
+            let v = d(a, b);
+            (v.x != 0.0 || v.y != 0.0).then_some((v, v))
+        }
+        PathSeg::Quad(a, b, e) => Some((first_nonzero(&[d(a, b), d(a, e)])?, first_nonzero(&[d(b, e), d(a, e)])?)),
+        PathSeg::Cubic(a, b, c, e) => {
+            Some((first_nonzero(&[d(a, b), d(a, c), d(a, e)])?, first_nonzero(&[d(c, e), d(b, e), d(a, e)])?))
+        }
+        PathSeg::ArcTo(_, arc) => {
+            let [m0, m1, m2, m3] = arc.m;
+            let sign = if arc.dtheta < 0.0 { -1.0 } else { 1.0 };
+            let tan = |th: f64| {
+                let (sn, cs) = (math::sin(th), math::cos(th));
+                Point::new(sign * (-m0 * sn + m1 * cs), sign * (-m2 * sn + m3 * cs))
+            };
+            let (t0, t1) = (tan(arc.theta1), tan(arc.theta1 + arc.dtheta));
+            let ok = |v: Point| v.x.is_finite() && v.y.is_finite() && (v.x != 0.0 || v.y != 0.0);
+            (ok(t0) && ok(t1)).then_some((t0, t1))
+        }
+    }
+}
+
+/// 2 つの向きが同じか（なす角がおよそ 0.06° 未満。曲線のつなぎ目の滑らかさ）。
+pub(crate) fn same_direction(u: Point, v: Point) -> bool {
+    let cross = u.x * v.y - u.y * v.x;
+    let dot = u.x * v.x + u.y * v.y;
+    let lens = math::hypot(u.x, u.y) * math::hypot(v.x, v.y);
+    dot > 0.0 && cross.abs() <= 1e-3 * lens && lens.is_finite()
+}
+
 /// `line` の同じ形のパス。
 pub(crate) fn line(w: &mut PathWriter<'_, '_>, p1: Point, p2: Point) -> Result<(), Error> {
     w.move_to(p1)?;

@@ -615,3 +615,31 @@ fn two_point_closed_subpaths_cover_once() {
     // 太さ 1.5 の横の線の縁（y 9.5〜11 のうち 9.5〜10 と 10〜11）は 128 と 255、内側の画素も 255 を超えない
     assert_eq!((h[9 * 20 + 10], h[10 * 20 + 10]), (128, 255));
 }
+
+/// 曲がりの半径より太い線（ADR-99 (2)）：曲線の内側の点では頂点を通さないので、円の中に半径 h − r の穴が残る（resvg・
+/// Chrome と同じ）。多角形の頂点は頂点を通すので、中まで塗る（resvg・Chrome と同じ）。
+#[test]
+fn thick_strokes_on_tight_curves_leave_a_hole() {
+    let center = |shape: &str| {
+        let src = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"40\">{shape}</svg>");
+        let doc = crate::doc::parse(src.as_bytes(), &crate::style::ParseOptions::DEFAULT, &Never).unwrap();
+        let t = doc.build(&Never).unwrap();
+        let plan = t.plan(&RenderOptions::DEFAULT, &Never).unwrap();
+        let mut px = vec![0u8; 40 * 40 * 4];
+        plan.render(&mut PixmapMut::new(&mut px, 40, 40, 160).unwrap(), &Never).unwrap();
+        let a = |x: usize, y: usize| px[(y * 40 + x) * 4 + 3];
+        (a(20, 20), a(18, 20), a(20, 6), a(20, 33))
+    };
+    let (c, near, top, bottom) =
+        center("<circle cx=\"20\" cy=\"20\" r=\"5\" fill=\"none\" stroke=\"black\" stroke-width=\"20\"/>");
+    assert_eq!((c, near, top, bottom), (0, 0, 255, 255));
+    let pts: String = (0..16)
+        .map(|i| {
+            let a = 2.0 * core::f64::consts::PI * f64::from(i) / 16.0;
+            format!("{},{} ", 20.0 + 5.0 * crate::math::cos(a), 20.0 + 5.0 * crate::math::sin(a))
+        })
+        .collect();
+    let (c, near, ..) =
+        center(&format!("<polygon points=\"{pts}\" fill=\"none\" stroke=\"black\" stroke-width=\"20\"/>"));
+    assert_eq!((c, near), (255, 255));
+}

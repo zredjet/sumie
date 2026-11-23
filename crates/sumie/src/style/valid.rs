@@ -2,7 +2,7 @@
 //! 文脈（文字の大きさ・表示の領域）を使って読み直す。
 
 use crate::budget::Budget;
-use crate::css::lex::{Kind as Tk, ident_is};
+use crate::css::lex::{Kind as Tk, Lexer, ident_is};
 use crate::error::Error;
 use crate::style::props::Kind;
 use crate::values::{self, Unit, Values};
@@ -65,6 +65,7 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
         // `d` 属性はパスの書き方（SVG 2 では壊れた所までを描くので、形はパスを作る段で確かめる）
         Kind::Path if cx.attr => return Ok(true),
         Kind::Font => return Ok(font_parts(s, range, cx, budget)?.is_some()),
+        Kind::Background => return Ok(background_color(s, range, budget)?.is_some()),
         _ => {}
     }
     let mut v = Values::new(s, range, budget);
@@ -269,7 +270,7 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
             }
             true
         }
-        Kind::Transform | Kind::Font => false,
+        Kind::Transform | Kind::Font | Kind::Background => false,
     };
     Ok(ok && v.at_end()?)
 }
@@ -650,3 +651,165 @@ pub(crate) fn font_parts(s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) ->
 
 #[cfg(test)]
 mod tests;
+
+/// 層の部分の数 `n[k]` を 1 つ足す（`max` を超えれば偽：壊れた形）。
+fn bump(n: &mut [u8; 7], k: usize, max: u8) -> bool {
+    match n.get_mut(k) {
+        Some(c) if *c < max => {
+            *c = c.saturating_add(1);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `background` のまとめ（CSS Backgrounds 3 §3.10）の形を確かめ、最後の層の色の範囲を返す（色がなければ `Some(None)`、
+/// 形が壊れていれば None）。層は `,` で分け、層ごとに 画像（`none`・`url()`・グラデーションなどの関数）1 つまで・位置（言葉と
+/// 長さか割合）4 つまで・`/` のあとの大きさ（`auto`・`cover`・`contain`・長さか割合）2 つまで・繰り返し 2 つまで・付き方 1 つ
+/// まで・箱 2 つまで。色は最後の層に 1 つまで（ADR-99 (4)）。
+pub(crate) fn background_color(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<Option<Option<Span>>, Error> {
+    let budget = budget_ref(budget);
+    let mut lex = Lexer::over(s, range, budget);
+    let mut color: Option<Span> = None;
+    // 層ごとの数：何かある・画像・位置・大きさ・繰り返し・付き方・箱・色、`/` のあと（大きさを待つ）
+    let mut n = [0u8; 7];
+    let (mut any, mut slash, mut layer_color) = (false, false, false);
+    loop {
+        let t = lex.next()?;
+        match t.kind {
+            Tk::Eof => break,
+            Tk::Whitespace => continue,
+            Tk::Comma => {
+                // 色は最後の層だけ。空の層と `/` で終わる層は壊れた形
+                if layer_color || !any || (slash && n[2] == 0) {
+                    return Ok(None);
+                }
+                n = [0; 7];
+                any = false;
+                slash = false;
+                continue;
+            }
+            _ => {}
+        }
+        // 部分の範囲：字句 1 つか、関数なら対応する `)` まで（閉じなければ値の終わりまで）
+        let start = t.span.start;
+        let mut end = t.span.end;
+        if t.kind == Tk::Function {
+            let mut depth = 1u32;
+            loop {
+                let u = lex.next()?;
+                match u.kind {
+                    Tk::Eof => {
+                        end = range.end;
+                        break;
+                    }
+                    Tk::Function | Tk::LParen | Tk::LBracket | Tk::LBrace => depth = depth.saturating_add(1),
+                    Tk::RParen | Tk::RBracket | Tk::RBrace => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            end = u.span.end;
+                            break;
+                        }
+                    }
+                    Tk::BadString | Tk::BadUrl => return Ok(None),
+                    _ => {}
+                }
+            }
+        }
+        let part = Span { start, end };
+        any = true;
+        let is = |w: &[u8]| t.kind == Tk::Ident && ident_is(s, t.inner, t.escaped, w);
+        let fname = |w: &[u8]| t.kind == Tk::Function && ident_is(s, t.inner, t.escaped, w);
+        if slash {
+            // `/` のあとは大きさ（1 つか 2 つ。cover・contain は 1 つだけ）。大きさのあとはほかの部分に戻る
+            let keyword = is(b"cover") || is(b"contain");
+            let size = keyword
+                || is(b"auto")
+                || matches!(t.kind, Tk::Percentage | Tk::Dimension)
+                || (t.kind == Tk::Number && t.value == 0.0);
+            let first = n.get(2).copied().unwrap_or(0);
+            if size && first == 0 {
+                bump(&mut n, 2, 2);
+                if keyword {
+                    bump(&mut n, 2, 2);
+                }
+                continue;
+            }
+            if size && first == 1 {
+                bump(&mut n, 2, 2);
+                continue;
+            }
+            if first == 0 {
+                return Ok(None);
+            }
+            slash = false;
+        }
+        if t.kind == Tk::Delim && t.is_delim(b'/') {
+            // 位置のあとだけ。大きさを待つ
+            if n.get(1).copied().unwrap_or(0) == 0 || n.get(2).copied().unwrap_or(0) != 0 {
+                return Ok(None);
+            }
+            slash = true;
+            continue;
+        }
+        let ok = if matches!(t.kind, Tk::Hash | Tk::Ident | Tk::Function) && {
+            let mut v = Values::new(s, part, budget);
+            v.color()?.is_some() && v.at_end()?
+        } {
+            if layer_color {
+                false
+            } else {
+                layer_color = true;
+                color = Some(part);
+                true
+            }
+        } else if t.kind == Tk::Url
+            || is(b"none")
+            || [
+                b"url".as_slice(),
+                b"linear-gradient",
+                b"radial-gradient",
+                b"conic-gradient",
+                b"repeating-linear-gradient",
+                b"repeating-radial-gradient",
+                b"repeating-conic-gradient",
+                b"image",
+                b"image-set",
+                b"cross-fade",
+                b"element",
+            ]
+            .iter()
+            .any(|w| fname(w))
+        {
+            bump(&mut n, 0, 1)
+        } else if is(b"left")
+            || is(b"right")
+            || is(b"top")
+            || is(b"bottom")
+            || is(b"center")
+            || matches!(t.kind, Tk::Percentage | Tk::Dimension)
+            || (t.kind == Tk::Number && t.value == 0.0)
+        {
+            bump(&mut n, 1, 4)
+        } else if is(b"repeat-x") || is(b"repeat-y") {
+            // 1 つで両方の軸を決めるので、ほかの繰り返しと並べない
+            bump(&mut n, 3, 1) && bump(&mut n, 3, 2)
+        } else if is(b"repeat") || is(b"space") || is(b"round") || is(b"no-repeat") {
+            bump(&mut n, 3, 2)
+        } else if is(b"scroll") || is(b"fixed") || is(b"local") {
+            bump(&mut n, 4, 1)
+        } else if is(b"border-box") || is(b"padding-box") || is(b"content-box") || is(b"text") {
+            bump(&mut n, 5, 2)
+        } else {
+            false
+        };
+        if !ok {
+            return Ok(None);
+        }
+    }
+    // `/` のあとに大きさがない・空の値か空の最後の層は壊れた形
+    if (slash && n.get(2).copied().unwrap_or(0) == 0) || !any {
+        return Ok(None);
+    }
+    Ok(Some(color))
+}

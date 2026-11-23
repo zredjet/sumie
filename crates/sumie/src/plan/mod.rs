@@ -17,7 +17,7 @@ use crate::cost;
 use crate::doc::PixelSize;
 use crate::error::{Error, Invalid, InvalidReason, Resource, Stage};
 use crate::geom::flatten::{BOX, flatten_seg, pieces};
-use crate::geom::stroke::{Cap, Dashes, Join, LoopSink, Pen, dash_polyline, stroke_polyline};
+use crate::geom::stroke::{Cap, Dashes, Join, LoopSink, Pen, Poly, PolyBuf, dash_polyline, stroke_polyline};
 use crate::geom::{PathRef, PathSeg, Point, Transform};
 use crate::limits::RenderLimits;
 use crate::math;
@@ -665,8 +665,8 @@ pub(crate) const RENDER_SLACK: u64 = 1024;
 /// 行とセルの上限を数える分）。
 const EDGE_WORK: u64 =
     push_cost(size_of::<Edge>() as u64).saturating_add(cost::OP_STEP.saturating_mul(2)).saturating_add(cost::PLAN_EDGE);
-/// 点 1 つを置き場に足す手間。
-const POINT_WORK: u64 = push_cost(size_of::<Point>() as u64);
+/// 点 1 つを置き場に足す手間（折れ線の置き場は点と滑らかな点の印を並べて足す）。
+const POINT_WORK: u64 = push_cost(size_of::<Point>() as u64).saturating_add(push_cost(1));
 
 /// 描く段の手間の式（`cost` に置いたもの。範囲の見積もりと同じ口）。
 pub(crate) use cost::{
@@ -860,6 +860,7 @@ fn bound_node(
             .saturating_add(c.curves.saturating_mul(passes).saturating_mul(cost::FLATTEN_CURVE))
             .saturating_add(c.segs.saturating_mul(passes).saturating_mul(cost::OP_STEP))
             .saturating_add(if pen.join == Join::Round { c.segs.saturating_mul(cost::TURN_SEGMENT) } else { 0 })
+            .saturating_add(c.segs.saturating_mul(cost::JOIN_TANGENT))
             .saturating_add(if mode.device { v.saturating_mul(POINT_WORK) } else { 0 })
             .saturating_add(dash_pts.saturating_mul(cost::OUTLINE_POINT.saturating_add(POINT_WORK)))
             .saturating_add(dedup.saturating_mul(POINT_WORK.saturating_add(cost::OP_STEP)))
@@ -955,10 +956,11 @@ impl Tree {
         }
         let edge_bytes = tot.edges.saturating_mul(size_of::<Edge>() as u64);
         let item_bytes = tot.items.saturating_mul(size_of::<DrawItem>() as u64);
-        // 計画の一時の置き場：部分パスの点・まとめた点・破線の部分の点（どれも点の最大の分）と、辺の並べ替えの作業の領域
+        // 計画の一時の置き場：部分パスの点・まとめた点・破線の部分の点（どれも点の最大の分。点と滑らかな点の印 1 バイト）と、
+        // 辺の並べ替えの作業の領域
         let scratch = tot
             .scratch_points
-            .saturating_mul(size_of::<Point>() as u64)
+            .saturating_mul((size_of::<Point>() as u64).saturating_add(1))
             .saturating_mul(5)
             .saturating_add(tot.max_dashes.saturating_mul(8));
         let sort = cost::stable_sort_bytes(tot.max_item_edges, size_of::<Edge>() as u64);
@@ -1003,11 +1005,11 @@ impl Tree {
         let mut edges: MVec<'_, Edge> = MVec::with_capacity(b, cap(tot.edges)?)?;
         let mut items: MVec<'_, DrawItem> = MVec::with_capacity(b, cap(tot.items)?)?;
         let sp = cap(tot.scratch_points)?;
-        let mut poly: MVec<'_, Point> = MVec::with_capacity(b, sp)?;
-        let mut scratch: MVec<'_, Point> = MVec::with_capacity(b, sp)?;
-        let mut dashbuf: MVec<'_, Point> = MVec::with_capacity(b, sp)?;
-        let mut devbuf: MVec<'_, Point> = MVec::with_capacity(b, sp)?;
-        let mut head: MVec<'_, Point> = MVec::with_capacity(b, sp)?;
+        let mut poly = PolyBuf::with_capacity(b, sp)?;
+        let mut scratch = PolyBuf::with_capacity(b, sp)?;
+        let mut dashbuf = PolyBuf::with_capacity(b, sp)?;
+        let mut devbuf = PolyBuf::with_capacity(b, sp)?;
+        let mut head = PolyBuf::with_capacity(b, sp)?;
         let mut dash_scaled: MVec<'_, f64> = MVec::with_capacity(b, cap(tot.max_dashes)?)?;
         let mut max_item = 0u64;
         for n in self.nodes.as_slice() {
@@ -1147,46 +1149,97 @@ fn edges_box(edges: &[Edge], budget: &Budget<'_>) -> Result<(PixelBox, u32), Err
 }
 
 /// 部分パスの点と閉じたかを受け取る口。
-type SubpathFn<'a> = dyn FnMut(&[Point], bool) -> Result<(), Error> + 'a;
+type SubpathFn<'a> = dyn FnMut(Poly<'_>, bool) -> Result<(), Error> + 'a;
 
 /// 部分パスごとに平坦化した点（ユーザー単位）を `poly` に集め、`f(点, 閉じたか)` を呼ぶ。
+#[allow(clippy::too_many_arguments, reason = "平坦化の条件と置き場を分けて渡す")]
 fn subpaths(
     path: PathRef<'_>,
     t: &Transform,
     q: Quality,
     reach: f64,
-    poly: &mut MVec<'_, Point>,
+    poly: &mut PolyBuf<'_>,
+    smooth: bool,
     budget: &Budget<'_>,
     f: &mut SubpathFn<'_>,
 ) -> Result<(), Error> {
     poly.clear();
     let mut open = false;
+    // 曲線の内側の点は滑らかな点、区間のつなぎ目は角。ただし曲線の前か後ろのつなぎ目で接線が続くものは滑らかな点
+    // （ADR-99 (2)）。前の区間の終わりの接線と曲線か、部分パスの最初の区間の始めの接線と曲線か
+    let mut last: Option<(Point, bool)> = None;
+    let mut first: Option<(Point, bool)> = None;
     for seg in path.segments() {
         // 区間ごとに払う（続く閉じ（`ZZZ…`）も。単位 2 の 3 回目のレビュー）
         budget.spend(cost::OP_STEP)?;
         match seg {
             PathSeg::Move(p) => {
                 if open {
-                    f(poly.as_slice(), false)?;
+                    f(poly.view(), false)?;
                 }
                 poly.clear();
-                poly.push(p)?;
+                poly.push(p, false)?;
                 open = true;
+                last = None;
+                first = None;
             }
-            PathSeg::Close(..) => {
+            PathSeg::Close(a, b) => {
+                if open && smooth {
+                    // 閉じの線分（長さがあれば）と、始めの点のつなぎ目（区間ごとにつなぎ目の向きを求める手間を払う）
+                    budget.spend(cost::JOIN_TANGENT)?;
+                    let closing = crate::geom::seg_tangents(&seg);
+                    let start_from = match closing {
+                        Some((v, _)) => {
+                            if let Some((lt, lc)) = last
+                                && lc
+                                && crate::geom::same_direction(lt, v)
+                            {
+                                poly.set_last_smooth(true);
+                            }
+                            Some((v, false))
+                        }
+                        None if a == b => last,
+                        None => None,
+                    };
+                    if let (Some((lt, lc)), Some((ft, fc))) = (start_from, first)
+                        && (lc || fc)
+                        && crate::geom::same_direction(lt, ft)
+                    {
+                        poly.set_first_smooth(true);
+                    }
+                }
                 if open {
-                    f(poly.as_slice(), true)?;
+                    f(poly.view(), true)?;
                 }
                 poly.clear();
                 open = false;
             }
+            _ if !smooth => {
+                flatten_seg(&seg, t, q.tol, reach, budget, &mut |p| poly.push(p, false))?;
+            }
             _ => {
-                flatten_seg(&seg, t, q.tol, reach, budget, &mut |p| poly.push(p))?;
+                budget.spend(cost::JOIN_TANGENT)?;
+                let curve = !matches!(seg, PathSeg::Line(..));
+                let tans = crate::geom::seg_tangents(&seg);
+                if let (Some((lt, lc)), Some((st, _))) = (last, tans)
+                    && (lc || curve)
+                    && crate::geom::same_direction(lt, st)
+                {
+                    poly.set_last_smooth(true);
+                }
+                flatten_seg(&seg, t, q.tol, reach, budget, &mut |p| poly.push(p, curve))?;
+                poly.set_last_smooth(false);
+                if let Some((st, et)) = tans {
+                    if first.is_none() {
+                        first = Some((st, curve));
+                    }
+                    last = Some((et, curve));
+                }
             }
         }
     }
     if open {
-        f(poly.as_slice(), false)?;
+        f(poly.view(), false)?;
     }
     Ok(())
 }
@@ -1196,11 +1249,12 @@ fn fill_edges(
     path: PathRef<'_>,
     t: &Transform,
     q: Quality,
-    poly: &mut MVec<'_, Point>,
+    poly: &mut PolyBuf<'_>,
     edges: &mut MVec<'_, Edge>,
     budget: &Budget<'_>,
 ) -> Result<(), Error> {
-    subpaths(path, t, q, 0.0, poly, budget, &mut |pts, _| {
+    subpaths(path, t, q, 0.0, poly, false, budget, &mut |line, _| {
+        let pts = line.pts;
         let Some(&first) = pts.first() else { return Ok(()) };
         let mut prev = t.apply(first);
         for &p in pts.iter().skip(1) {
@@ -1216,11 +1270,11 @@ fn fill_edges(
 
 /// 線の一時の置き場（部分パスの点・まとめた点・破線の部分の点・non-scaling の描く座標系の点・掛けた破線の並び）。
 struct StrokeParts<'a, 'b> {
-    poly: &'a mut MVec<'b, Point>,
-    scratch: &'a mut MVec<'b, Point>,
-    dashbuf: &'a mut MVec<'b, Point>,
-    devbuf: &'a mut MVec<'b, Point>,
-    head: &'a mut MVec<'b, Point>,
+    poly: &'a mut PolyBuf<'b>,
+    scratch: &'a mut PolyBuf<'b>,
+    dashbuf: &'a mut PolyBuf<'b>,
+    devbuf: &'a mut PolyBuf<'b>,
+    head: &'a mut PolyBuf<'b>,
     dash_scaled: &'a mut MVec<'b, f64>,
     /// キャンバスの画素の矩形（破線の部分を落とす見る箱の元）
     canvas: PixelBox,
@@ -1291,7 +1345,8 @@ fn stroke_edges(
     let mut factor = 1.0;
     if n.path_length > 0.0 && !dashes_src.is_empty() {
         let mut total = 0.0;
-        subpaths(path, t, q, reach, parts.poly, budget, &mut |pts, closed| {
+        subpaths(path, t, q, reach, parts.poly, false, budget, &mut |line, closed| {
+            let pts = line.pts;
             let m = |p: Point| p;
             let mut a = match pts.first() {
                 Some(&p) => m(p),
@@ -1352,15 +1407,15 @@ fn stroke_edges(
         round_left = round_join_extra(&pen, turn.sum);
     }
     let round_left = &mut round_left;
-    subpaths(path, t, q, reach, poly, budget, &mut |pts, closed| {
+    subpaths(path, t, q, reach, poly, true, budget, &mut |line, closed| {
         if device {
-            // non-scaling と細い線は描く座標系の点にしてから線を作る
+            // non-scaling と細い線は描く座標系の点にしてから線を作る（印はそのまま）
             devbuf.clear();
-            for &p in pts {
-                devbuf.push(t.apply(p))?;
+            for (i, &p) in line.pts.iter().enumerate() {
+                devbuf.push(t.apply(p), line.smooth.get(i).is_some_and(|&s| s != 0))?;
             }
             stroke_one(
-                devbuf.as_slice(),
+                devbuf.view(),
                 closed,
                 &pen,
                 dashes.as_ref(),
@@ -1372,7 +1427,7 @@ fn stroke_edges(
             )
         } else {
             stroke_one(
-                pts,
+                line,
                 closed,
                 &pen,
                 dashes.as_ref(),
@@ -1445,21 +1500,21 @@ impl Cull {
 /// 点の置き場。
 #[allow(clippy::too_many_arguments, reason = "置き場を分けて渡す")]
 fn stroke_one(
-    pts: &[Point],
+    line: Poly<'_>,
     closed: bool,
     pen: &Pen,
     dashes: Option<&Dashes<'_>>,
     cull: &Cull,
-    bufs: [&mut MVec<'_, Point>; 3],
+    bufs: [&mut PolyBuf<'_>; 3],
     round_left: &mut u64,
     sink: &mut EdgeSink<'_, '_>,
     budget: &Budget<'_>,
 ) -> Result<(), Error> {
     let [dashbuf, head, scratch] = bufs;
     match dashes {
-        None => stroke_polyline(pts, closed, pen, scratch, budget, round_left, sink),
+        None => stroke_polyline(line, closed, pen, scratch, budget, round_left, sink),
         Some(d) => dash_polyline(
-            pts,
+            line,
             closed,
             d,
             dashbuf,
@@ -1467,7 +1522,7 @@ fn stroke_one(
             budget,
             Some(&|a, b| cull.range(a, b)),
             &mut |piece, piece_closed| {
-                if !cull.visible(piece, piece_closed, budget)? {
+                if !cull.visible(piece.pts, piece_closed, budget)? {
                     return Ok(());
                 }
                 stroke_polyline(piece, piece_closed, pen, scratch, budget, &mut *round_left, sink)

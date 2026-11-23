@@ -387,6 +387,7 @@ struct Shorthands {
     font: Option<PropertyId>,
     font_longhands: [Option<PropertyId>; 11],
     markers: [Option<PropertyId>; 3],
+    background_color: Option<PropertyId>,
 }
 
 impl Shorthands {
@@ -395,6 +396,7 @@ impl Shorthands {
             font: lookup(b"font", false),
             font_longhands: FONT_LONGHANDS.map(|n| lookup(n, false)),
             markers: [b"marker-start".as_slice(), b"marker-mid", b"marker-end"].map(|n| lookup(n, false)),
+            background_color: lookup(b"background-color", false),
         }
     }
 }
@@ -445,6 +447,9 @@ impl Out<'_, '_> {
         if name == b"font" {
             return self.offer_font(key, spec, font);
         }
+        if name == b"background" {
+            return self.offer_background(key, spec);
+        }
         // use・symbol・入れ子の svg の width・height は CSS のプロパティでない（木を作る段が属性として読む）
         if (name == b"width" || name == b"height")
             && let Some(n) = self.node()
@@ -482,6 +487,26 @@ impl Out<'_, '_> {
             self.put(id, key, s)?;
         }
         Ok(())
+    }
+
+    /// `background` を `background-color` に分ける（最後の層の色の範囲。色がなければ `initial`。全体の言葉はそのまま。
+    /// ほかの長い名前は描かないので置かない。ADR-99 (4)）。
+    fn offer_background(&mut self, key: Key, spec: Specified) -> Result<(), Error> {
+        let Some(id) = self.short.background_color else { return Ok(()) };
+        if spec.wide != WIDE_NONE {
+            return self.put(id, key, Specified { prop: id, ..spec });
+        }
+        let buf = match spec.src {
+            SRC_STORE => self.doc.store.as_slice(),
+            SRC_SHEET => self.sheet.text.as_slice(),
+            _ => self.input,
+        };
+        let s = match crate::style::valid::background_color(buf, spec.value, self.budget)? {
+            Some(Some(range)) => Specified { prop: id, value: range, ..spec },
+            Some(None) => Specified { prop: id, value: Span::default(), wide: WIDE_INITIAL, ..spec },
+            None => return Ok(()),
+        };
+        self.put(id, key, s)
     }
 
     fn put(&mut self, prop: PropertyId, key: Key, spec: Specified) -> Result<(), Error> {

@@ -27,6 +27,8 @@ pub(crate) const FLATTEN_CURVE: u64 = 64;
 /// 計画が round の継ぎ目の点を抑えるために、区間 1 つの曲がる角を求める手間（向きの角の `atan2` が数個と、弧の接線の
 /// `sin`・`cos`。単位 1 の 4 回目のレビュー）。
 pub(crate) const TURN_SEGMENT: u64 = 128;
+/// 線を作るときに区間 1 つのつなぎ目が滑らかかを決める手間（始めと終わりの接線（弧は `sin`・`cos`）と向きの比べ。ADR-99 (2)）。
+pub(crate) const JOIN_TANGENT: u64 = 64;
 /// 計画で辺を 1 本作る手間（描く座標系に写した線分を確かめ、箱で切り、固定小数にする。M2 の仮の校正。ADR-98）。
 pub(crate) const PLAN_EDGE: u64 = 16;
 /// 線の外形・破線の点を 1 つ作る手間。

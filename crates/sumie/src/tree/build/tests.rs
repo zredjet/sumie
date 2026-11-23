@@ -168,6 +168,16 @@ fn content_size() {
         let t = build(&doc(&format!("<path d=\"{d}\" stroke=\"black\"/>{rect}"))).unwrap();
         assert_eq!((t.size().width, t.size().height), (side, side), "{d}");
     }
+    // 大きさを中身で決める文書の % は 100 × 100 で解く（usvg の既定の大きさ。resvg・Chrome と同じ絵。ADR-99 (1)）
+    let t = build(&doc(
+        "<rect width=\"40%\" height=\"40%\" fill=\"lime\"/><rect width=\"10\" height=\"10\" fill=\"blue\"/>",
+    ))
+    .unwrap();
+    assert_eq!((t.size().width, t.size().height), (40.0, 40.0));
+    let t = build(&doc("<circle cx=\"20\" cy=\"20\" r=\"10%\"/><rect width=\"5\" height=\"5\"/>")).unwrap();
+    assert_eq!((t.size().width, t.size().height), (30.0, 30.0));
+    let t = build(&doc("<rect x=\"50%\" width=\"10\" height=\"10\"/>")).unwrap();
+    assert_eq!((t.size().width, t.size().height), (60.0, 10.0));
 }
 
 #[test]
@@ -451,6 +461,31 @@ fn adversarial_estimates_hold() {
 fn decl_sizes_match_the_estimate() {
     assert_eq!(size_of::<super::DeclKey>() as u64, crate::doc::weights::KEY_BYTES);
     assert_eq!(size_of::<super::DeclSlot>() as u64, crate::doc::weights::SLOT_BYTES);
+}
+
+/// 根の svg の `background` のまとめは、最後の層の色を `background-color` として描く（Chrome と同じ。画像は描かない。
+/// まとめの後ろの `background-color` が勝ち、色のないまとめは透明に戻す。ADR-99 (4)）。
+#[test]
+fn background_shorthand() {
+    let root = |style: &str| {
+        let a = alpha_at(&format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\" style=\"{style}\"><rect width=\"1\" height=\"1\"/></svg>"
+        ));
+        a(5, 5)
+    };
+    assert_eq!(root("background: lime"), 255);
+    assert_eq!(root("background: url(x.png) center / cover no-repeat #0000ff80"), 128);
+    assert_eq!(root("background: none"), 0);
+    // 色は最後の層だけ（前の層の色は壊れた形で、宣言ごと無視する）
+    assert_eq!(root("background-color: lime; background: red, url(x.png)"), 255);
+    assert_eq!(root("background: url(a.png), lime"), 255);
+    // 後ろが勝つ
+    assert_eq!(root("background: lime; background-color: transparent"), 0);
+    assert_eq!(root("background-color: lime; background: url(x.png)"), 0);
+    // 壊れた形は無視する
+    assert_eq!(root("background-color: lime; background: lime red"), 255);
+    assert_eq!(root("background-color: lime; background: center /"), 255);
+    assert_eq!(root("background-color: lime; background: banana"), 255);
 }
 
 /// 根の svg の background-color を描く（resvg・Chrome と同じ。ADR-97 (4)）。1 画素より細い線は 1 画素の線を太さの α で

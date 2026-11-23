@@ -51,6 +51,8 @@ pub(crate) enum Kind {
     Overflow,
     /// `font` のまとめ（カスケードで長い名前に分ける）
     Font,
+    /// `background` のまとめ（カスケードで `background-color` に分ける）
+    Background,
     /// `baseline`・`sub`・`super` か長さか割合
     BaselineShift,
     /// CSS の `transform`
@@ -230,7 +232,9 @@ const POINTER_EVENTS: &[&[u8]] = &[
 /// 表（名前のバイトの順）。
 pub(crate) const PROPS: &[Prop] = &[
     p(b"alignment-baseline", false, true, Kind::Keywords(ALIGNMENT)),
-    // 根の svg の背景（CSS のプロパティとしてだけ。属性は読まない。resvg・Chrome と同じく描く。ADR-97 (4)）
+    // 根の svg の背景（CSS のプロパティとしてだけ。属性は読まない。resvg・Chrome と同じく描く。ADR-97 (4)）。まとめは
+    // カスケードで `background-color` に分ける（最後の層の色。画像は描かない。Chrome と同じ。ADR-99 (4)）
+    p(b"background", false, false, Kind::Background),
     p(b"background-color", false, false, Kind::Color),
     pu(b"baseline-shift", false, true, Kind::BaselineShift),
     p(b"clip", false, true, Kind::Raw),

@@ -257,11 +257,12 @@ fn inherited_details() {
     let (p, q) = (at(0.0, -20.0), at(10.0, -10.0));
     assert!(close(p.0, 100.0) && close(p.1, 20.0) && close(q.0, 90.0) && close(q.1, 10.0), "{p:?} {q:?}");
     assert!(!get(&rows, "tb").1.ctm_known);
-    // 表示の領域のない文書の入れ子の svg・use の x・y の % は解けない
+    // 大きさを中身で決める文書の入れ子の svg・use の x・y の % は 100 × 100 で解く（usvg の既定の大きさ。ADR-99 (1)）
     let rows = run(&format!(
         r##"<svg {X}><svg id="s" x="10%" width="50" height="50"><rect id="r"/></svg><use id="u" href="#r" x="20%"/><rect id="ok"/></svg>"##
     ));
-    assert!(!get(&rows, "s").1.ctm_known && !get(&rows, "r").1.ctm_known && !get(&rows, "u").1.ctm_known);
+    assert!(get(&rows, "s").1.ctm_known && get(&rows, "r").1.ctm_known && get(&rows, "u").1.ctm_known);
+    assert!(close(get(&rows, "r").1.ctm.e, 10.0), "{:?}", get(&rows, "r").1.ctm);
     assert!(get(&rows, "ok").1.ctm_known);
 }
 

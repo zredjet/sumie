@@ -1128,7 +1128,7 @@ pub fn path_ops(data: &[u8]) -> Check {
 /// 外形の点が有限（入力が有限なら）。手間の上限は 2²⁴（速く回すため。超えれば `Limit` で、両方の回で同じなら良い）。
 pub fn stroke_ops(data: &[u8]) -> Check {
     use crate::geom::flatten::flatten_seg;
-    use crate::geom::stroke::{Cap, Dashes, Join, LoopSink, Pen, dash_polyline, stroke_polyline};
+    use crate::geom::stroke::{Cap, Dashes, Join, LoopSink, Pen, PolyBuf, dash_polyline, stroke_polyline};
     use crate::geom::{PathRef, PathSeg, PathWriter, Point, Transform};
     let Some((head, text)) = data.split_first_chunk::<4>() else { return Check::Ok };
     let cap = match head[0] % 3 {
@@ -1172,20 +1172,20 @@ pub fn stroke_ops(data: &[u8]) -> Check {
         }
         let pen = Pen { half, cap, join, miter_limit: limit, scale: 1.0, tol: 0.25 };
         let dashes = Dashes::new(dash, offset, &b)?;
-        let mut poly: MVec<'_, Point> = MVec::new(&b);
-        let mut scratch: MVec<'_, Point> = MVec::new(&b);
-        let mut buf: MVec<'_, Point> = MVec::new(&b);
-        let mut hd: MVec<'_, Point> = MVec::new(&b);
+        let mut poly = PolyBuf::new(&b);
+        let mut scratch = PolyBuf::new(&b);
+        let mut buf = PolyBuf::new(&b);
+        let mut hd = PolyBuf::new(&b);
         let mut sink = Count { loops: 0, points: 0, finite: true };
         let mut input_points = 0u64;
         let mut all_finite = true;
         let path = PathRef { verbs: verbs.as_slice(), coords: coords.as_slice() };
         // round の継ぎ目の点は抑えない（節の見積もりの式は計画が持つ）
         let mut round = u64::MAX;
-        let mut flush = |poly: &mut MVec<'_, Point>, closed: bool, sink: &mut Count| -> Result<(), Error> {
+        let mut flush = |poly: &mut PolyBuf<'_>, closed: bool, sink: &mut Count| -> Result<(), Error> {
             match &dashes {
-                None => stroke_polyline(poly.as_slice(), closed, &pen, &mut scratch, &b, &mut round, sink)?,
-                Some(d) => dash_polyline(poly.as_slice(), closed, d, &mut buf, &mut hd, &b, None, &mut |piece, pc| {
+                None => stroke_polyline(poly.view(), closed, &pen, &mut scratch, &b, &mut round, sink)?,
+                Some(d) => dash_polyline(poly.view(), closed, d, &mut buf, &mut hd, &b, None, &mut |piece, pc| {
                     stroke_polyline(piece, pc, &pen, &mut scratch, &b, &mut round, sink)
                 })?,
             }
@@ -1198,14 +1198,19 @@ pub fn stroke_ops(data: &[u8]) -> Check {
                     if !poly.is_empty() {
                         flush(&mut poly, false, &mut sink)?;
                     }
-                    poly.push(p)?;
+                    poly.push(p, false)?;
                 }
                 PathSeg::Close(..) => flush(&mut poly, true, &mut sink)?,
-                _ => flatten_seg(&seg, &Transform::IDENTITY, 0.25, half, &b, &mut |p| {
-                    input_points = input_points.saturating_add(1);
-                    all_finite &= p.finite();
-                    poly.push(p)
-                })?,
+                _ => {
+                    // 曲線の内側の点は滑らかな点（計画と同じ）
+                    let smooth = !matches!(seg, PathSeg::Line(..));
+                    flatten_seg(&seg, &Transform::IDENTITY, 0.25, half, &b, &mut |p| {
+                        input_points = input_points.saturating_add(1);
+                        all_finite &= p.finite();
+                        poly.push(p, smooth)
+                    })?;
+                    poly.set_last_smooth(false);
+                }
             }
         }
         if !poly.is_empty() {

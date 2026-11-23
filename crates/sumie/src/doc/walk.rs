@@ -148,6 +148,9 @@ struct Walker<'a, 'd, 'b> {
     overflow_id: Option<crate::style::props::PropertyId>,
 }
 
+/// 大きさを中身で決める文書の表示の領域（usvg の `Options::default_size` と同じ 100 × 100。Kura は変えない）。
+pub(crate) const CONTENT_SIZED_VIEWPORT: (f64, f64) = (100.0, 100.0);
+
 impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
     /// 根を計算して `f` に渡し、根の段を積む（根が要素でなければ None）。
     fn start(
@@ -163,6 +166,9 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
         let ids = PropIds::new();
         let bufs = Bufs { input, store: doc.store.as_slice(), sheet: d.sheet.text.as_slice() };
         let size = d.size.known().map(|s| (s.width, s.height));
+        // 大きさを中身で決める文書（幅・高さ・viewBox のない根）の表示の領域は 100 × 100（usvg の既定の大きさ。% の長さを
+        // 解く基準。大きさそのものは中身の外接矩形で決める。ADR-99 (1)）
+        let size = size.or(Some(CONTENT_SIZED_VIEWPORT));
         let initial = Computed::initial(d.font_size);
         let mut base = Base {
             default_font: d.font_size,
