@@ -22,6 +22,14 @@ pub(crate) const PATH_GEOMETRY_BYTES: u64 = 12;
 pub(crate) const FLATTEN_POINT: u64 = 8;
 /// 線の外形・破線の点を 1 つ作る手間。
 pub(crate) const OUTLINE_POINT: u64 = 8;
+/// ラスタライズ：1 行の決まった手間・行にかかる辺 1 本の手間・セル 1 つの手間・掃く画素 1 つの手間。
+pub(crate) const RASTER_ROW: u64 = 8;
+pub(crate) const RASTER_EDGE_ROW: u64 = 8;
+pub(crate) const RASTER_CELL: u64 = 4;
+pub(crate) const RASTER_SWEEP: u64 = 1;
+/// 塗り：画素 1 つを合成する手間。
+#[allow(dead_code, reason = "塗る段（paint）から使う")]
+pub(crate) const PAINT_PIXEL: u64 = 2;
 /// 2 分の探索の 1 歩の手間。
 pub(crate) const SEARCH_STEP: u64 = 8;
 /// id の表の 2 分の探索で、表が大きいとき 1 歩に足す手間（1 歩で表・属性・入力の 3 か所を散らばって読み、表が大きいと

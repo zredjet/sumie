@@ -20,6 +20,7 @@ mod geom;
 mod limits;
 mod math;
 mod mem;
+mod raster;
 mod report;
 mod style;
 mod values;
