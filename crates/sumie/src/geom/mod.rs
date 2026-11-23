@@ -14,6 +14,7 @@
 #![allow(dead_code, reason = "木を作る段・計画（M2）から使う。単位ごとに足していく")]
 
 pub(crate) mod flatten;
+pub(crate) mod stroke;
 
 use crate::error::Error;
 use crate::math;

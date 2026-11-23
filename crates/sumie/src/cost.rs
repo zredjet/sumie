@@ -20,6 +20,8 @@ pub(crate) const MERGE_STEP: u64 = 4;
 pub(crate) const PATH_GEOMETRY_BYTES: u64 = 12;
 /// 平坦化で点を 1 つ求める手間（曲線の式を解いて点を渡す。architecture.md §5.2 の「計画」）。
 pub(crate) const FLATTEN_POINT: u64 = 8;
+/// 線の外形・破線の点を 1 つ作る手間。
+pub(crate) const OUTLINE_POINT: u64 = 8;
 /// 2 分の探索の 1 歩の手間。
 pub(crate) const SEARCH_STEP: u64 = 8;
 /// id の表の 2 分の探索で、表が大きいとき 1 歩に足す手間（1 歩で表・属性・入力の 3 か所を散らばって読み、表が大きいと
