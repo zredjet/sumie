@@ -248,6 +248,108 @@ fn turn_between(a: Point, b: Point) -> f64 {
     math::atan2(cross, dot).abs()
 }
 
+/// 制御多角形の曲がる角の和（線を作る座標系。部分パスごとに π と、部分パスの終わりから始めへの角も足す。弧は接線で）。
+/// 見積もりの `count` と、計画が round の継ぎ目の点を抑える（[`round_join_extra`]）ときに、同じ区間を同じ順で足すので同じ値に
+/// なる（丸めで乱れた折れ線でも、計画の継ぎ目の点が見積もりを超えない。単位 1 の 4 回目のレビュー）。
+#[derive(Debug, Clone, Copy, Default)]
+struct Turning {
+    sum: f64,
+    first: Option<Point>,
+    last: Option<Point>,
+}
+
+impl Turning {
+    /// 部分パスを閉じる（終わりから始めへの角）。
+    fn close(&mut self) {
+        if let (Some(f), Some(l)) = (self.first, self.last) {
+            self.sum += turn_between(l, f);
+        }
+        self.first = None;
+        self.last = None;
+    }
+
+    /// 向き `d` の区間を足す（長さ 0 は飛ばす）。
+    fn dir(&mut self, d: Point) {
+        if d.x == 0.0 && d.y == 0.0 {
+            return;
+        }
+        if let Some(l) = self.last {
+            self.sum += turn_between(l, d);
+        }
+        if self.first.is_none() {
+            self.first = Some(d);
+        }
+        self.last = Some(d);
+    }
+
+    /// 区間 1 つを足す（`s` は線を作る座標系への変形）。
+    fn feed(&mut self, seg: &PathSeg, s: &Transform) {
+        let v = |a: Point, b: Point| s.apply_vec(Point::new(b.x - a.x, b.y - a.y));
+        match *seg {
+            PathSeg::Move(_) => {
+                self.close();
+                self.sum += core::f64::consts::PI;
+            }
+            PathSeg::Close(a, b) => {
+                let d = v(a, b);
+                if let Some(l) = self.last {
+                    self.sum += turn_between(l, d);
+                }
+                if d.x != 0.0 || d.y != 0.0 {
+                    self.last = Some(d);
+                }
+                self.close();
+            }
+            PathSeg::Line(a, b) => self.dir(v(a, b)),
+            PathSeg::Quad(a, b, e) => {
+                self.dir(v(a, b));
+                self.dir(v(b, e));
+            }
+            PathSeg::Cubic(a, b, d, e) => {
+                self.dir(v(a, b));
+                self.dir(v(b, d));
+                self.dir(v(d, e));
+            }
+            PathSeg::ArcTo(_, arc) => {
+                // 始めと終わりの接線
+                let tangent = |th: f64| {
+                    let [m0, m1, m2, m3] = arc.m;
+                    let (sn, cs) = (math::sin(th), math::cos(th));
+                    let sign = if arc.dtheta < 0.0 { -1.0 } else { 1.0 };
+                    s.apply_vec(Point::new(sign * (-m0 * sn + m1 * cs), sign * (-m2 * sn + m3 * cs)))
+                };
+                // 弧の中の曲がる角：線を作る座標系の楕円の接線を、始め・真ん中・終わりで求めて隣どうしの角を足す（半分ずつは
+                // 掃く角が π 未満なので、楕円の接線は単調に回り、これで正確。|Δθ| は円でない楕円で曲がる角より小さい。単位 1・2 の
+                // レビュー）。接線が長さ 0（つぶれた楕円）なら π ⌈|Δθ| / π⌉
+                let (t0, tm, t1) =
+                    (tangent(arc.theta1), tangent(arc.theta1 + arc.dtheta / 2.0), tangent(arc.theta1 + arc.dtheta));
+                let flat = |d: Point| !(d.x.is_finite() && d.y.is_finite()) || (d.x == 0.0 && d.y == 0.0);
+                self.sum += if flat(t0) || flat(tm) || flat(t1) {
+                    core::f64::consts::PI * (arc.dtheta.abs() / core::f64::consts::PI).ceil()
+                } else {
+                    turn_between(t0, tm) + turn_between(tm, t1)
+                };
+                // 弧の中の曲がりは上で足したので、2 つの接線の間は数えない
+                if let Some(l) = self.last {
+                    self.sum += turn_between(l, t0);
+                }
+                if self.first.is_none() && (t0.x != 0.0 || t0.y != 0.0) {
+                    self.first = Some(t0);
+                }
+                if t1.x != 0.0 || t1.y != 0.0 {
+                    self.last = Some(t1);
+                }
+            }
+        }
+    }
+}
+
+/// round の継ぎ目の円弧で、頂点ごとの 1 つを超えて使ってよい点の数（`turning` は [`Turning`] の和。見積もりの式と同じ）。
+fn round_join_extra(pen: &Pen, turning: f64) -> u64 {
+    let kk = (pen.half * pen.scale / (8.0 * pen.tol)).sqrt();
+    up(kk * turning)
+}
+
 /// 節を数える。`t` は描く座標系への変形、`stroke_space` は線を作る座標系への変形（ユーザー単位なら単位の行列）。
 #[allow(clippy::too_many_arguments, reason = "数えの箱を分けて渡す")]
 fn count(
@@ -262,18 +364,13 @@ fn count(
 ) -> Result<Counts, Error> {
     let mut c = Counts::default();
     let mut sub = 0u64;
-    let mut last_dir: Option<Point> = None;
-    let mut first_dir: Option<Point> = None;
-    let mut dirs: [Point; 4] = [Point::new(0.0, 0.0); 4];
+    let mut turn = Turning::default();
     let len = |a: Point, b: Point, m: &Transform| {
         let (p, r) = (m.apply(a), m.apply(b));
         math::hypot(r.x - p.x, r.y - p.y)
     };
-    let close_sub = |c: &mut Counts, sub: &mut u64, first: Option<Point>, last: Option<Point>| {
+    let close_sub = |c: &mut Counts, sub: &mut u64| {
         c.max_sub = c.max_sub.max(*sub);
-        if let (Some(f), Some(l)) = (first, last) {
-            c.turning += turn_between(l, f);
-        }
         *sub = 0;
     };
     // 塗りの暗黙の閉じ（部分パスの終わりから始めへ）の帯の中の長さ
@@ -289,6 +386,7 @@ fn count(
     for seg in path.segments() {
         budget.spend(cost::OP_STEP)?;
         c.segs = c.segs.saturating_add(1);
+        turn.feed(&seg, stroke_space);
         sub_end = match seg {
             PathSeg::Move(_) => sub_end,
             PathSeg::Close(_, b) => Some(b),
@@ -299,11 +397,8 @@ fn count(
                 implicit_close(&mut c, sub_end, sub_start);
                 sub_start = Some(p);
                 sub_end = Some(p);
-                close_sub(&mut c, &mut sub, first_dir, last_dir);
+                close_sub(&mut c, &mut sub);
                 c.subpaths = c.subpaths.saturating_add(1);
-                c.turning += core::f64::consts::PI;
-                first_dir = None;
-                last_dir = None;
                 sub = 1;
                 c.points = c.points.saturating_add(1);
                 continue;
@@ -313,16 +408,7 @@ fn count(
                 c.len_user += len(a, b, &Transform::IDENTITY);
                 c.len_stroke += len(a, b, stroke_space);
                 in_view(&mut c, &seg, 1, t, stroke_space, view, band, q.tol, reach, budget)?;
-                let d = stroke_space.apply_vec(Point::new(b.x - a.x, b.y - a.y));
-                if let Some(l) = last_dir {
-                    c.turning += turn_between(l, d);
-                }
-                if d.x != 0.0 || d.y != 0.0 {
-                    last_dir = Some(d);
-                }
-                close_sub(&mut c, &mut sub, first_dir, last_dir);
-                first_dir = None;
-                last_dir = None;
+                close_sub(&mut c, &mut sub);
                 continue;
             }
             PathSeg::Line(..) => 1,
@@ -335,94 +421,34 @@ fn count(
         sub = sub.saturating_add(n);
         // 見る箱にかかる長さ（線分は箱の中の割合、曲線は厳密な外接矩形が箱にかかれば全体）
         in_view(&mut c, &seg, n, t, stroke_space, view, band, q.tol, reach, budget)?;
-        // 制御多角形の向きの並びと長さ
-        let mut k = 0usize;
-        let push_dir = |d: Point, dirs: &mut [Point; 4], k: &mut usize| {
-            if let Some(slot) = dirs.get_mut(*k) {
-                *slot = d;
-                *k = k.saturating_add(1);
-            }
-        };
+        // 制御多角形の長さ
         let s = stroke_space;
         match seg {
             PathSeg::Line(a, b) => {
                 c.len_dev += len(a, b, t);
                 c.len_user += len(a, b, &Transform::IDENTITY);
                 c.len_stroke += len(a, b, s);
-                push_dir(s.apply_vec(Point::new(b.x - a.x, b.y - a.y)), &mut dirs, &mut k);
             }
             PathSeg::Quad(a, b, e) => {
                 c.len_dev += len(a, b, t) + len(b, e, t);
                 c.len_user += len(a, b, &Transform::IDENTITY) + len(b, e, &Transform::IDENTITY);
                 c.len_stroke += len(a, b, s) + len(b, e, s);
-                for (p, r) in [(a, b), (b, e)] {
-                    push_dir(s.apply_vec(Point::new(r.x - p.x, r.y - p.y)), &mut dirs, &mut k);
-                }
             }
             PathSeg::Cubic(a, b, d, e) => {
                 let id = Transform::IDENTITY;
                 c.len_dev += len(a, b, t) + len(b, d, t) + len(d, e, t);
                 c.len_user += len(a, b, &id) + len(b, d, &id) + len(d, e, &id);
                 c.len_stroke += len(a, b, s) + len(b, d, s) + len(d, e, s);
-                for (p, r) in [(a, b), (b, d), (d, e)] {
-                    push_dir(s.apply_vec(Point::new(r.x - p.x, r.y - p.y)), &mut dirs, &mut k);
-                }
             }
             PathSeg::ArcTo(_, arc) => {
-                let r_dev = arc.transformed(t).max_radius();
-                let r_s = arc.transformed(s).max_radius();
-                c.len_dev += arc.dtheta.abs() * r_dev;
+                c.len_dev += arc.dtheta.abs() * arc.transformed(t).max_radius();
                 c.len_user += arc.dtheta.abs() * arc.max_radius();
-                c.len_stroke += arc.dtheta.abs() * r_s;
-                // 始めと終わりの接線
-                let tangent = |th: f64| {
-                    let [m0, m1, m2, m3] = arc.m;
-                    let (sn, cs) = (math::sin(th), math::cos(th));
-                    let sign = if arc.dtheta < 0.0 { -1.0 } else { 1.0 };
-                    s.apply_vec(Point::new(sign * (-m0 * sn + m1 * cs), sign * (-m2 * sn + m3 * cs)))
-                };
-                // 弧の中の曲がる角：線を作る座標系の楕円の接線を、始め・真ん中・終わりで求めて隣どうしの角を足す（半分ずつは
-                // 掃く角が π 未満なので、楕円の接線は単調に回り、これで正確。|Δθ| は円でない楕円で曲がる角より小さい。単位 1・2 の
-                // レビュー）。接線が長さ 0（つぶれた楕円）なら π ⌈|Δθ| / π⌉
-                let (t0, tm, t1) =
-                    (tangent(arc.theta1), tangent(arc.theta1 + arc.dtheta / 2.0), tangent(arc.theta1 + arc.dtheta));
-                let flat = |d: Point| !(d.x.is_finite() && d.y.is_finite()) || (d.x == 0.0 && d.y == 0.0);
-                c.turning += if flat(t0) || flat(tm) || flat(t1) {
-                    core::f64::consts::PI * (arc.dtheta.abs() / core::f64::consts::PI).ceil()
-                } else {
-                    turn_between(t0, tm) + turn_between(tm, t1)
-                };
-                push_dir(tangent(arc.theta1), &mut dirs, &mut k);
-                push_dir(tangent(arc.theta1 + arc.dtheta), &mut dirs, &mut k);
-                // 弧の中の曲がりは上で足したので、2 つの接線の間は数えない
-                if let (Some(&d0), Some(&d1)) = (dirs.first(), dirs.get(1)) {
-                    if let Some(l) = last_dir {
-                        c.turning += turn_between(l, d0);
-                    }
-                    if first_dir.is_none() && (d0.x != 0.0 || d0.y != 0.0) {
-                        first_dir = Some(d0);
-                    }
-                    if d1.x != 0.0 || d1.y != 0.0 {
-                        last_dir = Some(d1);
-                    }
-                }
-                continue;
+                c.len_stroke += arc.dtheta.abs() * arc.transformed(s).max_radius();
             }
             _ => {}
         }
-        for d in dirs.iter().take(k).copied() {
-            if d.x == 0.0 && d.y == 0.0 {
-                continue;
-            }
-            if let Some(l) = last_dir {
-                c.turning += turn_between(l, d);
-            }
-            if first_dir.is_none() {
-                first_dir = Some(d);
-            }
-            last_dir = Some(d);
-        }
     }
+    c.turning = turn.sum;
     c.max_sub = c.max_sub.max(sub);
     implicit_close(&mut c, sub_end, sub_start);
     Ok(c)
@@ -751,12 +777,7 @@ fn bound_node(
             Cap::Square => 4,
             Cap::Round => r.saturating_add(1),
         };
-        let k_join = if pen.join == Join::Round {
-            let kk = (pen.half * pen.scale / (8.0 * pen.tol)).sqrt();
-            up(kk * c.turning).saturating_add(v)
-        } else {
-            0
-        };
+        let k_join = if pen.join == Join::Round { round_join_extra(&pen, c.turning).saturating_add(v) } else { 0 };
         // 破線の数（pathLength="0" は実線）
         let dashes = if n.flags & PATH_LENGTH_ZERO != 0 { &[][..] } else { tree.dash_list(n) };
         let mut total = 0.0;
@@ -789,7 +810,10 @@ fn bound_node(
             } else {
                 let all = up(c.len_stroke / period).saturating_add(s.saturating_mul(2)).saturating_add(1);
                 let vis = up(c.len_stroke_in / period).saturating_add(c.segs_in.saturating_mul(2)).saturating_add(1);
-                (all.saturating_mul(half_k), vis.min(all).saturating_mul(half_k))
+                // 計画は見えない所を周期ごとに飛ばすので、歩くのは見える分と、区間ごとに飛ばす前後の余白（2 周期ずつと
+                // 端数。奇数個を 2 度並べた周期は合計の 2 倍なので 16 周期で覆う）だけ（ADR-30 (4)）
+                let walked = vis.saturating_add(v.saturating_mul(16));
+                (all.min(walked).saturating_mul(half_k), vis.min(all).saturating_mul(half_k))
             }
         };
         // 計画が破線の並びを断って実線にしても足りるように、部分パスの数を下限にする
@@ -827,12 +851,15 @@ fn bound_node(
         let vertex_calls = dedup.saturating_mul(2);
         let dash_segs = if dash_pieces > 0 { v.saturating_add(s).saturating_mul(passes) } else { 0 };
         let joins = if dash_pieces > 0 { v.saturating_add(dash_pieces.saturating_mul(2)) } else { 0 };
-        let phase_steps = s.saturating_add(dash_pieces);
+        // 位相を進める手間と、区間ごとに見えない所を飛ばす手間（前と後ろで 2 度まで）
+        let phase_steps =
+            s.saturating_add(dash_pieces).saturating_add(if dash_pieces > 0 { v.saturating_mul(2) } else { 0 });
         out.plan_work = out
             .plan_work
             .saturating_add(v.saturating_mul(passes).saturating_mul(cost::FLATTEN_POINT.saturating_add(POINT_WORK)))
             .saturating_add(c.curves.saturating_mul(passes).saturating_mul(cost::FLATTEN_CURVE))
             .saturating_add(c.segs.saturating_mul(passes).saturating_mul(cost::OP_STEP))
+            .saturating_add(if pen.join == Join::Round { c.segs.saturating_mul(cost::TURN_SEGMENT) } else { 0 })
             .saturating_add(if mode.device { v.saturating_mul(POINT_WORK) } else { 0 })
             .saturating_add(dash_pts.saturating_mul(cost::OUTLINE_POINT.saturating_add(POINT_WORK)))
             .saturating_add(dedup.saturating_mul(POINT_WORK.saturating_add(cost::OP_STEP)))
@@ -1313,6 +1340,18 @@ fn stroke_edges(
     let mut sink = EdgeSink { edges, t: to_dev, first: None, prev: None, budget: budget_ref(budget) };
     // 破線の部分は見る箱にかかるものだけを作る（ADR-30 (4)。見積もりと同じ箱）
     let cull = Cull { to_dev, view: View::new(canvas, reach) };
+    // round の継ぎ目の点の残り：制御多角形の曲がる角の和から、見積もりと同じ式で（区間ごとに払う）
+    let mut round_left = 0u64;
+    if pen.join == Join::Round {
+        let stroke_space = if device { *t } else { Transform::IDENTITY };
+        let mut turn = Turning::default();
+        for seg in path.segments() {
+            budget.spend(cost::TURN_SEGMENT)?;
+            turn.feed(&seg, &stroke_space);
+        }
+        round_left = round_join_extra(&pen, turn.sum);
+    }
+    let round_left = &mut round_left;
     subpaths(path, t, q, reach, poly, budget, &mut |pts, closed| {
         if device {
             // non-scaling と細い線は描く座標系の点にしてから線を作る
@@ -1327,6 +1366,7 @@ fn stroke_edges(
                 dashes.as_ref(),
                 &cull,
                 [&mut *dashbuf, &mut *head, &mut *scratch],
+                &mut *round_left,
                 &mut sink,
                 budget,
             )
@@ -1338,6 +1378,7 @@ fn stroke_edges(
                 dashes.as_ref(),
                 &cull,
                 [&mut *dashbuf, &mut *head, &mut *scratch],
+                &mut *round_left,
                 &mut sink,
                 budget,
             )
@@ -1377,6 +1418,29 @@ impl Cull {
     }
 }
 
+impl Cull {
+    /// 線を作る座標系の区間 a → b のうち見る箱にかかる所（区間の割合。かからなければ None）。見積もりと同じ切り方
+    /// （[`View::clip`]）。有限でなければ全体。
+    fn range(&self, a: Point, b: Point) -> Option<(f64, f64)> {
+        let (p, q) = (self.to_dev.apply(a), self.to_dev.apply(b));
+        if !p.finite() || !q.finite() {
+            return Some((0.0, 1.0));
+        }
+        if p == q {
+            return if self.view.meets(p.x, p.y, p.x, p.y) { Some((0.0, 1.0)) } else { None };
+        }
+        let (c0, c1) = self.view.clip(p, q)?;
+        let (dx, dy) = (q.x - p.x, q.y - p.y);
+        let frac = |c: Point| if dx.abs() >= dy.abs() { (c.x - p.x) / dx } else { (c.y - p.y) / dy };
+        let (u0, u1) = (frac(c0), frac(c1));
+        if !(u0.is_finite() && u1.is_finite()) {
+            return Some((0.0, 1.0));
+        }
+        let (lo, hi) = if u0 <= u1 { (u0, u1) } else { (u1, u0) };
+        Some((math::max(lo, 0.0), math::min(hi, 1.0)))
+    }
+}
+
 /// 1 本の部分パスの線（破線があれば部分ごと。見る箱にかからない部分は作らない）。`bufs` は破線の部分・最初の部分・まとめた
 /// 点の置き場。
 #[allow(clippy::too_many_arguments, reason = "置き場を分けて渡す")]
@@ -1387,18 +1451,28 @@ fn stroke_one(
     dashes: Option<&Dashes<'_>>,
     cull: &Cull,
     bufs: [&mut MVec<'_, Point>; 3],
+    round_left: &mut u64,
     sink: &mut EdgeSink<'_, '_>,
     budget: &Budget<'_>,
 ) -> Result<(), Error> {
     let [dashbuf, head, scratch] = bufs;
     match dashes {
-        None => stroke_polyline(pts, closed, pen, scratch, budget, sink),
-        Some(d) => dash_polyline(pts, closed, d, dashbuf, head, budget, &mut |piece, piece_closed| {
-            if !cull.visible(piece, piece_closed, budget)? {
-                return Ok(());
-            }
-            stroke_polyline(piece, piece_closed, pen, scratch, budget, sink)
-        }),
+        None => stroke_polyline(pts, closed, pen, scratch, budget, round_left, sink),
+        Some(d) => dash_polyline(
+            pts,
+            closed,
+            d,
+            dashbuf,
+            head,
+            budget,
+            Some(&|a, b| cull.range(a, b)),
+            &mut |piece, piece_closed| {
+                if !cull.visible(piece, piece_closed, budget)? {
+                    return Ok(());
+                }
+                stroke_polyline(piece, piece_closed, pen, scratch, budget, &mut *round_left, sink)
+            },
+        ),
     }
 }
 

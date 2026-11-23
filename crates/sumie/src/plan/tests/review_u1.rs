@@ -575,3 +575,43 @@ fn cubic_bounds_render_limit() {
         Err(e) => panic!("{e:?}"),
     }
 }
+
+/// 単位 1 の 4 回目のレビュー (1)：座標が 2⁵² で曲線が小さく、平坦化の点が丸めで乱れた折れ線（曲がる角が制御多角形より
+/// 大きい）でも、round の継ぎ目の点は見積もりの式で抑えるので、見積もりが通れば計画も通る。
+#[test]
+fn jagged_round_joins_fit_the_estimate() {
+    let q = "Q 4503599627370586 4503599627370526 4503599627370526 4503599627370506 Q 4503599627370436 4503599627370476 4503599627370496 4503599627370496";
+    for (copies, scale) in [(1usize, "20"), (40, "20")] {
+        let d: String = (0..copies).map(|_| format!("M 4503599627370496 4503599627370496 {q} ")).collect();
+        let src = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"400\" height=\"400\"><path transform=\"translate(200 200) scale({scale}) translate(-4503599627370496 -4503599627370496)\" d=\"{d}\" fill=\"none\" stroke=\"black\" stroke-width=\"40\" stroke-linejoin=\"round\"/></svg>"
+        );
+        let r = svg_plan(&src);
+        assert!(r.starts_with("OK") || r.starts_with("estimate ERR"), "{copies}：{r}");
+    }
+    // 座標 10⁶・曲線の大きさ 3×10⁻⁷・scale(2×10¹⁰)
+    let src = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"400\" height=\"400\"><path transform=\"translate(200 200) scale(2e10) translate(-1000000 -1000000)\" d=\"M1000000 1000000 Q 1000000.0000003 1000000.0000001 1000000.0000002 1000000.00000005 Q 999999.9999999 1000000.0000001 1000000 1000000\" fill=\"none\" stroke=\"black\" stroke-width=\"40\" stroke-linejoin=\"round\"/></svg>";
+    let r = svg_plan(src);
+    assert!(r.starts_with("OK") || r.starts_with("estimate ERR"), "{r}");
+}
+
+/// 単位 1 の 4 回目のレビュー (2)：点が 2 つだけの閉じた部分パス（`M a L b Z`・2 点の polygon）は、前へ回る輪だけで線を
+/// 覆う（後ろへの輪で同じ所を 2 度覆うと、面積の被覆が縁の画素を濃くする）。斜めの線は、開いた 1 本の線と同じ画素。
+#[test]
+fn two_point_closed_subpaths_cover_once() {
+    let draw = |d: &str| {
+        let src = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\"><path d=\"{d}\" fill=\"none\" stroke=\"black\" stroke-width=\"1.5\"/></svg>"
+        );
+        let doc = crate::doc::parse(src.as_bytes(), &crate::style::ParseOptions::DEFAULT, &Never).unwrap();
+        let t = doc.build(&Never).unwrap();
+        let plan = t.plan(&RenderOptions::DEFAULT, &Never).unwrap();
+        let mut px = vec![0u8; 20 * 20 * 4];
+        plan.render(&mut PixmapMut::new(&mut px, 20, 20, 80).unwrap(), &Never).unwrap();
+        px.as_chunks::<4>().0.iter().map(|p| p[3]).collect::<Vec<u8>>()
+    };
+    assert_eq!(draw("M 2 3 L 18 14 Z"), draw("M 2 3 L 18 14"));
+    let h = draw("M 2 10.25 L 18 10.25 Z");
+    // 太さ 1.5 の横の線の縁（y 9.5〜11 のうち 9.5〜10 と 10〜11）は 128 と 255、内側の画素も 255 を超えない
+    assert_eq!((h[9 * 20 + 10], h[10 * 20 + 10]), (128, 255));
+}

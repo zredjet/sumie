@@ -103,12 +103,13 @@ pub(crate) fn flatten_seg(
     };
     let step = chunk_len(cost::FLATTEN_POINT) as u64;
     let nf = n as f64;
-    let mut i = 1u64;
-    while i <= n {
-        let k = step.min(n.saturating_sub(i).saturating_add(1));
+    // 終わった点の数（n が u64::MAX でも終わる。単位 1 の 4 回目のレビュー）
+    let mut done = 0u64;
+    while done < n {
+        let k = step.min(n.saturating_sub(done));
         budget.spend(k.saturating_mul(cost::FLATTEN_POINT))?;
-        let end = i.saturating_add(k);
-        while i < end {
+        for j in 1..=k {
+            let i = done.saturating_add(j);
             let p = if i == n {
                 end_point(seg)
             } else {
@@ -121,8 +122,8 @@ pub(crate) fn flatten_seg(
                 }
             };
             out(p)?;
-            i = i.saturating_add(1);
         }
+        done = done.saturating_add(k);
     }
     Ok(())
 }

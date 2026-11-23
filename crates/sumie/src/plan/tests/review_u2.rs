@@ -322,10 +322,10 @@ fn r6_random_nasty_scales() {
     assert!(bad.is_empty(), "{} {:?}", bad.len(), &bad[..bad.len().min(5)]);
 }
 
-/// キャンバスの外の長い破線：見る箱にかかる部分は少ないのに、計画は道の全体の破線の境を 1 つずつ歩き、見積もりもその分を
-/// 数えて断る（ADR-30 (4) の「破線の数は算術で数え」と違う）。
+/// キャンバスの外の長い破線：計画は見えない所の破線の境を周期ごとに算術で飛ばし、見積もりも見える分と区間ごとの余白だけを
+/// 数える（ADR-30 (4)。単位 1 の 4 回目のレビュー）。半径 10⁵ の円の細かい破線と、長さ 2×10⁸ の線（Chrome は描く）。
 #[test]
-fn r7_offcanvas_dashes_refused() {
+fn r7_offcanvas_dashes_are_skipped() {
     for dash in [0.05, 0.01] {
         let mut b = Builder::new();
         let d = b.dashes(&[dash, dash]);
@@ -340,14 +340,21 @@ fn r7_offcanvas_dashes_refused() {
         );
         let t = b.tree(100.0, 100.0);
         let est = t.estimate(&RenderOptions::DEFAULT, &Never).unwrap();
-        let r = t.plan(&RenderOptions::DEFAULT, &Never);
-        println!(
-            "r7: dash {dash} est plan work {} render {} → {:?}",
-            est.plan.work,
-            est.render.work,
-            r.as_ref().map(|p| p.edges.len()).map_err(|e| *e)
-        );
+        assert!(est.plan.work < 1 << 28, "{dash}：{}", est.plan.work);
+        let p = t.plan(&RenderOptions::DEFAULT, &Never).unwrap();
+        assert!(!p.edges.is_empty());
     }
+    let src = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"20\"><line x1=\"-1e8\" y1=\"10\" x2=\"1e8\" y2=\"10\" stroke=\"black\" stroke-dasharray=\"2 2\" stroke-width=\"2\"/></svg>";
+    let doc = crate::doc::parse(src.as_bytes(), &crate::style::ParseOptions::DEFAULT, &Never).unwrap();
+    let t = doc.build(&Never).unwrap();
+    let est = t.estimate(&RenderOptions::DEFAULT, &Never).unwrap();
+    assert!(est.plan.work < 1 << 20, "{}", est.plan.work);
+    let plan = t.plan(&RenderOptions::DEFAULT, &Never).unwrap();
+    let mut px = vec![0u8; 40 * 20 * 4];
+    plan.render(&mut PixmapMut::new(&mut px, 40, 20, 160).unwrap(), &Never).unwrap();
+    // 破線の位相は道の全体の長さで決める：x = -10⁸ から 2 2 の周期なので、x = 0〜2 は線、2〜4 は隙間
+    let a = |x: usize| px[(10 * 40 + x) * 4 + 3];
+    assert_eq!((a(0), a(1), a(2), a(3), a(4)), (255, 255, 0, 0, 255));
 }
 
 /// 頂点の多い太い round の線：描く手間の見積もり（外形の点ごとに 2r × max(miterlimit, 2) の長さ）と、計画の項目ごとの

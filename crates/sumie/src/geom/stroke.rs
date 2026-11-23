@@ -107,6 +107,8 @@ fn add(p: Point, v: Point, k: f64) -> Point {
 struct Emit<'s, 'b> {
     sink: &'s mut dyn LoopSink,
     budget: &'b Budget<'b>,
+    /// round の継ぎ目の円弧で、頂点ごとの 1 つを超えて使ってよい点の残り（節の全体で。呼び手が見積もりと同じ式で決める）
+    round_left: &'s mut u64,
 }
 
 impl Emit<'_, '_> {
@@ -123,21 +125,26 @@ impl Emit<'_, '_> {
     /// 中心 `c`・半径 `r` の、向き `from` から角 `sweep`（ラジアン。正は y が下向きの座標で時計回り）の円弧の点（始めの点を
     /// 除き、終わりの点を含む）。分ける数は `pen.round_pieces`。
     fn arc(&mut self, pen: &Pen, c: Point, from: Point, sweep: f64) -> Result<(), Error> {
-        let n = pen.round_pieces(sweep);
+        self.arc_n(pen, c, from, sweep, pen.round_pieces(sweep))
+    }
+
+    /// [`Emit::arc`] を `n` 個に分けて。
+    fn arc_n(&mut self, pen: &Pen, c: Point, from: Point, sweep: f64, n: u64) -> Result<(), Error> {
         let a0 = math::atan2(from.y, from.x);
         let step = chunk_len(cost::OUTLINE_POINT) as u64;
         let nf = n as f64;
-        let mut i = 1u64;
-        while i <= n {
-            let k = step.min(n.saturating_sub(i).saturating_add(1));
+        // 終わった点の数（n が u64::MAX でも終わる。単位 1 の 4 回目のレビュー）
+        let mut done = 0u64;
+        while done < n {
+            let k = step.min(n.saturating_sub(done));
             self.budget.spend(k.saturating_mul(cost::OUTLINE_POINT))?;
-            let end = i.saturating_add(k);
-            while i < end {
+            for j in 1..=k {
+                let i = done.saturating_add(j);
                 let a = a0 + sweep * ((i as f64) / nf);
                 let p = Point::new(c.x + pen.half * math::cos(a), c.y + pen.half * math::sin(a));
                 self.sink.point(p)?;
-                i = i.saturating_add(1);
             }
+            done = done.saturating_add(k);
         }
         Ok(())
     }
@@ -162,6 +169,7 @@ pub(crate) fn stroke_polyline(
     pen: &Pen,
     scratch: &mut crate::mem::MVec<'_, Point>,
     budget: &Budget<'_>,
+    round_left: &mut u64,
     sink: &mut dyn LoopSink,
 ) -> Result<(), Error> {
     let budget = budget_ref(budget);
@@ -175,14 +183,16 @@ pub(crate) fn stroke_polyline(
         scratch.truncate(n);
     }
     let v = scratch.as_slice();
-    let mut e = Emit { sink, budget };
+    let mut e = Emit { sink, budget, round_left };
     if v.len() == 1 {
         return zero_length(&mut e, pen, v.first().copied().unwrap_or(Point::new(0.0, 0.0)));
     }
     if closed {
-        // 左の縁の輪（前へ）と右の縁の輪（後ろへ）
+        // 左の縁の輪（前へ）と右の縁の輪（後ろへ）。点が 2 つだけなら前への輪だけ（両端の折り返しの継ぎ目が入った 1 周で
+        // 線の全体を覆う。後ろへの輪は同じ所をもう 1 度覆い、面積の被覆が縁の画素を濃くする。単位 1 の 4 回目のレビュー）
         let n = v.len();
-        for forward in [true, false] {
+        let loops: &[bool] = if n == 2 { &[true] } else { &[true, false] };
+        for &forward in loops {
             e.begin()?;
             for k in 0..n {
                 let i = if forward { k } else { n.saturating_sub(1).saturating_sub(k) };
@@ -268,7 +278,10 @@ fn vertex(e: &mut Emit<'_, '_>, pen: &Pen, a: Point, p: Point, b: Point, forward
         Join::Round => {
             // 外側の円弧（曲がる角だけ。左の縁が外なので負の向き。折り返し（外積 0・内積が負）は半回り）
             let turn = if cross == 0.0 { -core::f64::consts::PI } else { math::atan2(cross, dot) };
-            return e.arc(pen, p, n1, turn);
+            // 頂点ごとに 1 つと、節の残りの分まで（丸めで乱れた折れ線でも見積もりの式を超えない。単位 1 の 4 回目のレビュー）
+            let n = pen.round_pieces(turn).min(e.round_left.saturating_add(1));
+            *e.round_left = e.round_left.saturating_sub(n.saturating_sub(1));
+            return e.arc_n(pen, p, n1, turn, n);
         }
         Join::Miter => {
             // 比の 2 乗の逆数 = (1 + cos φ) / 2 ≥ 1 / limit²
@@ -338,6 +351,8 @@ pub(crate) struct Dashes<'a> {
     /// 頭の位相が入る並びの番号と、その部分の中ですでに進んだ長さ（部分パスごとに求め直さない）
     start: usize,
     start_left: f64,
+    /// 線の部分の和が正か（境の足し算が進まないとき、残りを線にするか。作るときに 1 度だけ求める）
+    on_positive: bool,
 }
 
 impl<'a> Dashes<'a> {
@@ -347,12 +362,14 @@ impl<'a> Dashes<'a> {
             return Ok(None);
         }
         let mut total = 0.0;
-        for &d in dashes {
+        let mut on_positive = false;
+        for (i, &d) in dashes.iter().enumerate() {
             budget.spend(cost::OP_STEP)?;
             if d.is_nan() || d < 0.0 || !d.is_finite() {
                 return Ok(None);
             }
             total += d;
+            on_positive |= i.is_multiple_of(2) && d > 0.0;
         }
         if total.is_nan() || total <= 0.0 || !total.is_finite() {
             return Ok(None);
@@ -379,12 +396,16 @@ impl<'a> Dashes<'a> {
                 break;
             }
         }
-        Ok(Some(Dashes { dashes, total, phase, start: idx, start_left: left }))
+        Ok(Some(Dashes { dashes, total, phase, start: idx, start_left: left, on_positive }))
     }
 }
 
 /// 破線の部分を受け取る口（部分の折れ線と、閉じた線として描くか）。
 pub(crate) type PieceFn<'f> = &'f mut dyn FnMut(&[Point], bool) -> Result<(), Error>;
+
+/// 区間 a → b のうち見える所（区間の割合の範囲。見えなければ None）を返す口。見えない所の破線は作らないので、境を周期ごとに
+/// 算術で飛ばす（ADR-30 (4)。単位 1 の 4 回目のレビュー）。
+pub(crate) type VisibleFn<'f> = &'f dyn Fn(Point, Point) -> Option<(f64, f64)>;
 
 /// 部分パスの折れ線 `pts` を破線に分け、線の部分ごとに `piece`（その部分の折れ線）を呼ぶ。`buf` は部分の点の置き場、
 /// `head` は閉じた部分パスの最初の部分を最後の部分につなぐための置き場（resvg・Chrome と同じ。ADR-92 (1)）。閉じた長さ 0 の
@@ -398,6 +419,7 @@ pub(crate) fn dash_polyline(
     buf: &mut crate::mem::MVec<'_, Point>,
     head: &mut crate::mem::MVec<'_, Point>,
     budget: &Budget<'_>,
+    visible: Option<VisibleFn<'_>>,
     piece: PieceFn<'_>,
 ) -> Result<(), Error> {
     let Some(&first) = pts.first() else { return Ok(()) };
@@ -431,7 +453,7 @@ pub(crate) fn dash_polyline(
     // 進まなければ、部分パスの残りを線の部分の和が正なら線、0 なら隙間として扱う（残りを捨てない。Skia は破線が多すぎると
     // 実線で描く。単位 1 の 3 回目のレビュー。ADR-97 (5)）
     let mut stall = 0usize;
-    let on_sum_positive = dashes.dashes.iter().enumerate().any(|(i, &d)| i.is_multiple_of(2) && d > 0.0);
+    let on_sum_positive = dashes.on_positive;
     for k in 0..count {
         budget.spend(cost::OP_STEP)?;
         let (Some(&a), Some(&b)) = (pts.get(k), pts.get(ring_next(k, pts.len()))) else { continue };
@@ -440,10 +462,47 @@ pub(crate) fn dash_polyline(
             break;
         }
         let (dx, dy) = (b.x - a.x, b.y - a.y);
+        // 区間の見える所（長さで。見えない区間は全体を見えない所として飛ばす）
+        let (vis_lo, vis_hi) = match visible {
+            None => (0.0, seg),
+            Some(f) => match f(a, b) {
+                Some((u0, u1)) => (u0 * seg, u1 * seg),
+                None => (seg, seg),
+            },
+        };
         let mut t0 = 0.0;
+        // 区間の頭は前の区間の続き（破線の中ほど）。境に来てから飛ばす
+        let mut at_boundary = false;
         // 区間の中の破線の境
         while seg - t0 > remain {
+            // 見えない所は、境の上（並びの番号・線か隙間・残りが周期で変わらない）から周期ごとに飛ばす。前後に 2 周期の
+            // 余白を残し、閉じた部分パスの頭を貯めている間は飛ばさない
+            if at_boundary && !holding {
+                let target = if t0 < vis_lo {
+                    vis_lo
+                } else if t0 > vis_hi {
+                    seg
+                } else {
+                    t0
+                };
+                let periods = ((target - t0) / dashes.total).floor() - 2.0;
+                let skipped = t0 + periods * dashes.total;
+                if periods >= 1.0 && skipped > t0 {
+                    budget.spend(cost::OP_STEP)?;
+                    t0 = skipped;
+                    stall = 0;
+                    if on {
+                        let u = t0 / seg;
+                        buf.clear();
+                        buf.push(Point::new(a.x + dx * u, a.y + dy * u))?;
+                    }
+                    if seg - t0 <= remain {
+                        break;
+                    }
+                }
+            }
             budget.spend(cost::OUTLINE_POINT)?;
+            at_boundary = true;
             let next_t = t0 + remain;
             if next_t > t0 {
                 stall = 0;

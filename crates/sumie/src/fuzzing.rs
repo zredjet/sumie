@@ -1180,11 +1180,13 @@ pub fn stroke_ops(data: &[u8]) -> Check {
         let mut input_points = 0u64;
         let mut all_finite = true;
         let path = PathRef { verbs: verbs.as_slice(), coords: coords.as_slice() };
+        // round の継ぎ目の点は抑えない（節の見積もりの式は計画が持つ）
+        let mut round = u64::MAX;
         let mut flush = |poly: &mut MVec<'_, Point>, closed: bool, sink: &mut Count| -> Result<(), Error> {
             match &dashes {
-                None => stroke_polyline(poly.as_slice(), closed, &pen, &mut scratch, &b, sink)?,
-                Some(d) => dash_polyline(poly.as_slice(), closed, d, &mut buf, &mut hd, &b, &mut |piece, pc| {
-                    stroke_polyline(piece, pc, &pen, &mut scratch, &b, sink)
+                None => stroke_polyline(poly.as_slice(), closed, &pen, &mut scratch, &b, &mut round, sink)?,
+                Some(d) => dash_polyline(poly.as_slice(), closed, d, &mut buf, &mut hd, &b, None, &mut |piece, pc| {
+                    stroke_polyline(piece, pc, &pen, &mut scratch, &b, &mut round, sink)
                 })?,
             }
             poly.clear();
