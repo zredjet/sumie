@@ -187,42 +187,7 @@ fn estimate_covers_random_documents() {
     let (mut parsed, mut built) = (0, 0);
     let (mut ratio_w, mut ratio_b, mut min_w) = (0.0f64, 0.0f64, 1.0f64);
     for _ in 0..300 {
-        let big = r.i(4) == 0;
-        let n = 1 + r.i(if big { 400 } else { 30 }) as usize;
-        let mut body = String::from(
-            "<style>.a{fill:red;stroke:blue;stroke-dasharray:1 2 3} .b{d:path('M0 0 L3 3 Q 5 5 6 0 Z')}</style>",
-        );
-        let mut open = 0;
-        for i in 0..n {
-            let id = format!("e{i}");
-            let tgt = format!("e{}", r.i(n as u64));
-            let k = r.i(9);
-            let s = match k {
-                0 => {
-                    open += 1;
-                    format!("<g id=\"{id}\" transform=\"translate(1 2)\">")
-                }
-                1 if open > 0 => {
-                    open -= 1;
-                    "</g>".to_string()
-                }
-                1 => String::new(),
-                2 => format!("<use id=\"{id}\" href=\"#{tgt}\" x=\"3\"/>"),
-                3 => format!("<rect id=\"{id}\" class=\"a\" width=\"{}\" height=\"5%\" rx=\"1em\"/>", r.i(50)),
-                4 => format!("<path id=\"{id}\" class=\"b\" stroke=\"black\"/>"),
-                5 => format!(
-                    "<path id=\"{id}\" d=\"M0 0 C 1 2 3 4 5 6 A 3 4 10 1 1 9 9 z m 1 1 h 3\" fill=\"url(#none) green\"/>"
-                ),
-                6 => format!("<polygon id=\"{id}\" points=\"0 0 5 5 9 0 3 3\" stroke=\"red\" stroke-width=\"2\"/>"),
-                7 => format!("<defs><circle id=\"{id}\" r=\"3\" fill=\"context-stroke\"/></defs>"),
-                _ => format!("<symbol id=\"{id}\" overflow=\"visible\"><ellipse rx=\"2\" ry=\"3\"/></symbol>"),
-            };
-            body.push_str(&s);
-        }
-        for _ in 0..open {
-            body.push_str("</g>");
-        }
-        let src = svg(&body);
+        let src = random_doc(&mut r);
         let Ok(d) = crate::doc::parse(src.as_bytes(), &ParseOptions::DEFAULT, &Never) else { continue };
         parsed += 1;
         let r = build(&src);
@@ -323,4 +288,75 @@ fn path_length_follows_chrome() {
         alpha_at(&svg("<g transform=\"scale(2)\"><path d=\"M0 10 H40\" pathLength=\"10\" stroke-dasharray=\"5 5\" \
          vector-effect=\"non-scaling-stroke\" fill=\"none\" stroke=\"green\" stroke-width=\"6\"/></g>"));
     assert_eq!((a(10, 20), a(30, 20), a(50, 20)), (255, 0, 255));
+}
+
+/// use の中の symbol は子を描き（overflow が見えるもの）、use の x・y は CSS のプロパティとしても読む（ADR-84 (6)）。
+#[test]
+fn symbol_children_and_use_css_position() {
+    let t = build(&svg(
+        "<symbol id=\"s\" overflow=\"visible\"><rect x=\"20\" y=\"20\" width=\"10\" height=\"10\" fill=\"green\"/></symbol>\
+         <use href=\"#s\" width=\"100\" height=\"100\"/>\
+         <defs><rect id=\"r\" width=\"5\" height=\"5\"/></defs><use href=\"#r\" style=\"x: 7px; y: 10%\"/>",
+    ))
+    .unwrap();
+    let n = t.nodes.as_slice();
+    assert_eq!(n.len(), 2);
+    assert_eq!(n[0].bounds.x0, 20.0);
+    assert_eq!((n[1].transform.e, n[1].transform.f), (7.0, 10.0));
+}
+
+/// 乱数の文書（g・use・図形・規則・属性の組み合わせ）。
+fn random_doc(r: &mut Rng) -> String {
+    let big = r.i(4) == 0;
+    let n = 1 + r.i(if big { 400 } else { 30 }) as usize;
+    let mut body = String::from(
+        "<style>.a{fill:red;stroke:blue;stroke-dasharray:1 2 3} .b{d:path('M0 0 L3 3 Q 5 5 6 0 Z')}</style>",
+    );
+    let mut open = 0;
+    for i in 0..n {
+        let id = format!("e{i}");
+        let tgt = format!("e{}", r.i(n as u64));
+        let k = r.i(9);
+        let s = match k {
+            0 => {
+                open += 1;
+                format!("<g id=\"{id}\" transform=\"translate(1 2)\">")
+            }
+            1 if open > 0 => {
+                open -= 1;
+                "</g>".to_string()
+            }
+            1 => String::new(),
+            2 => format!("<use id=\"{id}\" href=\"#{tgt}\" x=\"3\"/>"),
+            3 => format!("<rect id=\"{id}\" class=\"a\" width=\"{}\" height=\"5%\" rx=\"1em\"/>", r.i(50)),
+            4 => format!("<path id=\"{id}\" class=\"b\" stroke=\"black\"/>"),
+            5 => format!(
+                "<path id=\"{id}\" d=\"M0 0 C 1 2 3 4 5 6 A 3 4 10 1 1 9 9 z m 1 1 h 3\" fill=\"url(#none) green\"/>"
+            ),
+            6 => format!("<polygon id=\"{id}\" points=\"0 0 5 5 9 0 3 3\" stroke=\"red\" stroke-width=\"2\"/>"),
+            7 => format!("<defs><circle id=\"{id}\" r=\"3\" fill=\"context-stroke\"/></defs>"),
+            _ => format!("<symbol id=\"{id}\" overflow=\"visible\"><ellipse rx=\"2\" ry=\"3\"/></symbol>"),
+        };
+        body.push_str(&s);
+    }
+    for _ in 0..open {
+        body.push_str("</g>");
+    }
+    svg(&body)
+}
+
+/// 乱数の文書で、描く段までの確かめ（`fuzzing::render_ops`：形の約束・範囲の一致・同じ画素）を通す。
+#[test]
+fn render_ops_on_random_documents() {
+    let mut r = Rng(0x5eed_4e4d);
+    let mut drawn = 0;
+    for _ in 0..200 {
+        let src = random_doc(&mut r);
+        let mut data = vec![(r.i(4)) as u8, r.i(256) as u8, r.i(256) as u8, r.i(256) as u8];
+        data.extend_from_slice(src.as_bytes());
+        assert_eq!(crate::fuzzing::render_ops(&data), crate::fuzzing::Check::Ok, "{src}");
+        let d = crate::doc::parse(src.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+        drawn += usize::from(d.build(&Never).is_ok());
+    }
+    assert!(drawn > 150, "{drawn}");
 }

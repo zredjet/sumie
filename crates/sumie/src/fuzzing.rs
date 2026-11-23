@@ -1281,3 +1281,77 @@ pub fn build_ops(data: &[u8]) -> Check {
         _ => Check::Violation("同じ入力で結果が違う"),
     }
 }
+
+/// 描く段までを通す（ファズの `render` の対象）。頭の 4 バイトで倍率と範囲を選び、残りを SVG として読む。読めて木が
+/// できたら、確かめること：見積もりが通れば計画と描画が上限で断らない（形の約束。ADR-37）・範囲の見積もりが全体の
+/// 見積もりを超えない・範囲の描画が全体の同じ矩形とビット単位で同じ（ADR-13）・同じ入力で同じ画素。大きなキャンバス
+/// （256 × 256 を超えるもの）は速さのために描かない。
+pub fn render_ops(data: &[u8]) -> Check {
+    use crate::doc::parse;
+    use crate::plan::RenderOptions;
+    use crate::render::PixelRect;
+    let Some((head, svg)) = data.split_first_chunk::<4>() else { return Check::Ok };
+    let scale = [1.0, 0.5, 2.0, 0.25].get(usize::from(head[0] & 3)).copied().unwrap_or(1.0);
+    let opts = crate::style::ParseOptions::DEFAULT;
+    let Ok(d) = parse(svg, &opts, &Never) else { return Check::Ok };
+    let Ok(tree) = d.build(&Never) else { return Check::Ok };
+    let ropts = RenderOptions { scale, ..RenderOptions::DEFAULT };
+    let Ok(px) = tree.pixel_size(scale) else { return Check::Ok };
+    if u64::from(px.width).saturating_mul(u64::from(px.height)) > 256 * 256 {
+        return Check::Ok;
+    }
+    let Ok(est) = tree.estimate(&ropts, &Never) else { return Check::Ok };
+    let Ok(plan) = tree.plan(&ropts, &Never) else {
+        return Check::Violation("見積もりが通ったのに計画を断った");
+    };
+    let (w, h) = (plan.width, plan.height);
+    let b = Budget::new(Stage::Render, u64::MAX, u64::MAX, &Never);
+    let full_rect = PixelRect { x: 0, y: 0, width: w, height: h };
+    let Some(full) = draw_rect(&plan, full_rect, &b) else {
+        return Check::Violation("見積もりが通ったのに全体を描けない");
+    };
+    match plan.estimate_region(full_rect, &Never) {
+        Ok(e) if e.work <= est.render.work && e.peak_bytes <= est.render.peak_bytes => {}
+        _ => return Check::Violation("全体の範囲の見積もりが描く見積もりを超える"),
+    }
+    // 範囲：頭の 3 バイトから
+    let x = u32::from(head[1]).checked_rem(w).unwrap_or(0);
+    let y = u32::from(head[2]).checked_rem(h).unwrap_or(0);
+    let (room_w, room_h) = (w.saturating_sub(x), h.saturating_sub(y));
+    let rw = u32::from(head[3] & 15).checked_rem(room_w).unwrap_or(0).saturating_add(1);
+    let rh = u32::from(head[3] >> 4).checked_rem(room_h).unwrap_or(0).saturating_add(1);
+    let rect = PixelRect { x, y, width: rw.min(room_w), height: rh.min(room_h) };
+    match plan.estimate_region(rect, &Never) {
+        Ok(e) if e.work <= est.render.work => {}
+        _ => return Check::Violation("範囲の見積もりが全体を超える"),
+    }
+    let Some(part) = draw_rect(&plan, rect, &b) else { return Check::Violation("範囲を描けない") };
+    let (fs, ps) = (full.as_slice(), part.as_slice());
+    let n = (rect.width as usize).saturating_mul(4);
+    for yy in 0..rect.height as usize {
+        let a = (rect.y as usize)
+            .saturating_add(yy)
+            .saturating_mul(w as usize)
+            .saturating_add(rect.x as usize)
+            .saturating_mul(4);
+        let o = yy.saturating_mul(n);
+        if fs.get(a..a.saturating_add(n)) != ps.get(o..o.saturating_add(n)) {
+            return Check::Violation("範囲の描画が全体と違う");
+        }
+    }
+    match draw_rect(&plan, full_rect, &b) {
+        Some(again) if again.as_slice() == fs => Check::Ok,
+        _ => Check::Violation("同じ入力で画素が違う"),
+    }
+}
+
+/// 計画の範囲 `rect` を描いた画素（描けなければ None）。
+fn draw_rect<'b>(plan: &crate::plan::Plan, rect: crate::render::PixelRect, b: &'b Budget<'b>) -> Option<MVec<'b, u8>> {
+    let n = (rect.width as usize).checked_mul(rect.height as usize)?.checked_mul(4)?;
+    let mut buf: MVec<'_, u8> = MVec::with_capacity(b, n).ok()?;
+    buf.resize_to(n, 0).ok()?;
+    let stride = (rect.width as usize).checked_mul(4)?;
+    let mut out = crate::render::PixmapMut::new(buf.as_mut_slice(), rect.width, rect.height, stride).ok()?;
+    plan.render_region(rect, &mut out, &Never).ok()?;
+    Some(buf)
+}

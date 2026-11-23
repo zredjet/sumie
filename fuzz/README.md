@@ -15,9 +15,10 @@ architecture.md §9）。種は `seeds/<対象>/`（コミットする）、育�
 | `path` | パスのデータと `points` の読み（`values::path`）と平坦化（`geom::flatten`）。頭の 1 バイトで読む口（パスのデータか `points`）と変形を選ぶ。置き場に書く量が入力の 1 バイトあたり `cost::PATH_GEOMETRY_BYTES` 以下・1 回の払い・同じ入力で同じ結果・平坦化の点の数が分ける数の和（見積もりと同じ式）・点が区間の厳密な外接矩形の中 | `sumie::fuzzing::path_ops` |
 | `stroke` | 線の外形と破線（`geom::stroke`）。頭の 4 バイトで端・継ぎ目・太さ・miterlimit・破線と位相を選び、残りをパスのデータとして読む。1 回の払い・同じ入力で同じ結果・点ごとに払う（手間 ≥ 平坦化の点の数）・有限な入力の外形の点が有限 | `sumie::fuzzing::stroke_ops` |
 | `tree` | 木を作る段（`Document::estimate_build`・`build`）。読めた文書で、見積もり ≥ 実際（手間・確保の山・持ち続ける量）・1 回の払い・返しすぎ・同じ入力で同じ木か同じ断り・見積もりが通れば上限か中止で断らない・見積もりの上限で作っても同じ木 | `sumie::fuzzing::build_ops` |
+| `render` | 描く段まで（`Tree::estimate`・`plan`・`Plan::render_region`・`estimate_region`）。頭の 4 バイトで倍率と範囲を選び、残りを SVG として読む（256 × 256 以内のキャンバス）。見積もりが通れば計画と描画が上限で断らない・範囲の見積もりが全体を超えない・範囲の描画が全体の同じ矩形とビット単位で同じ・同じ入力で同じ画素 | `sumie::fuzzing::render_ops` |
 
 種は `crates/sumie/tests/mutate.rs` の `MEM_SEEDS` と同じにする（試験 `fuzz_seeds_match_mem_seeds` が照らす）。
-`xml`・`dtd`・`css`・`values`・`document`・`path`・`stroke`・`tree` の種は `crates/sumie/tests/mutate.rs` の種つきの変異の試験も使う（`dtd` は DTD の、`css` は
+`xml`・`dtd`・`css`・`values`・`document`・`path`・`stroke`・`tree`・`render` の種は `crates/sumie/tests/mutate.rs` の種つきの変異の試験も使う（`dtd` は DTD の、`css` は
 CSS の目印の字句で変異させる）。libFuzzer の既定の長さ（4096 バイト）
 では、長い名前・大きな実体のような長い入力の場合に届かないので、それは `crates/sumie/src/xml/tests.rs` の試験が受け持つ。
 Kura のファズのコーパス（`/Users/redjet/aruma/repos/zredjet/kura/fuzz/corpus/decode_svg/`。

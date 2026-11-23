@@ -461,3 +461,158 @@ fn regenerate_estimates() {
     }
     std::fs::write(goldens().join("estimate.jsonl"), out).unwrap();
 }
+
+/// 版に入る報告のダイジェスト（README の並べ方：使ったフォントの数（u32 LE）と各 32 バイトの鍵と u32 の書体の番号・
+/// 見つからなかった文字の数と各 u32 の符号位置・デコーダの識別子の長さ（u32）とバイト列。M2 はフォントもデコーダもなく、
+/// 12 バイトの 0）。
+fn report_digest() -> String {
+    blake3::hash(&[0u8; 12]).to_hex().to_string()
+}
+
+/// 描いた画素のダイジェスト（幅・高さの u32 LE と、行を詰めた RGBA8 乗算済み）。
+fn pixels_digest(w: u32, h: u32, px: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&w.to_le_bytes());
+    hasher.update(&h.to_le_bytes());
+    hasher.update(px);
+    hasher.finalize().to_hex().to_string()
+}
+
+/// 読む → 木 → 計画 → 描く（`region` は範囲。なければ全体）。描けなければ誤りの文。
+fn render(data: &[u8], scale: f64, region: Option<(u32, u32, u32, u32)>) -> Result<(u32, u32, Vec<u8>), String> {
+    let doc = sumie::parse(data, &sumie::ParseOptions::DEFAULT, &sumie::Never).map_err(|e| format!("{e:?}"))?;
+    let tree = doc.build(&sumie::Never).map_err(|e| format!("{e:?}"))?;
+    let opts = sumie::RenderOptions { scale, ..sumie::RenderOptions::DEFAULT };
+    let plan = tree.plan(&opts, &sumie::Never).map_err(|e| format!("{e:?}"))?;
+    let size = plan.pixel_size();
+    let rect = match region {
+        Some((x, y, w, h)) => sumie::PixelRect { x, y, width: w, height: h },
+        None => sumie::PixelRect { x: 0, y: 0, width: size.width, height: size.height },
+    };
+    let mut px = vec![0u8; rect.width as usize * rect.height as usize * 4];
+    let mut out = sumie::PixmapMut::new(&mut px, rect.width, rect.height, rect.width as usize * 4)
+        .map_err(|e| format!("{e:?}"))?;
+    plan.render_region(rect, &mut out, &sumie::Never).map_err(|e| format!("{e:?}"))?;
+    Ok((rect.width, rect.height, px))
+}
+
+/// 描いた行。
+fn render_line(name: &str, path: &str, data: &[u8], scale: f64, region: Option<(u32, u32, u32, u32)>) -> Option<Line> {
+    let (w, h, px) = render(data, scale, region).ok()?;
+    let region_text = region.map_or(String::new(), |(x, y, w, h)| format!("{x},{y},{w},{h}"));
+    Some(
+        Line::new()
+            .str("name", name)
+            .str("input", blake3::hash(data).to_hex().to_string())
+            .str("path", path)
+            .str("fonts", "")
+            .str("decoder", "")
+            .str("style", "default")
+            .str("scale", format!("{scale}"))
+            .str("region", region_text)
+            .int("width", i128::from(w))
+            .int("height", i128::from(h))
+            .str("pixels", pixels_digest(w, h, &px))
+            .str("report", report_digest()),
+    )
+}
+
+/// 今の版の行を描き直して、画素と大きさと報告が同じ（D1。全ターゲットで同じファイル）。
+#[test]
+fn renders_match_the_golden() {
+    let root = workspace();
+    let current = current_version();
+    let text = std::fs::read_to_string(goldens().join(format!("render-v{current}.jsonl"))).unwrap();
+    let index = input_index(&root);
+    let mut errs = Vec::new();
+    let mut n = 0usize;
+    for raw in text.lines() {
+        let line = Line::parse(raw).unwrap();
+        let get = |k: &str| line.get_str(k).unwrap().to_string();
+        let Some(path) = index.get(&get("input")) else {
+            errs.push(format!("{}：入力がない", get("name")));
+            continue;
+        };
+        let data = std::fs::read(root.join(path)).unwrap();
+        let scale: f64 = get("scale").parse().unwrap();
+        let region = (!get("region").is_empty()).then(|| {
+            let p: Vec<u32> = get("region").split(',').map(|v| v.parse().unwrap()).collect();
+            (p[0], p[1], p[2], p[3])
+        });
+        match render_line(&get("name"), &get("path"), &data, scale, region) {
+            Some(got) if got.to_json() == raw => {}
+            Some(got) => {
+                errs.push(format!("{}：\n  ゴールデン {raw}\n  このターゲット {}", get("name"), got.to_json()))
+            }
+            None => errs.push(format!("{}：描けない {:?}", get("name"), render(&data, scale, region).err())),
+        }
+        n += 1;
+    }
+    assert!(
+        n >= 100,
+        "render-v{current}.jsonl の行が少ない（{n}）。`cargo test -p sumie --test golden -- --ignored regenerate_renders` で作る"
+    );
+    assert!(
+        errs.is_empty(),
+        "D1 がゴールデンと違う（{} 件）：\n{}",
+        errs.len(),
+        errs.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
+    );
+}
+
+/// 描く行の例（名前・道・倍率・範囲）。
+type RenderCase = (String, String, f64, Option<(u32, u32, u32, u32)>);
+
+/// 描く行の例：`tests/svg/` の描けるものすべて（倍率 1）と、`corpus/` のうち BLAKE3 の頭の 16 進が 0 で描けて 512 × 512 以内の
+/// もの（倍率 1）。`tests/svg/m2-probe/` は倍率 0.5・2.5 と、範囲（全体の右下の 4 分の 1・1 画素の列）も。名前は道と設定。
+fn render_cases(index: &BTreeMap<String, String>) -> Vec<RenderCase> {
+    let mut v = Vec::new();
+    let mut paths: Vec<(&String, &String)> = index.iter().map(|(h, p)| (p, h)).collect();
+    paths.sort();
+    for (path, hash) in paths {
+        let in_tests = path.starts_with("tests/svg/");
+        if !in_tests && !hash.starts_with('0') {
+            continue;
+        }
+        v.push((path.clone(), path.clone(), 1.0, None));
+        if path.starts_with("tests/svg/m2-probe/") {
+            v.push((format!("{path}@0.5"), path.clone(), 0.5, None));
+            v.push((format!("{path}@2.5"), path.clone(), 2.5, None));
+            v.push((format!("{path}#quarter"), path.clone(), 1.0, Some((50, 50, 50, 50))));
+            v.push((format!("{path}#column"), path.clone(), 1.0, Some((37, 0, 1, 100))));
+        }
+    }
+    v
+}
+
+/// render-v0.jsonl を作り直す（版 0 は M7 まで作り直してよい。ADR-20。`cargo test -p sumie --test golden -- --ignored
+/// regenerate_renders`）。
+#[test]
+#[ignore]
+fn regenerate_renders() {
+    let root = workspace();
+    assert_eq!(current_version(), 0, "凍結した版は作り直さない（追記だけ）");
+    let index = input_index(&root);
+    let mut out = String::new();
+    for (name, path, scale, region) in render_cases(&index) {
+        let data = std::fs::read(root.join(&path)).unwrap();
+        if !path.starts_with("tests/svg/") {
+            // 大きな集まりの例は 512 × 512 以内だけ（debug の試験を速く保つ）
+            match render(&data, 1.0, Some((0, 0, 1, 1))) {
+                Ok(_) => {}
+                Err(_) => continue,
+            }
+            let doc = sumie::parse(&data, &sumie::ParseOptions::DEFAULT, &sumie::Never).unwrap();
+            let tree = doc.build(&sumie::Never).unwrap();
+            let px = tree.pixel_size(1.0).unwrap();
+            if px.width > 512 || px.height > 512 {
+                continue;
+            }
+        }
+        if let Some(line) = render_line(&name, &path, &data, scale, region) {
+            out.push_str(&line.to_json());
+            out.push('\n');
+        }
+    }
+    std::fs::write(goldens().join("render-v0.jsonl"), out).unwrap();
+}

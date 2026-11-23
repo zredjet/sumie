@@ -22,7 +22,7 @@ use crate::doc::refs::{EDGE_FILL, EDGE_STROKE, fits, not_rendered, renders_child
 use crate::error::Error;
 use crate::mem::{MVec, Plain};
 use crate::style::computed::{
-    Axis, Base, Bufs, CPaint, Computed, FALLBACK_COLOR, PAINT_CONTEXT_FILL, PAINT_CONTEXT_STROKE, PAINT_NONE,
+    Axis, Base, Bufs, CPaint, Computed, FALLBACK_COLOR, G_X, G_Y, PAINT_CONTEXT_FILL, PAINT_CONTEXT_STROKE, PAINT_NONE,
     PAINT_URL, PropIds, compute, resolve,
 };
 use crate::values::{self, Aspect, Color, Length, Transform, Unit, Values, ViewBox, view_box_transform};
@@ -342,8 +342,18 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
             })
         };
         if svg_ns && local == b"use" {
-            let x = len0(b"x", Axis::X)?;
-            let y = len0(b"y", Axis::Y)?;
+            // 木を作るたどり方は x・y を CSS のプロパティ（計算した値）として読む（ADR-84 (6)。M1 の照合の道具は属性だけ）
+            let (x, y) = if self.opts.build {
+                let gx = comp.geo.used(G_X, vp.map(|(w, _)| w));
+                let gy = comp.geo.used(G_Y, vp.map(|(_, h)| h));
+                // 基準のない % は 0 にして「解けない」印を付ける
+                if gx.is_none() || gy.is_none() {
+                    known_ctm = false;
+                }
+                (gx.unwrap_or(0.0), gy.unwrap_or(0.0))
+            } else {
+                (len0(b"x", Axis::X)?, len0(b"y", Axis::Y)?)
+            };
             ctm = ctm.then(&Transform { e: x, f: y, ..Transform::IDENTITY });
             child_ctm = ctm;
         } else if svg_ns && (local == b"svg" || symbol_instance) {
@@ -430,7 +440,8 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
             child: n.first_child,
             ctx: top.ctx,
             has_vp,
-            children_rendered: u8::from(rendered && renders_children(local)),
+            // use の中の symbol は子を描く（SVG 2 §5.5。ほかの文脈の symbol は描く木に入らない）
+            children_rendered: u8::from(rendered && (renders_children(local) || symbol_instance)),
             known: u8::from(known_ctm),
             in_text: u8::from(top.in_text != 0 || (svg_ns && local == b"text")),
             single: 0,
