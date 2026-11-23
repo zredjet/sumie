@@ -44,7 +44,7 @@ fn values_by_property() {
         ("x", &["5", "-5", "5%"], &["auto"]),
         ("line-height", &["normal", "1.5", "12px", "150%"], &["-1", "a"]),
         ("color-rendering", &["optimizeQuality", "auto"], &["crispEdges"]),
-        ("stroke-linejoin", &["arcs", "miter-clip", "round"], &["rounded"]),
+        ("stroke-linejoin", &["miter", "bevel", "round"], &["rounded", "arcs", "miter-clip"]),
         (
             "display",
             &[

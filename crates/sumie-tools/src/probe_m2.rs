@@ -30,6 +30,212 @@ fn shows_red(name: &'static str, what: &'static str, shape: &str, point: (u32, u
     p
 }
 
+/// 線の試し（赤い全面の上の緑の線）。`yes_red` なら効いたとき背景が見える。
+fn stroke(name: &'static str, what: &'static str, shape: &str, point: (u32, u32), yes_red: bool) -> Probe {
+    let mut p = on_red("線", name, what, shape, point);
+    if yes_red {
+        p.yes = RED;
+        p.no = GREEN;
+    }
+    p
+}
+
+/// 線の試しの並び（ADR-89 の照らして決める項目）。
+fn stroke_probes() -> Vec<Probe> {
+    let g = "fill=\"none\" stroke=\"green\"";
+    // 頂きの角は約 53°。太さ 20 の miter の先は頂きの 22.4 上、bevel の縁は 4.5 上、miterlimit 1.5 の切り詰めは 15 上
+    let apex = |join: &str, limit: &str| {
+        format!(
+            "<polyline points=\"20,80 50,20 80,80\" {g} stroke-width=\"20\" stroke-linejoin=\"{join}\" stroke-miterlimit=\"{limit}\"/>"
+        )
+    };
+    let hline =
+        |extra: &str| format!("<line x1=\"10\" y1=\"50\" x2=\"90\" y2=\"50\" {g} stroke-width=\"10\" {extra}/>");
+    let crisp = |mode: &str| {
+        format!("<rect x=\"10.3\" y=\"10\" width=\"80\" height=\"80\" fill=\"green\" shape-rendering=\"{mode}\"/>")
+    };
+    vec![
+        stroke("join-miter", "miter（比 2.24 ≤ 4）は先まで描く", &apex("miter", "4"), (50, 5), false),
+        stroke(
+            "join-miter-limit",
+            "miterlimit を超える miter は bevel（先を描かない）",
+            &apex("miter", "1.5"),
+            (50, 10),
+            true,
+        ),
+        stroke(
+            "join-miter-clip",
+            "miter-clip は miterlimit の所で切った先を描く",
+            &apex("miter-clip", "1.5"),
+            (50, 10),
+            false,
+        ),
+        stroke("join-arcs", "arcs（直線どうしは miter-clip と同じ形）", &apex("arcs", "1.5"), (50, 10), false),
+        stroke(
+            "join-miter-clip-inherit",
+            "親が round のとき子の miter-clip は壊れた値として親の round を受け継ぐか（受け継げば頂きの 9 上も描く）",
+            &format!("<g stroke-linejoin=\"round\">{}</g>", apex("miter-clip", "1.5")),
+            (50, 11),
+            false,
+        ),
+        stroke(
+            "join-arcs-inherit",
+            "親が round のとき子の arcs は壊れた値として親の round を受け継ぐか",
+            &format!("<g stroke-linejoin=\"round\">{}</g>", apex("arcs", "1.5")),
+            (50, 11),
+            false,
+        ),
+        stroke(
+            "join-round",
+            "round は円の形（bevel より先、miter の先より手前）",
+            &apex("round", "4"),
+            (50, 11),
+            false,
+        ),
+        stroke("join-bevel", "bevel", &apex("bevel", "4"), (50, 10), true),
+        stroke(
+            "miterlimit-below-1",
+            "miterlimit が 1 未満（壊れた値として既定の 4 にするか）",
+            &apex("miter", "0.5"),
+            (50, 5),
+            false,
+        ),
+        stroke(
+            "cap-zero-round",
+            "長さ 0 の部分パス（M L 同じ点）の丸い端は点を描く",
+            &format!("<path d=\"M50 50 L50 50\" {g} stroke-width=\"20\" stroke-linecap=\"round\"/>"),
+            (50, 50),
+            false,
+        ),
+        stroke(
+            "cap-zero-close",
+            "長さ 0 の閉じた部分パス（M z）の丸い端",
+            &format!("<path d=\"M50 50 z\" {g} stroke-width=\"20\" stroke-linecap=\"round\"/>"),
+            (50, 50),
+            false,
+        ),
+        stroke(
+            "cap-zero-square",
+            "長さ 0 の四角い端は軸に沿う正方形（円の外の角も描く）",
+            &format!("<path d=\"M50 50 L50 50\" {g} stroke-width=\"20\" stroke-linecap=\"square\"/>"),
+            (58, 58),
+            false,
+        ),
+        stroke(
+            "cap-zero-butt",
+            "長さ 0 の平らな端は描かない",
+            &format!("<path d=\"M50 50 L50 50\" {g} stroke-width=\"20\"/>"),
+            (50, 50),
+            true,
+        ),
+        stroke(
+            "cap-moveto-only",
+            "M だけの部分パスは描かない（丸い端でも）",
+            &format!("<path d=\"M50 50\" {g} stroke-width=\"20\" stroke-linecap=\"round\"/>"),
+            (50, 50),
+            true,
+        ),
+        stroke(
+            "dash-negative",
+            "負の値のある stroke-dasharray は実線",
+            &hline("stroke-dasharray=\"10 -5\""),
+            (22, 50),
+            false,
+        ),
+        stroke(
+            "dash-zero-sum",
+            "合計 0 の stroke-dasharray は実線",
+            &hline("stroke-dasharray=\"0 0\""),
+            (50, 50),
+            false,
+        ),
+        stroke(
+            "dash-odd",
+            "奇数個の stroke-dasharray は 2 度並べる（`10` は 10 10。20〜30 は隙間）",
+            &hline("stroke-dasharray=\"10\""),
+            (25, 50),
+            true,
+        ),
+        stroke(
+            "dash-percent",
+            "% の stroke-dasharray（対角の √2 で割ったものに対して。10% は 10）",
+            &hline("stroke-dasharray=\"10%\""),
+            (25, 50),
+            true,
+        ),
+        stroke(
+            "dash-subpath-reset",
+            "破線は部分パスごとに始め直す（2 本目の頭も線）",
+            &format!("<path d=\"M10 30 H60 M10 70 H60\" {g} stroke-width=\"10\" stroke-dasharray=\"30 30\"/>"),
+            (15, 70),
+            false,
+        ),
+        stroke(
+            "dash-offset",
+            "stroke-dashoffset（5 ずらすと 15〜20 の隙間が 10〜15 に）",
+            &hline("stroke-dasharray=\"10 5\" stroke-dashoffset=\"5\""),
+            (17, 50),
+            false,
+        ),
+        stroke(
+            "dash-path-length",
+            "pathLength が破線の長さに効く（長さ 80 を 4 とみなすと 1 1 は 20 20。30〜50 は隙間）",
+            &format!("<path d=\"M10 50 H90\" pathLength=\"4\" {g} stroke-width=\"10\" stroke-dasharray=\"1 1\"/>"),
+            (40, 50),
+            true,
+        ),
+        stroke(
+            "non-scaling-stroke",
+            "non-scaling-stroke は画面の太さ（縦 4 倍でも太さ 2）",
+            "<g transform=\"scale(1 4)\"><line x1=\"10\" y1=\"12.5\" x2=\"90\" y2=\"12.5\" fill=\"none\" stroke=\"green\" stroke-width=\"2\" vector-effect=\"non-scaling-stroke\"/></g>",
+            (50, 53),
+            true,
+        ),
+        stroke(
+            "crisp-edges",
+            "crispEdges は反エイリアスなし（縁 10.3 の画素 10 は全部塗る）",
+            &crisp("crispEdges"),
+            (10, 50),
+            false,
+        ),
+        stroke(
+            "optimize-speed",
+            "optimizeSpeed（crispEdges と同じに扱うか）",
+            &crisp("optimizeSpeed"),
+            (10, 50),
+            false,
+        ),
+        stroke(
+            "geometric-precision",
+            "geometricPrecision は反エイリアス（縁の画素は混ざる。どちらでもないが正しい）",
+            &crisp("geometricPrecision"),
+            (10, 50),
+            false,
+        ),
+        stroke(
+            "closed-join",
+            "閉じたパスの始めの点も継ぎ目（miter の角を描く）",
+            &format!("<path d=\"M30 30 H70 V70 H30 Z\" {g} stroke-width=\"20\"/>"),
+            (22, 22),
+            false,
+        ),
+        stroke(
+            "paint-order-stroke",
+            "paint-order: stroke は塗りを線の上に描く（線の内側の半分は緑の塗り）",
+            "<rect x=\"20\" y=\"20\" width=\"60\" height=\"60\" fill=\"green\" stroke=\"red\" stroke-width=\"20\" paint-order=\"stroke\"/>",
+            (25, 50),
+            false,
+        ),
+        stroke(
+            "stroke-width-zero",
+            "太さ 0 の線は描かない",
+            &format!("<line x1=\"10\" y1=\"50\" x2=\"90\" y2=\"50\" {g} stroke-width=\"0\"/>"),
+            (50, 50),
+            true,
+        ),
+    ]
+}
+
 pub(crate) fn probes() -> Vec<Probe> {
     let lower_left = (30, 70);
     let upper_right = (70, 30);
@@ -175,4 +381,7 @@ pub(crate) fn probes() -> Vec<Probe> {
             (50, 50),
         ),
     ]
+    .into_iter()
+    .chain(stroke_probes())
+    .collect()
 }

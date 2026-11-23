@@ -91,8 +91,9 @@ const fn pu(name: &'static [u8], inherited: bool, attr: bool, kind: Kind) -> Pro
 }
 
 const LINECAP: &[&[u8]] = &[b"butt", b"round", b"square"];
-// `miter-clip`・`arcs` は SVG 2 にあり FR-PT-03 で読む（Chrome は読まないが仕様に合わせる。ADR-74）
-const LINEJOIN: &[&[u8]] = &[b"miter", b"miter-clip", b"round", b"bevel", b"arcs"];
+// `miter-clip`・`arcs` は SVG 2 にあるが、Chrome と同じく壊れた値にする（宣言を無視して親の値を受け継ぐ。ADR-91 (1)。
+// ADR-74 の「仕様に合わせて読む」を改める）
+const LINEJOIN: &[&[u8]] = &[b"miter", b"round", b"bevel"];
 const RULE: &[&[u8]] = &[b"nonzero", b"evenodd"];
 const VISIBILITY: &[&[u8]] = &[b"visible", b"hidden", b"collapse"];
 pub(crate) const DISPLAY: &[&[u8]] = &[

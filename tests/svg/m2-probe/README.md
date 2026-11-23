@@ -57,3 +57,36 @@
 | `polygon-error-keeps` | 壊れた points の前の点は描く（三角の右上） | 効く | 効かない |
 | `polyline-fill` | polyline も塗る（閉じない形を閉じて塗る） | 効く | 効く |
 | `line-no-fill` | line は塗らない（線だけ） | 効かない | 効かない |
+
+## 線
+
+| 試し | 何を見るか | resvg | Chrome |
+|---|---|---|---|
+| `join-miter` | miter（比 2.24 ≤ 4）は先まで描く | 効く | 効く |
+| `join-miter-limit` | miterlimit を超える miter は bevel（先を描かない） | 効く | 効く |
+| `join-miter-clip` | miter-clip は miterlimit の所で切った先を描く | 効く | 効かない |
+| `join-arcs` | arcs（直線どうしは miter-clip と同じ形） | 効かない | 効かない |
+| `join-miter-clip-inherit` | 親が round のとき子の miter-clip は壊れた値として親の round を受け継ぐか（受け継げば頂きの 9 上も描く） | 効く | 効く |
+| `join-arcs-inherit` | 親が round のとき子の arcs は壊れた値として親の round を受け継ぐか | 効かない | 効く |
+| `join-round` | round は円の形（bevel より先、miter の先より手前） | 効く | 効く |
+| `join-bevel` | bevel | 効く | 効く |
+| `miterlimit-below-1` | miterlimit が 1 未満（壊れた値として既定の 4 にするか） | 効かない | 効かない |
+| `cap-zero-round` | 長さ 0 の部分パス（M L 同じ点）の丸い端は点を描く | 効く | 効く |
+| `cap-zero-close` | 長さ 0 の閉じた部分パス（M z）の丸い端 | 効く | 効く |
+| `cap-zero-square` | 長さ 0 の四角い端は軸に沿う正方形（円の外の角も描く） | 効く | 効く |
+| `cap-zero-butt` | 長さ 0 の平らな端は描かない | 効く | 効く |
+| `cap-moveto-only` | M だけの部分パスは描かない（丸い端でも） | 効く | 効く |
+| `dash-negative` | 負の値のある stroke-dasharray は実線 | 効く | 効く |
+| `dash-zero-sum` | 合計 0 の stroke-dasharray は実線 | 効く | 効く |
+| `dash-odd` | 奇数個の stroke-dasharray は 2 度並べる（`10` は 10 10。20〜30 は隙間） | 効く | 効く |
+| `dash-percent` | % の stroke-dasharray（対角の √2 で割ったものに対して。10% は 10） | 効く | 効く |
+| `dash-subpath-reset` | 破線は部分パスごとに始め直す（2 本目の頭も線） | 効く | 効く |
+| `dash-offset` | stroke-dashoffset（5 ずらすと 15〜20 の隙間が 10〜15 に） | 効かない | 効かない |
+| `dash-path-length` | pathLength が破線の長さに効く（長さ 80 を 4 とみなすと 1 1 は 20 20。30〜50 は隙間） | 効かない | 効く |
+| `non-scaling-stroke` | non-scaling-stroke は画面の太さ（縦 4 倍でも太さ 2） | 効かない | 効く |
+| `crisp-edges` | crispEdges は反エイリアスなし（縁 10.3 の画素 10 は全部塗る） | 効く | 効く |
+| `optimize-speed` | optimizeSpeed（crispEdges と同じに扱うか） | 効く | 効く |
+| `geometric-precision` | geometricPrecision は反エイリアス（縁の画素は混ざる。どちらでもないが正しい） | 効く | 効く |
+| `closed-join` | 閉じたパスの始めの点も継ぎ目（miter の角を描く） | 効く | 効く |
+| `paint-order-stroke` | paint-order: stroke は塗りを線の上に描く（線の内側の半分は緑の塗り） | 効く | 効く |
+| `stroke-width-zero` | 太さ 0 の線は描かない | 効く | 効く |

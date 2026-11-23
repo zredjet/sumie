@@ -92,7 +92,7 @@
 |---|---|---|
 | FR-SH-01 | M | `path`：パスのデータの文法すべて（暗黙の命令の繰り返し・区切りのない数・弧の旗の詰め書き）。途中で壊れていれば、そこまでを描く（SVG の誤りの扱い）。弧は SVG 1.1 の付録 F の式で中心の形に直し、半径が足りなければ広げる |
 | FR-SH-02 | M | `rect`（`rx`・`ry` の `auto` と半分への切り詰め）・`circle`・`ellipse`（SVG 2 の `auto`）・`line`・`polyline`・`polygon`（数が奇数なら最後を捨てる）。大きさが 0 か負なら描かない |
-| FR-SH-03 | S | `pathLength`（破線と textPath の `startOffset` の割合に効く。resvg が受けるなら M） |
+| FR-SH-03 | M | `pathLength`（破線と textPath の `startOffset` の割合に効く。Chrome と同じ。resvg は読まない。ADR-91 (2)） |
 | FR-SH-04 | M | 長さの単位：数・px・in・cm・mm・Q・pt・pc・em・ex（em の半分）・ch（em の半分）・ic（1em）・cap（0.7em）・lh（`line-height` の計算した値）・rlh（根の要素の `line-height`）・rem・%（向きに応じた表示の領域の幅・高さ・対角の √2 で割ったもの）・vw・vh・vmin・vmax・vi・vb（横書きなので vi は vw、vb は vh。`@media` と同じ文書の大きさから。中身で大きさが決まる文書では壊れた値）。ch・ic・cap は読む段にフォントがないので CSS Values 4 の代わりの値（ADR-74）。単位の大文字小文字は区別しない（ADR-66 (4)）。CSS の宣言では、単位のない長さは SVG のプロパティ（x・y・r・rx・ry・cx・cy・stroke-width・stroke-dashoffset・baseline-shift・stroke-dasharray）だけが受ける（属性はどれも受ける。Chrome と同じ。ADR-74）。`calc()`・`var()` は M1 では読まずに壊れた値として警告する |
 
 ### 2.4 塗りと線（FR-PT）
@@ -101,7 +101,7 @@
 |---|---|---|
 | FR-PT-01 | M | 塗り：`none`・色・`url(#id)`（あとに代わりの色を付けられる）・`currentColor`・`context-fill`・`context-stroke`（marker の中。SVG 2。marker の中から使われる pattern・mask・clipPath・filter の中身と、marker の外には文脈の要素がなく、塗らない。Chrome と同じ。ADR-87 (4)） |
 | FR-PT-02 | M | 色：SVG の 147 の名前・`#rgb`・`#rgba`・`#rrggbb`・`#rrggbbaa`・`rgb()`・`rgba()`・`hsl()`・`hsla()`・`transparent`。CSS Color 4 の `/` の α と `hwb()` も読む。システムの色は読まない。`lab()`・`oklch()` などは M1 では読まずに警告し、照らしてから決める（ADR-66 (4)） |
-| FR-PT-03 | M | `fill-rule`・`fill-opacity`・`stroke-opacity`・`stroke-width`・`stroke-linecap`・`stroke-linejoin`（`miter`・`round`・`bevel`・`miter-clip`・`arcs` は resvg と同じ扱い）・`stroke-miterlimit`（負だけが壊れた値。1 未満は継ぎ目がいつも bevel。ADR-76）・`stroke-dasharray`（奇数個は 2 度並べる・% ・負や合計 0 は実線）・`stroke-dashoffset` |
+| FR-PT-03 | M | `fill-rule`・`fill-opacity`・`stroke-opacity`・`stroke-width`・`stroke-linecap`・`stroke-linejoin`（`miter`・`round`・`bevel`。SVG 2 の `miter-clip`・`arcs` は Chrome と同じく壊れた値。ADR-91 (1)）・`stroke-miterlimit`（負だけが壊れた値。1 未満は継ぎ目がいつも bevel。ADR-76）・`stroke-dasharray`（奇数個は 2 度並べる・% ・負や合計 0 は実線）・`stroke-dashoffset` |
 | FR-PT-04 | M | `paint-order`・`vector-effect: non-scaling-stroke`・`shape-rendering`（`crispEdges` は反エイリアスなし。`optimizeSpeed` は resvg と同じ扱い。M2 で照らす） |
 | FR-PT-05 | M | `linearGradient`・`radialGradient`：`gradientUnits`・`gradientTransform`・`spreadMethod`（pad・reflect・repeat）・`href` の鎖での属性と stop の受け継ぎ（輪は FR-CO-05）・焦点（`fx`・`fy`・SVG 2 の `fr`）・stop の offset の切り詰めと単調化・`stop-color`・`stop-opacity`。stop が 1 つなら単色、0 なら塗らない。stop が多くても・同じ offset が多くても、画素ごとの仕事は stop の数に比例しない（Kura の S2・S3） |
 | FR-PT-06 | M | `pattern`：`patternUnits`・`patternContentUnits`・`patternTransform`・`viewBox`・`preserveAspectRatio`・`x`・`y`・`width`・`height`・`href` の鎖での受け継ぎ・入れ子の pattern |
