@@ -190,7 +190,11 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
         let mut root_drawn = true;
         // 大きさが決まる文書だけが viewBox の変形を持つ（中身で決める文書の表示の領域は書いた幅・高さか 100 で、変形はない。
         // ADR-102 (2)）
-        let (root_ctm, root_vp) = match (known, view_box_of(doc, input, root, budget)?) {
+        // 根の viewBox は根が SVG の svg のときだけ読む（ほかの根は何も描かない。見積もりは SVG の svg の viewBox だけを数える：
+        // 根が SVG でない文書の長い viewBox でファズが見つけた）
+        let is_svg_root = root.ns == NS_SVG && root.local.of(input) == b"svg";
+        let root_vb = if is_svg_root { view_box_of(doc, input, root, budget)? } else { None };
+        let (root_ctm, root_vp) = match (known, root_vb) {
             (Some((w, h)), Some((vb, aspect))) => match view_box_transform(&vb, aspect, w, h) {
                 Some(t) => (t, Some((vb.w, vb.h))),
                 None => {
