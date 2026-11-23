@@ -3,6 +3,7 @@
 //! `cargo run -p sumie-tools --release -- <命令> …`
 
 mod bench;
+mod bench_sumie;
 mod compare;
 mod compare_sumie;
 mod corpus;
@@ -27,6 +28,7 @@ const USAGE: &str = "使い方：sumie-tools <命令> …
   oracle resvg <in.svg> <out.png> [--fonts system|none|<dir>] [--scale S]   resvg（Kura の設定）で描き、使った書体を出す
   oracle chrome <in.svg> <out.png>                                       Chrome のヘッドレスで描く（大きさは resvg と同じ）
   compare [--root corpus] [--filter …] [--limit N] [--jobs N] [--out …]   resvg と Chrome の差の一覧（HTML）と分布
+  bench-sumie <file>… [--repeat N] [--scale s] [--tile N]   sumie の段ごとの時間と見積もり（ns／単位）
   compare-sumie [--root corpus] [--cache <dir>,…] [--filter …] [--jobs N] [--out …]   sumie を resvg・Chrome と比べる（M2 の集まり）
   bench [--root corpus|local/heavy] [--repeat N] [--timeout 秒] [--out …]  resvg 単体の時間と確保の山
   corpus import-resvg|fetch-w3c|fetch-real|index …                       照合の集まり（ADR-21・ADR-59。取ったものは照らしてから写す）
@@ -55,6 +57,7 @@ fn main() {
         "compare-sumie" => compare_sumie::run(rest),
         "bench" => bench::run(rest),
         "bench-one" => bench::one(rest),
+        "bench-sumie" => bench_sumie::run(rest),
         "corpus" => corpus::run(rest),
         "gen-heavy" => gen_heavy::run(rest),
         "kura-compat" => kura_compat::run(rest),
