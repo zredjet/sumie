@@ -652,3 +652,37 @@ fn off_canvas_length_is_not_counted_for_raster() {
         render_full(&far_tree, 1.0).unwrap();
     }
 }
+
+/// 曲線のあとに接線の続く直線が来る線の端（照合の control-points-clamping-1）：端の区間が直線なら、端は直線の向きで作る
+/// （曲線の弦からの外挿は、端の 2 本の弦が同じ曲線のときだけ。つなぎ目の点を曲線の内側の点と分ける）。始めの側も同じ。
+#[test]
+fn line_after_curve_keeps_its_cap_direction() {
+    for reversed in [false, true] {
+        let mut b = Builder::new();
+        b.add(
+            |w| {
+                if reversed {
+                    // 直線で始まり、曲線へ接線が続く
+                    w.move_to(Point::new(15.0, 175.0)).unwrap();
+                    w.line_to(Point::new(175.0, 175.0)).unwrap();
+                    w.cubic_to(Point::new(175.1, 175.0), Point::new(175.0, 30.0), Point::new(175.0, 15.0)).unwrap();
+                } else {
+                    w.move_to(Point::new(175.0, 15.0)).unwrap();
+                    w.cubic_to(Point::new(175.0, 30.0), Point::new(175.1, 175.0), Point::new(175.0, 175.0)).unwrap();
+                    w.line_to(Point::new(15.0, 175.0)).unwrap();
+                }
+            },
+            |n| {
+                n.flags = HAS_STROKE;
+                n.stroke = GREEN;
+                n.stroke_width = 20.0;
+            },
+        );
+        let (w, _, px) = draw(&b.tree(200.0, 200.0), 1.0);
+        let alpha = |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+        // butt の端は x = 15 の縦の縁：線の太さの中のどの行も、x = 14 は透明、x = 15 は不透明
+        for y in 166..184 {
+            assert_eq!((alpha(14, y), alpha(15, y)), (0, 255), "逆向き {reversed}・y = {y}：端が斜め");
+        }
+    }
+}

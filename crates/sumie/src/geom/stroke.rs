@@ -20,7 +20,14 @@ use crate::error::Error;
 use crate::math;
 use crate::mem::MVec;
 
-/// 折れ線（点と、点が曲線の内側の点（平坦化で分けた点。滑らかな点）かの印）。印の並びが短ければ、足りない点は角。
+/// 点の印：角・曲線の内側の点（平坦化で分けた点。前後の弦が同じ曲線のもの）・接線が続くつなぎ目（区間の境で、曲線の前か
+/// 後ろ。ADR-99 (2)）。内側の点とつなぎ目はどちらも滑らかな点（継ぎ目を作らない）。端の向きを曲線の弦から外挿するのは
+/// 内側の点だけ（つなぎ目の向こうの弦は別の区間）。
+pub(crate) const CORNER: u8 = 0;
+pub(crate) const INTERIOR: u8 = 1;
+pub(crate) const JOINT: u8 = 2;
+
+/// 折れ線（点と、点の印（[`CORNER`]・[`INTERIOR`]・[`JOINT`]））。印の並びが短ければ、足りない点は角。
 /// 始めと終わりの向き（`start_dir`・`end_dir`）があれば、端はその向きで作る（曲線で始まる・終わる線の端は、平坦化した弦でなく
 /// 接線の向き。resvg・Chrome と同じ。ADR-101）。
 #[derive(Debug, Clone, Copy)]
@@ -38,7 +45,12 @@ impl<'a> Poly<'a> {
     }
 
     fn smooth_at(&self, i: usize) -> bool {
-        self.smooth.get(i).is_some_and(|&s| s != 0)
+        self.smooth.get(i).is_some_and(|&s| s != CORNER)
+    }
+
+    /// 点の印（足りなければ角）。
+    pub(crate) fn flag_at(&self, i: usize) -> u8 {
+        self.smooth.get(i).copied().unwrap_or(CORNER)
     }
 }
 
@@ -77,9 +89,15 @@ impl<'b> PolyBuf<'b> {
         self.smooth.pop();
     }
 
-    pub(crate) fn push(&mut self, p: Point, smooth: bool) -> Result<(), Error> {
+    /// 点を足す（`interior` なら曲線の内側の点、でなければ角）。
+    pub(crate) fn push(&mut self, p: Point, interior: bool) -> Result<(), Error> {
+        self.push_flag(p, if interior { INTERIOR } else { CORNER })
+    }
+
+    /// 点を印つきで足す（別の折れ線の印を写すとき）。
+    pub(crate) fn push_flag(&mut self, p: Point, flag: u8) -> Result<(), Error> {
         self.pts.push(p)?;
-        self.smooth.push(u8::from(smooth))
+        self.smooth.push(flag)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -95,17 +113,17 @@ impl<'b> PolyBuf<'b> {
         self.smooth.truncate(n);
     }
 
-    /// 最後の点の印を変える（曲線の終わりの点は角）。
-    pub(crate) fn set_last_smooth(&mut self, smooth: bool) {
+    /// 最後の点を接線が続くつなぎ目（`joint`）か角にする（曲線の終わりの点は角）。
+    pub(crate) fn set_last_smooth(&mut self, joint: bool) {
         if let Some(s) = self.smooth.last_mut() {
-            *s = u8::from(smooth);
+            *s = if joint { JOINT } else { CORNER };
         }
     }
 
-    /// 始めの点の印を変える（閉じた部分パスの始めのつなぎ目）。
-    pub(crate) fn set_first_smooth(&mut self, smooth: bool) {
+    /// 始めの点を接線が続くつなぎ目（`joint`）か角にする（閉じた部分パスの始めのつなぎ目）。
+    pub(crate) fn set_first_smooth(&mut self, joint: bool) {
         if let Some(s) = self.smooth.get_mut(0) {
-            *s = u8::from(smooth);
+            *s = if joint { JOINT } else { CORNER };
         }
     }
 
@@ -122,7 +140,7 @@ impl<'b> PolyBuf<'b> {
     fn append_from(&mut self, other: Poly<'_>, skip: usize, budget: &Budget<'_>) -> Result<(), Error> {
         for (i, &p) in other.pts.iter().enumerate().skip(skip) {
             budget.spend(cost::OP_STEP)?;
-            self.push(p, other.smooth_at(i))?;
+            self.push_flag(p, other.flag_at(i))?;
         }
         Ok(())
     }
@@ -205,7 +223,8 @@ fn seg_len(a: Point, b: Point) -> f64 {
 
 /// 曲線で始まる（終わる）折れ線の端の向き：始めの 2 本の弦の向きから外挿する（d0 を d1 との角の半分だけ戻す：1.5 d0 −
 /// 0.5 d1）。弧のように滑らかな曲線では接線とほぼ一致し、端の制御点が端点にごく近い曲線（線として書いた曲線）では曲線の
-/// おおよその向きになる（resvg・Chrome と同じ。本当の接線は使わない。ADR-101）。2 つ目の点が曲線の内側の点でなければ None。
+/// おおよその向きになる（resvg・Chrome と同じ。本当の接線は使わない。ADR-101）。2 つ目の点が曲線の内側の点（[`INTERIOR`]）
+/// でなければ None（接線が続くつなぎ目でも、端の区間が直線なら直線の向き）。
 fn curve_end_dir(line: Poly<'_>, at_start: bool) -> Option<Point> {
     let n = line.pts.len();
     if n < 3 {
@@ -217,7 +236,8 @@ fn curve_end_dir(line: Poly<'_>, at_start: bool) -> Option<Point> {
         let at = |k: usize| n.checked_sub(k);
         (line.pts.get(at(1)?)?, line.pts.get(at(2)?)?, line.pts.get(at(3)?)?, at(2)?)
     };
-    if !line.smooth_at(inner) {
+    // 2 本の弦が同じ曲線のものだけ（接線が続くつなぎ目の向こうは直線か別の曲線。端の区間が直線なら、その向きのまま）
+    if line.flag_at(inner) != INTERIOR {
         return None;
     }
     let (d0, d1) = (direction(*a, *b)?, direction(*b, *c)?);
@@ -283,18 +303,22 @@ impl Emit<'_, '_> {
     }
 }
 
-/// 続く同じ点をまとめた折れ線を `out` に入れ直す（`out` は呼び手の置き場。まとめた点は、どれかが角なら角）。
+/// 続く同じ点をまとめた折れ線を `out` に入れ直す（`out` は呼び手の置き場。まとめた点は、どれかが角なら角、内側の点と
+/// つなぎ目が混じればつなぎ目）。
 fn dedup(line: Poly<'_>, out: &mut PolyBuf<'_>, budget: &Budget<'_>) -> Result<(), Error> {
     out.clear();
     for (i, &p) in line.pts.iter().enumerate() {
         budget.spend(cost::OP_STEP)?;
-        let smooth = line.smooth_at(i);
+        let flag = line.flag_at(i);
         if out.pts.last() == Some(&p) {
-            if !smooth {
-                out.set_last_smooth(false);
+            // まとめた点は、どれかが角なら角、内側の点とつなぎ目が混じればつなぎ目
+            if let Some(s) = out.smooth.last_mut()
+                && *s != flag
+            {
+                *s = if *s == CORNER || flag == CORNER { CORNER } else { JOINT };
             }
         } else {
-            out.push(p, smooth)?;
+            out.push_flag(p, flag)?;
         }
     }
     Ok(())
@@ -645,7 +669,7 @@ pub(crate) fn dash_polyline(
         Ok(unit(Some(Point::new(ta.x * (1.0 - u) + tb.x * u, ta.y * (1.0 - u) + tb.y * u))).or(Some(dk)))
     };
     if on {
-        buf.push(first, line.smooth_at(0))?;
+        buf.push_flag(first, line.flag_at(0))?;
         buf.start_dir = if closed { tangent(0, 0.0)? } else { line.start_dir };
     }
     // 境の足し算が進まない（今の位置に比べて値が小さすぎる）ときは長さ 0 の部分と同じに切り替えて続け、並びを 1 周しても
@@ -753,7 +777,7 @@ pub(crate) fn dash_polyline(
         remain -= seg - t0;
         if on {
             budget.spend(cost::OUTLINE_POINT)?;
-            buf.push(b, line.smooth_at(ring_next(k, pts.len())))?;
+            buf.push_flag(b, line.flag_at(ring_next(k, pts.len())))?;
         }
     }
     if holding {

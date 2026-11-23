@@ -1631,7 +1631,7 @@ fn stroke_edges(
             // non-scaling と細い線は描く座標系の点にしてから線を作る（印はそのまま）
             devbuf.clear();
             for (i, &p) in line.pts.iter().enumerate() {
-                devbuf.push(t.apply(p), line.smooth.get(i).is_some_and(|&s| s != 0))?;
+                devbuf.push_flag(t.apply(p), line.flag_at(i))?;
             }
             stroke_one(
                 devbuf.view(),
