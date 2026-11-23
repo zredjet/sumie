@@ -359,7 +359,7 @@ pub(crate) fn used_paint(
     } else {
         scratch.append_slice(p.href.of(buf))?;
     }
-    let v = scratch.as_slice().trim_ascii();
+    let v = super::trim_ws(scratch.as_slice(), budget)?;
     let Some(id) = v.strip_prefix(b"#") else { return Ok(fallback(p)) };
     let Some(t) = d.ids.find(doc, d.input, id, budget)? else { return Ok(fallback(p)) };
     let server = doc.node(t).is_some_and(|x| {

@@ -246,6 +246,43 @@ fn root_font_size(
     Ok(c.font_size)
 }
 
+/// 前後の空白（XML と CSS の空白）を除く。読むバイトを塊ずつ払う（長い空白の値で中止を読む間が伸びない。文書の 1・5 回目の
+/// レビュー）。
+pub(crate) fn trim_ws<'a>(s: &'a [u8], budget: &Budget<'_>) -> Result<&'a [u8], Error> {
+    let ws = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0C);
+    let mut meter = crate::xml::lex::ScanMeter::new(0, s.len());
+    let mut a = s.len();
+    for (k, &c) in s.iter().enumerate() {
+        meter.pay(budget, k)?;
+        if !ws(c) {
+            a = k;
+            break;
+        }
+    }
+    let mut b = a;
+    let mut back = crate::xml::lex::ScanMeter::new(0, s.len().saturating_sub(a));
+    for (k, &c) in s.iter().enumerate().skip(a).rev() {
+        back.pay(budget, s.len().saturating_sub(k).saturating_sub(1))?;
+        if !ws(c) {
+            b = k.saturating_add(1);
+            break;
+        }
+    }
+    Ok(s.get(a..b).unwrap_or(&[]))
+}
+
+/// `s` の頭から、最初の `stop` の前まで（なければ全体）。読むバイトを塊ずつ払う。
+pub(crate) fn head_until<'a>(s: &'a [u8], stop: u8, budget: &Budget<'_>) -> Result<&'a [u8], Error> {
+    let mut meter = crate::xml::lex::ScanMeter::new(0, s.len());
+    for (k, &c) in s.iter().enumerate() {
+        meter.pay(budget, k)?;
+        if c == stop {
+            return Ok(s.get(..k).unwrap_or(&[]));
+        }
+    }
+    Ok(s)
+}
+
 fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {
     b
 }

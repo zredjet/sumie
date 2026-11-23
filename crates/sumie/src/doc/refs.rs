@@ -235,7 +235,7 @@ impl Cx<'_, '_> {
         } else {
             self.scratch.append_slice(raw.of(buf))?;
         }
-        let v = trim_ascii_ws(self.scratch.as_slice());
+        let v = super::trim_ws(self.scratch.as_slice(), self.budget)?;
         if let Some(id) = v.strip_prefix(b"#") {
             return self.ids.find(self.doc, self.input, id, self.budget);
         }
@@ -266,20 +266,6 @@ impl Cx<'_, '_> {
             }
         }
     }
-}
-
-fn trim_ascii_ws(mut s: &[u8]) -> &[u8] {
-    while let [first, rest @ ..] = s
-        && matches!(first, b' ' | b'\t' | b'\n' | b'\r' | 0x0C)
-    {
-        s = rest;
-    }
-    while let [rest @ .., last] = s
-        && matches!(last, b' ' | b'\t' | b'\n' | b'\r' | 0x0C)
-    {
-        s = rest;
-    }
-    s
 }
 
 /// 受け継がない参照の置き場（0 clip-path・1 mask・2 filter）の inherit の印。
@@ -468,7 +454,7 @@ pub(crate) fn build(
                     _ => {
                         let want: &[&[u8]] = if k < 2 { PAINT_SERVERS } else { &[b"marker"] };
                         let slot = if s.src == SRC_SHEET {
-                            Some(crate::mem::lower_bound(inh_keys.as_slice(), |&x| x < s.value.start))
+                            Some(crate::mem::lower_bound_try(budget, inh_keys.as_slice(), |&x| Ok(x < s.value.start))?)
                         } else {
                             None
                         };
@@ -527,7 +513,7 @@ pub(crate) fn build(
                 WIDE_NONE => {
                     // 規則の値は当たる要素で共有する。属性と style 属性の値は要素ごと
                     let id = if s.src == SRC_SHEET {
-                        crate::mem::lower_bound(sheet_keys.as_slice(), |&k| k < s.value.start)
+                        crate::mem::lower_bound_try(budget, sheet_keys.as_slice(), |&k| Ok(k < s.value.start))?
                     } else {
                         let id = lists.len();
                         lists.push(ListRec { start: 0, len: 0, pos: 0, resolved: 0, pad: [0; 3] })?;
@@ -596,9 +582,26 @@ pub(crate) fn build(
         }
     }
     start.push(edges.len() as u32)?;
+    let parts = Parts { start, edges, ledges, notes, hidden, inherit_bits };
+    finish(doc, input, parts, lists.as_slice(), budget)
+}
+
+/// 要素の辺まで作った表（`finish` に渡す）。
+struct Parts<'b> {
+    start: MVec<'b, u32>,
+    edges: MVec<'b, Edge>,
+    ledges: MVec<'b, Edge>,
+    notes: MVec<'b, RefNote>,
+    hidden: MVec<'b, u8>,
+    inherit_bits: MVec<'b, u8>,
+}
+
+/// 並びの節の辺を足し、輪を取り除き、展開の数を求めて表を閉じる（`build` の残り。`build` のスタックの枠を小さく保つ）。
+fn finish(doc: &XmlDoc, input: &[u8], parts: Parts<'_>, lists: &[ListRec], budget: &Budget<'_>) -> Result<Refs, Error> {
+    let Parts { mut start, mut edges, ledges, mut notes, hidden, inherit_bits } = parts;
     // 並びの節の辺（並びの番号の順）
     let mut list_pos: MVec<'_, u32> = MVec::with_capacity(budget, lists.len())?;
-    for l in lists.as_slice() {
+    for l in lists {
         budget.spend(cost::OP_STEP)?;
         let a = l.start as usize;
         let b = a.saturating_add(l.len as usize);
@@ -608,7 +611,6 @@ pub(crate) fn build(
     }
     // 輪を取り除き、展開の数を求める
     let start = start.freeze();
-    let mut edges = edges;
     remove_cycles(doc, start.as_slice(), &mut edges, &mut notes, list_pos.as_slice(), budget)?;
     let instances = count_instances(doc, input, start.as_slice(), edges.as_slice(), inherit_bits.as_slice(), budget)?;
     // 覚えは位置の順（足した順は節の順なので、位置の順になっている）
@@ -679,15 +681,15 @@ fn conditions_pass(
         if v.get(i).is_some_and(|&c| c != b',') {
             continue;
         }
-        let tag = trim_ascii_ws(v.get(a..i).unwrap_or(&[]));
+        let tag = super::trim_ws(v.get(a..i).unwrap_or(&[]), budget)?;
         a = i.saturating_add(1);
-        let head = tag.split(|&c| c == b'-').next().unwrap_or(&[]);
+        let head = super::head_until(tag, b'-', budget)?;
         if head.is_empty() {
             continue;
         }
         for l in languages {
             budget.spend(cost::OP_STEP)?;
-            let lh = l.as_bytes().split(|&c| c == b'-').next().unwrap_or(&[]);
+            let lh = super::head_until(l.as_bytes(), b'-', budget)?;
             if crate::mem::bytes_eq_ignore_case(budget, head, lh)? {
                 return Ok(true);
             }
@@ -903,15 +905,23 @@ fn remove_cycles(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Tally {
     count: u64,
+    /// 部分木の中の塗る要素の数（use の中身なら use の塗りを受け継ぎうる要素。marker の中の塗る要素も倍で入る）
     paints: u64,
     marks: u64,
+    /// この節の塗り・線を使う要素の数（自分・use の中身の塗る要素・marker の中の塗る要素。子は自分の辺で数えるので入れない。
+    /// 塗りの辺の倍率。文書の 5 回目のレビュー）
+    users: u64,
+    /// 部分木の marker を付ける要素の、自分の文書の文脈の塗り・線の参照先の数の和（use から受け継いだ marker の中の
+    /// `context-fill`・`context-stroke` はその要素の塗りを使うので、use の marker の辺はこの数の倍で数える。文書の 5 回目の
+    /// レビュー）
+    mpaint: u64,
     /// 受け継がない参照（clip-path・mask・filter の順）を `inherit` の鎖で節の親から受け取る、部分木の要素の数（use の中身
     /// では use の値を受け取る。文書の 4 回目のレビュー）
     inh: [u64; 3],
 }
 
 impl Tally {
-    const ZERO: Tally = Tally { count: 0, paints: 0, marks: 0, inh: [0; 3] };
+    const ZERO: Tally = Tally { count: 0, paints: 0, marks: 0, users: 0, mpaint: 0, inh: [0; 3] };
 }
 
 impl Plain for Tally {}
@@ -937,10 +947,13 @@ struct CountFrame {
     edge: u32,
     /// use・feImage の中身（中身を作る href の行き先。なければ NONE）
     content: u32,
-    /// 親へ足すときの倍率と、つなぎ（0 子、1 use の中身、2 そのほかの中身を作る参照）
+    /// 親へ足すときの倍率と、つなぎ（`add` の注）。`mult2` は塗りの辺の `mpaint` の倍率と、marker の辺の `mpaint` の数
     mult: u64,
+    mult2: u64,
     link: u8,
-    pad: [u8; 7],
+    /// `content` を 1 度目の数から読む（use の中身の辺が輪として取り除いた辺）
+    content_prev: u8,
+    pad: [u8; 6],
 }
 
 impl Plain for CountFrame {}
@@ -950,6 +963,9 @@ impl Plain for CountFrame {}
 /// use・feImage の中身は use から塗りと marker を受け継ぐので、use の受け継いだ塗りの参照先は「中身の塗る要素の数」、
 /// marker は「中身の marker を付ける要素の数」の倍で数える（中身の要素ごとに参照先の中身を作る。文書の 2 回目の
 /// レビュー）。数は `CAP` で止める。並びの節（XML の節の数から後ろ）は自分を数えず、参照先の和。
+///
+/// 輪として取り除いた辺の先は、M2 が 1 段だけ描き直す（その中で取り除いた辺にまた当たったら描かない）ので、2 度数える：
+/// 1 度目は取り除いた辺を飛ばし、2 度目は取り除いた辺の先を 1 度目の数で足す（ADR-86 (1)）。
 fn count_instances(
     doc: &XmlDoc,
     input: &[u8],
@@ -959,11 +975,26 @@ fn count_instances(
     budget: &Budget<'_>,
 ) -> Result<u64, Error> {
     let budget = budget_ref(budget);
+    let first = count_pass(doc, input, start, edges, inherit_bits, None, budget)?;
+    let second = count_pass(doc, input, start, edges, inherit_bits, Some(first.as_slice()), budget)?;
+    Ok(second.as_slice().first().map_or(0, |t| t.count))
+}
+
+/// 展開の数を 1 度数え、節ごとの数を返す（`prev` は 1 度目の数。あれば取り除いた辺の先をそれで足す）。
+fn count_pass<'b>(
+    doc: &XmlDoc,
+    input: &[u8],
+    start: &[u32],
+    edges: &[Edge],
+    inherit_bits: &[u8],
+    prev: Option<&[Tally]>,
+    budget: &'b Budget<'b>,
+) -> Result<MVec<'b, Tally>, Error> {
     let nodes = doc.nodes.as_slice();
     let n = nodes.len();
     let total = start.len().saturating_sub(1);
     if n == 0 {
-        return Ok(0);
+        return Ok(MVec::new(budget));
     }
     let mut done: MVec<'_, Tally> = MVec::with_capacity(budget, total)?;
     done.resize_to(total, Tally { count: NOT_YET, ..Tally::ZERO })?;
@@ -989,20 +1020,30 @@ fn count_instances(
                     count: 1,
                     paints: u64::from(shape),
                     marks: u64::from(mark),
+                    users: u64::from(shape),
+                    mpaint: 0,
                     inh: [u64::from(b & 1 != 0), u64::from(b & 2 != 0), u64::from(b & 4 != 0)],
                 }
             }
         }
     };
-    // 子の分（中身の塗る要素と marker を付ける要素も足す）・use の中身の分（同じ）・ほかの参照の分（数だけを倍で）
-    // つなぎ：0 子・1 use の中身（数と、塗りを使う要素・marker を付ける要素の数を足す）、2 ほかの中身を作る参照（数だけを倍で）、
-    // 3 marker（数を倍で足し、marker の中の塗る要素を「この要素の塗りを使う要素」に倍で足す：context-fill・context-stroke）
-    // 子と use の中身の `inherit` の数は、親（`pb` は親の inherit の印）が inherit のときだけ上へ伝わる
-    let add = |a: &mut Tally, t: Tally, link: u8, mult: u64, pb: u8| match link {
+    // つなぎ：
+    // - 0 子・1 use の中身：数・塗る要素・marker を付ける要素・`mpaint` を足す。use の中身の塗る要素は use の塗りを使う
+    //   （`users`）。`inherit` の数は、親（`pb` は親の inherit の印）が inherit のときだけ上へ伝わる
+    // - 2 ほかの中身を作る参照：数だけを倍で
+    // - 3 marker：数を倍で足し、marker の中の塗る要素の 2 倍（fill と stroke の両方）を「この要素の塗りを使う要素」に倍で
+    //   足す（context-fill・context-stroke）。use から付く marker の中の塗る要素は、中身の marker を付ける要素の自分の塗りも
+    //   使う（`mult2` は中身の `mpaint`）
+    // - 4 塗り・線：数を `users` の倍で足し、`mpaint` に参照先の数を `mult2` の倍で足す
+    let add = |a: &mut Tally, t: Tally, link: u8, mult: u64, mult2: u64, pb: u8| match link {
         0 | 1 => {
             a.count = cap_add(a.count, t.count);
             a.paints = cap_add(a.paints, t.paints);
             a.marks = cap_add(a.marks, t.marks);
+            a.mpaint = cap_add(a.mpaint, t.mpaint);
+            if link == 1 {
+                a.users = cap_add(a.users, t.paints);
+            }
             for (k, x) in a.inh.iter_mut().enumerate() {
                 if pb & slot_bit(k) != 0 {
                     *x = cap_add(*x, t.inh.get(k).copied().unwrap_or(0));
@@ -1010,131 +1051,193 @@ fn count_instances(
             }
         }
         3 => {
+            // marker の中の塗る要素は fill と stroke の両方で文脈の塗りを使える（`fill: context-fill;
+            // stroke: context-fill`）ので 2 倍
+            let ctx = cap_mul(t.paints, 2);
             a.count = cap_add(a.count, cap_mul(t.count, mult));
-            a.paints = cap_add(a.paints, cap_mul(t.paints, mult));
+            a.count = cap_add(a.count, cap_mul(ctx, mult2));
+            a.paints = cap_add(a.paints, cap_mul(ctx, mult));
+            a.users = cap_add(a.users, cap_mul(ctx, mult));
+        }
+        4 => {
+            a.count = cap_add(a.count, cap_mul(t.count, mult));
+            a.mpaint = cap_add(a.mpaint, cap_mul(t.count, mult2));
         }
         _ => a.count = cap_add(a.count, cap_mul(t.count, mult)),
     };
-    stack.push(CountFrame {
-        node: 0,
-        child: first_child(0),
-        edge: edge_start(0),
-        content: NONE,
-        mult: 1,
-        link: 0,
-        pad: [0; 7],
-    })?;
-    acc.push(own(0))?;
-    if let Some(x) = on_stack.get_mut(0) {
-        *x = 1;
-    }
-    while let Some(top) = stack.last().copied() {
-        budget.spend(cost::OP_STEP)?;
-        // 次の行き先：（節, つなぎ, 倍率）
-        let mut next: Option<(u32, u8, u64)> = None;
-        let mut frame = top;
-        while frame.child != NONE {
-            budget.spend(cost::OP_STEP)?;
-            let c = frame.child;
-            let Some(x) = nodes.get(c as usize) else { break };
-            frame.child = x.next_sibling;
-            if x.kind != KIND_ELEMENT {
-                continue;
+    // 数え始める節：根と、1 度目は輪として取り除いた辺の行き先（2 度目に足す 1 度目の数が要る。行き先は根から取り除いて
+    // いない辺で届かないことがある）
+    let mut s0: u32 = 0;
+    let mut scan = 0usize;
+    loop {
+        if done.get(s0 as usize).is_some_and(|t| t.count == NOT_YET) {
+            stack.push(CountFrame {
+                node: s0,
+                child: first_child(s0),
+                edge: edge_start(s0),
+                content: NONE,
+                mult: 1,
+                mult2: 0,
+                link: 0,
+                content_prev: 0,
+                pad: [0; 6],
+            })?;
+            acc.push(own(s0))?;
+            if let Some(x) = on_stack.get_mut(s0 as usize) {
+                *x = 1;
             }
-            // 子を描かない入れ物（defs・symbol・pattern など）は、子の辺では自分の 1 つだけを数え、中身は参照の辺で
-            // 入ったときに数える（木を作る段も参照されたものだけを展開する）
-            if x.ns == NS_SVG && not_rendered(x.local.of(input)) {
-                if let Some(a) = acc.last_mut() {
-                    a.count = cap_add(a.count, 1);
-                }
-                continue;
-            }
-            next = Some((c, 0, 1));
-            break;
-        }
-        if next.is_none() {
-            let end = edge_start(top.node.saturating_add(1));
-            while frame.edge < end {
+            while let Some(top) = stack.last().copied() {
                 budget.spend(cost::OP_STEP)?;
-                let k = frame.edge;
-                frame.edge = frame.edge.saturating_add(1);
-                let Some(e) = edges.get(k as usize) else { continue };
-                if e.removed != 0 || !instancing(e, nodes, input) {
-                    continue;
-                }
-                let from_use = is_use(top.node);
-                if e.kind == EDGE_USE && from_use {
-                    frame.content = e.target;
-                    next = Some((e.target, 1, 1));
+                // 次の行き先：（節, つなぎ, 倍率, 2 つめの倍率）
+                let mut next: Option<(u32, u8, u64, u64)> = None;
+                let mut frame = top;
+                while frame.child != NONE {
+                    budget.spend(cost::OP_STEP)?;
+                    let c = frame.child;
+                    let Some(x) = nodes.get(c as usize) else { break };
+                    frame.child = x.next_sibling;
+                    if x.kind != KIND_ELEMENT {
+                        continue;
+                    }
+                    // 子を描かない入れ物（defs・symbol・pattern など）は、子の辺では自分の 1 つだけを数え、中身は参照の辺で
+                    // 入ったときに数える（木を作る段も参照されたものだけを展開する）
+                    if x.ns == NS_SVG && not_rendered(x.local.of(input)) {
+                        if let Some(a) = acc.last_mut() {
+                            a.count = cap_add(a.count, 1);
+                        }
+                        continue;
+                    }
+                    next = Some((c, 0, 1, 0));
                     break;
                 }
-                // 塗りの参照先は「この要素の塗りを使う要素」の数の倍（自分・use の中身の塗る要素・marker の中の塗る要素。
-                // 辺は use の中身、marker、塗りの順に張るので、ここまでに数え終えている）。use の marker は中身の marker を
-                // 付ける要素の数の倍
-                let content = done.get(frame.content as usize).copied().filter(|t| t.count != NOT_YET);
-                let users = acc.last().map_or(1, |a| a.paints);
-                let (link, mult) = match e.kind {
-                    EDGE_FILL | EDGE_STROKE => (2, users),
-                    EDGE_MARKER_START | EDGE_MARKER_MID | EDGE_MARKER_END => {
-                        (3, if from_use { content.map_or(0, |t| t.marks) } else { 1 })
-                    }
-                    // use の受け継がない参照は、中身の中で inherit の鎖で use の値を受け取る要素の分も実体になる
-                    EDGE_CLIP | EDGE_MASK | EDGE_FILTER if from_use => {
-                        let k = match e.kind {
-                            EDGE_CLIP => 0usize,
-                            EDGE_MASK => 1,
-                            _ => 2,
+                if next.is_none() {
+                    let end = edge_start(top.node.saturating_add(1));
+                    while frame.edge < end {
+                        budget.spend(cost::OP_STEP)?;
+                        let k = frame.edge;
+                        frame.edge = frame.edge.saturating_add(1);
+                        let Some(e) = edges.get(k as usize) else { continue };
+                        // 輪として取り除いた辺：1 度目は飛ばし、2 度目は先の 1 度目の数を足す（行き先へは入らない）
+                        let removed = e.removed != 0;
+                        if (removed && prev.is_none()) || !instancing(e, nodes, input) {
+                            continue;
+                        }
+                        let prev_of = |t: u32| prev.and_then(|p| p.get(t as usize)).copied().unwrap_or(Tally::ZERO);
+                        let from_use = is_use(top.node);
+                        if e.kind == EDGE_USE && from_use {
+                            frame.content = e.target;
+                            frame.content_prev = u8::from(removed);
+                            if removed {
+                                if let Some(a) = acc.last_mut() {
+                                    add(a, prev_of(e.target), 1, 1, 0, bits(top.node));
+                                }
+                                continue;
+                            }
+                            next = Some((e.target, 1, 1, 0));
+                            break;
+                        }
+                        // 塗りの参照先は「この要素の塗りを使う要素」の数の倍（自分・use の中身の塗る要素・marker の中の塗る要素。
+                        // 辺は use の中身、marker、塗りの順に張るので、ここまでに数え終えている）。use の marker は中身の marker を
+                        // 付ける要素の数の倍
+                        let content = if frame.content_prev != 0 {
+                            Some(prev_of(frame.content))
+                        } else {
+                            done.get(frame.content as usize).copied().filter(|t| t.count != NOT_YET)
                         };
-                        (2, cap_add(1, content.map_or(0, |t| t.inh.get(k).copied().unwrap_or(0))))
+                        let users = acc.last().map_or(1, |a| a.users);
+                        let marks_here = if from_use {
+                            content.map_or(0, |t| t.marks)
+                        } else {
+                            u64::from(local_of(top.node).is_some_and(markable))
+                        };
+                        let (link, mult, mult2) = match e.kind {
+                            EDGE_FILL | EDGE_STROKE => (4, users, marks_here),
+                            EDGE_MARKER_START | EDGE_MARKER_MID | EDGE_MARKER_END => {
+                                (3, marks_here, if from_use { content.map_or(0, |t| t.mpaint) } else { 0 })
+                            }
+                            // use の受け継がない参照は、中身の中で inherit の鎖で use の値を受け取る要素の分も実体になる
+                            EDGE_CLIP | EDGE_MASK | EDGE_FILTER if from_use => {
+                                let k = match e.kind {
+                                    EDGE_CLIP => 0usize,
+                                    EDGE_MASK => 1,
+                                    _ => 2,
+                                };
+                                (2, cap_add(1, content.map_or(0, |t| t.inh.get(k).copied().unwrap_or(0))), 0)
+                            }
+                            _ => (2, 1, 0),
+                        };
+                        if removed {
+                            if let Some(a) = acc.last_mut() {
+                                add(a, prev_of(e.target), link, mult, mult2, bits(top.node));
+                            }
+                            continue;
+                        }
+                        next = Some((e.target, link, mult, mult2));
+                        break;
                     }
-                    _ => (2, 1),
-                };
-                next = Some((e.target, link, mult));
+                }
+                if let Some(x) = stack.last_mut() {
+                    *x = frame;
+                }
+                match next {
+                    Some((t, link, mult, mult2)) => {
+                        let d = done.get(t as usize).copied().unwrap_or(Tally::ZERO);
+                        if d.count != NOT_YET {
+                            if let Some(a) = acc.last_mut() {
+                                add(a, d, link, mult, mult2, bits(top.node));
+                            }
+                        } else if on_stack.get(t as usize).copied() == Some(0) {
+                            if let Some(x) = on_stack.get_mut(t as usize) {
+                                *x = 1;
+                            }
+                            stack.push(CountFrame {
+                                node: t,
+                                child: first_child(t),
+                                edge: edge_start(t),
+                                content: NONE,
+                                mult,
+                                mult2,
+                                link,
+                                content_prev: 0,
+                                pad: [0; 6],
+                            })?;
+                            acc.push(own(t))?;
+                        }
+                    }
+                    None => {
+                        stack.pop();
+                        let mine = acc.pop().unwrap_or(Tally::ZERO);
+                        if let Some(c) = done.get_mut(top.node as usize) {
+                            *c = mine;
+                        }
+                        if let Some(x) = on_stack.get_mut(top.node as usize) {
+                            *x = 0;
+                        }
+                        if let Some(a) = acc.last_mut() {
+                            add(a, mine, top.link, top.mult, top.mult2, stack.last().map_or(0, |f| bits(f.node)));
+                        }
+                    }
+                }
+            }
+        }
+        if prev.is_some() {
+            break;
+        }
+        let mut found = None;
+        while let Some(e) = edges.get(scan) {
+            budget.spend(cost::OP_STEP)?;
+            scan = scan.saturating_add(1);
+            if e.removed != 0 {
+                found = Some(e.target);
                 break;
             }
         }
-        if let Some(x) = stack.last_mut() {
-            *x = frame;
-        }
-        match next {
-            Some((t, link, mult)) => {
-                let d = done.get(t as usize).copied().unwrap_or(Tally::ZERO);
-                if d.count != NOT_YET {
-                    if let Some(a) = acc.last_mut() {
-                        add(a, d, link, mult, bits(top.node));
-                    }
-                } else if on_stack.get(t as usize).copied() == Some(0) {
-                    if let Some(x) = on_stack.get_mut(t as usize) {
-                        *x = 1;
-                    }
-                    stack.push(CountFrame {
-                        node: t,
-                        child: first_child(t),
-                        edge: edge_start(t),
-                        content: NONE,
-                        mult,
-                        link,
-                        pad: [0; 7],
-                    })?;
-                    acc.push(own(t))?;
-                }
-            }
-            None => {
-                stack.pop();
-                let mine = acc.pop().unwrap_or(Tally::ZERO);
-                if let Some(c) = done.get_mut(top.node as usize) {
-                    *c = mine;
-                }
-                if let Some(x) = on_stack.get_mut(top.node as usize) {
-                    *x = 0;
-                }
-                if let Some(a) = acc.last_mut() {
-                    add(a, mine, top.link, top.mult, stack.last().map_or(0, |f| bits(f.node)));
-                }
-            }
+        match found {
+            Some(t) => s0 = t,
+            None => break,
         }
     }
-    Ok(done.get(0).map_or(0, |t| t.count))
+    Ok(done)
 }
 
 /// 値の前の空白を除いた頭が `#` か（読むバイトを塊ずつ払う）。

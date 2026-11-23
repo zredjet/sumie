@@ -150,7 +150,10 @@ pub(crate) struct Computed {
     pub(crate) sw_is_pct: u8,
     /// `transform-box` が view-box（初期の値。ほかは外接矩形が要る）
     pub(crate) box_vb: u8,
-    pub(crate) pad: [u8; 2],
+    /// `transform-origin` の点が解けた（0 なら % を解く表示の領域がない。`transform-origin: inherit` が受け継ぐ。文書の 5 回目の
+    /// レビュー）
+    pub(crate) origin_known: u8,
+    pub(crate) pad: [u8; 1],
 }
 
 impl Plain for Computed {}
@@ -184,7 +187,8 @@ impl Computed {
             lh_number: 1,
             sw_is_pct: 0,
             box_vb: 1,
-            pad: [0; 2],
+            origin_known: 1,
+            pad: [0; 1],
         }
     }
 }
@@ -391,6 +395,7 @@ pub(crate) fn compute(
         transform_raw: initial.transform_raw,
         origin_x: 0.0,
         origin_y: 0.0,
+        origin_known: 1,
         transform_known: initial.transform_known,
         box_vb: initial.box_vb,
         ..*parent
@@ -710,7 +715,10 @@ fn transform(
     if let Some(o) = p.transform_origin.as_ref() {
         budget.spend(cost::OP_STEP)?;
         let (x, y) = match o.wide {
-            WIDE_INHERIT => (parent.origin_x, parent.origin_y),
+            WIDE_INHERIT => {
+                origin_known = parent.origin_known != 0;
+                (parent.origin_x, parent.origin_y)
+            }
             WIDE_NONE => match origin(o, bufs, font, line, base, budget)? {
                 Some(pt) => pt,
                 None => {
@@ -725,6 +733,7 @@ fn transform(
         c.origin_x = x;
         c.origin_y = y;
     }
+    c.origin_known = u8::from(origin_known);
     let Some(s) = p.transform.as_ref() else { return Ok(()) };
     budget.spend(cost::OP_STEP)?;
     let (m, mut known) = match s.wide {

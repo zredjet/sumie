@@ -843,6 +843,21 @@ pub fn document_parse_cancel(data: &[u8], cancel: &dyn Cancel) -> DocOutcome {
                 return out;
             }
             out.peak = out.peak.max(d.held_bytes().saturating_add(wb.peak()));
+            // 木の見積もり（展開の数・要るもの）は、同じ文書なら同じで、断るなら上限か未対応（文書の 5 回目のレビュー）
+            let b1 = d.estimate_build(cancel);
+            let needs = d.needs();
+            match &b1 {
+                Ok(_) | Err(Error::Cancelled | Error::Unsupported(_)) => {}
+                Err(Error::Limit(l)) if l.resource == Resource::Instances => {}
+                Err(_) => {
+                    out.check = Check::Violation("木の見積もりが思わぬ誤りを返した");
+                    return out;
+                }
+            }
+            if !matches!(b1, Err(Error::Cancelled)) && (d.estimate_build(&Never) != b1 || d.needs() != needs) {
+                out.check = Check::Violation("木の見積もりか要るものが呼ぶたびに違う");
+                return out;
+            }
             e
         }
         (_, Err(Error::Cancelled)) | (Err(Error::Cancelled), _) => return out,

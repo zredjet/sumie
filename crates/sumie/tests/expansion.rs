@@ -2,9 +2,10 @@
 //! （文書の段の 4 回目のレビュー：use の文脈の受け継ぎ・marker の context-fill・受け継がない参照の inherit の数え漏らしが
 //! 回ごとに見つかったので、数え方の全体を素朴な展開と照らす）。
 //!
-//! 文書は、参照が前の定義だけを指す（輪のない）乱数の文書。素朴な展開は、要素を文脈（受け継いだ塗り・親の mask・marker の
-//! context-fill）つきで、use の中身・塗りの pattern・mask・marker を参照ごとに展開して数える（SVG 2 の use の影の木と、
-//! pattern・mask・marker の中身は参照ごとに作り、中身は自分の文書の祖先から受け継ぐ規則）。
+//! 文書は、参照が前の定義だけを指す（輪のない）乱数の文書。素朴な展開は、要素を文脈（受け継いだ塗り・線・marker・親の
+//! mask・marker の context-fill・context-stroke）つきで、use の中身・塗りと線の pattern・mask・marker を参照ごとに展開して
+//! 数える（SVG 2 の use の影の木と、pattern・mask・marker の中身は参照ごとに作り、中身は自分の文書の祖先から受け継ぐ規則）。
+//! 文書の 5 回目のレビューで、use・g から受け継ぐ marker・線・context-stroke を足した。
 
 #![allow(
     clippy::unwrap_used,
@@ -44,11 +45,12 @@ enum DefKind {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Fill {
+enum Paint {
     Unset,
     None,
     Url(usize),
-    Context,
+    ContextFill,
+    ContextStroke,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -58,19 +60,29 @@ enum MaskV {
     Inherit,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum MarkerV {
+    Unset,
+    None,
+    Url(usize),
+}
+
 #[derive(Clone)]
 enum Kind {
     G(Vec<Elem>),
     Rect,
-    Path(Option<usize>),
+    Path,
     Use(usize),
 }
 
 #[derive(Clone)]
 struct Elem {
     kind: Kind,
-    fill: Fill,
+    fill: Paint,
+    stroke: Paint,
     mask: MaskV,
+    /// 受け継ぐ marker（marker-end。use・g にも付けられ、path が受け取る）
+    marker: MarkerV,
 }
 
 struct Def {
@@ -79,33 +91,56 @@ struct Def {
     elem: Elem,
 }
 
+/// 種類 `k` の定義を 1 つ選ぶ（`defs` は前の定義だけ）。
+fn pick(r: &mut Rng, defs: &[Def], k: DefKind) -> Option<usize> {
+    let cands: Vec<usize> = defs.iter().enumerate().filter(|(_, d)| d.kind == k).map(|(i, _)| i).collect();
+    if cands.is_empty() { None } else { Some(cands[r.below(cands.len() as u64) as usize]) }
+}
+
+fn gen_paint(r: &mut Rng, defs: &[Def], in_marker: bool) -> Paint {
+    match r.below(6) {
+        0 => pick(r, defs, DefKind::Pattern).map_or(Paint::Unset, Paint::Url),
+        1 => Paint::None,
+        2 if in_marker => Paint::ContextFill,
+        3 if in_marker => Paint::ContextStroke,
+        _ => Paint::Unset,
+    }
+}
+
 /// 定義 `below` より前のものだけを指す要素を作る。
 fn gen_elem(r: &mut Rng, defs: &[Def], depth: u32, in_marker: bool) -> Elem {
-    let pick = |r: &mut Rng, k: DefKind| -> Option<usize> {
-        let cands: Vec<usize> = defs.iter().enumerate().filter(|(_, d)| d.kind == k).map(|(i, _)| i).collect();
-        if cands.is_empty() { None } else { Some(cands[r.below(cands.len() as u64) as usize]) }
-    };
-    let fill = match r.below(5) {
-        0 => pick(r, DefKind::Pattern).map_or(Fill::Unset, Fill::Url),
-        1 => Fill::None,
-        2 if in_marker => Fill::Context,
-        _ => Fill::Unset,
-    };
+    let fill = gen_paint(r, defs, in_marker);
+    let stroke = if r.below(3) == 0 { gen_paint(r, defs, in_marker) } else { Paint::Unset };
     let mask = match r.below(5) {
-        0 => pick(r, DefKind::Mask).map_or(MaskV::Unset, MaskV::Url),
+        0 => pick(r, defs, DefKind::Mask).map_or(MaskV::Unset, MaskV::Url),
         1 => MaskV::Inherit,
         _ => MaskV::Unset,
+    };
+    let marker = match r.below(6) {
+        0 => pick(r, defs, DefKind::Marker).map_or(MarkerV::Unset, MarkerV::Url),
+        1 => MarkerV::None,
+        _ => MarkerV::Unset,
     };
     let kind = match r.below(5) {
         0 | 1 if depth < 3 => {
             let n = 1 + r.below(3) as usize;
             Kind::G((0..n).map(|_| gen_elem(r, defs, depth + 1, in_marker)).collect())
         }
-        2 => Kind::Path(pick(r, DefKind::Marker)),
-        3 => pick(r, DefKind::Group).map_or(Kind::Rect, Kind::Use),
+        2 => Kind::Path,
+        3 => pick(r, defs, DefKind::Group).map_or(Kind::Rect, Kind::Use),
         _ => Kind::Rect,
     };
-    Elem { kind, fill, mask }
+    Elem { kind, fill, stroke, mask, marker }
+}
+
+fn paint_attr(name: &str, p: Paint) -> String {
+    match p {
+        Paint::Unset => String::new(),
+        Paint::None => format!(" {name}=\"none\""),
+        Paint::Url(i) => format!(" {name}=\"url(#d{i})\""),
+        Paint::ContextFill => format!(" {name}=\"context-fill\""),
+        Paint::ContextStroke => format!(" {name}=\"context-stroke\""),
+    }
 }
 
 fn write_elem(e: &Elem, out: &mut String, id: Option<usize>) {
@@ -113,16 +148,17 @@ fn write_elem(e: &Elem, out: &mut String, id: Option<usize>) {
     if let Some(i) = id {
         attrs.push_str(&format!(" id=\"d{i}\""));
     }
-    match e.fill {
-        Fill::Unset => {}
-        Fill::None => attrs.push_str(" fill=\"none\""),
-        Fill::Url(p) => attrs.push_str(&format!(" fill=\"url(#d{p})\"")),
-        Fill::Context => attrs.push_str(" fill=\"context-fill\""),
-    }
+    attrs.push_str(&paint_attr("fill", e.fill));
+    attrs.push_str(&paint_attr("stroke", e.stroke));
     match e.mask {
         MaskV::Unset => {}
         MaskV::Url(m) => attrs.push_str(&format!(" mask=\"url(#d{m})\"")),
         MaskV::Inherit => attrs.push_str(" style=\"mask: inherit\""),
+    }
+    match e.marker {
+        MarkerV::Unset => {}
+        MarkerV::None => attrs.push_str(" marker-end=\"none\""),
+        MarkerV::Url(k) => attrs.push_str(&format!(" marker-end=\"url(#d{k})\"")),
     }
     match &e.kind {
         Kind::G(ch) => {
@@ -133,31 +169,33 @@ fn write_elem(e: &Elem, out: &mut String, id: Option<usize>) {
             out.push_str("</g>");
         }
         Kind::Rect => out.push_str(&format!("<rect width=\"1\" height=\"1\"{attrs}/>")),
-        Kind::Path(m) => {
-            let mk = m.map_or(String::new(), |k| format!(" marker-end=\"url(#d{k})\""));
-            out.push_str(&format!("<path d=\"M0 0L1 1\"{attrs}{mk}/>"));
-        }
+        Kind::Path => out.push_str(&format!("<path d=\"M0 0L1 1\"{attrs}/>")),
         Kind::Use(t) => out.push_str(&format!("<use href=\"#d{t}\"{attrs}/>")),
     }
 }
 
-/// 文脈：受け継いだ塗り（pattern の定義の番号）・親の計算した mask・marker の context-fill。
+/// 文脈：受け継いだ塗り・線（pattern の定義の番号）・親の計算した mask・受け継いだ marker・marker の context-fill・
+/// context-stroke。
 #[derive(Clone, Copy)]
 struct Ctx {
     fill: Option<usize>,
+    stroke: Option<usize>,
     mask: Option<usize>,
-    context: Option<usize>,
+    marker: Option<usize>,
+    context_fill: Option<usize>,
+    context_stroke: Option<usize>,
 }
 
-const NONE_CTX: Ctx = Ctx { fill: None, mask: None, context: None };
+const NONE_CTX: Ctx =
+    Ctx { fill: None, stroke: None, mask: None, marker: None, context_fill: None, context_stroke: None };
 
 fn sat(a: u64, b: u64) -> u64 {
     a.saturating_add(b)
 }
 
 /// 定義の中身を 1 度作る数（定義の要素 1 つ ＋ 中身。中身は自分の文書の祖先から受け継ぐ：根は塗りも mask もない）。
-fn expand_def(defs: &[Def], d: usize, context: Option<usize>) -> u64 {
-    let ctx = Ctx { context, ..NONE_CTX };
+fn expand_def(defs: &[Def], d: usize, context_fill: Option<usize>, context_stroke: Option<usize>) -> u64 {
+    let ctx = Ctx { context_fill, context_stroke, ..NONE_CTX };
     let mut n = 1u64;
     if let Kind::G(ch) = &defs[d].elem.kind {
         for c in ch {
@@ -167,42 +205,52 @@ fn expand_def(defs: &[Def], d: usize, context: Option<usize>) -> u64 {
     n
 }
 
+fn resolve(p: Paint, inherited: Option<usize>, ctx: &Ctx) -> Option<usize> {
+    match p {
+        Paint::Unset => inherited,
+        Paint::None => None,
+        Paint::Url(i) => Some(i),
+        Paint::ContextFill => ctx.context_fill,
+        Paint::ContextStroke => ctx.context_stroke,
+    }
+}
+
 /// 要素を文脈 `ctx` で素朴に展開した要素の数。
 fn count(defs: &[Def], e: &Elem, ctx: Ctx) -> u64 {
-    let fill = match e.fill {
-        Fill::Unset => ctx.fill,
-        Fill::None => None,
-        Fill::Url(p) => Some(p),
-        Fill::Context => ctx.context,
-    };
+    let fill = resolve(e.fill, ctx.fill, &ctx);
+    let stroke = resolve(e.stroke, ctx.stroke, &ctx);
     let mask = match e.mask {
         MaskV::Unset => None,
         MaskV::Url(m) => Some(m),
         MaskV::Inherit => ctx.mask,
     };
+    let marker = match e.marker {
+        MarkerV::Unset => ctx.marker,
+        MarkerV::None => None,
+        MarkerV::Url(k) => Some(k),
+    };
     let mut n = 1u64;
     if let Some(m) = mask {
-        n = sat(n, expand_def(defs, m, None));
+        n = sat(n, expand_def(defs, m, None, None));
     }
-    let inner = Ctx { fill, mask, context: ctx.context };
+    let inner = Ctx { fill, stroke, mask, marker, ..ctx };
+    let shape = |n: &mut u64| {
+        for p in [fill, stroke].into_iter().flatten() {
+            *n = sat(*n, expand_def(defs, p, None, None));
+        }
+    };
     match &e.kind {
         Kind::G(ch) => {
             for c in ch {
                 n = sat(n, count(defs, c, inner));
             }
         }
-        Kind::Rect => {
-            if let Some(p) = fill {
-                n = sat(n, expand_def(defs, p, None));
-            }
-        }
-        Kind::Path(marker) => {
-            if let Some(p) = fill {
-                n = sat(n, expand_def(defs, p, None));
-            }
-            // marker の中身の context-fill はこの要素の塗り
+        Kind::Rect => shape(&mut n),
+        Kind::Path => {
+            shape(&mut n);
+            // marker の中身の context-fill・context-stroke はこの要素の塗りと線
             if let Some(k) = marker {
-                n = sat(n, expand_def(defs, *k, fill));
+                n = sat(n, expand_def(defs, k, fill, stroke));
             }
         }
         // use の中身（g の定義の要素）は use の文脈で受け継ぐ
@@ -259,12 +307,20 @@ fn counted_instances_cover_naive_expansion() {
             let in_marker = kind == DefKind::Marker;
             let n = 1 + r.below(3) as usize;
             let ch: Vec<Elem> = (0..n).map(|_| gen_elem(&mut r, &defs, 1, in_marker)).collect();
-            let mut elem = Elem { kind: Kind::G(ch), fill: Fill::Unset, mask: MaskV::Unset };
+            let mut elem = Elem {
+                kind: Kind::G(ch),
+                fill: Paint::Unset,
+                stroke: Paint::Unset,
+                mask: MaskV::Unset,
+                marker: MarkerV::Unset,
+            };
             if kind == DefKind::Group {
-                // use で使う g は、自分の塗りと mask も持てる
+                // use で使う g は、自分の塗り・線・mask・marker も持てる
                 let e = gen_elem(&mut r, &defs, 3, false);
                 elem.fill = e.fill;
+                elem.stroke = e.stroke;
                 elem.mask = e.mask;
+                elem.marker = e.marker;
             }
             defs.push(Def { kind, elem });
         }

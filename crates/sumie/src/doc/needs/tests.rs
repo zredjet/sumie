@@ -95,3 +95,12 @@ fn referenced_containers_ignore_display_and_conditions() {
     let d = crate::doc::parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
     assert!(!d.needs().raster_images);
 }
+
+/// 輪として取り除いた参照の先（use の文脈では輪でないもの）も、M2 が 1 段だけ描き直すので要るものに入れる（ADR-86 (1)）。
+#[test]
+fn removed_cycle_edges_are_followed() {
+    let n = needs_of(&format!(
+        "<pattern id=\"p\"><use href=\"#r\"/><image href=\"{PNG}\"/></pattern><g fill=\"url(#p)\"><rect id=\"r\"/></g>"
+    ));
+    assert!(n.raster_images);
+}

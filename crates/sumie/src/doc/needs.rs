@@ -112,11 +112,10 @@ pub(crate) fn needs(
             if let Some(x) = seen.get_mut(i as usize) {
                 *x = prev | bit;
             }
+            // 輪として取り除いた辺もたどる（M2 は取り除いた参照の先を 1 段だけ描き直す。ADR-86 (1)）
             for e in refs.of(i) {
                 budget.spend(cost::OP_STEP)?;
-                if e.removed == 0 {
-                    stack.push((u64::from(e.target) << 3) | 1)?;
-                }
+                stack.push((u64::from(e.target) << 3) | 1)?;
             }
             continue;
         };
@@ -181,10 +180,10 @@ pub(crate) fn needs(
                 c = nodes.get(c as usize).map_or(NONE, |x| x.next_sibling);
             }
         }
-        // 中身を作る参照の辺（clip-path の中身は画像を描かない）
+        // 中身を作る参照の辺（clip-path の中身は画像を描かない）。輪として取り除いた辺もたどる（ADR-86 (1)）
         for e in refs.of(i) {
             budget.spend(cost::OP_STEP)?;
-            if e.removed != 0 || e.kind == EDGE_HREF || e.kind == EDGE_TEXT || e.kind == EDGE_CLIP {
+            if e.kind == EDGE_HREF || e.kind == EDGE_TEXT || e.kind == EDGE_CLIP {
                 continue;
             }
             stack.push((u64::from(e.target) << 3) | 1)?;
@@ -207,7 +206,7 @@ fn classify(
         None => doc.attr(input, n, NS_XLINK, b"href", budget)?,
     };
     let Some(v) = a else { return Ok(()) };
-    let v = trim(v, budget)?;
+    let v = super::trim_ws(v, budget)?;
     if v.is_empty() || (local == b"feImage" && v.starts_with(b"#")) {
         return Ok(());
     }
@@ -238,30 +237,6 @@ fn classify(
         }
     }
     Ok(())
-}
-
-/// 前後の空白を除く（読むバイトを塊ずつ払う。文書の 2 回目のレビュー）。
-fn trim<'a>(s: &'a [u8], budget: &Budget<'_>) -> Result<&'a [u8], Error> {
-    let ws = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0C);
-    let mut meter = crate::xml::lex::ScanMeter::new(0, s.len());
-    let mut a = s.len();
-    for (k, &c) in s.iter().enumerate() {
-        meter.pay(budget, k)?;
-        if !ws(c) {
-            a = k;
-            break;
-        }
-    }
-    let mut b = a;
-    let mut back = crate::xml::lex::ScanMeter::new(0, s.len().saturating_sub(a));
-    for (k, &c) in s.iter().enumerate().skip(a).rev() {
-        back.pay(budget, s.len().saturating_sub(k).saturating_sub(1))?;
-        if !ws(c) {
-            b = k.saturating_add(1);
-            break;
-        }
-    }
-    Ok(s.get(a..b).unwrap_or(&[]))
 }
 
 fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {

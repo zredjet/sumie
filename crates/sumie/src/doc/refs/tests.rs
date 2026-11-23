@@ -521,3 +521,48 @@ fn inherited_sheet_values_resolve_once() {
     let d = crate::doc::parse(svg.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
     assert_eq!(d.report().unread_refs().count(), 1);
 }
+
+/// use から受け継いだ marker の中の `context-fill` は、中身の要素が自分で持つ塗りを使うので、その参照先も marker の中の
+/// 塗る要素の数だけ実体になる（入れ子の use を挟んでも同じ。文書の 5 回目のレビュー）。
+#[test]
+fn use_marker_context_fill_uses_content_paint() {
+    let rects = "<rect/>".repeat(20);
+    let ctx = "<rect fill=\"context-fill\"/>".repeat(10);
+    let defs = format!(
+        "<defs><pattern id=\"P\">{rects}</pattern><marker id=\"M\">{ctx}</marker><g id=\"G\"><path d=\"M0 0L1 1\" fill=\"url(#P)\"/></g>\
+         <g id=\"H\"><use href=\"#I\" fill=\"url(#P)\"/></g><g id=\"I\"><path d=\"M0 0L1 1\"/></g></defs>"
+    );
+    // 中身の path が自分で P を持つ：use 3 つ × marker の塗る要素 10 × P の 21
+    let (_, _, n, _) = run(&format!("{defs}{}", "<use href=\"#G\" marker-end=\"url(#M)\"/>".repeat(3)));
+    assert!(n >= 3 * 10 * 21, "{n}");
+    // 塗りが中の use から来る：同じ数
+    let (_, _, n, _) = run(&format!("{defs}{}", "<use href=\"#H\" marker-end=\"url(#M)\"/>".repeat(3)));
+    assert!(n >= 3 * 10 * 21, "{n}");
+}
+
+/// text・tspan の塗りの参照先は、塗る要素ごとに 1 度（子の tspan は自分の辺で数えるので、親の倍率に入れない。入れ子で
+/// 2 乗に数えすぎていた。文書の 5 回目のレビュー）。
+#[test]
+fn nested_tspans_count_each_paint_once() {
+    let rects = "<rect/>".repeat(20);
+    let open = "<tspan>".repeat(10);
+    let close = "</tspan>".repeat(10);
+    let (_, _, n, _) = run(&format!("<pattern id=\"P\">{rects}</pattern><text fill=\"url(#P)\">{open}a{close}</text>"));
+    // 根・pattern・text と tspan 10・塗る要素 11 × P の 21
+    assert_eq!(n, 1 + 1 + 11 + 11 * 21);
+}
+
+/// 輪として取り除いた辺の先は、M2 が 1 段だけ描き直すので、その中身も展開の数に入れる（use の文脈では輪でない形。
+/// Chrome と resvg は描く。ADR-86 (1)）。
+#[test]
+fn removed_cycle_edges_count_one_level() {
+    let rects = "<rect/>".repeat(100);
+    let (_, _, n, cycles) =
+        run(&format!("<pattern id=\"p\"><use href=\"#r\"/>{rects}</pattern><g fill=\"url(#p)\"><rect id=\"r\"/></g>"));
+    assert!(cycles > 0);
+    assert!(n >= 100, "{n}");
+    // 本当の輪（use が自分を含む g を指す）も 1 段だけ足す（M2 は文脈で輪と確かめて描かない。数えすぎの側）
+    let (_, _, n, cycles) = run(&format!("<g id=\"g\"><use href=\"#g\"/>{rects}</g>"));
+    assert!(cycles > 0);
+    assert!((100..=1000).contains(&n), "{n}");
+}
