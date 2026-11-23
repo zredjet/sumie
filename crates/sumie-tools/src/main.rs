@@ -37,7 +37,7 @@ const USAGE: &str = "使い方：sumie-tools <命令> …
   corpus import-resvg|fetch-w3c|fetch-real|index …                       照合の集まり（ADR-21・ADR-59。取ったものは照らしてから写す）
   gen-heavy [--out local/heavy]                                          重い入力を作る（architecture.md §10）
   kura-compat --kura <一覧> [--dir <SVG の根>]                           Kura の SvgCodec の結果と照らす（NFR-10）
-  render・golden                                                         sumie で描く・ゴールデンを足す（M2 から）
+  render <in.svg> <out.png> [--scale N]                                  sumie で描く（整数の倍率）
   gen-disallowed [--check]                                               crates/sumie/clippy.toml を std の文書から作る
   check-lint-probe                                                       禁じる口が clippy で本当に拾われるかを確かめる
   oracle-lock --kura <Kura の Cargo.lock> --rev <コミット>                 照合の相手の依存の版を Kura と照らして記録する
@@ -65,7 +65,8 @@ fn main() {
         "corpus" => corpus::run(rest),
         "gen-heavy" => gen_heavy::run(rest),
         "kura-compat" => kura_compat::run(rest),
-        "render" | "golden" => Err(format!("{cmd} は sumie の描く口ができる M2 から")),
+        "render" => render_cmd(rest),
+        "golden" => Err(format!("{cmd} はゴールデンの試験（crates/sumie/tests/golden.rs）の regenerate_* を使う")),
         "gen-disallowed" => gen_disallowed::run(rest),
         "check-lint-probe" => lint_probe::run(rest),
         "oracle-lock" => oracle_lock::run(rest),
@@ -83,6 +84,23 @@ fn main() {
     if let Err(e) = result {
         eprintln!("誤り：{e}");
         std::process::exit(1);
+    }
+}
+
+/// sumie で描いて PNG に書く（乗算済みの RGBA8 をそのまま。断れば理由を書いて誤り）。
+fn render_cmd(args: &[String]) -> Result<(), String> {
+    corpus::check_args(args, &["--scale"], &[], 2)?;
+    let input = PathBuf::from(args.first().ok_or("入力の SVG")?);
+    let output = PathBuf::from(args.get(1).ok_or("出力の PNG")?);
+    let scale = corpus::num_arg::<u32>(args, "--scale", 1)?.max(1);
+    let svg = std::fs::read(&input).map_err(|e| e.to_string())?;
+    match compare_sumie::render_sumie(&svg, scale) {
+        compare_sumie::Drawn::Image(img) => {
+            image::write_png(&output, &img)?;
+            println!("{}×{}", img.w, img.h);
+            Ok(())
+        }
+        compare_sumie::Drawn::Excluded(r) | compare_sumie::Drawn::Refused(r) => Err(r),
     }
 }
 
