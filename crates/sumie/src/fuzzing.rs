@@ -1187,16 +1187,25 @@ pub fn stroke_ops(data: &[u8]) -> Check {
         let q = crate::plan::Quality::DEFAULT;
         // 平坦化の届く幅も計画と同じ（太さの半分 × 外への広がり）
         let reach = half * crate::plan::reach_factor(&pen);
-        crate::plan::subpaths(path, &Transform::IDENTITY, q, reach, &mut poly, true, &b, &mut |line, closed| {
-            input_points = input_points.saturating_add(line.pts.len() as u64);
-            all_finite &= line.pts.iter().all(|p| p.finite());
-            match &dashes {
-                None => stroke_polyline(line, closed, &pen, &mut scratch, &b, &mut round, &mut sink),
-                Some(d) => dash_polyline(line, closed, d, &mut buf, &mut hd, &b, None, &mut |piece, pc| {
-                    stroke_polyline(piece, pc, &pen, &mut scratch, &b, &mut round, &mut sink)
-                }),
-            }
-        })?;
+        crate::plan::subpaths(
+            path,
+            &Transform::IDENTITY,
+            q,
+            reach,
+            &mut poly,
+            Some(&Transform::IDENTITY),
+            &b,
+            &mut |line, closed| {
+                input_points = input_points.saturating_add(line.pts.len() as u64);
+                all_finite &= line.pts.iter().all(|p| p.finite());
+                match &dashes {
+                    None => stroke_polyline(line, closed, &pen, &mut scratch, &b, &mut round, &mut sink),
+                    Some(d) => dash_polyline(line, closed, d, &mut buf, &mut hd, &b, None, &mut |piece, pc| {
+                        stroke_polyline(piece, pc, &pen, &mut scratch, &b, &mut round, &mut sink)
+                    }),
+                }
+            },
+        )?;
         if b.max_spend() >= CANCEL_INTERVAL || b.over_released() {
             return Err(Error::Cancelled);
         }

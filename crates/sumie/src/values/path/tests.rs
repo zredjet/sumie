@@ -102,21 +102,31 @@ fn errors_draw_up_to_the_error() {
         assert!(s.is_empty(), "{d}");
         assert!(matches!(r, Parsed::Error(_)), "{d}");
     }
-    // 末尾の `.`（SVG 2 の文法は数字が要る。Chrome と同じ。ADR-90）
+    // 末尾の `.`（SVG 2 の文法は数字が要る。Chrome と同じ。ADR-90）。誤りの位置は壊れた数の始め
     let (s, r, _) = read("M10. 10 H90");
-    assert!(s.is_empty() && matches!(r, Parsed::Error(3)), "{r:?}");
-    let (s, _, _) = read("M10 10 H90 V90 H10. Z");
-    assert_eq!(s.len(), 4);
+    assert!(s.is_empty() && matches!(r, Parsed::Error(1)), "{r:?}");
+    // 壊れた数を含む命令ごと描かない（Chrome と同じ。単位 4 の 3 回目のレビュー）
+    let (s, r, _) = read("M10 10 H90 V90 H10. Z");
+    assert_eq!(s.len(), 3);
+    assert!(matches!(r, Parsed::Error(_)));
+    let (s, _, _) = read("M10 10 H90 V90 L10. 90 Z");
+    assert_eq!(s.len(), 3);
+    // 小数の部分のあとの `.` は次の数（10.5 と .5）
+    let (s, r, _) = read("M10.5.5 L1 1");
+    assert_eq!(s.len(), 2);
+    assert!(matches!(r, Parsed::Complete), "{r:?}");
     // 引数の足りない命令は最後の正しい区間まで
     let (s, r, _) = read("M10 10 H90 V90 L10");
     assert_eq!(s.len(), 3);
     assert!(matches!(r, Parsed::Error(_)));
     let (s, _, _) = read("M0 0 L1 1 2 2 3");
     assert_eq!(s.len(), 3);
-    // 数字のない指数は、数がその前で終わり、e で誤り
+    // 数字のない指数は壊れた数で、その命令ごと描かない（Chrome と同じ）
     let (s, r, _) = read("M10 10 H90 V90e H10 Z");
-    assert_eq!(s.len(), 3);
+    assert_eq!(s.len(), 2);
     assert!(matches!(r, Parsed::Error(_)));
+    let (s, _, _) = read("M10 10 H90 V90e+ H10 Z");
+    assert_eq!(s.len(), 2);
     // Z のあとの数は誤り
     let (s, r, _) = read("M10 10 H90 V90 Z 10 90 90 90");
     assert_eq!(s.len(), 4);

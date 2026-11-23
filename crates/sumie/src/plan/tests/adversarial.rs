@@ -778,3 +778,36 @@ fn dash_ends_after_a_joint_follow_the_curve() {
     assert!(alpha(60, 78) > 64, "下の端が左へ傾きすぎる：{}", alpha(60, 78));
     assert_eq!(alpha(62, 60), 0);
 }
+
+/// non-scaling の線の滑らかなつなぎ目は描く座標系の接線で決める（単位 2 の 5 回目のレビュー）：縦に 60 倍する変形の下で、
+/// まっすぐな 3 次曲線のあとの線分のつなぎ目は、ユーザー単位では 1.15° でも描く座標系では 50° の角なので、指定の miter で
+/// 作る（同じ形を線分で書いたものと同じ画素。Chrome・resvg と同じ）。
+#[test]
+fn non_scaling_joints_are_judged_in_device_space() {
+    let mk = |curve: bool| {
+        let mut b = Builder::new();
+        b.add(
+            |w| {
+                w.move_to(Point::new(0.0, 0.0)).unwrap();
+                if curve {
+                    w.cubic_to(Point::new(30.0, 0.0), Point::new(60.0, 0.0), Point::new(100.0, 0.0)).unwrap();
+                } else {
+                    w.line_to(Point::new(100.0, 0.0)).unwrap();
+                }
+                w.line_to(Point::new(200.0, 2.0)).unwrap();
+            },
+            |n| {
+                n.flags = HAS_STROKE | NON_SCALING;
+                n.stroke = GREEN;
+                n.stroke_width = 20.0;
+                n.join = JOIN_MITER;
+                n.transform = Transform { a: 1.0, b: 0.0, c: 0.0, d: 60.0, e: 20.0, f: 20.0 };
+            },
+        );
+        b.tree(300.0, 200.0)
+    };
+    let (_, _, a) = draw(&mk(true), 1.0);
+    let (_, _, b) = draw(&mk(false), 1.0);
+    let differ = a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0.iter()).filter(|(p, q)| p != q).count();
+    assert_eq!(differ, 0, "曲線と線分で {differ} 画素違う");
+}

@@ -36,8 +36,9 @@ pub(crate) const DASH_TANGENT: u64 = 160;
 pub(crate) const CURVE_SIDE: u64 = 32;
 /// 見積もり（`Tree::estimate`）が区間 1 つを数える手間：決まった分（描く座標系の長さ・行の帯と見る箱の切り取り）・線のとき
 /// の分（曲がる角の `atan2`・線を作る座標系の長さ）・曲線の分（分ける数・厳密な外接矩形・制御多角形の長さ）。前は区間ごとに
-/// 4 単位だけで、時間が手間の 15〜80 倍だった（単位 2 の 4 回目のレビュー。ADR-101）。
-pub(crate) const COUNT_SEGMENT: u64 = 32;
+/// 4 単位だけで、時間が手間の 15〜80 倍だった（単位 2 の 4 回目のレビュー。ADR-101）。見る箱をまたぐ線分ばかりの塗りで
+/// 2.1 ns／単位だったので、区間の決まった分を 32 → 40 にした（単位 2 の 5 回目のレビュー）。
+pub(crate) const COUNT_SEGMENT: u64 = 40;
 pub(crate) const COUNT_STROKE: u64 = 32;
 pub(crate) const COUNT_CURVE: u64 = 160;
 /// 計画で辺を 1 本作る手間（描く座標系に写した線分を確かめ、箱で切り、固定小数にする。M2 の仮の校正。ADR-98）。

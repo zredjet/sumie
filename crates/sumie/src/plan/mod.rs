@@ -245,8 +245,8 @@ impl View {
 /// 線分（描く座標系の `p` → `r`）のうち、描く段の行とセルにかかる分の割合（0〜1。行の帯 `band` の中の割合以下）：見る箱
 /// `view` の中の部分は長さで、帯の中で箱の横の外の部分は y の差だけで数える（描く段は範囲の左の外を 1 列にまとめ、右の外を
 /// 落とすので、横の外の部分は行ごとに 1 セル。巨大な線分の、キャンバスの横の外の長さを数えない）。有限でなければ帯の割合。
-fn raster_fraction(view: &View, band: &View, p: Point, r: Point) -> f64 {
-    let g = band.inside_fraction(p, r);
+/// `f`・`g` は見る箱と行の帯の中の割合（呼び手が求めたもの。切り取りを 2 度求めない。単位 2 の 5 回目のレビュー）。
+fn raster_fraction(view: &View, band: &View, p: Point, r: Point, f: f64, g: f64) -> f64 {
     if g <= 0.0 {
         return 0.0;
     }
@@ -256,8 +256,7 @@ fn raster_fraction(view: &View, band: &View, p: Point, r: Point) -> f64 {
     }
     let Some((a, b)) = band.clip(p, r) else { return g };
     let dy_band = (b.y - a.y).abs();
-    let f = view.inside_fraction(p, r);
-    let dy_view = view.clip(p, r).map_or(0.0, |(c, d)| (d.y - c.y).abs());
+    let dy_view = if f > 0.0 { view.clip(p, r).map_or(0.0, |(c, d)| (d.y - c.y).abs()) } else { 0.0 };
     let out = dy_band - dy_view;
     let h = (f * l + if out > 0.0 { out } else { 0.0 }) / l;
     if h.is_finite() { math::min(h, g) } else { g }
@@ -445,7 +444,7 @@ fn count(
     let implicit_close = |c: &mut Counts, a: Option<Point>, b: Option<Point>| {
         if let (Some(a), Some(b)) = (a, b) {
             let (p, r) = (t.apply(a), t.apply(b));
-            let f = raster_fraction(view, band, p, r);
+            let f = raster_fraction(view, band, p, r, view.inside_fraction(p, r), band.inside_fraction(p, r));
             c.len_dev_band += f * math::hypot(r.x - p.x, r.y - p.y);
         }
     };
@@ -563,8 +562,9 @@ fn in_view(
             c.segs_in = c.segs_in.saturating_add(1);
         }
         // 帯の中で見る箱の横の外の部分は y の差だけ（描く段の行とセル。[`raster_fraction`]）
-        let g = raster_fraction(view, band, p, r);
-        if band.inside_fraction(p, r) > 0.0 {
+        let gb = band.inside_fraction(p, r);
+        let g = raster_fraction(view, band, p, r, f, gb);
+        if gb > 0.0 {
             c.len_dev_band += g * len_in(a, b, t);
             c.len_stroke_band += g * len_in(a, b, s);
             c.pts_band = c.pts_band.saturating_add(pts);
@@ -632,6 +632,8 @@ struct Bounds {
     max_item_edges: u64,
     /// 計画が要る一時の置き場（[`BUF_STROKE`] など）
     buffers: u8,
+    /// 範囲の見積もり自身の手間のうち、項目ごとの分（決まった分と自分の辺の 2 分の探索）
+    region_self: u64,
 }
 
 /// 計画の一時の置き場の印：線（まとめた点）・描く座標系で作る線（写した点）・破線（部分と最初の部分）。
@@ -902,6 +904,7 @@ fn bound_node(
             .render_work
             .saturating_add(render_work(rows, width, e, cells, edge_rows))
             .saturating_add(region_search(e));
+        out.region_self = out.region_self.saturating_add(cost::OP_STEP.saturating_add(region_search(e)));
     }
     if has_stroke {
         let v = c.points;
@@ -1043,6 +1046,7 @@ fn bound_node(
             .render_work
             .saturating_add(render_work(rows, width, e, cells, edge_rows))
             .saturating_add(region_search(e));
+        out.region_self = out.region_self.saturating_add(cost::OP_STEP.saturating_add(region_search(e)));
     }
     out.plan_work = out.plan_work.saturating_add(c.subpaths.saturating_mul(cost::OP_STEP)).saturating_add(64);
     Ok(out)
@@ -1062,6 +1066,8 @@ pub(crate) struct Totals {
     /// 見積もり自身が払った手間（計測と試験のため）
     #[allow(dead_code, reason = "試験と計測が読む")]
     pub(crate) self_work: u64,
+    /// 範囲の見積もり自身の手間のうち、項目ごとの分の和
+    region_self: u64,
     /// 計画が要る一時の置き場の印
     buffers: u8,
 }
@@ -1114,6 +1120,7 @@ impl Tree {
             tot.items = tot.items.saturating_add(b.items);
             tot.scratch_points = tot.scratch_points.max(b.scratch_points);
             tot.render_work = tot.render_work.saturating_add(b.render_work);
+            tot.region_self = tot.region_self.saturating_add(b.region_self);
             tot.max_item_edges = tot.max_item_edges.max(b.max_item_edges);
             tot.buffers |= b.buffers;
             // 破線の並び：解いて写す・奇数個なら 2 度並べる・型を作るときになめる（2 倍の長さまで）
@@ -1159,11 +1166,11 @@ impl Tree {
         check(render.peak_bytes, lim.temp_bytes, Resource::Memory, Stage::Render)?;
         // 計画の一時の山（持ち続ける量を除く）は temp_bytes と比べる（ADR-101。ユーザーの判断）
         check(plan.peak_bytes.saturating_sub(plan.result_bytes), lim.temp_bytes, Resource::Memory, Stage::Plan)?;
-        // 範囲の見積もり自身の手間の上限（どの範囲でも：項目ごとの決まった分と 2 分の探索、辺ごとの分）。これが通れば、
-        // タイルの範囲の見積もりも見積もりの段の上限で断らない（単位 2 の 4 回目のレビュー）
+        // 範囲の見積もり自身の手間の上限（どの範囲でも：項目ごとの決まった分と自分の辺の 2 分の探索、辺ごとの分）。これが
+        // 通れば、タイルの範囲の見積もりも見積もりの段の上限で断らない（単位 2 の 4 回目のレビュー。項目ごとに自分の辺の数で
+        // 足す：辺の最大の項目で掛けると、項目の多い文書を断った。単位 2 の 5 回目のレビュー）
         let region_self = tot
-            .items
-            .saturating_mul(cost::OP_STEP.saturating_add(region_search(tot.max_item_edges)))
+            .region_self
             .saturating_add(tot.edges.saturating_mul(cost::OP_STEP))
             .saturating_add(cost::OP_STEP.saturating_mul(4));
         check(region_self, lim.estimate_work, Resource::Work, Stage::Estimate)?;
@@ -1364,7 +1371,9 @@ fn edges_box(edges: &[Edge], budget: &Budget<'_>) -> Result<(PixelBox, u32), Err
 /// 部分パスの点と閉じたかを受け取る口。
 pub(crate) type SubpathFn<'a> = dyn FnMut(Poly<'_>, bool) -> Result<(), Error> + 'a;
 
-/// 部分パスごとに平坦化した点（ユーザー単位）を `poly` に集め、`f(点, 閉じたか)` を呼ぶ。
+/// 部分パスごとに平坦化した点（ユーザー単位）を `poly` に集め、`f(点, 閉じたか)` を呼ぶ。`join_space` があれば点に滑らかさの
+/// 印を付け、区間のつなぎ目の接線をその座標系（線を作る座標系：non-scaling と細い線は描く座標系）で比べる（単位 2 の 5 回目の
+/// レビュー：ユーザー単位で比べると、縦横の倍率の違う変形で描く座標系の角を滑らかとみなし、曲がる角の見積もりも超えた）。
 #[allow(clippy::too_many_arguments, reason = "平坦化の条件と置き場を分けて渡す")]
 pub(crate) fn subpaths(
     path: PathRef<'_>,
@@ -1372,10 +1381,12 @@ pub(crate) fn subpaths(
     q: Quality,
     reach: f64,
     poly: &mut PolyBuf<'_>,
-    smooth: bool,
+    join_space: Option<&Transform>,
     budget: &Budget<'_>,
     f: &mut SubpathFn<'_>,
 ) -> Result<(), Error> {
+    let smooth = join_space.is_some();
+    let js = join_space.copied().unwrap_or(Transform::IDENTITY);
     poly.clear();
     let mut open = false;
     // 曲線の内側の点は滑らかな点、区間のつなぎ目は角。ただし曲線の前か後ろのつなぎ目で接線が続くものは滑らかな点
@@ -1414,7 +1425,7 @@ pub(crate) fn subpaths(
                 if open && smooth {
                     // 閉じの線分（長さがあれば）と、始めの点のつなぎ目（区間ごとにつなぎ目の向きを求める手間を払う）
                     budget.spend(cost::JOIN_TANGENT)?;
-                    let closing = crate::geom::seg_tangents(&seg);
+                    let closing = crate::geom::seg_tangents(&seg).map(|(a, b)| (js.apply_vec(a), js.apply_vec(b)));
                     let start_from = match closing {
                         Some((v, _)) => {
                             if let Some((lt, lc)) = last
@@ -1452,7 +1463,8 @@ pub(crate) fn subpaths(
                 budget.spend(cost::JOIN_TANGENT)?;
                 drew = true;
                 let curve = !matches!(seg, PathSeg::Line(..));
-                let Some((st, et)) = crate::geom::seg_tangents(&seg) else {
+                let Some((st, et)) = crate::geom::seg_tangents(&seg).map(|(a, b)| (js.apply_vec(a), js.apply_vec(b)))
+                else {
                     // 長さ 0 の区間（接線がない）は点を足さない（前後のつなぎ目の滑らかさを角に戻さない。ADR-101）
                     continue;
                 };
@@ -1486,7 +1498,7 @@ fn fill_edges(
     edges: &mut MVec<'_, Edge>,
     budget: &Budget<'_>,
 ) -> Result<(), Error> {
-    subpaths(path, t, q, 0.0, poly, false, budget, &mut |line, _| {
+    subpaths(path, t, q, 0.0, poly, None, budget, &mut |line, _| {
         let pts = line.pts;
         let Some(&first) = pts.first() else { return Ok(()) };
         let mut prev = t.apply(first);
@@ -1578,7 +1590,7 @@ fn stroke_edges(
     let mut factor = 1.0;
     if n.path_length > 0.0 && !dashes_src.is_empty() {
         let mut total = 0.0;
-        subpaths(path, t, q, reach, parts.poly, false, budget, &mut |line, closed| {
+        subpaths(path, t, q, reach, parts.poly, None, budget, &mut |line, closed| {
             let pts = line.pts;
             let m = |p: Point| p;
             let mut a = match pts.first() {
@@ -1638,7 +1650,7 @@ fn stroke_edges(
     }
     let mut round_left = round_join_extra(&pen, arc_turning(&pen, &turn));
     let round_left = &mut round_left;
-    subpaths(path, t, q, reach, poly, true, budget, &mut |line, closed| {
+    subpaths(path, t, q, reach, poly, Some(&stroke_space), budget, &mut |line, closed| {
         if device {
             // non-scaling と細い線は描く座標系の点にしてから線を作る（印はそのまま）
             devbuf.clear();

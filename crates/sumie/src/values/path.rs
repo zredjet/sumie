@@ -3,8 +3,9 @@
 //! - バイト列のまま走査し、読むバイトを塊ずつ払う（`ScanMeter`）。どの枝も 1 バイト以上進むか終わる
 //! - 空白は SVG 2 の wsp（空白・タブ・CR・LF・FF）。引数の間は「空白か、空白に囲まれた `,` 1 つ」で、省いてもよい（数の
 //!   符号・`.` で区切れる）。命令の字のすぐあとの `,` は誤り。最後の引数のあとの `,` は受ける（resvg・Chrome と同じ）
-//! - 数：`符号? (数字+ ("." 数字+)? | "." 数字+) (("e" | "E") 符号? 数字+)?`。`.` のあとに数字が要る（`10.` は `10` で終わり、
-//!   続く `.` は誤り。Chrome と同じ。ADR-90）。指数の字のあとに数字がなければ、数はその前で終わる。値は CSS の字句と同じ
+//! - 数：`符号? (数字+ ("." 数字+)? | "." 数字+) (("e" | "E") 符号? 数字+)?`。整数の部分のすぐあとの `.` には数字が要り、
+//!   指数の字のあとにも数字が要る：`10.`・`90e` は壊れた数で、その数を含む命令ごと描かない（Chrome と同じ。ADR-90・
+//!   単位 4 の 3 回目のレビュー）。小数の部分のあとの `.` は次の数の始め（`10.5.5` は 10.5 と .5）。値は CSS の字句と同じ
 //!   口（`css::lex::number_value`）で正しく丸めて読み、有限でなければ誤り
 //! - 弧の旗は 1 字（`0` か `1`）。`1190` は旗 1・1 と 90
 //! - 誤り：そこを含む命令の前まで（引数の足りない命令は、最後の正しい区間まで）を描く（SVG 2 §9.5.4）。初めの命令が `M`・
@@ -105,6 +106,10 @@ impl<'s, 'b> Scanner<'s, 'b> {
             j = j.saturating_add(1);
             any = true;
         }
+        // 整数の部分のすぐあとの `.` に数字がなければ壊れた数（`10.`。Chrome と同じ）
+        if any && self.at(j)? == Some(b'.') && self.digit_at(j.saturating_add(1))?.is_none() {
+            return Ok(None);
+        }
         if self.at(j)? == Some(b'.') && self.digit_at(j.saturating_add(1))?.is_some() {
             j = j.saturating_add(1);
             while let Some(b) = self.digit_at(j)? {
@@ -120,13 +125,15 @@ impl<'s, 'b> Scanner<'s, 'b> {
             let k = j.saturating_add(1);
             let sign = self.at(k)?;
             let digits = if matches!(sign, Some(b'+' | b'-')) { k.saturating_add(1) } else { k };
-            if self.digit_at(digits)?.is_some() {
-                d.exp_neg = sign == Some(b'-');
-                j = digits;
-                while let Some(b) = self.digit_at(j)? {
-                    d.exp_digit(b);
-                    j = j.saturating_add(1);
-                }
+            // 指数の字のあとに数字がなければ壊れた数（`90e`。Chrome と同じ）
+            if self.digit_at(digits)?.is_none() {
+                return Ok(None);
+            }
+            d.exp_neg = sign == Some(b'-');
+            j = digits;
+            while let Some(b) = self.digit_at(j)? {
+                d.exp_digit(b);
+                j = j.saturating_add(1);
             }
         }
         let v = number_value(self.s, i0, j, &d, neg, self.budget)?;
