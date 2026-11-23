@@ -439,7 +439,8 @@ fn visit(
     {
         use crate::style::props::{BOX_LOGICAL, BOX_OUTLINE, BOX_ROOT};
         let rect = n.ns == NS_SVG && n.local.of(d.input) == b"rect";
-        if c.css_box & BOX_OUTLINE != 0
+        // 何も描かない文書（幅 0 の viewBox）の子の outline は描かない（Chrome と同じ。ADR-103 (6) と同じ考え）
+        if (c.css_box & BOX_OUTLINE != 0 && !out.bbox_only)
             || (item.node == 0 && c.css_box & BOX_ROOT != 0)
             || (rect && c.css_box & BOX_LOGICAL != 0)
         {

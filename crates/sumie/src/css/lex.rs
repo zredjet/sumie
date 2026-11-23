@@ -118,6 +118,7 @@ const fn hex_value(b: u8) -> Option<u32> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct Lexer<'a, 'b> {
     s: &'a [u8],
     i: usize,

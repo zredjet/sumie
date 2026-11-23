@@ -1296,24 +1296,6 @@ fn effects(
             c.fx |= FX_CV_HIDDEN;
         }
     }
-    // `offset` のまとめが道を持つか（関数・url・箱の言葉。位置・anchor・回転・距離だけなら道がなく、Chrome でも動かない。
-    // 単位 3 の 6 回目のレビュー）
-    let has_path = |s: &Specified| -> Result<bool, Error> {
-        const BOXES: &[&[u8]] =
-            &[b"content-box", b"padding-box", b"border-box", b"margin-box", b"fill-box", b"stroke-box", b"view-box"];
-        let buf = bufs.of(s.src);
-        let mut v = Values::new(buf, s.value, budget);
-        loop {
-            budget.spend(cost::OP_STEP)?;
-            let t = v.next()?;
-            match t.kind {
-                Tk::Eof => return Ok(false),
-                Tk::Function | Tk::Url => return Ok(true),
-                Tk::Ident if BOXES.iter().any(|w| ident_is(buf, t.inner, t.escaped, w)) => return Ok(true),
-                _ => {}
-            }
-        }
-    };
     // CSS の個別の変形と offset-path・offset：none でなければ（offset は道があれば）まだ描かない（黙って変形なしで描かない。
     // 単位 3 の 4 回目のレビュー）
     for (k, sp) in p.css_transform.iter().enumerate() {
@@ -1322,7 +1304,8 @@ fn effects(
         let on = match wide(sp) {
             Some(true) => parent.fx & FX_CSS_TRANSFORM != 0,
             Some(false) => false,
-            None if k == 4 => has_path(sp)?,
+            // offset は道の印（カスケードが宣言ごとに 1 度だけ求めたもの。値は読み直さない）
+            None if k == 4 => sp.pad[0] & crate::style::cascade::OFFSET_PATH != 0,
             None => !none_only(sp)?,
         };
         if on {

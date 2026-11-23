@@ -138,8 +138,10 @@ pub(crate) const SIZE_KEYWORDS: &[&[u8]] = &[
     b"-webkit-fit-content",
 ];
 
-/// CSS の `width`・`height` で `auto` と同じに扱う大きさの関数（Chrome が受けるもの）。
-pub(crate) const SIZE_FUNCTIONS: &[&[u8]] = &[b"calc-size", b"anchor-size", b"fit-content", b"-webkit-fit-content"];
+/// `calc-size()` の基準で `auto` と同じになる大きさの言葉（Chrome。`any` と長さの基準は長さになる）。
+pub(crate) const SIZE_BASIS: &[&[u8]] = &[b"auto", b"min-content", b"max-content", b"fit-content", b"stretch"];
+/// `anchor-size()` の大きさの言葉。
+pub(crate) const ANCHOR_SIZES: &[&[u8]] = &[b"width", b"height", b"block", b"inline", b"self-block", b"self-inline"];
 
 /// プロパティ。
 #[derive(Debug, Clone, Copy)]

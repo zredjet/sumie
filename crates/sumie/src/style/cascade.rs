@@ -106,15 +106,26 @@ pub(crate) const BG_IMAGE_FROM_SHORTHAND: u8 = 0x80;
 pub(crate) const BOX_ON: u8 = 1;
 
 /// CSS の箱のプロパティの宣言の印（同じ絵にならなければ [`BOX_ON`]）。
+/// `offset` のまとめが道（関数か url）を持つ印（`pad[0]`。宣言ごとに 1 度だけ求める：要素ごとに読み直すと、木を作る段の
+/// 見積もりを超えた。単位 3 の 7 回目のレビュー）。
+pub(crate) const OFFSET_PATH: u8 = 1;
+
+/// 宣言ごとに 1 度だけ求める印：CSS の箱のプロパティ（同じ絵にならなければ [`BOX_ON`]）と、`offset` の道（[`OFFSET_PATH`]）。
 fn box_flag(id: PropertyId, text: &[u8], value: Span, budget: &Budget<'_>) -> Result<Option<u8>, Error> {
-    match prop(id).map(|p| p.kind) {
-        Some(crate::style::props::Kind::CssBox(rule)) => {
-            // 確かめは済んでいる（壊れた値は候補にならない）。同じ絵にならなければ BOX_ON
-            let cx = crate::style::valid::Ctx { attr: false, unitless: false, viewport: true };
-            let same = crate::style::valid::css_box(rule, text, value, cx, budget)?.unwrap_or(false);
-            Ok(Some(if same { 0 } else { BOX_ON }))
+    match prop(id) {
+        Some(p) if p.name == b"offset" => {
+            Ok(Some(if crate::style::valid::offset_has_path(text, value, budget)? { OFFSET_PATH } else { 0 }))
         }
-        _ => Ok(None),
+        Some(p) => match p.kind {
+            crate::style::props::Kind::CssBox(rule) => {
+                // 確かめは済んでいる（壊れた値は候補にならない）。同じ絵にならなければ BOX_ON
+                let cx = crate::style::valid::Ctx { attr: false, unitless: false, viewport: true };
+                let same = crate::style::valid::css_box(rule, text, value, cx, budget)?.unwrap_or(false);
+                Ok(Some(if same { 0 } else { BOX_ON }))
+            }
+            _ => Ok(None),
+        },
+        None => Ok(None),
     }
 }
 
@@ -558,6 +569,11 @@ impl Out<'_, '_> {
             } else {
                 0
             };
+            return self.put(prop, key, Specified { pad: [flag, 0, 0], ..spec });
+        }
+        // `offset`：道の印を置く（求めていなければ道があるとみなす。値は読み直さない）
+        if name == b"offset" && spec.wide == WIDE_NONE {
+            let flag = font.map_or(OFFSET_PATH, |r| r.pad[0]);
             return self.put(prop, key, Specified { pad: [flag, 0, 0], ..spec });
         }
         // 長い名前の `background-image`：画像の層の印を置く（まとめから分けたものと同じ形。値は読み直さない）

@@ -11,7 +11,9 @@
 use crate::budget::Budget;
 use crate::cost;
 use crate::css::sheet::Sheet;
-use crate::doc::refs::{EDGE_CLIP, EDGE_HREF, EDGE_TEXT, HIDDEN_SELF, Refs, fits, not_rendered, renders_children};
+use crate::doc::refs::{
+    EDGE_CLIP, EDGE_HREF, EDGE_TEXT, EDGE_USE, HIDDEN_SELF, Refs, fits, not_rendered, renders_children,
+};
 use crate::error::Error;
 use crate::mem::MVec;
 use crate::style::cascade::{SRC_SHEET, SRC_STORE, Styles, WIDE_NONE};
@@ -164,9 +166,10 @@ pub(crate) fn needs(
                 }
             }
         }
-        // content-visibility: hidden の入れ物の中身は描かない（walk と同じ。単位 3 の 6 回目のレビュー）
+        // content-visibility: hidden の入れ物・use・参照される symbol の中身は描かない（walk と同じ。単位 3 の 6・7 回目の
+        // レビュー）
         let mut cv_hidden = false;
-        if !referenced_container {
+        {
             let spec = styles.of(i).iter().find(|s| Some(s.prop) == content_visibility).copied();
             if let Some(s) = spec
                 && s.wide == WIDE_NONE
@@ -186,8 +189,11 @@ pub(crate) fn needs(
             classify(doc, input, n, local, &mut out, budget)?;
         }
         // 子（描かない入れ物は参照の辺で入ったときだけ。clipPath の中の画像は描かないので入らない。図形などの子は描かない）
-        let into =
-            if not_rendered(local) { via_ref && local != b"clipPath" } else { renders_children(local) && !cv_hidden };
+        let into = if not_rendered(local) {
+            via_ref && local != b"clipPath" && !(local == b"symbol" && cv_hidden)
+        } else {
+            renders_children(local) && !cv_hidden
+        };
         if into {
             let child_text = in_text || local == b"text";
             let child_filter = local == b"filter";
@@ -202,7 +208,7 @@ pub(crate) fn needs(
         // 中身を作る参照の辺（clip-path の中身は画像を描かない）。輪として取り除いた辺もたどる（ADR-86 (1)）
         for e in refs.of(i) {
             budget.spend(cost::OP_STEP)?;
-            if e.kind == EDGE_HREF || e.kind == EDGE_TEXT || e.kind == EDGE_CLIP {
+            if e.kind == EDGE_HREF || e.kind == EDGE_TEXT || e.kind == EDGE_CLIP || (cv_hidden && e.kind == EDGE_USE) {
                 continue;
             }
             stack.push((u64::from(e.target) << 3) | 1)?;

@@ -202,6 +202,13 @@ fn estimate_build_checks_instances_and_needs() {
     // content-visibility: hidden の入れ物の中の画像は描かないので要らない（単位 3 の 6 回目のレビュー）
     assert!(est("<g style=\"content-visibility: hidden\"><image href=\"a.png\"/></g>").is_ok());
     assert!(est("<g style=\"content-visibility: auto\"><image href=\"a.png\"/></g>").is_err());
+    // use と、use から参照する symbol の content-visibility: hidden も（単位 3 の 7 回目のレビュー）
+    assert!(est("<defs><g id=\"i\"><image href=\"a.png\"/></g></defs><use href=\"#i\" style=\"content-visibility: hidden\"/>").is_ok());
+    assert!(
+        est("<symbol id=\"s\" style=\"content-visibility: hidden\"><image href=\"a.png\"/></symbol><use href=\"#s\"/>")
+            .is_ok()
+    );
+    assert!(est("<symbol id=\"s\"><image href=\"a.png\"/></symbol><use href=\"#s\"/>").is_err());
     // 根の display: none と偽の条件は描くのを止めないので、中の画像も要る（ADR-102 (1)。単位 3 の 5 回目のレビュー）
     for attrs in ["display=\"none\"", "style=\"display: none\"", "systemLanguage=\"xx\""] {
         let src = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" {attrs}><image href=\"a.png\"/></svg>");

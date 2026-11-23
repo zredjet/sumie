@@ -190,7 +190,8 @@ impl Aspect {
     pub(crate) const DEFAULT: Aspect = Aspect { align: Align::XMidYMid, slice: false };
 }
 
-/// 値の字句を、空白を飛ばしながら読む口。
+/// 値の字句を、空白を飛ばしながら読む口（複製すると、読めるかを試してから戻せる。読み直す分も払う）。
+#[derive(Clone, Copy)]
 pub(crate) struct Values<'s, 'b> {
     pub(crate) s: &'s [u8],
     lex: Lexer<'s, 'b>,
@@ -241,7 +242,7 @@ impl<'s, 'b> Values<'s, 'b> {
         Ok(false)
     }
 
-    fn eat(&mut self, k: Kind) -> Result<bool, Error> {
+    pub(crate) fn eat(&mut self, k: Kind) -> Result<bool, Error> {
         if self.peek()?.kind == k {
             self.next()?;
             return Ok(true);

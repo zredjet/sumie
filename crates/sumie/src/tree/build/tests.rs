@@ -854,7 +854,6 @@ fn unit3_round6() {
         assert_eq!(notyet(root(&format!("style=\"{style}\""))), Some(Later::CssBox), "{style}");
     }
     for style in [
-        "border: banana",
         "padding: banana",
         "border-radius: 0 / 0",
         "outline: 2px red",
@@ -877,14 +876,19 @@ fn unit3_round6() {
     for css in ["offset: auto", "offset: normal", "offset: 30px 30px none", "offset: none"] {
         assert!(build(&svg(&format!("{r} style=\"{css}\"/>"))).is_ok(), "{css}");
     }
-    for css in ["offset: border-box", "offset: path('M0 0 L5 5')", "offset: ray(45deg)"] {
+    for css in ["offset: path('M0 0 L5 5')", "offset: ray(45deg)"] {
         assert_eq!(not_yet(&format!("{r} style=\"{css}\"/>")), Later::CssTransform, "{css}");
     }
     // overflow: overlay は auto（入れ子の svg を切らない）
     let nested = "<svg width=\"5\" height=\"5\" style=\"overflow: overlay\"><rect width=\"9\" height=\"9\"/></svg>";
     assert_eq!(build(&svg(nested)).unwrap().nodes.len(), 1);
     // width の大きさの関数は auto
-    for f in ["calc-size(auto, size)", "anchor-size(width)", "fit-content(10px)"] {
+    for f in [
+        "calc-size(auto, size)",
+        "calc-size(fit-content, 10px)",
+        "calc-size(calc-size(auto, size), size)",
+        "anchor-size(width)",
+    ] {
         assert_eq!(build(&svg(&format!("{r} style=\"width: {f}\"/>"))).unwrap().nodes.len(), 0, "{f}");
     }
     // 背景の image-set の文字列の data: と、tab を含む URL の data:
@@ -893,6 +897,61 @@ fn unit3_round6() {
         assert_eq!(notyet(build(&doc)), Some(Later::BackgroundImage), "{bg}");
     }
     assert!(build(&svg("<style>svg { background: image-set(\"a.png\" 1x) lime }</style>")).is_ok());
+}
+
+/// 単位 3 の 7 回目のレビュー：width の大きさの関数は Chrome が auto にする形だけ（fit-content() と、長さになる calc-size() と
+/// fallback のある anchor-size() と、壊れた引数は壊れた値として捨てる）。箱のプロパティの負の太さは壊れた値、読めない部品
+/// （色の関数・知らない単位・関数・知らない言葉）は NotYet。offset の箱の言葉だけは道でない。
+#[test]
+fn unit3_round7() {
+    let r = "<rect width=\"5\" height=\"5\"";
+    for f in [
+        "fit-content(10px)",
+        "-webkit-fit-content(10px)",
+        "calc-size(10px)",
+        "calc-size(banana)",
+        "calc-size(any, 10px)",
+        "calc-size(30px, size)",
+        "anchor-size(banana)",
+        "anchor-size(width, 10px)",
+        "anchor-size(--a width, 30px)",
+    ] {
+        assert_eq!(build(&svg(&format!("{r} style=\"width: {f}\"/>"))).unwrap().nodes.len(), 1, "{f}");
+    }
+    assert_eq!(build(&svg(&format!("{r} style=\"width: anchor-size(--a self-inline)\"/>"))).unwrap().nodes.len(), 0);
+    let root = |style: &str| {
+        build(&format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\" style=\"{style}\"><rect width=\"5\" height=\"5\"/></svg>"
+        ))
+    };
+    let css_box =
+        |r: Result<Tree, Error>| matches!(r, Err(Error::Unsupported(u)) if u.feature == Feature::NotYet(Later::CssBox));
+    for style in [
+        "border: 5px solid red; border: -5px red",
+        "border: 5px solid oklch(0 0 0)",
+        "border: 5px solid color-mix(in srgb, red, blue)",
+        "border: 1dvw solid red",
+        "border: banana",
+        "padding: 5dvh",
+        "padding: calc(5px)",
+        "margin: var(--m)",
+        "border-radius: calc(4px)",
+    ] {
+        assert!(css_box(root(style)), "{style}");
+    }
+    for style in ["border: -5px red", "border: none -5px red", "margin: banana", "padding: -1px", "border: 5 solid"] {
+        assert!(root(style).is_ok(), "{style}");
+    }
+    assert!(css_box(build(&svg(
+        "<style>@supports (border: 1px solid oklch(0 0 0)) { svg { border: 5px solid red } }</style>"
+    ))));
+    assert_eq!(not_yet(&format!("{r} style=\"outline: 5px solid red; outline: -1px red\"/>")), Later::CssBox);
+    for css in ["offset: border-box", "offset: view-box 50%", "offset: fill-box 30%"] {
+        assert!(build(&svg(&format!("{r} style=\"{css}\"/>"))).is_ok(), "{css}");
+    }
+    // 幅 0 の viewBox の文書の子の outline は描かない（断らない）
+    let zv = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 0 10\"><rect width=\"5\" height=\"5\" style=\"outline: 2px solid red\"/></svg>";
+    assert!(build(zv).is_ok());
 }
 
 /// 根の svg の display: none と偽の条件は描くことを止めない（Chrome と同じ。ADR-102。子の display: none は効く）。

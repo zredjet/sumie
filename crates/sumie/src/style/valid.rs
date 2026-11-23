@@ -334,17 +334,76 @@ fn skip_args(v: &mut Values<'_, '_>, cx: Ctx) -> Result<bool, Error> {
     }
 }
 
-/// width・height の大きさの関数（`calc-size()`・`anchor-size()`・`fit-content()`。Chrome は SVG の rect で auto と同じに
-/// 扱う。単位 3 の 6 回目のレビュー）を 1 つ読む。
+/// width・height の大きさの関数で、Chrome が SVG の rect で `auto` と同じに扱うもの（単位 3 の 6・7 回目のレビュー）を 1 つ
+/// 読む：基準が大きさの言葉の `calc-size()`（入れ子の `calc-size()` の基準も同じ。続く式は空でなければ受ける）と、fallback の
+/// ない `anchor-size()`（anchor の名前と大きさの言葉をそれぞれ 1 つまで）。基準が `any` か長さの `calc-size()` と fallback の
+/// ある `anchor-size()` は長さになり、`calc()` と同じく M7 まで壊れた値（偽を返す。字句は読み進めてよい：値は壊れたもの）。
 pub(crate) fn size_function(v: &mut Values<'_, '_>, cx: Ctx) -> Result<bool, Error> {
     let t = v.peek()?;
-    if t.kind == Tk::Function
-        && crate::style::props::SIZE_FUNCTIONS.iter().any(|w| ident_is(v.s, t.inner, t.escaped, w))
-    {
+    if t.kind != Tk::Function {
+        return Ok(false);
+    }
+    if ident_is(v.s, t.inner, t.escaped, b"calc-size") {
         v.next()?;
-        return skip_args(v, cx);
+        // 入れ子の calc-size( を数える（再帰しない）
+        let mut depth = 1u32;
+        loop {
+            let t = v.peek()?;
+            if t.kind == Tk::Function && ident_is(v.s, t.inner, t.escaped, b"calc-size") {
+                v.next()?;
+                depth = depth.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        if !eat_any(v, crate::style::props::SIZE_BASIS)? {
+            return Ok(false);
+        }
+        for _ in 0..depth {
+            if !v.eat(Tk::Comma)? || v.peek()?.kind == Tk::RParen || v.at_end()? {
+                return Ok(false);
+            }
+            skip_args(v, cx)?;
+        }
+        return Ok(true);
+    }
+    if ident_is(v.s, t.inner, t.escaped, b"anchor-size") {
+        v.next()?;
+        let (mut name, mut size) = (false, false);
+        loop {
+            let t = v.next()?;
+            match t.kind {
+                Tk::RParen | Tk::Eof => return Ok(true),
+                Tk::Ident
+                    if !size
+                        && crate::style::props::ANCHOR_SIZES.iter().any(|w| ident_is(v.s, t.inner, t.escaped, w)) =>
+                {
+                    size = true;
+                }
+                Tk::Ident if !name && v.s.get(t.inner.start as usize..).is_some_and(|b| b.starts_with(b"--")) => {
+                    name = true;
+                }
+                // fallback（長さになる）と、ほかの字句（壊れた値）
+                _ => return Ok(false),
+            }
+        }
     }
     Ok(false)
+}
+
+/// `offset` のまとめが道（関数か url）を持つか（位置・anchor・回転・距離と箱の言葉だけなら、Chrome でも SVG の要素は動かない。
+/// 単位 3 の 6・7 回目のレビュー）。字句ごとに払う。
+pub(crate) fn offset_has_path(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<bool, Error> {
+    let budget = budget_ref(budget);
+    let mut v = Values::new(s, range, budget);
+    loop {
+        budget.spend(crate::cost::OP_STEP)?;
+        match v.next()?.kind {
+            Tk::Eof => return Ok(false),
+            Tk::Function | Tk::Url => return Ok(true),
+            _ => {}
+        }
+    }
 }
 
 /// `url()` か、決まった名前の関数の並び（1 つ以上）。
@@ -719,9 +778,29 @@ pub(crate) fn css_box(
         }
         Ok(None)
     };
-    let nonneg = |v: &mut Values<'_, '_>| -> Result<Option<bool>, Error> {
-        Ok(len_of(v, cx)?.filter(|l| l.value >= 0.0).map(|l| l.value == 0.0))
+    // 読めない部品（sumie が読まない色の関数・ほかの関数・知らない単位の次元・知らない言葉）を 1 つ読み飛ばす。Chrome は
+    // 受けうるので壊れた値にせず、同じ絵にならないとみなす（NotYet。単位 3 の 7 回目のレビュー）。形の誤り（負の値・
+    // 2 つ目の太さなど）だけを壊れた値にする
+    let unknown_piece = |v: &mut Values<'_, '_>, idents: bool| -> Result<bool, Error> {
+        let t = v.peek()?;
+        match t.kind {
+            Tk::Function => {
+                v.next()?;
+                skip_args(v, cx)?;
+                Ok(true)
+            }
+            Tk::Dimension => {
+                v.next()?;
+                Ok(true)
+            }
+            Tk::Ident if idents => {
+                v.next()?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     };
+    let mut unknown = false;
     let out = match rule {
         BoxRule::BorderLine | BoxRule::OutlineLine => {
             let outline = rule == BoxRule::OutlineLine;
@@ -732,13 +811,33 @@ pub(crate) fn css_box(
                     && let Some(n) = style(&mut v, outline)?
                 {
                     line = Some(n);
-                } else if !width && (eat_any(&mut v, WIDTHS)? || nonneg(&mut v)?.is_some()) {
-                    width = true;
-                } else if !color && (v.color()?.is_some() || (outline && v.eat_ident(b"invert")?)) {
-                    color = true;
-                } else {
-                    return Ok(None);
+                    continue;
                 }
+                if !width && eat_any(&mut v, WIDTHS)? {
+                    width = true;
+                    continue;
+                }
+                if let Some(l) = len_of(&mut v, cx)? {
+                    // 負の太さと 2 つ目の太さは壊れた値（読み進めてから弾いて色として読まない）
+                    if width || l.value < 0.0 {
+                        return Ok(None);
+                    }
+                    width = true;
+                    continue;
+                }
+                if !color {
+                    let mut probe = v;
+                    if probe.color()?.is_some() {
+                        v = probe;
+                        color = true;
+                        continue;
+                    }
+                }
+                if unknown_piece(&mut v, true)? {
+                    unknown = true;
+                    continue;
+                }
+                return Ok(None);
             }
             Some(line.unwrap_or(true))
         }
@@ -763,8 +862,13 @@ pub(crate) fn css_box(
             while !v.at_end()? {
                 budget.spend(crate::cost::OP_STEP)?;
                 if auto && v.eat_ident(b"auto")? {
-                } else if let Some(l) = len_of(&mut v, cx)?.filter(|l| neg || l.value >= 0.0) {
+                } else if let Some(l) = len_of(&mut v, cx)? {
+                    if !neg && l.value < 0.0 {
+                        return Ok(None);
+                    }
                     same &= l.value == 0.0;
+                } else if unknown_piece(&mut v, false)? {
+                    unknown = true;
                 } else {
                     return Ok(None);
                 }
@@ -783,8 +887,16 @@ pub(crate) fn css_box(
                     after = true;
                     continue;
                 }
-                let Some(z) = nonneg(&mut v)? else { return Ok(None) };
-                same &= z;
+                if let Some(l) = len_of(&mut v, cx)? {
+                    if l.value < 0.0 {
+                        return Ok(None);
+                    }
+                    same &= l.value == 0.0;
+                } else if unknown_piece(&mut v, false)? {
+                    unknown = true;
+                } else {
+                    return Ok(None);
+                }
                 if after {
                     m = m.saturating_add(1);
                 } else {
@@ -806,8 +918,8 @@ pub(crate) fn css_box(
         BoxRule::Logical => {
             let ok = v.eat_ident(b"auto")?
                 || eat_any(&mut v, crate::style::props::SIZE_KEYWORDS)?
-                || size_function(&mut v, cx)?
-                || nonneg(&mut v)?.is_some();
+                || len_of(&mut v, cx)?.is_some_and(|l| l.value >= 0.0)
+                || unknown_piece(&mut v, false)?;
             ok.then_some(false)
         }
         BoxRule::Keyword { words, neutral } => {
@@ -834,7 +946,7 @@ pub(crate) fn css_box(
             }
         }
     };
-    Ok(if v.at_end()? { out } else { None })
+    Ok(if v.at_end()? { out.map(|same| same && !unknown) } else { None })
 }
 
 #[cfg(test)]
