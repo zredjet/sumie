@@ -32,7 +32,7 @@ fn edges_of(polys: &[&[(f64, f64)]], budget: &Budget<'_>) -> Vec<Edge> {
 fn grid(edges: &[Edge], rect: PixelBox, rule: FillRule, aa: bool) -> Vec<i64> {
     let budget = Budget::new(Stage::Render, u64::MAX, u64::MAX, &Never);
     let w = rect.width() as usize;
-    let mut scan = Scan::new(rect.x0, w, &budget).unwrap();
+    let mut scan = Scan::new(rect.x0, w, edges.len(), &budget).unwrap();
     let mut g = vec![0i64; w * rect.height() as usize];
     fill_region(edges, rule, aa, rect, &mut scan, &budget, &mut |x, y, len, c| {
         for k in 0..len as i64 {
@@ -190,7 +190,7 @@ fn scanning_pays() {
     let big: &[(f64, f64)] = &[(0.0, 0.0), (3000.0, 1.0), (3000.0, 2000.0), (0.0, 2000.0)];
     let e = edges_of(&[big], &budget);
     let b = Budget::new(Stage::Render, u64::MAX, u64::MAX, &Never);
-    let mut scan = Scan::new(0, 3000, &b).unwrap();
+    let mut scan = Scan::new(0, 3000, e.len(), &b).unwrap();
     fill_region(&e, FillRule::NonZero, true, rect_px(0, 0, 3000, 2000), &mut scan, &b, &mut |_, _, _, _| Ok(()))
         .unwrap();
     assert!(b.work() > 2000 * cost_row());

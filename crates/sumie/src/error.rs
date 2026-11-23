@@ -50,6 +50,12 @@ pub enum Resource {
     Depth,
     /// 展開したあとの要素の数（`Limits::instances`。use・marker・pattern などを参照ごとに数える）
     Instances,
+    /// キャンバスの 1 辺（`RenderLimits::canvas_side`）
+    CanvasSide,
+    /// キャンバスの画素の数（`RenderLimits::canvas_pixels`）
+    CanvasPixels,
+    /// 描く節の数（`RenderLimits::render_nodes`）
+    RenderNodes,
 }
 
 /// 段（どこで断ったか）。
@@ -94,6 +100,32 @@ pub enum Feature {
     NestedSvg,
     /// 文字があるのにフォントの集まりが空
     TextWithoutFonts,
+    /// まだ描かない機能（M2〜M6 の一時の印。M7 までになくす。ADR-89 (1)）
+    NotYet(Later),
+}
+
+/// [`Feature::NotYet`] の機能（描くマイルストーン）。
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Later {
+    /// グラデーションの塗り（M3）
+    Gradient,
+    /// pattern の塗り（M3）
+    Pattern,
+    /// `opacity` < 1（層。M3）
+    Opacity,
+    /// `clip-path`（M3）
+    Clip,
+    /// `mask`（M3）
+    Mask,
+    /// `mix-blend-mode`・`isolation`（M3）
+    Blend,
+    /// marker（M3）
+    Marker,
+    /// 切り取りの要る入れ子の svg・symbol（M3）
+    Viewport,
+    /// filter（M4）
+    Filter,
 }
 
 /// 壊れた入力・呼び手の誤り。

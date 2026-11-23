@@ -114,7 +114,7 @@ pub(crate) fn size_rule(doc: &XmlDoc, input: &[u8], font_size: f64, budget: &Bud
 
 /// 画素の大きさ（倍率を掛けたものを f32 にしてから四捨五入する。0.5 は遠い側・最小 1。resvg の `to_int_size` と同じ。
 /// ADR-78 (5)）。倍率が有限で正でないか、画素の数が u32 を超えれば `Invalid`（`Argument`）。
-pub(crate) fn pixel_size(size: Size, scale: f64) -> Result<PixelSize, Error> {
+pub(crate) fn to_pixels(size: Size, scale: f64) -> Result<PixelSize, Error> {
     let arg = || Error::Invalid(Invalid { reason: InvalidReason::Argument, position: None });
     if !(scale.is_finite() && scale > 0.0) {
         return Err(arg());

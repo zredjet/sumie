@@ -20,9 +20,13 @@ mod geom;
 mod limits;
 mod math;
 mod mem;
+mod paint;
+mod plan;
 mod raster;
+mod render;
 mod report;
 mod style;
+mod tree;
 mod values;
 mod xml;
 
@@ -32,10 +36,13 @@ pub mod fuzzing;
 pub use crate::budget::Estimate;
 pub use crate::cancel::{Cancel, Never};
 pub use crate::doc::{Document, Needs, PixelSize, Size};
-pub use crate::error::{Error, Feature, Invalid, InvalidReason, LimitError, Resource, Stage, Unsupported};
-pub use crate::limits::Limits;
+pub use crate::error::{Error, Feature, Invalid, InvalidReason, Later, LimitError, Resource, Stage, Unsupported};
+pub use crate::limits::{Limits, RenderLimits};
+pub use crate::plan::{Plan, RenderEstimate, RenderOptions};
+pub use crate::render::{PixelRect, PixmapMut};
 pub use crate::report::{Report, UnreadRef, Warning, WarningKind};
 pub use crate::style::{ColorScheme, GenericFamilies, ParseOptions, StyleDefaults};
+pub use crate::tree::Tree;
 
 /// 描画器の識別子。値を変える変更で数を上げる（determinism.md §8）。開発中は 0、M7 で 1 に凍結する。
 pub const RENDERER: &str = "sumie-render/0";

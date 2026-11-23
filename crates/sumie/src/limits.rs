@@ -48,3 +48,43 @@ impl Default for Limits {
         Limits::DEFAULT
     }
 }
+
+/// 計画と描く段の上限。`Plan` が写して持ち、`render`・`render_region` でも使う（requirements.md §2.10）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderLimits {
+    /// キャンバスの 1 辺と画素の数
+    pub canvas_side: u32,
+    pub canvas_pixels: u64,
+    /// 描く節の数（pattern などの描き直しを含む）
+    pub render_nodes: u64,
+    /// 見積もり自身の手間と確保（`Tree::estimate`・`Plan::estimate_region`）
+    pub estimate_work: u64,
+    pub estimate_bytes: u64,
+    /// 計画の手間と、`Plan` が持ち続ける量
+    pub plan_work: u64,
+    pub plan_bytes: u64,
+    /// 描く手間と、同時に生きる一時の確保
+    pub render_work: u64,
+    pub temp_bytes: u64,
+}
+
+impl RenderLimits {
+    /// 既定の上限（requirements.md §2.10）。
+    pub const DEFAULT: RenderLimits = RenderLimits {
+        canvas_side: 32_768,
+        canvas_pixels: 1 << 28,
+        render_nodes: 1 << 22,
+        estimate_work: 1 << 28,
+        estimate_bytes: 256 << 20,
+        plan_work: 1 << 32,
+        plan_bytes: 1 << 30,
+        render_work: 1 << 33,
+        temp_bytes: 1 << 30,
+    };
+}
+
+impl Default for RenderLimits {
+    fn default() -> RenderLimits {
+        RenderLimits::DEFAULT
+    }
+}

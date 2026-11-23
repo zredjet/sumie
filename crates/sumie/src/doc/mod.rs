@@ -76,10 +76,10 @@ impl<'s> Document<'s> {
     /// 画素の数が u32 を超えれば `Invalid`（`Argument`）。
     pub fn pixel_size(&self, scale: f64) -> Result<Option<PixelSize>, Error> {
         match self.size.known() {
-            Some(s) => Ok(Some(size::pixel_size(s, scale)?)),
+            Some(s) => Ok(Some(size::to_pixels(s, scale)?)),
             None => {
                 // 倍率の誤りは大きさが決まらなくても返す
-                size::pixel_size(Size { width: 1.0, height: 1.0 }, scale)?;
+                size::to_pixels(Size { width: 1.0, height: 1.0 }, scale)?;
                 Ok(None)
             }
         }

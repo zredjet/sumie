@@ -413,9 +413,14 @@ pub(crate) struct Scan<'b> {
 }
 
 impl<'b> Scan<'b> {
-    /// 範囲の幅の置き場を作る。
-    pub(crate) fn new(x0: i64, width: usize, budget: &'b crate::budget::Budget<'b>) -> Result<Scan<'b>, Error> {
-        Ok(Scan { cells: RowCells::new(x0, width, budget)?, active: MVec::new(budget) })
+    /// 範囲の幅の置き場を作る（行にかかる辺の番号は `max_edges` 個まで。伸ばさない）。
+    pub(crate) fn new(
+        x0: i64,
+        width: usize,
+        max_edges: usize,
+        budget: &'b crate::budget::Budget<'b>,
+    ) -> Result<Scan<'b>, Error> {
+        Ok(Scan { cells: RowCells::new(x0, width, budget)?, active: MVec::with_capacity(budget, max_edges)? })
     }
 }
 
@@ -515,7 +520,7 @@ pub(crate) fn fill_region(
             }
             // 触れた最後のセルの右は、範囲の右の終わりまで同じ被覆
             let tail_from = x0.saturating_add(i64::try_from(hi).unwrap_or(0));
-            let tail_end = x0.saturating_add(i64::try_from(width).unwrap_or(0));
+            let tail_end = x0.saturating_add(i64::try_from(width).unwrap_or(0)).min(rect.x1);
             let tail = value(acc, 0);
             if tail_from < tail_end {
                 let len = u64::try_from(tail_end.saturating_sub(tail_from)).unwrap_or(0);

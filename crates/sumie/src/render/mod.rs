@@ -1,0 +1,174 @@
+//! 段 6：描く（architecture.md §3・§4.5・§8・ADR-13・ADR-38）。範囲と交わる項目だけを選び、行ごとに被覆を求めて塗る。
+//! 範囲の画素は、全体を描いて同じ矩形を切り出したものとビット単位で同じ（点と辺は範囲に依らずに計画で決め、セルは辺の
+//! 元の両端から閉じた式で求める）。
+
+use crate::budget::{Budget, Estimate};
+use crate::cancel::Cancel;
+use crate::cost;
+use crate::error::{Error, Invalid, InvalidReason, Stage};
+use crate::plan::{Plan, RenderOptions};
+use crate::raster::{PixelBox, Scan, coverage_alpha, fill_region};
+use crate::tree::Tree;
+
+/// 出力の画素（RGBA8 の乗算済み。行のバイト数 `stride` ≥ 幅 × 4）。描く前に全体を透明にする（FR-OUT-04）。
+#[derive(Debug)]
+pub struct PixmapMut<'a> {
+    data: &'a mut [u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+}
+
+impl<'a> PixmapMut<'a> {
+    /// 画素の並びを包む（大きさと行のバイト数が合わなければ `Invalid`（呼び手の誤り））。
+    pub fn new(data: &'a mut [u8], width: u32, height: u32, stride: usize) -> Result<PixmapMut<'a>, Error> {
+        let row = (width as usize).checked_mul(4).ok_or_else(argument)?;
+        let need = stride.checked_mul(height as usize).ok_or_else(argument)?;
+        if width == 0 || height == 0 || stride < row || data.len() < need {
+            return Err(argument());
+        }
+        Ok(PixmapMut { data, width, height, stride })
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+}
+
+/// 画素の範囲（`x`・`y` から幅 `width`・高さ `height`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixelRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+fn argument() -> Error {
+    Error::Invalid(Invalid { reason: InvalidReason::Argument, position: None })
+}
+
+impl Plan {
+    /// 範囲を描く見積もり（範囲が全体に含まれるなら `RenderEstimate.render` を超えない。FR-OUT-06）。
+    pub fn estimate_region(&self, rect: PixelRect, cancel: &dyn Cancel) -> Result<Estimate, Error> {
+        let r = self.region(rect)?;
+        let budget = Budget::new(Stage::Estimate, self.limits.estimate_work, self.limits.estimate_bytes, cancel);
+        let mut work = 0u64;
+        for it in self.items.as_slice() {
+            budget.spend(cost::OP_STEP)?;
+            let b = it.pixel_box().intersect(&r);
+            if b.is_empty() {
+                continue;
+            }
+            let per_row = cost::RASTER_ROW
+                .saturating_add(cost::RASTER_SWEEP)
+                .saturating_add(b.width().saturating_mul(cost::RASTER_SWEEP.saturating_add(cost::PAINT_PIXEL)));
+            work = work
+                .saturating_add(b.height().saturating_mul(per_row))
+                .saturating_add(u64::from(it.edges[1]).saturating_mul(cost::RASTER_EDGE_ROW))
+                .saturating_add(it.edge_rows.saturating_mul(cost::RASTER_EDGE_ROW))
+                .saturating_add(it.cells.saturating_mul(cost::RASTER_CELL));
+        }
+        let (frame, peak_bytes) =
+            crate::plan::render_frame(r.width(), r.height(), self.max_item_edges, self.items.len() as u64);
+        Ok(Estimate { work: work.saturating_add(frame), peak_bytes, result_bytes: 0 })
+    }
+
+    /// 全体を描く（出力は計画の大きさ）。
+    pub fn render(&self, out: &mut PixmapMut<'_>, cancel: &dyn Cancel) -> Result<(), Error> {
+        let rect = PixelRect { x: 0, y: 0, width: self.width, height: self.height };
+        self.render_region(rect, out, cancel)
+    }
+
+    /// 範囲を描く（出力は範囲の大きさ）。全体の描画の同じ矩形とビット単位で同じ（ADR-13）。
+    pub fn render_region(&self, rect: PixelRect, out: &mut PixmapMut<'_>, cancel: &dyn Cancel) -> Result<(), Error> {
+        let r = self.region(rect)?;
+        if out.width != rect.width || out.height != rect.height {
+            return Err(argument());
+        }
+        let est = self.estimate_region(rect, cancel)?;
+        if est.work > self.limits.render_work {
+            return Err(Error::limit(crate::error::Resource::Work, est.work, self.limits.render_work, Stage::Render));
+        }
+        if est.peak_bytes > self.limits.temp_bytes {
+            return Err(Error::limit(
+                crate::error::Resource::Memory,
+                est.peak_bytes,
+                self.limits.temp_bytes,
+                Stage::Render,
+            ));
+        }
+        let budget = Budget::new(Stage::Render, est.work, est.peak_bytes, cancel);
+        // 出力を透明にする（行ごとに払う）
+        let row_len = (out.width as usize).saturating_mul(4);
+        for y in 0..out.height as usize {
+            budget.spend(cost::fill(row_len as u64).saturating_add(cost::OP_STEP))?;
+            let start = y.saturating_mul(out.stride);
+            if let Some(row) = out.data.get_mut(start..start.saturating_add(row_len)) {
+                for b in row.iter_mut() {
+                    *b = 0;
+                }
+            }
+        }
+        let width = usize::try_from(r.width()).map_err(|_| argument())?;
+        let max_edges = usize::try_from(self.max_item_edges).map_err(|_| budget.too_large())?;
+        let mut scan = Scan::new(r.x0, width, max_edges, &budget)?;
+        for it in self.items.as_slice() {
+            budget.spend(cost::OP_STEP)?;
+            let b = it.pixel_box().intersect(&r);
+            if b.is_empty() {
+                continue;
+            }
+            let color = it.color;
+            let stride = out.stride;
+            let data = &mut *out.data;
+            fill_region(
+                self.edges_of(it),
+                it.fill_rule(),
+                it.aa != 0,
+                b,
+                &mut scan,
+                &budget,
+                &mut |x, y, len, cov| {
+                    let a = coverage_alpha(cov);
+                    if a == 0 {
+                        return Ok(());
+                    }
+                    budget.spend(len.saturating_mul(cost::PAINT_PIXEL))?;
+                    let row = usize::try_from(y.saturating_sub(r.y0)).unwrap_or(0).saturating_mul(stride);
+                    let col = usize::try_from(x.saturating_sub(r.x0)).unwrap_or(0).saturating_mul(4);
+                    let start = row.saturating_add(col);
+                    let n = usize::try_from(len).unwrap_or(0).saturating_mul(4);
+                    if let Some(px) = data.get_mut(start..start.saturating_add(n)) {
+                        crate::paint::blend_span(px, color, a);
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 範囲を確かめて画素の矩形にする（空・キャンバスの外は呼び手の誤り）。
+    fn region(&self, rect: PixelRect) -> Result<PixelBox, Error> {
+        let x1 = u64::from(rect.x).saturating_add(u64::from(rect.width));
+        let y1 = u64::from(rect.y).saturating_add(u64::from(rect.height));
+        if rect.width == 0 || rect.height == 0 || x1 > u64::from(self.width) || y1 > u64::from(self.height) {
+            return Err(argument());
+        }
+        Ok(PixelBox { x0: i64::from(rect.x), y0: i64::from(rect.y), x1: x1 as i64, y1: y1 as i64 })
+    }
+}
+
+impl Tree {
+    /// 計画して全体を描く（出力は `pixel_size(scale)` の大きさ）。
+    pub fn render(&self, opts: &RenderOptions, out: &mut PixmapMut<'_>, cancel: &dyn Cancel) -> Result<(), Error> {
+        let plan = self.plan(opts, cancel)?;
+        let rect = PixelRect { x: 0, y: 0, width: plan.width, height: plan.height };
+        plan.render_region(rect, out, cancel)
+    }
+}
