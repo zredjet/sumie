@@ -150,6 +150,8 @@ DTD のまわりの多バイト文字・英数字と記号の 15 字のすべて
 - [ ] 画像のデコーダを注入する口（`ImageDecoder`・`data:` の URL・決定的な拡大縮小。ADR-16）
 - [ ] 知らない要素と `foreignObject` の警告（FR-ST-02・requirements §4。M2 のレビューで見つけた漏れ。ADR-98 (11)）
 - [ ] use の中身への CSS のセレクタを影の木の中で照らす（Chrome と同じ。ADR-102 (3)）・CSS の個別の変形と `offset-path`・`display: contents`・`mask` のまとめ・`shape()`・根の背景のグラデーションと data: の画像（M2 は NotYet。ADR-102 (6)(7)）
+- [ ] CSS の箱のプロパティ（根の border・padding・margin・角の丸み・box-shadow・position、要素の outline、rect の論理の大きさ）を
+  描くか既知の差にするかを決める（M2 は初期の値と同じ絵でなければ NotYet。ADR-103 (5)）
 
 **完了条件**：ここまでの機能の集まりで基準を満たす／Kura の pattern・mask の爆弾（巨大なタイル・objectBoundingBox の
 入れ子 24 段・曲線をタイルいっぱいに 3,000 回描き直す形・0.0001 の破線 1,000 本）を描く前に断るか、上限の内で描く／Kura の
@@ -234,7 +236,7 @@ pattern・clipPath・mask の中身にして 3,000 回参照）を上限の内�
 - [ ] 版の凍結（`sumie-render/1`）とゴールデンの凍結（以後は追記だけ）
 - [ ] 性能の計測と目標の確認（ADR-19）
 - [ ] resvg との差の記録（`docs/differences.md`）
-- [ ] CSS の `calc()`・`var()`（カスタムプロパティ）と `@scope` を読む・当てる（M1 では壊れた値・飛ばすアットルールとして警告
+- [ ] CSS の `calc()`・`var()`（カスタムプロパティ）・`attr()`（ADR-103 (5)(e)）と `@scope` を読む・当てる（M1 では壊れた値・飛ばすアットルールとして警告
   する。2026-11-23、ユーザーの判断。ADR-83 (3)）
 - [ ] ファズ：全部の対象の時間の合計で 24 時間以上（文書の全体を描く対象は、そのうち 8 時間以上）
 - [ ] Kura に渡す口の確定と、Kura の側の変更の案（`docs/kura-integration.md`：Kura の今の SVG の呼び出しの一覧と、そのすべての
