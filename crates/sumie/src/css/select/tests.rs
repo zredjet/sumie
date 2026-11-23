@@ -478,3 +478,76 @@ fn webkit_any_and_pseudo_classes_after_pseudo_elements() {
         assert_eq!(parse(bad), None, "{bad}");
     }
 }
+
+/// 単位 3 の 12 回目のレビュー：擬似要素ごとにあとに書ける擬似クラス（Chrome 157 と照らした）・スクロールバーの名前・
+/// 複合の引数・`::view-transition-*()` の空白。
+#[test]
+fn pseudo_elements_follow_chrome_per_element() {
+    let valid = |sel: &str| parse(&format!("rect, {sel}")).is_some();
+    for ok in [
+        "::file-selector-button:hover",
+        "::file-selector-button:focus-within",
+        "::cue:hover",
+        "::details-content:active",
+        "::scroll-marker:not(:hover)",
+        "::scroll-marker:target-current",
+        "::scroll-button(*):hover",
+        "::scroll-button(*):enabled",
+        "::picker(select):focus",
+        "::picker(select):open",
+        "::scroll-marker-group:hover",
+        "::scroll-marker-group:focus-within",
+        "::column::scroll-marker:hover",
+        "::part(x)::file-selector-button:hover",
+        "::slotted(a)::details-content:hover",
+        "::part(x):window-inactive",
+        "::-webkit-resizer:horizontal",
+        "::-webkit-resizer:enabled",
+        "::-webkit-scrollbar:hover",
+        "::-webkit-scrollbar-track-piece:start",
+        "::-webkit-foo:focus",
+        "::view-transition-group(*):only-child",
+        "::search-text:current",
+        "::view-transition-old(a .b)",
+        "::view-transition-new(.a .b)",
+        "::view-transition-group( a .b.c )",
+        ":host(:is(a b))",
+        "::slotted(:is(a b))",
+        ":host(.a:hover)",
+        "::cue(.a, b)",
+    ] {
+        assert!(valid(ok), "{ok}");
+    }
+    for bad in [
+        "::slotted(a):hover",
+        "::column:hover",
+        "::column:not(:hover)",
+        "::-webkit-scrollbar:focus",
+        "::-webkit-scrollbar:not(:focus)",
+        "::-webkit-resizer:focus",
+        "::part(x):horizontal",
+        "::part(x):not(:horizontal)",
+        "::-webkit-scrollbar-foo:horizontal",
+        "::-webkit-scrollbarx:horizontal",
+        "::-webkit-scrollbar:-webkit-drag",
+        "::cue(a):hover",
+        "::scroll-marker-group:focus",
+        "::view-transition-old(* .a)",
+        "::view-transition-old(a . b)",
+        "::view-transition-old(a. b)",
+        ":host(:foo)",
+        ":host(::before)",
+        ":host(:not(a b))",
+        ":host(:has(a))",
+        ":host(a b)",
+        ":host(a, b)",
+        ":host-context(:foo)",
+        "::slotted(:foo)",
+        "::slotted(a, b)",
+        "::cue(::before)",
+        "::cue(:foo)",
+        "::cue()",
+    ] {
+        assert!(!valid(bad), "{bad}");
+    }
+}

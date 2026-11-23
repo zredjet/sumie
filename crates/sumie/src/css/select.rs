@@ -376,6 +376,20 @@ const PE_COLUMN: u8 = 6;
 const PE_SCROLLBAR: u8 = 7;
 /// 表にないほかの `::-webkit-*`（利用者の動きの擬似クラス。Chrome と同じ）
 const PE_WEBKIT: u8 = 8;
+/// `::file-selector-button`・`::cue`（関数でない形）・`::details-content`（利用者の動きの擬似クラス）
+const PE_USER: u8 = 9;
+/// `::scroll-marker`（利用者の動きの擬似クラスと `:target-current`）
+const PE_SCROLL_MARKER: u8 = 10;
+/// `::scroll-button()`（利用者の動きの擬似クラスと `:enabled`・`:disabled`）
+const PE_SCROLL_BUTTON: u8 = 11;
+/// `::picker()`（利用者の動きの擬似クラスと `:open`・`:popover-open`）
+const PE_PICKER: u8 = 12;
+/// `::scroll-marker-group`（`:hover`・`:focus-within`）
+const PE_MARKER_GROUP: u8 = 13;
+/// `::view-transition-*()`（`:only-child`）
+const PE_VIEW_TRANSITION: u8 = 14;
+/// `::search-text`（`:current`）
+const PE_SEARCH_TEXT: u8 = 15;
 
 /// `::slotted()` のあとに書ける木に沿う擬似要素（Chrome 157 と照らした。`::first-line`・`::selection` は書けない）。
 const AFTER_SLOTTED: &[&[u8]] =
@@ -429,6 +443,10 @@ struct Frame {
     outer_pe: u8,
     /// `:-webkit-any()`（寛容でない複合の並び。詳細度は擬似クラス 1 つ。Chrome と同じ）
     webkit_any: bool,
+    /// 結合子を書けない並び（`:host()`・`:host-context()`・`::slotted()`・`::cue()` の引数と、その中の論理の擬似クラス）
+    compound: bool,
+    /// 関数の擬似の引数の並び（閉じても単純な選択子を足さない）：0 でない、1 ちょうど 1 つ、2 は 1 つ以上
+    arg: u8,
 }
 
 impl Frame {
@@ -460,6 +478,8 @@ impl Frame {
             base: 0,
             outer_pe: PE_NONE,
             webkit_any: false,
+            compound: false,
+            arg: 0,
         }
     }
 
@@ -673,6 +693,13 @@ fn parse_list(s: &[u8], range: Span, ns: NsTable<'_>, t: &mut Tables<'_>, budget
 /// 閉じた入れ子の並び `f` を、外の複合 `p` の単純な選択子にする。
 fn close_list(f: &Frame, t: &mut Tables<'_>, p: Option<&mut Frame>) -> R<()> {
     let Some(p) = p else { return Err(invalid()) };
+    // 関数の擬似の引数：選択子の数だけ確かめる（単純な選択子は始めに足した）
+    if f.arg != 0 {
+        if f.count == 0 || (f.arg == 1 && f.count != 1) {
+            p.broken = true;
+        }
+        return Ok(());
+    }
     if f.opaque || f.kind == S_NOT {
         // `:has()`・`of S`・`:not()` の空の並びは壊れている
         if f.count == 0 {
@@ -831,8 +858,8 @@ fn step(
             cur.next()?;
             cur.skip_ws()?;
         }
-        if f.pe_ctx() != PE_NONE || f.webkit_any {
-            // 擬似要素のあと（とその論理の擬似クラスの中）と `:-webkit-any()` の中に結合子は書けない
+        if f.pe_ctx() != PE_NONE || f.webkit_any || f.compound {
+            // 擬似要素のあと（とその論理の擬似クラスの中）と `:-webkit-any()`・複合の引数の中に結合子は書けない
             return Err(invalid());
         }
         if f.compound_empty {
@@ -1017,16 +1044,29 @@ fn pseudo(
     if element || legacy {
         // 擬似要素：いちばん外の並びにだけ書ける
         // 関数の形は引数を文法で確かめる（Chrome と仕様が捨てる形を受けない。単位 3 の 11 回目のレビュー）
+        // 複合の引数（`::slotted()`・`::cue()`）は入れ子の並びとして読む（再帰しない）
+        let mut compound_arg = 0u8;
+        let scrollbar = n.kind == Kind::Ident && !n.escaped && any(SCROLLBAR_ELEMENTS);
         let (known, listed) = match n.kind {
-            Kind::Ident => (any(PSEUDO_ELEMENTS) || webkit(), any(PSEUDO_ELEMENTS)),
-            Kind::Function => {
-                let form = pseudo_element_form(&nm);
-                let arg = cur.skip_function()?;
-                match form {
-                    Some(form) => (args_ok(s, arg, form, budget)?, true),
-                    None => (webkit(), false),
+            Kind::Ident => (any(PSEUDO_ELEMENTS) || webkit(), any(PSEUDO_ELEMENTS) || scrollbar),
+            Kind::Function => match pseudo_element_form(&nm) {
+                Some(ArgForm::Compound) => {
+                    compound_arg = 1;
+                    (true, true)
                 }
-            }
+                Some(ArgForm::CompoundList) => {
+                    compound_arg = 2;
+                    (true, true)
+                }
+                Some(form) => {
+                    let arg = cur.skip_function()?;
+                    (args_ok(s, arg, form, budget)?, true)
+                }
+                None => {
+                    cur.skip_function()?;
+                    (webkit(), false)
+                }
+            },
             _ => (false, false),
         };
         if !known || !f.top {
@@ -1046,27 +1086,50 @@ fn pseudo(
         if !follows {
             return Err(invalid());
         }
-        let scrollbar = n.inner.of(s).get(..17).is_some_and(|p| p.eq_ignore_ascii_case(b"-webkit-scrollbar"));
-        let next_pe = if n.kind == Kind::Ident && (is(b"before") || is(b"after")) {
+        // 擬似要素ごとに、あとに書ける擬似クラス（Chrome 157 と照らした。単位 3 の 12 回目のレビュー）
+        let ident = n.kind == Kind::Ident;
+        let func = n.kind == Kind::Function;
+        let next_pe = if ident && (is(b"before") || is(b"after")) {
             PE_BEFORE_AFTER
-        } else if n.kind == Kind::Ident && scrollbar && !n.escaped {
+        } else if scrollbar {
             PE_SCROLLBAR
         } else if !listed {
             PE_WEBKIT
-        } else if n.kind == Kind::Function && is(b"part") {
+        } else if func && is(b"part") {
             PE_PART
-        } else if n.kind == Kind::Ident && is(b"selection") {
+        } else if ident && is(b"selection") {
             PE_SELECTION
-        } else if n.kind == Kind::Function && is(b"slotted") {
+        } else if func && is(b"slotted") {
             PE_SLOTTED
-        } else if n.kind == Kind::Ident && is(b"column") {
+        } else if ident && is(b"column") {
             PE_COLUMN
+        } else if ident && (is(b"file-selector-button") || is(b"cue") || is(b"details-content")) {
+            PE_USER
+        } else if ident && is(b"scroll-marker") {
+            PE_SCROLL_MARKER
+        } else if ident && is(b"scroll-marker-group") {
+            PE_MARKER_GROUP
+        } else if ident && is(b"search-text") {
+            PE_SEARCH_TEXT
+        } else if func && is(b"scroll-button") {
+            PE_SCROLL_BUTTON
+        } else if func && is(b"picker") {
+            PE_PICKER
+        } else if func && pseudo_element_form(&nm) == Some(ArgForm::ViewTransition) {
+            PE_VIEW_TRANSITION
         } else {
             PE_OTHER
         };
         f.spec.c = f.spec.c.saturating_add(1);
         add_simple(f, t, Simple::new(S_NEVER), true)?;
         f.pe = next_pe;
+        if compound_arg != 0 {
+            let mut g = Frame::new(S_NEVER, false, false, false, true).at(cur.depth());
+            g.compound = true;
+            g.arg = compound_arg;
+            frames.push(g)?;
+            cur.skip_ws()?;
+        }
         return Ok(());
     }
     match n.kind {
@@ -1091,21 +1154,34 @@ fn pseudo(
                 S_LINK
             } else if is(b"defined") {
                 S_UNIVERSAL
-            } else if any(DYNAMIC) || any(SCROLLBAR_CLASSES) {
+            } else if any(DYNAMIC) || any(SCROLLBAR_CLASSES) || any(OTHER_NEVER) {
                 S_NEVER
             } else {
                 return Err(invalid());
             };
-            // 擬似要素のあと：`::part()` のあとは利用者の動きと構造でない擬似クラス、`::-webkit-scrollbar*` のあとは利用者の
-            // 動きとスクロールバーの擬似クラス、`::slotted()`・`::column` のあとは利用者の動きの擬似クラス、`::selection` の
-            // あとは `:window-inactive` だけ（`::before`・`::after`・`::selection`・`::placeholder` などのあとの `:hover` は
-            // Chrome が捨てる。単位 3 の 11 回目のレビュー）
+            // 擬似要素のあとに書ける擬似クラス（擬似要素ごと。Chrome 157 と照らした。単位 3 の 11・12 回目のレビュー）
             let pe = f.pe_ctx();
             let user = any(USER_ACTION);
-            let after_pe = (pe == PE_PART && matches!(kind, S_NEVER | S_LINK | S_UNIVERSAL))
-                || (pe == PE_SCROLLBAR && (user || any(SCROLLBAR_CLASSES) || is(b"enabled") || is(b"disabled")))
-                || (matches!(pe, PE_SLOTTED | PE_COLUMN | PE_WEBKIT) && user)
-                || (pe == PE_SELECTION && is(b"window-inactive"));
+            let after_pe = match pe {
+                PE_PART => matches!(kind, S_NEVER | S_LINK | S_UNIVERSAL) && !any(SCROLLBAR_CLASSES),
+                PE_SCROLLBAR => {
+                    is(b"hover")
+                        || is(b"active")
+                        || any(SCROLLBAR_CLASSES)
+                        || is(b"window-inactive")
+                        || is(b"enabled")
+                        || is(b"disabled")
+                }
+                PE_USER | PE_WEBKIT => user,
+                PE_SCROLL_MARKER => user || is(b"target-current"),
+                PE_SCROLL_BUTTON => user || is(b"enabled") || is(b"disabled"),
+                PE_PICKER => user || is(b"open") || is(b"popover-open"),
+                PE_MARKER_GROUP => is(b"hover") || is(b"focus-within"),
+                PE_VIEW_TRANSITION => is(b"only-child"),
+                PE_SEARCH_TEXT => is(b"current"),
+                PE_SELECTION => is(b"window-inactive"),
+                _ => false,
+            };
             if pe != PE_NONE && !after_pe {
                 return Err(invalid());
             }
@@ -1136,6 +1212,7 @@ fn pseudo(
                 let mut g = Frame::new(kind, false, forgiving, zero, f.in_has).at(cur.depth());
                 g.outer_pe = pe;
                 g.webkit_any = webkit_any;
+                g.compound = f.compound;
                 frames.push(g)?;
                 cur.skip_ws()?;
                 return Ok(());
@@ -1227,12 +1304,22 @@ fn pseudo(
                 return Err(invalid());
             }
             if let Some(form) = never_function_form(&nm) {
-                // 正しいが当てない（引数は文法で確かめる。単位 3 の 11 回目のレビュー）
+                // 正しいが当てない（引数は文法で確かめる。複合の引数は入れ子の並びとして読む。単位 3 の 11・12 回目の
+                // レビュー）
+                f.spec.b = f.spec.b.saturating_add(1);
+                if form == ArgForm::Compound {
+                    add_simple(f, t, Simple::new(S_NEVER), false)?;
+                    let mut g = Frame::new(S_NEVER, false, false, false, true).at(cur.depth());
+                    g.compound = true;
+                    g.arg = 1;
+                    frames.push(g)?;
+                    cur.skip_ws()?;
+                    return Ok(());
+                }
                 let arg = cur.skip_function()?;
                 if !args_ok(s, arg, form, budget)? {
                     return Err(invalid());
                 }
-                f.spec.b = f.spec.b.saturating_add(1);
                 return add_simple(f, t, Simple::new(S_NEVER), false);
             }
             cur.skip_function()?;
@@ -1323,8 +1410,8 @@ const DYNAMIC: &[&[u8]] = &[
     b"host",
 ];
 
-/// Chrome が受けるスクロールバーの擬似クラスと `-webkit-` の擬似クラス（静止した絵では当たらない。単位 3 の 11 回目の
-/// レビュー。ADR-73 (6)）。
+/// Chrome が受けるスクロールバーの擬似クラス（静止した絵では当たらない。単独でも書け、スクロールバーの擬似要素のあとに書ける。
+/// `::part()` のあとには書けない。単位 3 の 11・12 回目のレビュー。ADR-73 (6)）。
 const SCROLLBAR_CLASSES: &[&[u8]] = &[
     b"horizontal",
     b"vertical",
@@ -1336,10 +1423,21 @@ const SCROLLBAR_CLASSES: &[&[u8]] = &[
     b"single-button",
     b"no-button",
     b"corner-present",
-    b"window-inactive",
-    b"-webkit-drag",
-    b"-webkit-full-page-media",
-    b"-webkit-full-screen-ancestor",
+];
+
+/// Chrome が受けるほかの当てない擬似クラス（`:window-inactive` は `::selection` とスクロールバーのあとにも書ける）。
+const OTHER_NEVER: &[&[u8]] =
+    &[b"window-inactive", b"-webkit-drag", b"-webkit-full-page-media", b"-webkit-full-screen-ancestor"];
+
+/// スクロールバーの擬似要素（Chrome の知る `::-webkit-*`。名前全体で比べる）。
+const SCROLLBAR_ELEMENTS: &[&[u8]] = &[
+    b"-webkit-scrollbar",
+    b"-webkit-scrollbar-button",
+    b"-webkit-scrollbar-corner",
+    b"-webkit-scrollbar-thumb",
+    b"-webkit-scrollbar-track",
+    b"-webkit-scrollbar-track-piece",
+    b"-webkit-resizer",
 ];
 
 /// 関数の擬似クラス・擬似要素の引数の形（仕様の文法と Chrome。単位 3 の 11 回目のレビュー）。
@@ -1410,8 +1508,8 @@ fn args_ok(s: &[u8], arg: Span, form: ArgForm, budget: &Budget<'_>) -> Result<bo
     let mut lex = Lexer::over(s, arg, budget);
     let mut nest = Nest::new(budget);
     let list = matches!(form, ArgForm::IdentList | ArgForm::CompoundList);
-    // 今の項の字句の数・項の中の空白・前の字句が `.` か
-    let (mut items, mut ws, mut dot) = (0u32, false, false);
+    // 今の項の字句の数・項の中の空白・前の字句が `.` か・前の字句が名前か
+    let (mut items, mut ws, mut dot, mut name) = (0u32, false, false, false);
     loop {
         budget.spend(cost::OP_STEP)?;
         let t = lex.next()?;
@@ -1431,7 +1529,7 @@ fn args_ok(s: &[u8], arg: Span, form: ArgForm, budget: &Budget<'_>) -> Result<bo
                 if !list || items == 0 || dot {
                     return Ok(false);
                 }
-                (items, ws, dot) = (0, false, false);
+                (items, ws, dot, name) = (0, false, false, false);
                 continue;
             }
             _ => {}
@@ -1442,14 +1540,16 @@ fn args_ok(s: &[u8], arg: Span, form: ArgForm, budget: &Budget<'_>) -> Result<bo
             ArgForm::Ident | ArgForm::IdentList => items == 0 && t.kind == Kind::Ident,
             ArgForm::Select => items == 0 && is(b"select"),
             ArgForm::ScrollButton => items == 0 && (t.is_delim(b'*') || SCROLL_DIRECTIONS.iter().any(|w| is(w))),
+            // 名前の直後の空白だけ書ける（`*` と `.` の直後は書けない。Chrome と同じ）
             ArgForm::ViewTransition => {
-                !ws && if dot {
-                    t.kind == Kind::Ident
-                } else if items == 0 {
-                    t.kind == Kind::Ident || t.is_delim(b'*') || t.is_delim(b'.')
-                } else {
-                    t.is_delim(b'.')
-                }
+                (!ws || name)
+                    && if dot {
+                        t.kind == Kind::Ident
+                    } else if items == 0 {
+                        t.kind == Kind::Ident || t.is_delim(b'*') || t.is_delim(b'.')
+                    } else {
+                        t.is_delim(b'.')
+                    }
             }
             ArgForm::Compound | ArgForm::CompoundList => {
                 !ws && (matches!(t.kind, Kind::Ident | Kind::Hash | Kind::Colon | Kind::Function | Kind::LBracket)
@@ -1462,6 +1562,8 @@ fn args_ok(s: &[u8], arg: Span, form: ArgForm, budget: &Budget<'_>) -> Result<bo
             return Ok(false);
         }
         dot = t.is_delim(b'.');
+        name = t.kind == Kind::Ident;
+        ws = false;
         items = items.saturating_add(1);
         nest.feed(&t)?;
     }

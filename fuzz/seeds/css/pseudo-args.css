@@ -4,3 +4,5 @@
 :lang(\*-CH), :lang('en'), :lang(en, fr), [u*=d s], ::after:hover, :window-inactive, ::-webkit-foo:hover { fill: navy }
 @media selector(rect), ((min-width: 1px), print) { rect { fill: red } }
 @supports selector(::-webkit-foo) or selector(:is(:foo)) or (dominant-baseline: text-top) { rect { fill: red } }
+::file-selector-button:hover, ::scroll-marker:not(:hover), ::picker(select):open, ::-webkit-resizer:horizontal, ::view-transition-old(a .b) { fill: red }
+:host(:is(a b)), ::slotted(:not(a b)), ::cue(.a, b), :host-context(:has(a)), ::part(x):horizontal, ::column:hover { fill: blue }
