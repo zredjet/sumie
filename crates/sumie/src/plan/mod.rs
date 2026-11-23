@@ -242,6 +242,38 @@ impl View {
     }
 }
 
+/// 線分（描く座標系の `p` → `r`）のうち、描く段の行とセルにかかる分の割合（0〜1。行の帯 `band` の中の割合以下）：見る箱
+/// `view` の中の部分は長さで、帯の中で箱の横の外の部分は y の差だけで数える（描く段は範囲の左の外を 1 列にまとめ、右の外を
+/// 落とすので、横の外の部分は行ごとに 1 セル。巨大な線分の、キャンバスの横の外の長さを数えない）。有限でなければ帯の割合。
+fn raster_fraction(view: &View, band: &View, p: Point, r: Point) -> f64 {
+    let g = band.inside_fraction(p, r);
+    if g <= 0.0 {
+        return 0.0;
+    }
+    let l = math::hypot(r.x - p.x, r.y - p.y);
+    if !(l.is_finite() && l > 0.0) {
+        return g;
+    }
+    let Some((a, b)) = band.clip(p, r) else { return g };
+    let dy_band = (b.y - a.y).abs();
+    let f = view.inside_fraction(p, r);
+    let dy_view = view.clip(p, r).map_or(0.0, |(c, d)| (d.y - c.y).abs());
+    let out = dy_band - dy_view;
+    let h = (f * l + if out > 0.0 { out } else { 0.0 }) / l;
+    if h.is_finite() { math::min(h, g) } else { g }
+}
+
+/// 曲線の区間の、描く座標系の y の変化の上限（制御多角形の y の差の和。曲線は制御多角形より y の変化が小さい）。弧と
+/// ほかの区間は None。
+fn curve_dy(seg: &PathSeg, t: &Transform) -> Option<f64> {
+    let dy = |a: Point, b: Point| (t.apply(b).y - t.apply(a).y).abs();
+    match *seg {
+        PathSeg::Quad(a, b, e) => Some(dy(a, b) + dy(b, e)),
+        PathSeg::Cubic(a, b, d, e) => Some(dy(a, b) + dy(b, d) + dy(d, e)),
+        _ => None,
+    }
+}
+
 /// 2 つの向きの間の角の大きさ（0〜π。どちらかが長さ 0 なら 0）。
 fn turn_between(a: Point, b: Point) -> f64 {
     let cross = a.x * b.y - a.y * b.x;
@@ -413,7 +445,7 @@ fn count(
     let implicit_close = |c: &mut Counts, a: Option<Point>, b: Option<Point>| {
         if let (Some(a), Some(b)) = (a, b) {
             let (p, r) = (t.apply(a), t.apply(b));
-            let f = band.inside_fraction(p, r);
+            let f = raster_fraction(view, band, p, r);
             c.len_dev_band += f * math::hypot(r.x - p.x, r.y - p.y);
         }
     };
@@ -530,8 +562,9 @@ fn in_view(
             c.len_stroke_in += f * len_in(a, b, s);
             c.segs_in = c.segs_in.saturating_add(1);
         }
-        let g = band.inside_fraction(p, r);
-        if g > 0.0 {
+        // 帯の中で見る箱の横の外の部分は y の差だけ（描く段の行とセル。[`raster_fraction`]）
+        let g = raster_fraction(view, band, p, r);
+        if band.inside_fraction(p, r) > 0.0 {
             c.len_dev_band += g * len_in(a, b, t);
             c.len_stroke_band += g * len_in(a, b, s);
             c.pts_band = c.pts_band.saturating_add(pts);
@@ -569,8 +602,15 @@ fn in_view(
                 c.segs_in = c.segs_in.saturating_add(1);
             }
             if mb {
-                c.len_dev_band += lens(t);
-                c.len_stroke_band += lens(s);
+                // 見る箱の外の曲線は、描く段の行とセルに y の変化だけかかる（2 次・3 次は制御多角形の y の差の和で抑え、
+                // 線を作る座標系の長さも同じ割合にする。[`raster_fraction`]）
+                let (ld, ls) = (lens(t), lens(s));
+                let k = match curve_dy(seg, t) {
+                    Some(dy) if !mv && ld > 0.0 && (dy / ld).is_finite() => math::min(dy / ld, 1.0),
+                    _ => 1.0,
+                };
+                c.len_dev_band += k * ld;
+                c.len_stroke_band += k * ls;
                 c.pts_band = c.pts_band.saturating_add(n);
             }
         }
@@ -755,15 +795,20 @@ fn raster_bounds(l: f64, e: u64, rows: u64, width: u64) -> (u64, u64) {
     (edge_rows, by_len_cells.min(by_box_cells))
 }
 
-/// 項目の辺 1 本の、行とセルの数の上限（辺を項目の画素の矩形 `bbox` の行で切った部分だけ：その部分の行の数と、x と y の
-/// 差の画素の数 ＋ 4 か、行の数 × (幅 ＋ 3) の小さい方。矩形の行にかからない辺は 0。描く段は矩形の行の中だけを回る）。
+/// 項目の辺 1 本の、行とセルの数の上限（辺を項目の画素の矩形 `bbox` の行で切った部分だけ：その部分の行の数と、x（矩形の
+/// 列の左右 1 列の外で切る）と y の差の画素の数 ＋ 4 か、行の数 × (幅 ＋ 3) の小さい方。矩形の行にかからない辺は 0。描く段は
+/// 矩形の行の中だけを回る）。
 pub(crate) fn item_bounds(e: &Edge, bbox: &PixelBox) -> (u64, u64) {
     let ya = i64::from(e.y0).max(bbox.y0.saturating_mul(ONE));
     let yb = i64::from(e.y1).min(bbox.y1.saturating_mul(ONE));
     if ya >= yb {
         return (0, 0);
     }
-    let dx = crate::raster::x_at(e, yb).saturating_sub(crate::raster::x_at(e, ya)).unsigned_abs();
+    // x は矩形の列の左に 1・右に 1 を足した所で切る（描く段は範囲の左の外を 1 列にまとめ、右の外を落とす。
+    // `raster::RowCells::cells_bound`。巨大な辺の、矩形の横の外の長さを数えない）
+    let (lo, hi) = (bbox.x0.saturating_sub(1).saturating_mul(ONE), bbox.x1.saturating_add(1).saturating_mul(ONE));
+    let clamp_x = |x: i64| x.max(lo).min(hi);
+    let dx = clamp_x(crate::raster::x_at(e, yb)).saturating_sub(clamp_x(crate::raster::x_at(e, ya))).unsigned_abs();
     let dy = yb.saturating_sub(ya).unsigned_abs();
     let px = |v: u64| v.checked_div(ONE as u64).unwrap_or(0);
     let r0 = crate::raster::floor_div(ya, ONE);

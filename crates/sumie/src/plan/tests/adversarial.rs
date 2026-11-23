@@ -591,3 +591,64 @@ fn huge_miter_limit_is_not_refused() {
         render_full(&t, 1.0).unwrap();
     }
 }
+
+/// キャンバスの横の外へ長く延びる線と塗りの描く見積もりは、横の外の長さで膨らまない（描く段は範囲の左の外を 1 列に
+/// まとめ、右の外を落とす。ファズの作り直しの種 `dash-huge-line` で見つけたゆるさ）。延びた線は、キャンバスの少し外まで
+/// の線と見積もりがほぼ同じで、見積もりの内で描ける。
+#[test]
+fn off_canvas_length_is_not_counted_for_raster() {
+    let mk = |reach: f64, dashed: bool, fill: bool| {
+        let mut b = Builder::new();
+        let d = b.dashes(&[3.0, 2.0]);
+        b.add(
+            |w| {
+                w.move_to(Point::new(-reach, 150.0)).unwrap();
+                w.line_to(Point::new(200.0 + reach, 160.0)).unwrap();
+                if fill {
+                    w.line_to(Point::new(200.0 + reach, 170.0)).unwrap();
+                    w.line_to(Point::new(-reach, 165.0)).unwrap();
+                    w.close().unwrap();
+                }
+            },
+            |n| {
+                if fill {
+                    n.flags = HAS_FILL;
+                    n.fill = GREEN;
+                } else {
+                    n.flags = HAS_STROKE;
+                    n.stroke = RED;
+                    n.stroke_width = 3.0;
+                    if dashed {
+                        n.dashes = d;
+                    }
+                }
+            },
+        );
+        // 曲線もキャンバスの横の外に置く（制御多角形の y の差で抑える）
+        b.add(
+            |w| {
+                w.move_to(Point::new(-reach, 20.0)).unwrap();
+                w.cubic_to(Point::new(-reach - 50.0, 40.0), Point::new(-reach + 50.0, 60.0), Point::new(-reach, 80.0))
+                    .unwrap();
+            },
+            |n| {
+                n.flags = HAS_STROKE;
+                n.stroke = RED;
+                n.stroke_width = 2.0;
+            },
+        );
+        b.tree(200.0, 200.0)
+    };
+    for (dashed, fill) in [(true, false), (false, false), (false, true)] {
+        let near = mk(10.0, dashed, fill).estimate(&RenderOptions::DEFAULT, &Never).unwrap();
+        let far_tree = mk(1e8, dashed, fill);
+        let far = far_tree.estimate(&RenderOptions::DEFAULT, &Never).unwrap();
+        assert!(
+            far.render.work <= near.render.work.saturating_mul(2),
+            "破線 {dashed}・塗り {fill}：延びた線の描く見積もり {} が近い線 {} の 2 倍を超える",
+            far.render.work,
+            near.render.work
+        );
+        render_full(&far_tree, 1.0).unwrap();
+    }
+}
