@@ -193,3 +193,54 @@ fn computed_walk_deep_nesting_on_a_small_stack() {
     });
     assert_eq!(count, n + 3);
 }
+
+/// 読む段から全体を描くまでを 128 KiB のスタックで通し、各段の結果と描いた画素に色が付いたか（不透明の画素の数）を返す。
+fn render_small(src: String, limits: Limits) -> Result<usize, sumie::Error> {
+    let opts = sumie::ParseOptions { limits, ..sumie::ParseOptions::DEFAULT };
+    on_small_stack(move || {
+        sumie::estimate_parse(src.as_bytes(), &opts, &sumie::Never)?;
+        let d = sumie::parse(src.as_bytes(), &opts, &sumie::Never)?;
+        d.estimate_build(&sumie::Never)?;
+        let t = d.build(&sumie::Never)?;
+        let plan = t.plan(&sumie::RenderOptions::DEFAULT, &sumie::Never)?;
+        let size = plan.pixel_size();
+        let mut px = vec![0u8; size.width as usize * size.height as usize * 4];
+        let mut out = sumie::PixmapMut::new(&mut px, size.width, size.height, size.width as usize * 4)?;
+        plan.render(&mut out, &sumie::Never)?;
+        let half = sumie::PixelRect { x: 0, y: 0, width: size.width / 2, height: size.height };
+        let mut part = vec![0u8; half.width as usize * half.height as usize * 4];
+        let mut out = sumie::PixmapMut::new(&mut part, half.width, half.height, half.width as usize * 4)?;
+        plan.render_region(half, &mut out, &sumie::Never)?;
+        Ok(px.as_chunks::<4>().0.iter().filter(|p| p[3] == 255).count())
+    })
+}
+
+/// 描く段の例（M2）：太い破線の長いパス（2 次曲線・弧・round の継ぎ目と端）と、1 万段の入れ子の g の中の破線の角の丸い
+/// 矩形を、128 KiB のスタックで最後まで描く（平坦化・線の外形・破線・ラスタライズ・範囲の描画は再帰しない。単位 4 の
+/// レビュー）。
+#[test]
+fn strokes_and_dashes_on_a_small_stack() {
+    let x = "xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\"";
+    // 行って戻る曲線と弧（5000 組）を少しずつ下へずらす
+    let mut d = String::from("M20 5");
+    for i in 0..5000 {
+        let s = if i % 2 == 0 { 1 } else { -1 };
+        d.push_str(&format!(" q 10 {} 20 0 a 12 8 {} 0 1 -20 0.01", 6 * s, i % 90));
+    }
+    let path = format!(
+        "<svg {x}><path d=\"{d}\" fill=\"none\" stroke=\"black\" stroke-width=\"3\" stroke-dasharray=\"1 0.5\" \
+         stroke-linejoin=\"round\" stroke-linecap=\"round\"/></svg>"
+    );
+    let n = 10_000;
+    let nested = format!(
+        "<svg {x}>{}<rect x=\"2\" y=\"2\" width=\"40\" height=\"30\" rx=\"5\" fill=\"green\" stroke=\"navy\" \
+         stroke-width=\"2\" stroke-dasharray=\"3 1\" stroke-linejoin=\"miter-clip\"/>{}</svg>",
+        "<g transform=\"rotate(0.001)\" stroke-dashoffset=\"1\">".repeat(n),
+        "</g>".repeat(n)
+    );
+    let deep = Limits { depth: 20_000, ..Limits::DEFAULT };
+    for (name, src) in [("破線の長いパス", path), ("入れ子の中の破線の矩形", nested)] {
+        let painted = render_small(src, deep).unwrap_or_else(|e| panic!("{name}：{e:?}"));
+        assert!(painted > 50, "{name}：描いた不透明の画素が {painted}");
+    }
+}
