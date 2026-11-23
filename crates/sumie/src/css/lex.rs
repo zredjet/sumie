@@ -415,15 +415,7 @@ impl<'a, 'b> Lexer<'a, 'b> {
                 }
             }
         }
-        let text = self.s.get(i..j).unwrap_or(&[]);
-        let value = if text.len() <= SHORT_NUMBER {
-            self.budget.spend(cost::number(text.len() as u64))?;
-            parse_f64(text)
-        } else {
-            self.budget.spend(cost::number(NUM_BUF as u64))?;
-            let v = d.long_value(self.s);
-            if neg { -v } else { v }
-        };
+        let value = number_value(self.s, i, j, &d, neg, self.budget)?;
         let finite = value.is_finite();
         let mut t = if self.starts_ident(j)? {
             let (e, escaped) = self.skip_name(j)?;
@@ -551,13 +543,35 @@ const fn clamp_exp(e: i64) -> i64 {
     }
 }
 
+/// 数の字句 `s[i..j]` の値（`d` は読みながら数えたもの、`neg` は符号が `-` か）。短い字句はそのまま、長い字句は短い形に
+/// 揃えて `str::parse::<f64>` で読む（正しく丸める。読む手間は決まった上限の内）。CSS の字句とパスのデータ（`values::path`）が
+/// 使う。
+pub(crate) fn number_value(
+    s: &[u8],
+    i: usize,
+    j: usize,
+    d: &NumScan,
+    neg: bool,
+    budget: &Budget<'_>,
+) -> Result<f64, Error> {
+    let text = s.get(i..j).unwrap_or(&[]);
+    if text.len() <= SHORT_NUMBER {
+        budget.spend(cost::number(text.len() as u64))?;
+        Ok(parse_f64(text))
+    } else {
+        budget.spend(cost::number(NUM_BUF as u64))?;
+        let v = d.long_value(s);
+        Ok(if neg { -v } else { v })
+    }
+}
+
 fn parse_f64(text: &[u8]) -> f64 {
     core::str::from_utf8(text).ok().and_then(|t| t.parse::<f64>().ok()).unwrap_or(f64::NAN)
 }
 
 /// 数の字句を読みながら数えたもの（値は `digits × 10^(exp - frac)`）。
 #[derive(Default)]
-struct NumScan {
+pub(crate) struct NumScan {
     /// 有効数字（頭の 0 を除いた桁）の数と、最後の 0 でない桁が何桁目か
     n_sig: u64,
     last_nonzero: u64,
@@ -567,11 +581,11 @@ struct NumScan {
     frac: u64,
     /// 指数（`EXP_READ_CAP` で止める）
     exp: i64,
-    exp_neg: bool,
+    pub(crate) exp_neg: bool,
 }
 
 impl NumScan {
-    fn digit(&mut self, b: u8, at: usize, frac: bool) {
+    pub(crate) fn digit(&mut self, b: u8, at: usize, frac: bool) {
         if frac {
             self.frac = self.frac.saturating_add(1);
         }
@@ -587,7 +601,7 @@ impl NumScan {
         }
     }
 
-    fn exp_digit(&mut self, b: u8) {
+    pub(crate) fn exp_digit(&mut self, b: u8) {
         let v = self.exp.saturating_mul(10).saturating_add(i64::from(b.saturating_sub(b'0')));
         self.exp = if v > EXP_READ_CAP { EXP_READ_CAP } else { v };
     }

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use sumie::Cancel;
 use sumie::fuzzing::{
     CSS_HEAD, CSS_TAIL, Check, css_parse, document_parse, document_parse_cancel, dtd_parse, math_ops, mem_ops,
-    mem_ops_with, values_parse, xml_parse,
+    mem_ops_with, path_ops, values_parse, xml_parse,
 };
 use sumie_testkit::alloc::{assert_heap_within, measure};
 use sumie_testkit::mutate::cases;
@@ -393,4 +393,21 @@ fn document_survives_cancellation() {
         }
     }
     assert!(cancelled >= 8, "中止の道を通らなかった（{cancelled}）");
+}
+
+/// パスのデータの目印の字句（命令・区切り・数の書き方・弧の旗）。
+const PATH_DICT: &[&[u8]] = &[
+    b"M", b"m", b"L", b"l", b"H", b"v", b"C", b"s", b"Q", b"t", b"A", b"a", b"Z", b"z", b",", b" ", b".", b"-", b"+",
+    b"e", b"E-", b"1e400", b"0 1 1", b"11", b"10.", b".5.5", b"\t", b"1e308", b"-1e308",
+];
+
+#[test]
+fn path_survives_seeded_mutations() {
+    let seeds = fuzz_seeds("path");
+    let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
+    for (n, case) in cases(0x5eed_0009, 4000, &refs, PATH_DICT, 512).iter().enumerate() {
+        let (out, heap) = measure(|| path_ops(case));
+        assert_eq!(out, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
+        assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
+    }
 }

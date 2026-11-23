@@ -14,23 +14,23 @@ use crate::corpus::{arg, check_args, workspace_root};
 use crate::oracle::{Chrome, Fonts, Resvg};
 
 /// 色の試し。キャンバスは 100 × 100、点はふつう真ん中。
-struct Probe {
-    group: &'static str,
-    name: &'static str,
+pub(crate) struct Probe {
+    pub(crate) group: &'static str,
+    pub(crate) name: &'static str,
     /// 何を見るか（表の説明）
-    what: &'static str,
-    body: String,
-    yes: [u8; 3],
-    no: [u8; 3],
-    point: (u32, u32),
+    pub(crate) what: &'static str,
+    pub(crate) body: String,
+    pub(crate) yes: [u8; 3],
+    pub(crate) no: [u8; 3],
+    pub(crate) point: (u32, u32),
 }
 
-const GREEN: [u8; 3] = [0, 128, 0];
-const RED: [u8; 3] = [255, 0, 0];
+pub(crate) const GREEN: [u8; 3] = [0, 128, 0];
+pub(crate) const RED: [u8; 3] = [255, 0, 0];
 const BLACK: [u8; 3] = [0, 0, 0];
 const WHITE: [u8; 3] = [255, 255, 255];
 
-fn svg(body: &str) -> String {
+pub(crate) fn svg(body: &str) -> String {
     format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"100\" height=\"100\">\n{body}\n</svg>\n"
     )
@@ -720,21 +720,28 @@ fn judge(img: &crate::image::Rgba, p: &Probe) -> String {
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
-    check_args(args, &["--out"], &[], 0)?;
+    check_args(args, &["--out", "--set"], &[], 0)?;
     let root = workspace_root();
-    let out = arg(args, "--out").map(PathBuf::from).unwrap_or_else(|| root.join("tests/svg/m1-probe"));
+    // 試しの組：m1（既定。セレクタ・カスケード・値・大きさ）か m2（パスの文法と図形。ADR-89）
+    let set = arg(args, "--set").unwrap_or("m1");
+    let (list, default_out, title) = match set {
+        "m1" => (probes(), "tests/svg/m1-probe", "# M1 の照らし（試しの SVG）"),
+        "m2" => (crate::probe_m2::probes(), "tests/svg/m2-probe", "# M2 の照らし（試しの SVG）"),
+        other => return Err(format!("知らない組：{other}（m1・m2）")),
+    };
+    let out = arg(args, "--out").map(PathBuf::from).unwrap_or_else(|| root.join(default_out));
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     let resvg = Resvg::new(&Fonts::None);
     let chrome = Chrome::find().ok();
     let work = root.join(format!("local/probe/work-{}", std::process::id()));
     let mut lines = String::new();
-    let mut md = String::from(
-        "# M1 の照らし（試しの SVG）\n\n`cargo run -p sumie-tools --release -- probe` が作って描いた結果（roadmap M1 の依頼文。範囲はこの結果を見て\n\
+    let mut md = format!(
+        "{title}\n\n`cargo run -p sumie-tools --release -- probe --set {set}` が作って描いた結果（roadmap の依頼文。範囲はこの結果を見て\n\
          決める）。「効く」は決めた点の色が効いたときの色に近いこと。resvg は Kura の設定の 0.48.1、Chrome はヘッドレス\n\
          （`--disable-gpu`）。試しの SVG はこのリポジトリのために書いたもの（MIT OR Apache-2.0）。\n",
     );
     let mut group = "";
-    for p in probes() {
+    for p in list {
         let file = out.join(format!("{}.svg", p.name));
         std::fs::write(&file, &p.body).map_err(|e| e.to_string())?;
         let r = match resvg.render(p.body.as_bytes(), 1.0) {
@@ -758,10 +765,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
         lines.push_str(&l.to_json());
         lines.push('\n');
     }
-    let _ = write!(md, "\n## 大きさ\n\n| 試し | 何を見るか | resvg の大きさ |\n|---|---|---|\n");
+    let sizes = if set == "m1" { size_probes() } else { Vec::new() };
+    if !sizes.is_empty() {
+        let _ = write!(md, "\n## 大きさ\n\n| 試し | 何を見るか | resvg の大きさ |\n|---|---|---|\n");
+    }
     let size_dir = out.join("size");
-    std::fs::create_dir_all(&size_dir).map_err(|e| e.to_string())?;
-    for (name, what, body) in size_probes() {
+    if !sizes.is_empty() {
+        std::fs::create_dir_all(&size_dir).map_err(|e| e.to_string())?;
+    }
+    for (name, what, body) in sizes {
         std::fs::write(size_dir.join(format!("{name}.svg")), &body).map_err(|e| e.to_string())?;
         let r = match resvg.tree(body.as_bytes()) {
             Ok(t) => {
@@ -778,7 +790,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     let _ = std::fs::remove_dir_all(&work);
     std::fs::write(out.join("README.md"), md).map_err(|e| e.to_string())?;
-    let res = root.join("local/probe/result.jsonl");
+    let res = root.join(format!("local/probe/result-{set}.jsonl"));
     std::fs::create_dir_all(res.parent().ok_or("親がない")?).map_err(|e| e.to_string())?;
     std::fs::write(&res, lines).map_err(|e| e.to_string())?;
     println!("{} と {} を書いた", out.join("README.md").display(), res.display());
@@ -801,7 +813,8 @@ mod tests {
 
     #[test]
     fn probes_have_unique_names_and_parse() {
-        let ps = probes();
+        let mut ps = probes();
+        ps.extend(crate::probe_m2::probes());
         let mut names: Vec<&str> = ps.iter().map(|p| p.name).collect();
         names.sort_unstable();
         let n = names.len();

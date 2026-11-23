@@ -1014,3 +1014,95 @@ pub fn computed_values(d: &crate::Document<'_>, f: &mut dyn FnMut(&ComputedItem<
         Ok(())
     })
 }
+
+/// パスのデータと `points` の読みと平坦化を通す（ファズの `path` の対象）。頭の 1 バイトで、読む口（下の 1 ビット：0 は
+/// パスのデータ、1 は `points`）と変形（次の 2 ビット）を選び、残りを値にする。確かめること：
+/// - 置き場に書く量は入力の 1 バイトあたり `cost::PATH_GEOMETRY_BYTES` 以下（`estimate_build` の上限）
+/// - 1 回の払いが中止の間隔を超えない・同じ入力で同じ結果
+/// - 平坦化で渡した点の数は区間ごとの分ける数の和（見積もりと同じ式）で、点は区間の厳密な外接矩形の中
+pub fn path_ops(data: &[u8]) -> Check {
+    use crate::geom::flatten::{flatten_seg, pieces};
+    use crate::geom::{PathRef, PathSeg, PathWriter, Point, Rect, Transform, add_bounds};
+    let Some((&head, text)) = data.split_first() else { return Check::Ok };
+    let t = match (head >> 1) & 3 {
+        0 => Transform::IDENTITY,
+        1 => Transform::IDENTITY.scaled(7.5),
+        2 => Transform { a: 0.6, b: 0.8, c: -0.8, d: 0.6, e: 3.0, f: -2.0 },
+        _ => Transform { a: 1e-3, b: 0.0, c: 2.0, d: 1e3, e: 0.0, f: 0.0 },
+    };
+    let run = || -> Result<(u64, u64, u64, bool, bool), Error> {
+        let b = Budget::new(Stage::Build, u64::MAX, u64::MAX, &Never);
+        let mut verbs: MVec<'_, u8> = MVec::new(&b);
+        let mut coords: MVec<'_, f64> = MVec::new(&b);
+        let ok = if head & 1 == 0 {
+            let mut w = PathWriter::new(&mut verbs, &mut coords);
+            matches!(crate::values::path::path_data(text, &mut w, &b)?, crate::values::path::Parsed::Complete)
+        } else {
+            let mut pts: MVec<'_, Point> = MVec::new(&b);
+            let ok = crate::values::path::points(text, &mut pts, &b)?;
+            let mut w = PathWriter::new(&mut verbs, &mut coords);
+            for (i, &p) in pts.as_slice().iter().enumerate() {
+                if i == 0 { w.move_to(p)? } else { w.line_to(p)? }
+            }
+            ok
+        };
+        let bytes = (verbs.len() as u64).saturating_add((coords.len() as u64).saturating_mul(8));
+        let limit = cost::PATH_GEOMETRY_BYTES.saturating_mul(text.len() as u64).saturating_add(64);
+        if head & 1 == 0 && bytes > limit {
+            return Err(Error::Limit(crate::error::LimitError {
+                resource: Resource::Memory,
+                needed: bytes,
+                allowed: limit,
+                stage: Stage::Build,
+            }));
+        }
+        // 平坦化（点の数が大きすぎるものは数えるだけ）
+        let path = PathRef { verbs: verbs.as_slice(), coords: coords.as_slice() };
+        let mut total = 0u64;
+        for seg in path.segments() {
+            if matches!(seg, PathSeg::Move(_) | PathSeg::Close(..)) {
+                continue;
+            }
+            total = total.saturating_add(pieces(&seg, &t, 0.1));
+        }
+        let mut emitted = 0u64;
+        let mut inside = true;
+        if total <= 200_000 {
+            for seg in path.segments() {
+                let mut r = Rect::EMPTY;
+                add_bounds(&mut r, &seg);
+                let pad = |v: f64| 1e-9 * (1.0 + v.abs());
+                flatten_seg(&seg, &t, 0.1, &b, &mut |p| {
+                    emitted = emitted.saturating_add(1);
+                    if p.finite() && !r.is_empty() {
+                        let ok = p.x >= r.x0 - pad(r.x0)
+                            && p.x <= r.x1 + pad(r.x1)
+                            && p.y >= r.y0 - pad(r.y0)
+                            && p.y <= r.y1 + pad(r.y1);
+                        inside &= ok;
+                    }
+                    Ok(())
+                })?;
+            }
+            if emitted != total {
+                return Err(Error::Cancelled);
+            }
+        }
+        if b.max_spend() >= CANCEL_INTERVAL || b.over_released() {
+            return Err(Error::Cancelled);
+        }
+        Ok((bytes, total, emitted, ok, inside))
+    };
+    match (run(), run()) {
+        (Ok(a), Ok(b)) if a == b => {
+            if a.4 {
+                Check::Ok
+            } else {
+                Check::Violation("平坦化した点が区間の外接矩形の外")
+            }
+        }
+        (Err(Error::Limit(_)), _) => Check::Violation("置き場に書く量が入力の 12 倍を超えた"),
+        (Err(Error::Cancelled), _) => Check::Violation("平坦化の点の数が分ける数の和と違うか、勘定が崩れた"),
+        _ => Check::Violation("同じ入力で結果が違う"),
+    }
+}

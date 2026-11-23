@@ -15,6 +15,7 @@ mod lint_probe;
 mod oracle;
 mod oracle_lock;
 mod probe;
+mod probe_m2;
 mod sizes;
 mod values;
 mod wellformed;

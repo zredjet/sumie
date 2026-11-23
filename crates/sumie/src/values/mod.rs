@@ -11,6 +11,7 @@
 #![allow(dead_code, reason = "値そのものは木を作る段（M2）から使う。M1 は形の確かめだけ")]
 
 pub(crate) mod names;
+pub(crate) mod path;
 
 use crate::budget::Budget;
 use crate::cost;

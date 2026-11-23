@@ -14,6 +14,10 @@ pub(crate) const FILL_BYTES_PER_UNIT: u64 = 16;
 pub(crate) const COPY_BYTES_PER_UNIT: u64 = 16;
 /// 安定な併合の並べ替えの、1 つの要素を 1 段で比べて写す手間。
 pub(crate) const MERGE_STEP: u64 = 4;
+/// パスのデータ・`points` の入力 1 バイトあたりに、幾何の置き場（命令 1 バイト・座標 8 バイト）へ書く量の上限（`values::path`
+/// の注。最も多いのは `zh1` の繰り返しの 3 バイトで 35 バイト）。
+#[allow(dead_code, reason = "木の見積もり（M2 の tree）から使う")]
+pub(crate) const PATH_GEOMETRY_BYTES: u64 = 12;
 /// 平坦化で点を 1 つ求める手間（曲線の式を解いて点を渡す。architecture.md §5.2 の「計画」）。
 pub(crate) const FLATTEN_POINT: u64 = 8;
 /// 2 分の探索の 1 歩の手間。
