@@ -1411,7 +1411,8 @@ const FUZZ_FULL_PIXELS: u64 = 256 * 256;
 ///   全体の同じ矩形とビット単位で同じ（ADR-13）・同じ入力で同じ画素
 ///
 /// 倍率は頭の 1 バイト目の下の 3 ビット、範囲は 2〜4 バイト目（1 バイト目の 8 の位が立てば範囲を右下の角まで広げる）。
-/// 大きなキャンバス（256 × 256 を超えるもの）は全体を描かず、見積もり・計画・範囲の描画までを確かめる。
+/// 大きなキャンバス（256 × 256 を超えるもの）は全体を描かず、見積もり・計画と、128 × 128 までの範囲を 7 画素ずつ広げた範囲の
+/// 中の同じ矩形と照らす。
 pub fn render_ops(data: &[u8]) -> StageOutcome {
     use crate::doc::{Watch, parse_watch};
     use crate::plan::{Quality, RenderOptions};
@@ -1516,9 +1517,16 @@ pub fn render_ops(data: &[u8]) -> StageOutcome {
         Ok(_) => return bad("全体の範囲の見積もりが描く見積もりを超える", &m, &b),
         Err(_) => return bad("全体の範囲の見積もりが断った（見積もりが通ったのに）", &m, &b),
     };
-    // 範囲：頭の 2〜4 バイト目から（1 バイト目の 8 の位が立てば右下の角まで）
-    let x = u32::from(head[1]).checked_rem(w).unwrap_or(0);
-    let y = u32::from(head[2]).checked_rem(h).unwrap_or(0);
+    // 範囲：頭の 2〜4 バイト目から（1 バイト目の 8 の位が立てば右下の角まで）。大きなキャンバスは位置をキャンバスの全体に
+    // 散らし、大きさを 128 × 128 までにする（全体を描かない代わりに、少し広い範囲と照らす）
+    let place = |v: u8, n: u32| -> u32 {
+        if big {
+            u32::try_from(u64::from(v).saturating_mul(u64::from(n)) >> 8).unwrap_or(0)
+        } else {
+            u32::from(v).checked_rem(n).unwrap_or(0)
+        }
+    };
+    let (x, y) = (place(head[1], w), place(head[2], h));
     let (room_w, room_h) = (w.saturating_sub(x), h.saturating_sub(y));
     let (rw, rh) = if head[0] & 8 != 0 {
         (room_w, room_h)
@@ -1528,23 +1536,48 @@ pub fn render_ops(data: &[u8]) -> StageOutcome {
             u32::from(head[3] >> 4).checked_rem(room_h).unwrap_or(0).saturating_add(1),
         )
     };
-    let rect = PixelRect { x, y, width: rw.min(room_w), height: rh.min(room_h) };
+    let cap = if big { 128 } else { u32::MAX };
+    let rect = PixelRect { x, y, width: rw.min(room_w).min(cap), height: rh.min(room_h).min(cap) };
     let region = match plan.estimate_region(rect, &Never) {
         Ok(e) if e.work <= est.render.work && e.peak_bytes <= est.render.peak_bytes => e,
         Ok(_) => return bad("範囲の見積もりが全体の描く見積もりを超える", &m, &b),
         Err(_) => return bad("範囲の見積もりが断った（全体の見積もりが通ったのに）", &m, &b),
     };
     let part_bytes = u64::from(rect.width).saturating_mul(u64::from(rect.height)).saturating_mul(4);
-    if big && part_bytes > FUZZ_FULL_PIXELS.saturating_mul(4) {
-        // 大きなキャンバスの広い範囲は描かない（速さのため）
-        return StageOutcome { stroked, dashed, ..m.outcome(Check::Ok, reached, b.charged()) };
-    }
     let part = match draw_rect(&plan, rect, &b, &region, &mut m, part_bytes) {
         Ok(p) => p,
         Err(what) => return bad(what, &m, &b),
     };
     let ps = part.as_slice();
     if big {
+        // 大きなキャンバス：全体は描かず、範囲を 7 画素ずつ広げた範囲の中の同じ矩形と照らす（範囲の描画が範囲に依らない。
+        // 単位 4 の 3 回目のレビュー）
+        let (ox, oy) = (rect.x.saturating_sub(7), rect.y.saturating_sub(7));
+        let wide = PixelRect {
+            x: ox,
+            y: oy,
+            width: rect.x.saturating_add(rect.width).saturating_add(7).min(w).saturating_sub(ox),
+            height: rect.y.saturating_add(rect.height).saturating_add(7).min(h).saturating_sub(oy),
+        };
+        let wide_est = match plan.estimate_region(wide, &Never) {
+            Ok(e) if e.work <= est.render.work && e.peak_bytes <= est.render.peak_bytes => e,
+            Ok(_) => return bad("範囲の見積もりが全体の描く見積もりを超える", &m, &b),
+            Err(_) => return bad("範囲の見積もりが断った（全体の見積もりが通ったのに）", &m, &b),
+        };
+        let wide_bytes = u64::from(wide.width).saturating_mul(u64::from(wide.height)).saturating_mul(4);
+        let around = match draw_rect(&plan, wide, &b, &wide_est, &mut m, wide_bytes) {
+            Ok(p) => p,
+            Err(what) => return bad(what, &m, &b),
+        };
+        let (ws, n) = (around.as_slice(), (rect.width as usize).saturating_mul(4));
+        let (dx, dy) = (rect.x.saturating_sub(ox) as usize, rect.y.saturating_sub(oy) as usize);
+        for yy in 0..rect.height as usize {
+            let a = dy.saturating_add(yy).saturating_mul(wide.width as usize).saturating_add(dx).saturating_mul(4);
+            let o = yy.saturating_mul(n);
+            if ws.get(a..a.saturating_add(n)) != ps.get(o..o.saturating_add(n)) {
+                return bad("範囲の描画が広げた範囲の中の同じ矩形と違う", &m, &b);
+            }
+        }
         let drew = paints_beyond(ps, plan.background);
         return StageOutcome { drew, stroked, dashed, ..m.outcome(Check::Ok, reached, b.charged()) };
     }
