@@ -232,6 +232,13 @@ fn cases(scale: usize) -> Vec<(&'static str, Vec<u8>)> {
         "- のない長い systemLanguage",
         format!("{SVG}<rect systemLanguage=\"{}\"/></svg>", "e".repeat(n(8_000_000))).into_bytes(),
     ));
+    // 文書の段の 6 回目のレビューの形（id の表を散らばった順に引く。手間は順に引くものと同じ）
+    for (name, step) in [("id を散らばった順に引く use", 7919usize), ("id を順に引く use", 1)] {
+        let k = n(200_000);
+        let ids: String = (0..k).map(|i| format!("<rect id=\"i{i}\"/>")).collect();
+        let uses: String = (0..k).map(|i| format!("<use href=\"#i{}\"/>", (i * step) % k)).collect();
+        out.push((name, format!("{SVG}<defs>{ids}</defs>{uses}</svg>").into_bytes()));
+    }
     out.push(("深い入れ子", format!("{SVG}{}{}</svg>", "<g>".repeat(1000), "</g>".repeat(1000)).into_bytes()));
     out.push(("参照の多い文書（use の鎖）", {
         let mut body = String::from("<defs><rect id=\"r0\"/>");
