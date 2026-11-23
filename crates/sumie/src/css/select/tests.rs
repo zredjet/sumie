@@ -604,7 +604,11 @@ fn element_backed_pseudo_elements_share_chromes_table() {
         "::column:is()",
         "::column:not(:hover)",
         ":-webkit-any(:not(a b))",
-        ":-webkit-any(:is(a b))",
+        ":-webkit-any(:is(a):not(b c))",
+        "::details-content::cue(a)",
+        "::picker(select)::cue(a)",
+        "::part(x)::cue(a)",
+        "::details-content::-webkit-foo(x)",
         ":playing",
         ":paused",
         ":local-link",
@@ -612,5 +616,15 @@ fn element_backed_pseudo_elements_share_chromes_table() {
         assert!(!valid(bad), "{bad}");
     }
     assert!(valid("::column::scroll-marker:is(:hover)"));
+    // `:-webkit-any()` の中の `:is()`・`:where()` は寛容なまま（中は空。単位 3 の 14 回目のレビュー）
+    for ok in [
+        ":-webkit-any(:is(a b))",
+        ":-webkit-any(:where(a, b c))",
+        ":-webkit-any(:is(::before))",
+        ":-webkit-any(:not(:is(a b)))",
+        "::details-content::cue",
+    ] {
+        assert!(valid(ok), "{ok}");
+    }
     assert!(valid("::before:is(:hover)"));
 }

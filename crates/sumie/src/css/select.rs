@@ -447,8 +447,6 @@ struct Frame {
     compound: bool,
     /// 関数の擬似の引数の並び（閉じても単純な選択子を足さない）：0 でない、1 ちょうど 1 つ、2 は 1 つ以上
     arg: u8,
-    /// `:-webkit-any()` の中（入れ子の並びも寛容でない）
-    strict: bool,
 }
 
 impl Frame {
@@ -482,7 +480,6 @@ impl Frame {
             webkit_any: false,
             compound: false,
             arg: 0,
-            strict: false,
         }
     }
 
@@ -1082,7 +1079,8 @@ fn pseudo(
             PE_NONE => true,
             PE_BEFORE_AFTER => n.kind == Kind::Ident && is(b"marker"),
             // 要素に支えられた擬似要素のあとは `::part()`・`::slotted()` でない擬似要素（単位 3 の 13 回目のレビュー）
-            PE_PART => !(n.kind == Kind::Function && (is(b"part") || is(b"slotted"))),
+            // （関数の形の `::cue()` と表にない関数の形の `::-webkit-*()` も書けない。単位 3 の 14 回目のレビュー）
+            PE_PART => !(n.kind == Kind::Function && (is(b"part") || is(b"slotted") || is(b"cue") || !listed)),
             PE_SLOTTED => n.kind == Kind::Ident && any(AFTER_SLOTTED),
             PE_COLUMN => n.kind == Kind::Ident && is(b"scroll-marker"),
             _ => false,
@@ -1219,14 +1217,12 @@ fn pseudo(
                 } else {
                     (S_IS, true, false)
                 };
-                // 入れ子の並びを始める（外の複合の状態 `f` は、呼び手が外の段に書き戻す）。`:-webkit-any()` の中の並びは
-                // 寛容でなく、結合子も書けない（Chrome と同じ。単位 3 の 13 回目のレビュー）
-                let strict = f.strict || f.webkit_any;
-                let mut g = Frame::new(kind, false, forgiving && !strict, zero, f.in_has).at(cur.depth());
+                // 入れ子の並びを始める（外の複合の状態 `f` は、呼び手が外の段に書き戻す）。`:-webkit-any()` の中の並びにも
+                // 結合子は書けない（`:is()`・`:where()` は寛容なまま。Chrome と同じ。単位 3 の 13・14 回目のレビュー）
+                let mut g = Frame::new(kind, false, forgiving, zero, f.in_has).at(cur.depth());
                 g.outer_pe = pe;
                 g.webkit_any = webkit_any;
-                g.strict = strict;
-                g.compound = f.compound || webkit_any || strict;
+                g.compound = f.compound || webkit_any;
                 frames.push(g)?;
                 cur.skip_ws()?;
                 return Ok(());
