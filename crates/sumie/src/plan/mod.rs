@@ -453,7 +453,13 @@ fn bound_node(
         let dashes = tree.dash_list(n);
         let mut total = 0.0;
         for &d in dashes {
-            total += d;
+            match tree.dash_value(n, d) {
+                Some(v) => total += v,
+                None => {
+                    total = 0.0;
+                    break;
+                }
+            }
         }
         let factor = if n.path_length > 0.0 { c.len_stroke / n.path_length } else { 1.0 };
         let dash_scale = if non_scaling { factor * scale } else { factor };
@@ -924,7 +930,14 @@ fn stroke_edges(
     dash_scaled.clear();
     for &d in dashes_src {
         budget.spend(cost::OP_STEP)?;
-        dash_scaled.push(d * dash_scale)?;
+        match tree.dash_value(n, d) {
+            Some(v) => dash_scaled.push(v * dash_scale)?,
+            // 解けない長さがあれば実線（破線の宣言が効かない）
+            None => {
+                dash_scaled.clear();
+                break;
+            }
+        }
     }
     let dashes = Dashes::new(dash_scaled.as_slice(), n.dash_offset * dash_scale);
     let mut sink = EdgeSink { edges, dev, t: to_dev, first: None, prev: None, budget: budget_ref(budget) };

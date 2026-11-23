@@ -80,3 +80,10 @@ path = "fuzz_targets/stroke.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tree"
+path = "fuzz_targets/tree.rs"
+test = false
+doc = false
+bench = false

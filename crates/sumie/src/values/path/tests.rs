@@ -208,3 +208,55 @@ fn points_lists() {
     assert_eq!(pts(""), (vec![], true));
     assert_eq!(pts("  "), (vec![], true));
 }
+
+/// 読む手間は 1 バイトあたり `cost::DECL_BYTE` 以下で、書く命令は 1 バイトあたり 1 つ以下（＋ 1。木を作る段の見積もり）。
+#[test]
+fn work_and_verbs_per_byte() {
+    let mut worst_work = 0.0f64;
+    let mut worst_verbs = 0.0f64;
+    let unit = [
+        "z",
+        "zh1",
+        "l1 1",
+        "l.1.1",
+        "h1",
+        "M0 0",
+        "c1 1 1 1 1 1",
+        "a1 1 0001 1",
+        "q1-1-1-1",
+        "t1 1",
+        "s1 1 1 1",
+        "L1e5-1e5",
+        "h.5",
+        "v-.5",
+        "Z",
+        "a1,1,0,1,1,1,1",
+        "m1-1",
+        "h1111111111111111111111",
+        " ",
+        ",",
+    ];
+    for u in unit {
+        let s = format!("M0 0{}", u.repeat(2000));
+        let b = Budget::new(Stage::Build, u64::MAX, u64::MAX, &Never);
+        let mut verbs = MVec::new(&b);
+        let mut coords = MVec::new(&b);
+        {
+            let mut w = PathWriter::new(&mut verbs, &mut coords);
+            path_data(s.as_bytes(), &mut w, &b).unwrap();
+        }
+        let n = s.len() as f64;
+        worst_work = worst_work.max(b.work() as f64 / n);
+        worst_verbs = worst_verbs.max(verbs.len() as f64 / (n + 1.0));
+        assert!(verbs.len() as u64 <= s.len() as u64 + 1, "{u}");
+        assert!(b.work() <= crate::cost::PATH_BYTE * s.len() as u64 + 64, "{u}: {}", b.work() as f64 / n);
+        let (sv, sc) = crate::doc::weights::path_scan(s.as_bytes(), &b).unwrap();
+        assert!(
+            verbs.len() as u64 <= sv && coords.len() as u64 <= sc,
+            "{u}: {} {} / {sv} {sc}",
+            verbs.len(),
+            coords.len()
+        );
+    }
+    eprintln!("work/byte {worst_work:.2} verbs/byte {worst_verbs:.3}");
+}

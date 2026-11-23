@@ -1,0 +1,1 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><style>.a{stroke-dasharray:1 2;stroke:red}</style><g id="a"><rect class="a" width="3" height="3"/><use href="#b" x="1"/></g><g id="b"><circle r="2" fill="context-stroke"/><use href="#a"/></g><symbol id="s" overflow="visible"><path d="M0 0L5 5Q1 1 2 0Z"/></symbol><use href="#s" width="5" height="5"/></svg>

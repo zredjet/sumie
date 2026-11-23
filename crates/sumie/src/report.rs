@@ -7,6 +7,7 @@
 //! - 報告は何も借りない（`Tree` が持ち続ける。href は写して持つ）
 
 use crate::budget::Budget;
+use crate::cost;
 use crate::error::{Error, Resource};
 use crate::mem::{Frozen, MVec, Plain, stable_sort};
 
@@ -106,6 +107,29 @@ impl Report {
     pub(crate) fn bytes(&self) -> u64 {
         self.warnings.bytes().saturating_add(self.unread.bytes()).saturating_add(self.store.bytes())
     }
+
+    /// 写し（次の段の報告の始まり。`budget` で取る。手間は [`Report::copy_work`]）。
+    pub(crate) fn copy_in(&self, budget: &Budget<'_>) -> Result<Report, Error> {
+        let budget = budget_ref(budget);
+        let mut r = ReportBuilder::with_capacity(budget, self.warnings.len(), self.unread.len(), self.store.len())?;
+        r.warnings.append_slice(self.warnings.as_slice())?;
+        r.unread.append_slice(self.unread.as_slice())?;
+        r.store.append_slice(self.store.as_slice())?;
+        Ok(Report { warnings: r.warnings.freeze(), unread: r.unread.freeze(), store: r.store.freeze() })
+    }
+
+    /// [`Report::copy_in`] の手間の上限（確保 3 回と写し）。
+    pub(crate) fn copy_work(&self) -> u64 {
+        let w =
+            cost::append(0, self.warnings.len() as u64, self.warnings.len() as u64, size_of::<WarningEntry>() as u64).0;
+        let u = cost::append(0, self.unread.len() as u64, self.unread.len() as u64, size_of::<UnreadEntry>() as u64).0;
+        let s = cost::append(0, self.store.len() as u64, self.store.len() as u64, 1).0;
+        cost::ALLOC_STEP.saturating_mul(3).saturating_add(w).saturating_add(u).saturating_add(s)
+    }
+}
+
+fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {
+    b
 }
 
 /// 報告を作る口。段の中で足し、終わりに [`ReportBuilder::finish`] で位置の順に並べて `Report` にする。容量は段が数えた

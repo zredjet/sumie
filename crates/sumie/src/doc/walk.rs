@@ -42,7 +42,39 @@ pub(crate) struct WalkItem {
     pub(crate) ctm_known: bool,
     /// 描く木に入る
     pub(crate) rendered: bool,
+    /// 要素の長さの % の基準（最も近い表示の領域。決まらなければ None）
+    pub(crate) viewport: Option<(f64, f64)>,
+    /// 子を表示の領域で切る（入れ子の svg・use の中の symbol で、`overflow` が visible・auto でないもの。M2 は描かない。
+    /// ADR-89 (1)）
+    pub(crate) clips: bool,
+    /// 最も近い use の文脈の塗り（use の中身でなければ None）
+    pub(crate) context: Option<UseContext>,
 }
+
+/// たどり方。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WalkOptions {
+    /// 木を作る段のたどり方：use の参照先を use の文脈で展開し（参照先が積み上げにあれば輪：展開しない。輪として取り除いた
+    /// 参照の先は 1 段だけ描き直し、その中でまた取り除いた参照に当たったら展開しない。ADR-86 (1)）、描く木に入らない要素の
+    /// 部分木に降りない（要素そのものは渡す）
+    pub(crate) build: bool,
+}
+
+/// use の文脈の塗り（use の中身の `context-fill`・`context-stroke` は use の塗りを使う。SVG 2 §13.3）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct UseContext {
+    pub(crate) fill: CPaint,
+    pub(crate) stroke: CPaint,
+    /// それぞれの currentColor を解く色
+    pub(crate) fill_color: Color,
+    pub(crate) stroke_color: Color,
+    /// それぞれの url の取り除いた辺を見る節（塗りを書いた use）
+    pub(crate) fill_node: u32,
+    pub(crate) stroke_node: u32,
+}
+
+impl Plain for UseContext {}
 
 /// 積み上げの段。
 #[repr(C)]
@@ -57,134 +89,240 @@ struct Frame {
     node: u32,
     /// 次に見る子
     child: u32,
+    /// 子の use の文脈（`Walker::ctx` の番号。なければ NONE）。use の参照先の段では自分が足した番号
+    ctx: u32,
     has_vp: u8,
     /// 子が描く木に入りうる
     children_rendered: u8,
     known: u8,
     /// 子が文字の中（text の部分木）
     in_text: u8,
-    pad: [u8; 4],
+    /// use の参照先を 1 つだけ見る段（`child` だけを見て、兄弟を見ない。`node` は use）
+    single: u8,
+    /// 輪として取り除いた参照の先を描き直している中
+    redraw: u8,
+    pad: [u8; 2],
 }
 
 impl Plain for Frame {}
 
-/// 文書を行きがけの順にたどり、要素ごとに `f` を呼ぶ（描く木に入らない要素も、計算した値を求めて渡す）。
+/// たどる段の積み上げの 1 段と use の文脈の大きさ（木を作る段の見積もり）。
+pub(crate) const FRAME_BYTES: usize = size_of::<Frame>();
+pub(crate) const CONTEXT_BYTES: usize = size_of::<UseContext>();
+
+/// 文書を行きがけの順にたどり、要素ごとに `f` を呼ぶ（描く木に入らない要素も、計算した値を求めて渡す。use は展開しない）。
 pub(crate) fn walk(
     d: &Document<'_>,
     budget: &Budget<'_>,
     f: &mut dyn FnMut(&WalkItem) -> Result<(), Error>,
 ) -> Result<(), Error> {
+    walk_with(d, WalkOptions::default(), budget, f)
+}
+
+/// [`walk`] に、たどり方を選べるようにしたもの。
+pub(crate) fn walk_with(
+    d: &Document<'_>,
+    opts: WalkOptions,
+    budget: &Budget<'_>,
+    f: &mut dyn FnMut(&WalkItem) -> Result<(), Error>,
+) -> Result<(), Error> {
     let budget = budget_ref(budget);
-    let doc = &d.xml;
-    let input = d.input;
-    let nodes = doc.nodes.as_slice();
-    let Some(root) = nodes.first().filter(|n| n.kind == KIND_ELEMENT) else { return Ok(()) };
-    let ids = PropIds::new();
-    let bufs = Bufs { input, store: doc.store.as_slice(), sheet: d.sheet.text.as_slice() };
-    let size = d.size.known().map(|s| (s.width, s.height));
-    let initial = Computed::initial(d.font_size);
-    let mut base = Base {
-        default_font: d.font_size,
-        root_font: d.font_size,
-        root_line: initial.line_height,
-        viewport: size,
-        // vw などは `@media` と同じ文書の大きさ（既定の文字の大きさで解いたもの。ADR-74 (7)）
-        doc: d.media_size,
-        outermost: true,
-    };
-    budget.spend(cost::OP_STEP)?;
-    let c0 = compute(&initial, d.styles.of(0), &ids, &bufs, &base, budget)?;
-    base.root_font = c0.font_size;
-    base.root_line = c0.line_height;
-    base.outermost = false;
-    // 根の viewBox の変形と、子の表示の領域
-    // 幅か高さが 0 の viewBox の根は描かない（大きさは viewBox がないものとして決める。ADR-78 (7)）
-    let mut root_drawn = true;
-    let (root_ctm, root_vp) = match (size, view_box_of(doc, input, root, budget)?) {
-        (Some((w, h)), Some((vb, aspect))) => match view_box_transform(&vb, aspect, w, h) {
-            Some(t) => (t, Some((vb.w, vb.h))),
-            None => {
+    let Some(mut w) = Walker::start(d, opts, budget, f)? else { return Ok(()) };
+    while w.step(f)? {}
+    Ok(())
+}
+
+/// たどる途中の状態。
+struct Walker<'a, 'd, 'b> {
+    d: &'a Document<'d>,
+    opts: WalkOptions,
+    budget: &'b Budget<'b>,
+    ids: PropIds,
+    bufs: Bufs<'a>,
+    base: Base,
+    stack: MVec<'b, Frame>,
+    /// 要素ごとの、積み上げにある数（use の輪を見つける。木を作るたどり方だけ）
+    on_stack: MVec<'b, u32>,
+    /// use の文脈の積み上げ
+    ctx: MVec<'b, UseContext>,
+    overflow_id: Option<crate::style::props::PropertyId>,
+}
+
+impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
+    /// 根を計算して `f` に渡し、根の段を積む（根が要素でなければ None）。
+    fn start(
+        d: &'a Document<'d>,
+        opts: WalkOptions,
+        budget: &'b Budget<'b>,
+        f: &mut dyn FnMut(&WalkItem) -> Result<(), Error>,
+    ) -> Result<Option<Walker<'a, 'd, 'b>>, Error> {
+        let doc = &d.xml;
+        let input = d.input;
+        let nodes = doc.nodes.as_slice();
+        let Some(root) = nodes.first().filter(|n| n.kind == KIND_ELEMENT) else { return Ok(None) };
+        let ids = PropIds::new();
+        let bufs = Bufs { input, store: doc.store.as_slice(), sheet: d.sheet.text.as_slice() };
+        let size = d.size.known().map(|s| (s.width, s.height));
+        let initial = Computed::initial(d.font_size);
+        let mut base = Base {
+            default_font: d.font_size,
+            root_font: d.font_size,
+            root_line: initial.line_height,
+            viewport: size,
+            // vw などは `@media` と同じ文書の大きさ（既定の文字の大きさで解いたもの。ADR-74 (7)）
+            doc: d.media_size,
+            outermost: true,
+        };
+        budget.spend(cost::OP_STEP)?;
+        let c0 = compute(&initial, d.styles.of(0), &ids, &bufs, &base, budget)?;
+        base.root_font = c0.font_size;
+        base.root_line = c0.line_height;
+        base.outermost = false;
+        // 根の viewBox の変形と、子の表示の領域
+        // 幅か高さが 0 の viewBox の根は描かない（大きさは viewBox がないものとして決める。ADR-78 (7)）
+        let mut root_drawn = true;
+        let (root_ctm, root_vp) = match (size, view_box_of(doc, input, root, budget)?) {
+            (Some((w, h)), Some((vb, aspect))) => match view_box_transform(&vb, aspect, w, h) {
+                Some(t) => (t, Some((vb.w, vb.h))),
+                None => {
+                    root_drawn = false;
+                    (Transform::IDENTITY, size)
+                }
+            },
+            (None, Some((vb, _))) if vb.w <= 0.0 || vb.h <= 0.0 => {
                 root_drawn = false;
                 (Transform::IDENTITY, size)
             }
-        },
-        (None, Some((vb, _))) if vb.w <= 0.0 || vb.h <= 0.0 => {
-            root_drawn = false;
-            (Transform::IDENTITY, size)
+            _ => (Transform::IDENTITY, size),
+        };
+        let hidden = d.refs.hidden.as_slice().first().copied().unwrap_or(0) != 0;
+        let root_ok =
+            root.ns == NS_SVG && root.local.of(input) == b"svg" && c0.display_none == 0 && !hidden && root_drawn;
+        // 根の svg の変形は viewBox の変形の外側に掛ける（usvg・Chrome と同じ。文書の 1 回目のレビュー）。原点の既定は表示の
+        // 領域の真ん中（Chrome と同じ。usvg は原点。ADR-85 (1)）
+        let root_own = c0.transform;
+        let root_known = c0.transform_known != 0;
+        let root_child = root_own.then(&root_ctm);
+        let root_ok = root_ok && root_child.finite() && {
+            let det = root_own.a * root_own.d - root_own.b * root_own.c;
+            det != 0.0 && det.is_finite()
+        };
+        let root_child = if root_child.finite() { root_child } else { Transform::IDENTITY };
+        f(&WalkItem {
+            node: 0,
+            parent: NONE,
+            computed: c0,
+            ctm: root_own,
+            ctm_known: root_known,
+            rendered: root_ok,
+            viewport: size,
+            clips: false,
+            context: None,
+        })?;
+        let mut w = Walker {
+            d,
+            opts,
+            budget,
+            ids,
+            bufs,
+            base,
+            stack: MVec::new(budget),
+            on_stack: MVec::new(budget),
+            ctx: MVec::new(budget),
+            overflow_id: crate::style::props::lookup(b"overflow", false),
+        };
+        if opts.build {
+            if !root_ok {
+                return Ok(None);
+            }
+            w.on_stack.resize_to(nodes.len(), 0)?;
+            if let Some(x) = w.on_stack.get_mut(0) {
+                *x = 1;
+            }
         }
-        _ => (Transform::IDENTITY, size),
-    };
-    let hidden = d.refs.hidden.as_slice();
-    // 自分の印（条件が偽・switch が選ばない）。祖先の印は描く木に入るかで受け継ぐ
-    let is_hidden = |i: u32| hidden.get(i as usize).copied().unwrap_or(0) != 0;
-    let root_ok =
-        root.ns == NS_SVG && root.local.of(input) == b"svg" && c0.display_none == 0 && !is_hidden(0) && root_drawn;
-    // 根の svg の変形は viewBox の変形の外側に掛ける（usvg・Chrome と同じ。文書の 1 回目のレビュー）。原点の既定は表示の
-    // 領域の真ん中（Chrome と同じ。usvg は原点。ADR-85 (1)）
-    let root_own = c0.transform;
-    let root_known = c0.transform_known != 0;
-    let root_child = root_own.then(&root_ctm);
-    let root_ok = root_ok && root_child.finite() && {
-        let det = root_own.a * root_own.d - root_own.b * root_own.c;
-        det != 0.0 && det.is_finite()
-    };
-    let root_child = if root_child.finite() { root_child } else { Transform::IDENTITY };
-    f(&WalkItem { node: 0, parent: NONE, computed: c0, ctm: root_own, ctm_known: root_known, rendered: root_ok })?;
-    let mut stack: MVec<'_, Frame> = MVec::new(budget);
-    let (vp_w, vp_h, has_vp) = match root_vp {
-        Some((w, h)) => (w, h, 1),
-        None => (0.0, 0.0, 0),
-    };
-    stack.push(Frame {
-        computed: c0,
-        ctm_children: root_child,
-        vp_w,
-        vp_h,
-        node: 0,
-        child: root.first_child,
-        has_vp,
-        children_rendered: u8::from(root_ok),
-        known: u8::from(root_known),
-        in_text: 0,
-        pad: [0; 4],
-    })?;
-    while let Some(top) = stack.last().copied() {
+        let (vp_w, vp_h, has_vp) = match root_vp {
+            Some((w, h)) => (w, h, 1),
+            None => (0.0, 0.0, 0),
+        };
+        w.stack.push(Frame {
+            computed: c0,
+            ctm_children: root_child,
+            vp_w,
+            vp_h,
+            node: 0,
+            child: root.first_child,
+            ctx: NONE,
+            has_vp,
+            children_rendered: u8::from(root_ok),
+            known: u8::from(root_known),
+            in_text: 0,
+            single: 0,
+            redraw: 0,
+            pad: [0; 2],
+        })?;
+        Ok(Some(w))
+    }
+
+    /// 次の要素を 1 つ見る（積み上げが空なら偽）。
+    fn step(&mut self, f: &mut dyn FnMut(&WalkItem) -> Result<(), Error>) -> Result<bool, Error> {
+        let budget = self.budget;
+        let d = self.d;
+        let doc = &d.xml;
+        let input = d.input;
+        let nodes = doc.nodes.as_slice();
+        let Some(top) = self.stack.last().copied() else { return Ok(false) };
         budget.spend(cost::OP_STEP)?;
-        // 次の要素の子
+        // 次の要素の子（use の参照先の段は参照先だけ）
         let mut c = top.child;
         let mut next = NONE;
-        while c != NONE {
-            budget.spend(cost::OP_STEP)?;
-            let Some(x) = nodes.get(c as usize) else { break };
-            let after = x.next_sibling;
-            if x.kind == KIND_ELEMENT {
-                next = c;
+        if top.single != 0 {
+            next = c;
+            c = NONE;
+        } else {
+            while c != NONE {
+                budget.spend(cost::OP_STEP)?;
+                let Some(x) = nodes.get(c as usize) else { break };
+                let after = x.next_sibling;
+                if x.kind == KIND_ELEMENT {
+                    next = c;
+                    c = after;
+                    break;
+                }
                 c = after;
-                break;
             }
-            c = after;
         }
-        if let Some(t) = stack.last_mut() {
+        if let Some(t) = self.stack.last_mut() {
             t.child = c;
         }
         if next == NONE {
-            stack.pop();
-            continue;
+            if let Some(done) = self.stack.pop() {
+                if done.single == 0 {
+                    if let Some(x) = self.on_stack.get_mut(done.node as usize) {
+                        *x = x.saturating_sub(1);
+                    }
+                } else {
+                    self.ctx.truncate(done.ctx as usize);
+                }
+            }
+            return Ok(true);
         }
-        let Some(n) = nodes.get(next as usize) else { continue };
+        let Some(n) = nodes.get(next as usize) else { return Ok(true) };
+        let hidden = d.refs.hidden.as_slice().get(next as usize).copied().unwrap_or(0) != 0;
         let vp = (top.has_vp != 0).then_some((top.vp_w, top.vp_h));
-        let b = Base { viewport: vp, ..base };
-        let comp = compute(&top.computed, d.styles.of(next), &ids, &bufs, &b, budget)?;
+        let b = Base { viewport: vp, ..self.base };
+        let comp = compute(&top.computed, d.styles.of(next), &self.ids, &self.bufs, &b, budget)?;
         let local = n.local.of(input);
         let svg_ns = n.ns == NS_SVG;
         let t = &comp.transform;
         let det = t.a * t.d - t.b * t.c;
+        // use の参照先の symbol は表示の領域として描く（SVG 2 §5.5）
+        let symbol_instance = top.single != 0 && svg_ns && local == b"symbol";
         let mut rendered = top.children_rendered != 0
             && svg_ns
             && known(local)
-            && !not_rendered(local)
+            && (!not_rendered(local) || symbol_instance)
             && fits(local, top.in_text != 0)
-            && !is_hidden(next)
+            && !hidden
             && comp.display_none == 0
             && det != 0.0
             && det.is_finite();
@@ -208,20 +346,26 @@ pub(crate) fn walk(
             let y = len0(b"y", Axis::Y)?;
             ctm = ctm.then(&Transform { e: x, f: y, ..Transform::IDENTITY });
             child_ctm = ctm;
-        } else if svg_ns && local == b"svg" {
-            // 入れ子の svg：x・y・width・height（既定 100%）と viewBox
+        } else if svg_ns && (local == b"svg" || symbol_instance) {
+            // 入れ子の svg：x・y・width・height（既定 100%）と viewBox。use の中の symbol は use の width・height が勝つ
             let x = len0(b"x", Axis::X)?;
             let y = len0(b"y", Axis::Y)?;
             let full =
                 |axis: Axis| resolve(Length::new(100.0, Unit::Percent), comp.font_size, comp.line_height, &b, axis);
-            let w = match attr_len(doc, input, n, b"width", &comp, &b, Axis::X, budget)? {
-                Some(w) => w,
-                None => full(Axis::X),
+            let use_node = if symbol_instance { nodes.get(top.node as usize) } else { None };
+            let size_of = |name: &[u8], axis: Axis| -> Result<Option<f64>, Error> {
+                if let Some(u) = use_node
+                    && let Some(v) = attr_len(doc, input, u, name, &comp, &b, axis, budget)?
+                {
+                    return Ok(v);
+                }
+                Ok(match attr_len(doc, input, n, name, &comp, &b, axis, budget)? {
+                    Some(v) => v,
+                    None => full(axis),
+                })
             };
-            let h = match attr_len(doc, input, n, b"height", &comp, &b, Axis::Y, budget)? {
-                Some(h) => h,
-                None => full(Axis::Y),
-            };
+            let w = size_of(b"width", Axis::X)?;
+            let h = size_of(b"height", Axis::Y)?;
             let to = ctm.then(&Transform { e: x, f: y, ..Transform::IDENTITY });
             match (w, h) {
                 (Some(w), Some(h)) if w > 0.0 && h > 0.0 => match view_box_of(doc, input, n, budget)? {
@@ -253,26 +397,121 @@ pub(crate) fn walk(
             known_ctm = false;
             rendered = false;
         }
-        f(&WalkItem { node: next, parent: top.node, computed: comp, ctm, ctm_known: known_ctm, rendered })?;
+        // 表示の領域で切るか（入れ子の svg・use の中の symbol。overflow が visible・auto なら切らない）
+        let clips = svg_ns
+            && (local == b"svg" || symbol_instance)
+            && !overflow_visible(d, next, self.overflow_id, &self.bufs, budget)?;
+        let context = if top.ctx == NONE { None } else { self.ctx.get(top.ctx as usize).copied() };
+        f(&WalkItem {
+            node: next,
+            parent: top.node,
+            computed: comp,
+            ctm,
+            ctm_known: known_ctm,
+            rendered,
+            viewport: vp,
+            clips,
+            context,
+        })?;
+        // 木を作るたどり方は、描く木に入らない要素の部分木に降りない
+        if self.opts.build && !rendered {
+            return Ok(true);
+        }
         let (vp_w, vp_h, has_vp) = match child_vp {
             Some((w, h)) => (w, h, 1),
             None => (0.0, 0.0, 0),
         };
-        stack.push(Frame {
+        let frame = Frame {
             computed: comp,
             ctm_children: child_ctm,
             vp_w,
             vp_h,
             node: next,
             child: n.first_child,
+            ctx: top.ctx,
             has_vp,
             children_rendered: u8::from(rendered && renders_children(local)),
             known: u8::from(known_ctm),
             in_text: u8::from(top.in_text != 0 || (svg_ns && local == b"text")),
-            pad: [0; 4],
-        })?;
+            single: 0,
+            redraw: top.redraw,
+            pad: [0; 2],
+        };
+        self.stack.push(frame)?;
+        if let Some(x) = self.on_stack.get_mut(next as usize) {
+            *x = x.saturating_add(1);
+        }
+        if self.opts.build && svg_ns && local == b"use" {
+            self.expand_use(&frame, top.redraw, context)?;
+        }
+        Ok(true)
     }
-    Ok(())
+
+    /// use の参照先を use の文脈で展開する段を積む（参照先が積み上げにあれば輪：積まない。取り除いた参照は、描き直しの
+    /// 中でなければ 1 段だけ描き直す）。
+    fn expand_use(&mut self, frame: &Frame, redraw: u8, outer: Option<UseContext>) -> Result<(), Error> {
+        let budget = self.budget;
+        let nodes = self.d.xml.nodes.as_slice();
+        let mut edge = None;
+        for e in self.d.refs.of(frame.node) {
+            budget.spend(cost::OP_STEP)?;
+            if e.kind == crate::doc::refs::EDGE_USE {
+                edge = Some(*e);
+                break;
+            }
+        }
+        let Some(e) = edge else { return Ok(()) };
+        let removed = e.removed != 0;
+        if !nodes.get(e.target as usize).is_some_and(|x| x.kind == KIND_ELEMENT)
+            || self.on_stack.get(e.target as usize).copied() != Some(0)
+            || (removed && redraw != 0)
+        {
+            return Ok(());
+        }
+        // use の中身の context-fill・context-stroke が使う塗り（use の塗りがまた文脈の塗りなら、外の use の文脈から）
+        let c = &frame.computed;
+        let pick = |p: CPaint| -> (CPaint, Color, u32) {
+            match (p.kind, outer) {
+                (PAINT_CONTEXT_FILL, Some(o)) => (o.fill, o.fill_color, o.fill_node),
+                (PAINT_CONTEXT_STROKE, Some(o)) => (o.stroke, o.stroke_color, o.stroke_node),
+                (PAINT_CONTEXT_FILL | PAINT_CONTEXT_STROKE, None) => (CPaint::NONE, c.color, frame.node),
+                _ => (p, c.color, frame.node),
+            }
+        };
+        let (fill, fill_color, fill_node) = pick(c.fill);
+        let (stroke, stroke_color, stroke_node) = pick(c.stroke);
+        let at = self.ctx.len();
+        self.ctx.push(UseContext { fill, stroke, fill_color, stroke_color, fill_node, stroke_node })?;
+        self.stack.push(Frame {
+            child: e.target,
+            ctx: at as u32,
+            children_rendered: 1,
+            single: 1,
+            redraw: redraw | u8::from(removed),
+            ..*frame
+        })?;
+        Ok(())
+    }
+}
+
+/// 要素の `overflow` が visible か auto か（受け継がない。書いていなければ偽：UA の規則で入れ子の svg と symbol は hidden）。
+fn overflow_visible(
+    d: &Document<'_>,
+    node: u32,
+    id: Option<crate::style::props::PropertyId>,
+    bufs: &Bufs<'_>,
+    budget: &Budget<'_>,
+) -> Result<bool, Error> {
+    let budget = budget_ref(budget);
+    for s in d.styles.of(node) {
+        budget.spend(cost::OP_STEP)?;
+        if Some(s.prop) != id || s.wide != crate::style::cascade::WIDE_NONE {
+            continue;
+        }
+        let mut v = Values::new(bufs.of(s.src), s.value, budget);
+        return Ok(v.eat_ident(b"visible")? || v.eat_ident(b"auto")?);
+    }
+    Ok(false)
 }
 
 /// 属性の長さ（単位のない数も受ける）をユーザー単位に解く。書いていない・`auto`・壊れた値は None、基準がなく解けない

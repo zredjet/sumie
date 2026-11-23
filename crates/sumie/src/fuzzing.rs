@@ -1017,7 +1017,8 @@ pub fn computed_values(d: &crate::Document<'_>, f: &mut dyn FnMut(&ComputedItem<
 
 /// パスのデータと `points` の読みと平坦化を通す（ファズの `path` の対象）。頭の 1 バイトで、読む口（下の 1 ビット：0 は
 /// パスのデータ、1 は `points`）と変形（次の 2 ビット）を選び、残りを値にする。確かめること：
-/// - 置き場に書く量は入力の 1 バイトあたり `cost::PATH_GEOMETRY_BYTES` 以下（`estimate_build` の上限）
+/// - 置き場に書く量は入力の 1 バイトあたり `cost::PATH_GEOMETRY_BYTES` 以下で、命令と座標の数は読む段の数え
+///   （`doc::weights::path_scan`）以下（`estimate_build` の上限）
 /// - 1 回の払いが中止の間隔を超えない・同じ入力で同じ結果
 /// - 平坦化で渡した点の数は区間ごとの分ける数の和（見積もりと同じ式）で、点は区間の厳密な外接矩形の中
 pub fn path_ops(data: &[u8]) -> Check {
@@ -1048,7 +1049,10 @@ pub fn path_ops(data: &[u8]) -> Check {
         };
         let bytes = (verbs.len() as u64).saturating_add((coords.len() as u64).saturating_mul(8));
         let limit = cost::PATH_GEOMETRY_BYTES.saturating_mul(text.len() as u64).saturating_add(64);
-        if head & 1 == 0 && bytes > limit {
+        // 書いた命令と座標は、読む段の数え（`doc::weights::path_scan`。木を作る段の見積もりと置き場の容量）以下
+        let (sv, sc) = crate::doc::weights::path_scan(text, &b)?;
+        let over = head & 1 == 0 && (verbs.len() as u64 > sv || coords.len() as u64 > sc);
+        if head & 1 == 0 && (bytes > limit || over) {
             return Err(Error::Limit(crate::error::LimitError {
                 resource: Resource::Memory,
                 needed: bytes,
@@ -1227,5 +1231,53 @@ pub fn stroke_ops(data: &[u8]) -> Check {
             Check::Violation("線の勘定が崩れたか、点ごとに払っていない")
         }
         _ => Check::Violation("同じ入力で線の結果が違う"),
+    }
+}
+
+/// 木を作る段を通す（ファズの `build` の対象）。入力を SVG として読み、読めたら `estimate_build` と見張りつきの `build` を
+/// 2 度呼ぶ。確かめること：見積もり ≥ 実際（手間・確保の山・持ち続ける量）・1 回の払いが中止の間隔を超えない・返しすぎない・
+/// 見積もりが通れば同じ断り（Unsupported）か木を返す・同じ入力で同じ結果（節の並び）・見積もりの上限で作っても同じ。
+pub fn build_ops(data: &[u8]) -> Check {
+    use crate::doc::{Watch, parse};
+    let opts = crate::style::ParseOptions::DEFAULT;
+    let Ok(d) = parse(data, &opts, &Never) else { return Check::Ok };
+    let est = d.estimate_build(&Never);
+    let run = || {
+        let mut w = Watch::default();
+        let t = d.build_watch(&Never, &mut w);
+        (t, w)
+    };
+    let (a, wa) = run();
+    let (b, wb) = run();
+    if wa != wb {
+        return Check::Violation("同じ入力で木を作る段の勘定が違う");
+    }
+    if wa.over_released || wa.max_spend >= CANCEL_INTERVAL {
+        return Check::Violation("木を作る段の勘定が崩れた");
+    }
+    match (&est, &a, &b) {
+        (Ok(e), Ok(t), Ok(u)) => {
+            if t.nodes.as_slice() != u.nodes.as_slice() || t.coords.as_slice() != u.coords.as_slice() {
+                return Check::Violation("同じ入力で木が違う");
+            }
+            if wa.work > e.work || wa.peak > e.peak_bytes || t.held_bytes() > e.result_bytes {
+                return Check::Violation("木を作る段の見積もりが実際を下回る");
+            }
+            match d.build(&Never) {
+                Ok(v) if v.nodes.as_slice() == t.nodes.as_slice() => Check::Ok,
+                _ => Check::Violation("見積もりの上限で作ると違う"),
+            }
+        }
+        (Ok(_), Err(x), Err(y)) => {
+            if x != y {
+                return Check::Violation("同じ入力で断りが違う");
+            }
+            match x {
+                Error::Unsupported(_) | Error::Invalid(_) => Check::Ok,
+                _ => Check::Violation("見積もりが通ったのに上限か中止で断った"),
+            }
+        }
+        (Err(_), _, _) => Check::Ok,
+        _ => Check::Violation("同じ入力で結果が違う"),
     }
 }

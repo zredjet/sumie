@@ -90,6 +90,8 @@ pub(crate) struct Refs {
     pub(crate) hidden: Frozen<u8>,
     /// 根から展開したあとの要素の数（飽和する）
     pub(crate) instances: u64,
+    /// 木を作る段の見積もり（ADR-93）
+    pub(crate) weights: crate::doc::weights::BuildWeights,
     /// 輪の警告と、読まなかった参照（位置の順）
     pub(crate) notes: Frozen<RefNote>,
 }
@@ -588,7 +590,17 @@ pub(crate) fn build(
     start.push(edges.len() as u32)?;
     // 要素の辺を作るだけの入れ物は、輪の取り除きと数えの前に捨てる（確保の山を小さくする。文書の 6 回目のレビュー）
     drop((cx, inh, inh_cache, own_lists, switch_chosen, sheet_keys, inh_keys));
-    let parts = Parts { start, edges, ledges, notes, hidden, inherit_bits };
+    let parts = Parts {
+        start,
+        edges,
+        ledges,
+        notes,
+        hidden,
+        inherit_bits,
+        styles,
+        sheet: sheet.text.as_slice(),
+        ids: ids.entries.len() as u64,
+    };
     finish(doc, input, parts, lists.as_slice(), budget)
 }
 
@@ -600,11 +612,18 @@ struct Parts<'b> {
     notes: MVec<'b, RefNote>,
     hidden: MVec<'b, u8>,
     inherit_bits: MVec<'b, u8>,
+    /// 木を作る段の見積もりの重みを求める材料（カスケードの結果・規則の並びの字・id の数）
+    styles: &'b Styles,
+    sheet: &'b [u8],
+    ids: u64,
 }
 
 /// 並びの節の辺を足し、輪を取り除き、展開の数を求めて表を閉じる（`build` の残り。`build` のスタックの枠を小さく保つ）。
 fn finish(doc: &XmlDoc, input: &[u8], parts: Parts<'_>, lists: &[ListRec], budget: &Budget<'_>) -> Result<Refs, Error> {
-    let Parts { mut start, mut edges, ledges, mut notes, hidden, inherit_bits } = parts;
+    let Parts { mut start, mut edges, ledges, mut notes, hidden, inherit_bits, styles, sheet, ids } = parts;
+    // 要素ごとの木を作る段の重み（並びの節の辺を足す前の、要素の辺の数で）
+    let (weights, globals) =
+        crate::doc::weights::node_weights(doc, input, sheet, styles, start.as_slice(), ids, budget)?;
     // 並びの節の辺（並びの番号の順）
     let mut list_pos: MVec<'_, u32> = MVec::with_capacity(budget, lists.len())?;
     for l in lists {
@@ -618,13 +637,32 @@ fn finish(doc: &XmlDoc, input: &[u8], parts: Parts<'_>, lists: &[ListRec], budge
     // 輪を取り除き、展開の数を求める
     let start = start.freeze();
     remove_cycles(doc, start.as_slice(), &mut edges, &mut notes, list_pos.as_slice(), budget)?;
-    let instances = count_instances(doc, input, start.as_slice(), edges.as_slice(), inherit_bits.as_slice(), budget)?;
+    let root = count_instances(
+        doc,
+        input,
+        start.as_slice(),
+        edges.as_slice(),
+        inherit_bits.as_slice(),
+        weights.as_slice(),
+        budget,
+    )?;
+    drop(weights);
+    let instances = root.instances;
     // 覚えは位置の順（足した順は節の順なので、位置の順になっている）
     let mut exact_notes: MVec<'_, RefNote> = MVec::with_capacity(budget, notes.len())?;
     exact_notes.append_slice(notes.as_slice())?;
     let mut exact_edges: MVec<'_, Edge> = MVec::with_capacity(budget, edges.len())?;
     exact_edges.append_slice(edges.as_slice())?;
-    Ok(Refs { start, edges: exact_edges.freeze(), hidden: hidden.freeze(), instances, notes: exact_notes.freeze() })
+    // 報告の量は文書の段の終わりに決まるので、木を作る段の見積もりは報告を除いて閉じ、`estimate_build` が足す
+    let weights = crate::doc::weights::close_weights(&globals, &root, 0);
+    Ok(Refs {
+        start,
+        edges: exact_edges.freeze(),
+        hidden: hidden.freeze(),
+        instances,
+        weights,
+        notes: exact_notes.freeze(),
+    })
 }
 
 /// 指定の値の置き場。
@@ -924,10 +962,16 @@ struct Tally {
     /// 受け継がない参照（clip-path・mask・filter の順）を `inherit` の鎖で節の親から受け取る、部分木の要素の数（use の中身
     /// では use の値を受け取る。文書の 4 回目のレビュー）
     inh: [u64; 3],
+    /// 木を作る段の手間の重みの和と、節ごとに書く図形（rect・circle・ellipse・line）の数（ADR-93）
+    work: u64,
+    basic: u64,
+    /// 展開した部分木の深さ（子と use の中身で深くなる。木を作る段のたどる積み上げの上限）
+    depth: u64,
 }
 
 impl Tally {
-    const ZERO: Tally = Tally { count: 0, paints: 0, marks: 0, users: 0, mpaint: 0, inh: [0; 3] };
+    const ZERO: Tally =
+        Tally { count: 0, paints: 0, marks: 0, users: 0, mpaint: 0, inh: [0; 3], work: 0, basic: 0, depth: 0 };
 }
 
 impl Plain for Tally {}
@@ -978,12 +1022,13 @@ fn count_instances(
     start: &[u32],
     edges: &[Edge],
     inherit_bits: &[u8],
+    weights: &[u64],
     budget: &Budget<'_>,
-) -> Result<u64, Error> {
+) -> Result<crate::doc::weights::Expanded, Error> {
     let budget = budget_ref(budget);
     let nodes = doc.nodes.as_slice();
     let n = nodes.len();
-    let first = count_pass(doc, input, start, edges, inherit_bits, None, budget)?;
+    let first = count_pass(doc, input, start, edges, inherit_bits, weights, None, budget)?;
     // 2 度目に要るのは取り除いた辺の行き先の 1 度目の数だけ（1 度目の表を先に捨てて確保の山を小さくする）
     let mut targets: MVec<'_, u32> = MVec::new(budget);
     for e in edges {
@@ -1038,8 +1083,15 @@ fn count_instances(
         edges,
         n,
     };
-    let second = count_pass(doc, input, start, edges, inherit_bits, Some(&prev), budget)?;
-    Ok(second.as_slice().first().map_or(0, |t| t.count))
+    let second = count_pass(doc, input, start, edges, inherit_bits, weights, Some(&prev), budget)?;
+    let root = second.as_slice().first().copied().unwrap_or(Tally::ZERO);
+    Ok(crate::doc::weights::Expanded {
+        instances: root.count,
+        work: root.work,
+        shapes: root.paints,
+        basic: root.basic,
+        depth: root.depth,
+    })
 }
 
 /// 2 度目の数えに渡す、取り除いた辺の行き先の 1 度目の数と、本当の輪を見分ける表。
@@ -1100,12 +1152,14 @@ impl Prev<'_> {
 }
 
 /// 展開の数を 1 度数え、節ごとの数を返す（`prev` は 1 度目の数。あれば取り除いた辺の先をそれで足す）。
+#[allow(clippy::too_many_arguments, reason = "参照の表の部分をまとめて渡す")]
 fn count_pass<'b>(
     doc: &XmlDoc,
     input: &[u8],
     start: &[u32],
     edges: &[Edge],
     inherit_bits: &[u8],
+    weights: &[u64],
     prev: Option<&Prev<'_>>,
     budget: &'b Budget<'b>,
 ) -> Result<MVec<'b, Tally>, Error> {
@@ -1127,6 +1181,7 @@ fn count_pass<'b>(
     let is_use = |i: u32| local_of(i).is_some_and(|l| matches!(l, b"use" | b"feImage"));
     // 節を数え始めるときの自分の分
     let bits = |i: u32| inherit_bits.get(i as usize).copied().unwrap_or(0);
+    let weight = |i: u32| weights.get(i as usize).copied().unwrap_or(0);
     let own = |i: u32| -> Tally {
         match nodes.get(i as usize) {
             None => Tally::ZERO,
@@ -1142,6 +1197,9 @@ fn count_pass<'b>(
                     users: u64::from(shape),
                     mpaint: 0,
                     inh: [u64::from(b & 1 != 0), u64::from(b & 2 != 0), u64::from(b & 4 != 0)],
+                    work: weight(i),
+                    basic: u64::from(matches!(l, b"rect" | b"circle" | b"ellipse" | b"line")),
+                    depth: 1,
                 }
             }
         }
@@ -1154,9 +1212,11 @@ fn count_pass<'b>(
     //   足す（context-fill・context-stroke）。use から付く marker の中の塗る要素は、中身の marker を付ける要素の自分の塗りも
     //   使う（`mult2` は中身の `mpaint`）
     // - 4 塗り・線：数を `users` の倍で足し、`mpaint` に参照先の数を `mult2` の倍で足す
-    let add = |a: &mut Tally, t: Tally, link: u8, mult: u64, mult2: u64, pb: u8| match link {
+    let add_counts = |a: &mut Tally, t: Tally, link: u8, mult: u64, mult2: u64, pb: u8| match link {
         0 | 1 => {
             a.count = cap_add(a.count, t.count);
+            a.work = cap_add(a.work, t.work);
+            a.basic = cap_add(a.basic, t.basic);
             a.paints = cap_add(a.paints, t.paints);
             a.marks = cap_add(a.marks, t.marks);
             a.mpaint = cap_add(a.mpaint, t.mpaint);
@@ -1174,15 +1234,29 @@ fn count_pass<'b>(
             // stroke: context-fill`）ので 2 倍
             let ctx = cap_mul(t.paints, 2);
             a.count = cap_add(a.count, cap_mul(t.count, mult));
+            a.work = cap_add(a.work, cap_mul(t.work, mult));
+            a.basic = cap_add(a.basic, cap_mul(t.basic, mult));
             a.count = cap_add(a.count, cap_mul(ctx, mult2));
             a.paints = cap_add(a.paints, cap_mul(ctx, mult));
             a.users = cap_add(a.users, cap_mul(ctx, mult));
         }
         4 => {
             a.count = cap_add(a.count, cap_mul(t.count, mult));
+            a.work = cap_add(a.work, cap_mul(t.work, mult));
+            a.basic = cap_add(a.basic, cap_mul(t.basic, mult));
             a.mpaint = cap_add(a.mpaint, cap_mul(t.count, mult2));
         }
-        _ => a.count = cap_add(a.count, cap_mul(t.count, mult)),
+        _ => {
+            a.count = cap_add(a.count, cap_mul(t.count, mult));
+            a.work = cap_add(a.work, cap_mul(t.work, mult));
+            a.basic = cap_add(a.basic, cap_mul(t.basic, mult));
+        }
+    };
+    let add = |a: &mut Tally, t: Tally, link: u8, mult: u64, mult2: u64, pb: u8| {
+        // 深さ：子は 1 つ、use の中身は use の段と参照先の段で 2 つ深い
+        let deeper = t.depth.saturating_add(if link == 1 { 2 } else { 1 });
+        a.depth = a.depth.max(deeper);
+        add_counts(a, t, link, mult, mult2, pb);
     };
     // 数え始める節：根と、1 度目は輪として取り除いた辺の行き先（2 度目に足す 1 度目の数が要る。行き先は根から取り除いて
     // いない辺で届かないことがある）
@@ -1223,6 +1297,8 @@ fn count_pass<'b>(
                     if x.ns == NS_SVG && not_rendered(x.local.of(input)) {
                         if let Some(a) = acc.last_mut() {
                             a.count = cap_add(a.count, 1);
+                            // 木を作る段は入れ物そのものを計算する（子には降りない）
+                            a.work = cap_add(a.work, weight(c));
                         }
                         continue;
                     }

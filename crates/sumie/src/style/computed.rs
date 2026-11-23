@@ -156,13 +156,141 @@ pub(crate) struct Computed {
     pub(crate) sw_is_pct: u8,
     /// `transform-box` が view-box（初期の値。ほかは外接矩形が要る）
     pub(crate) box_vb: u8,
+    /// 線と塗りの細部
+    pub(crate) line: LineStyle,
+    /// 幾何のプロパティ（受け継がない）
+    pub(crate) geo: Geo,
+    /// M2 でまだ描かない効果の印（受け継がない。[`FX_CLIP`] など）
+    pub(crate) fx: u8,
     /// `transform-origin` の計算した値の長さが解けた（`transform-origin: inherit` が受け継ぐ。文書の 5 回目のレビュー）
     pub(crate) origin_known: u8,
     /// `transform_raw` の長さが解けた（割合を除く。`transform: inherit` が受け継ぐ）
     pub(crate) raw_known: u8,
     /// `transform_raw` に割合の平行移動がある（`raw_coef` を使う）
     pub(crate) raw_pct: u8,
-    pub(crate) pad: [u8; 7],
+    pub(crate) pad: [u8; 6],
+}
+
+/// 効果の印：`clip-path` が url でも none でもない（基本の形など）・`filter` が url でも none でもない（フィルタの関数）・
+/// `mask` が url でも none でもない・`mix-blend-mode` が normal でない・`isolation: isolate`。url の効果は参照の辺で見る
+/// （参照先が正しいときだけ効く）。
+pub(crate) const FX_CLIP: u8 = 1;
+pub(crate) const FX_FILTER: u8 = 2;
+pub(crate) const FX_MASK: u8 = 4;
+pub(crate) const FX_BLEND: u8 = 8;
+pub(crate) const FX_ISOLATE: u8 = 16;
+
+/// 幾何のプロパティの欄（[`Geo::v`] の番号）。
+pub(crate) const G_X: usize = 0;
+pub(crate) const G_Y: usize = 1;
+pub(crate) const G_WIDTH: usize = 2;
+pub(crate) const G_HEIGHT: usize = 3;
+pub(crate) const G_RX: usize = 4;
+pub(crate) const G_RY: usize = 5;
+pub(crate) const G_R: usize = 6;
+pub(crate) const G_CX: usize = 7;
+pub(crate) const G_CY: usize = 8;
+const GEO_SLOTS: usize = 9;
+
+/// 幾何のプロパティの計算した値（SVG 2 §10・ADR-66 (4)。受け継がない）。長さは px、割合は割合のまま（`pct` の印。使う
+/// 要素の表示の領域で解く）、`auto` は印。`d` は宣言の場所（置き場と範囲。木を作る段が宣言ごとに 1 度だけ読む）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Geo {
+    pub(crate) v: [f64; GEO_SLOTS],
+    pub(crate) d: Span,
+    /// 欄ごとの印（bit k が欄 k）
+    pub(crate) pct: u16,
+    pub(crate) auto: u16,
+    /// `d` の置き場（[`DASH_NONE`] と同じ 0xFF ならなし）・`d` が属性（パスのデータ）か CSS（`path("…")`）か
+    pub(crate) d_src: u8,
+    pub(crate) d_attr: u8,
+    pub(crate) pad: [u8; 2],
+}
+
+impl Plain for Geo {}
+
+impl Geo {
+    /// 初期の値（width・height・rx・ry は auto、ほかは 0、d は none）。
+    pub(crate) const INITIAL: Geo = Geo {
+        v: [0.0; GEO_SLOTS],
+        d: Span { start: 0, end: 0 },
+        pct: 0,
+        auto: (1 << G_WIDTH) | (1 << G_HEIGHT) | (1 << G_RX) | (1 << G_RY),
+        d_src: DASH_NONE,
+        d_attr: 0,
+        pad: [0; 2],
+    };
+
+    fn copy_slot(&mut self, from: &Geo, k: usize) {
+        if let (Some(d), Some(f)) = (self.v.get_mut(k), from.v.get(k)) {
+            *d = *f;
+        }
+        let bit = 1u16.checked_shl(k as u32).unwrap_or(0);
+        self.pct = (self.pct & !bit) | (from.pct & bit);
+        self.auto = (self.auto & !bit) | (from.auto & bit);
+    }
+
+    /// 欄 `k` の使う値（割合は `basis` に対して。`auto` は None）。
+    pub(crate) fn used(&self, k: usize, basis: Option<f64>) -> Option<f64> {
+        let bit = 1u16.checked_shl(k as u32).unwrap_or(0);
+        if self.auto & bit != 0 {
+            return None;
+        }
+        let v = self.v.get(k).copied().unwrap_or(0.0);
+        if self.pct & bit != 0 {
+            return basis.map(|b| v * b / 100.0).filter(|x| x.is_finite());
+        }
+        Some(v)
+    }
+}
+
+/// 線と塗りの細部（M2。受け継ぐ：塗りの規則・端・継ぎ目・miterlimit・破線・位相・paint-order・shape-rendering。受け継がない：
+/// vector-effect）。破線の並びは宣言の場所（置き場と範囲）だけを持ち、木を作る段と計画が解く（同じ宣言を多くの要素が使っても
+/// 写しが膨らまない）。破線の位相は長さのまま（使う要素の文脈で解く）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LineStyle {
+    pub(crate) miter_limit: f64,
+    pub(crate) dash_offset: Length,
+    /// 破線の宣言の範囲（`dash_src` の置き場の中。`dash_src` が [`DASH_NONE`] なら実線）
+    pub(crate) dash: Span,
+    pub(crate) dash_src: u8,
+    /// 破線の宣言は単位のない長さを受ける（属性か SVG のプロパティ）
+    pub(crate) dash_unitless: u8,
+    /// 0 非ゼロ・1 偶奇
+    pub(crate) fill_rule: u8,
+    /// 0 butt・1 round・2 square
+    pub(crate) cap: u8,
+    /// 0 miter・1 round・2 bevel
+    pub(crate) join: u8,
+    /// 線を塗りより先に描く（paint-order）
+    pub(crate) stroke_first: u8,
+    /// 反エイリアスなし（crispEdges・optimizeSpeed。ADR-91 (4)）
+    pub(crate) crisp: u8,
+    /// vector-effect: non-scaling-stroke（受け継がない）
+    pub(crate) non_scaling: u8,
+}
+
+impl Plain for LineStyle {}
+
+/// 実線（破線の宣言がない）。
+pub(crate) const DASH_NONE: u8 = 0xFF;
+
+impl LineStyle {
+    pub(crate) const INITIAL: LineStyle = LineStyle {
+        miter_limit: 4.0,
+        dash_offset: Length::new(0.0, Unit::None),
+        dash: Span { start: 0, end: 0 },
+        dash_src: DASH_NONE,
+        dash_unitless: 0,
+        fill_rule: 0,
+        cap: 0,
+        join: 0,
+        stroke_first: 0,
+        crisp: 0,
+        non_scaling: 0,
+    };
 }
 
 /// `transform-origin` の 50% 50%（CSS の初期の値・根の svg の既定）。
@@ -202,10 +330,13 @@ impl Computed {
             lh_number: 1,
             sw_is_pct: 0,
             box_vb: 1,
+            line: LineStyle::INITIAL,
+            geo: Geo::INITIAL,
+            fx: 0,
             origin_known: 1,
             raw_known: 1,
             raw_pct: 0,
-            pad: [0; 7],
+            pad: [0; 6],
         }
     }
 }
@@ -227,7 +358,26 @@ pub(crate) struct PropIds {
     transform_box: Option<PropertyId>,
     transform_origin: Option<PropertyId>,
     visibility: Option<PropertyId>,
+    fill_rule: Option<PropertyId>,
+    linecap: Option<PropertyId>,
+    linejoin: Option<PropertyId>,
+    miterlimit: Option<PropertyId>,
+    dasharray: Option<PropertyId>,
+    dashoffset: Option<PropertyId>,
+    paint_order: Option<PropertyId>,
+    shape_rendering: Option<PropertyId>,
+    vector_effect: Option<PropertyId>,
+    geo: [Option<PropertyId>; GEO_SLOTS],
+    d: Option<PropertyId>,
+    clip_path: Option<PropertyId>,
+    filter: Option<PropertyId>,
+    mask: Option<PropertyId>,
+    blend: Option<PropertyId>,
+    isolation: Option<PropertyId>,
 }
+
+/// 幾何の欄のプロパティの名前（[`G_X`] などの順）。
+const GEO_NAMES: [&[u8]; GEO_SLOTS] = [b"x", b"y", b"width", b"height", b"rx", b"ry", b"r", b"cx", b"cy"];
 
 impl PropIds {
     pub(crate) fn new() -> PropIds {
@@ -246,6 +396,22 @@ impl PropIds {
             transform_box: lookup(b"transform-box", false),
             transform_origin: lookup(b"transform-origin", false),
             visibility: lookup(b"visibility", false),
+            fill_rule: lookup(b"fill-rule", false),
+            linecap: lookup(b"stroke-linecap", false),
+            linejoin: lookup(b"stroke-linejoin", false),
+            miterlimit: lookup(b"stroke-miterlimit", false),
+            dasharray: lookup(b"stroke-dasharray", false),
+            dashoffset: lookup(b"stroke-dashoffset", false),
+            paint_order: lookup(b"paint-order", false),
+            shape_rendering: lookup(b"shape-rendering", false),
+            vector_effect: lookup(b"vector-effect", false),
+            geo: GEO_NAMES.map(|n| lookup(n, false)),
+            d: lookup(b"d", false),
+            clip_path: lookup(b"clip-path", false),
+            filter: lookup(b"filter", false),
+            mask: lookup(b"mask", false),
+            blend: lookup(b"mix-blend-mode", false),
+            isolation: lookup(b"isolation", false),
         }
     }
 }
@@ -267,6 +433,22 @@ struct Picked {
     transform_box: Option<Specified>,
     transform_origin: Option<Specified>,
     visibility: Option<Specified>,
+    fill_rule: Option<Specified>,
+    linecap: Option<Specified>,
+    linejoin: Option<Specified>,
+    miterlimit: Option<Specified>,
+    dasharray: Option<Specified>,
+    dashoffset: Option<Specified>,
+    paint_order: Option<Specified>,
+    shape_rendering: Option<Specified>,
+    vector_effect: Option<Specified>,
+    geo: [Option<Specified>; GEO_SLOTS],
+    d: Option<Specified>,
+    clip_path: Option<Specified>,
+    filter: Option<Specified>,
+    mask: Option<Specified>,
+    blend: Option<Specified>,
+    isolation: Option<Specified>,
 }
 
 fn pick(specs: &[Specified], ids: &PropIds, budget: &Budget<'_>) -> Result<Picked, Error> {
@@ -302,6 +484,41 @@ fn pick(specs: &[Specified], ids: &PropIds, budget: &Budget<'_>) -> Result<Picke
             &mut p.transform_origin
         } else if id == ids.visibility {
             &mut p.visibility
+        } else if id == ids.fill_rule {
+            &mut p.fill_rule
+        } else if id == ids.linecap {
+            &mut p.linecap
+        } else if id == ids.linejoin {
+            &mut p.linejoin
+        } else if id == ids.miterlimit {
+            &mut p.miterlimit
+        } else if id == ids.dasharray {
+            &mut p.dasharray
+        } else if id == ids.dashoffset {
+            &mut p.dashoffset
+        } else if id == ids.paint_order {
+            &mut p.paint_order
+        } else if id == ids.shape_rendering {
+            &mut p.shape_rendering
+        } else if id == ids.vector_effect {
+            &mut p.vector_effect
+        } else if id == ids.d {
+            &mut p.d
+        } else if id == ids.clip_path {
+            &mut p.clip_path
+        } else if id == ids.filter {
+            &mut p.filter
+        } else if id == ids.mask {
+            &mut p.mask
+        } else if id == ids.blend {
+            &mut p.blend
+        } else if id == ids.isolation {
+            &mut p.isolation
+        } else if let Some(k) = ids.geo.iter().position(|g| id == *g) {
+            match p.geo.get_mut(k) {
+                Some(x) => x,
+                None => continue,
+            }
         } else {
             continue;
         };
@@ -419,6 +636,9 @@ pub(crate) fn compute(
         raw_pct: 0,
         transform_known: initial.transform_known,
         box_vb: initial.box_vb,
+        line: LineStyle { non_scaling: 0, ..parent.line },
+        geo: Geo::INITIAL,
+        fx: 0,
         ..*parent
     };
     let p = pick(specs, ids, budget)?;
@@ -569,6 +789,9 @@ pub(crate) fn compute(
         // 受け継いだ割合をこの要素の表示の領域で解き直す（解けなければ親の使った値）
         c.stroke_width = pct_width(parent.sw_pct).unwrap_or(parent.stroke_width);
     }
+    line_style(&mut c, parent, &p, bufs, &wide, budget)?;
+    geometry(&mut c, parent, &p, bufs, base, &wide, budget)?;
+    effects(&mut c, parent, &p, bufs, &wide, budget)?;
     if let Some(s) = p.visibility.as_ref() {
         budget.spend(cost::OP_STEP)?;
         c.visibility = match wide(s) {
@@ -680,6 +903,279 @@ fn line_height(
         _ => resolve(l, font, parent.line_height, base, Axis::Diag),
     };
     Ok(out.filter(|&x| x >= 0.0).map(|x| (false, x)))
+}
+
+/// 線と塗りの細部（[`LineStyle`]）を求める。
+fn line_style(
+    c: &mut Computed,
+    parent: &Computed,
+    p: &Picked,
+    bufs: &Bufs<'_>,
+    wide: &dyn Fn(&Specified) -> Option<bool>,
+    budget: &Budget<'_>,
+) -> Result<(), Error> {
+    let budget = budget_ref(budget);
+    let init = LineStyle::INITIAL;
+    let pl = parent.line;
+    // 言葉の並びから番号（知らない言葉・壊れた値は None で親の値）
+    let keyword = |s: &Specified, words: &[&[u8]]| -> Result<Option<u8>, Error> {
+        let buf = bufs.of(s.src);
+        let mut v = Values::new(buf, s.value, budget);
+        let t = v.next()?;
+        if t.kind != Tk::Ident || !v.at_end()? {
+            return Ok(None);
+        }
+        Ok(words.iter().position(|w| ident_is(buf, t.inner, t.escaped, w)).and_then(|i| u8::try_from(i).ok()))
+    };
+    let mut kw = |sp: Option<Specified>,
+                  words: &[&[u8]],
+                  get: fn(&LineStyle) -> u8,
+                  set: fn(&mut LineStyle, u8)|
+     -> Result<(), Error> {
+        let Some(s) = sp else { return Ok(()) };
+        budget.spend(cost::OP_STEP)?;
+        let v = match wide(&s) {
+            Some(true) => get(&pl),
+            Some(false) => get(&init),
+            None => keyword(&s, words)?.unwrap_or(get(&pl)),
+        };
+        set(&mut c.line, v);
+        Ok(())
+    };
+    kw(p.fill_rule, &[b"nonzero", b"evenodd"], |l| l.fill_rule, |l, v| l.fill_rule = v)?;
+    kw(p.linecap, &[b"butt", b"round", b"square"], |l| l.cap, |l, v| l.cap = v)?;
+    kw(p.linejoin, &[b"miter", b"round", b"bevel"], |l| l.join, |l, v| l.join = v)?;
+    // shape-rendering：crispEdges と optimizeSpeed は反エイリアスなし（ADR-91 (4)）
+    kw(
+        p.shape_rendering,
+        &[b"auto", b"geometricPrecision", b"crispEdges", b"optimizeSpeed"],
+        |l| l.crisp,
+        |l, v| l.crisp = u8::from(v >= 2),
+    )?;
+    if let Some(s) = p.vector_effect.as_ref() {
+        budget.spend(cost::OP_STEP)?;
+        c.line.non_scaling = match wide(s) {
+            Some(true) => pl.non_scaling,
+            Some(false) => 0,
+            None => u8::from(keyword(s, &[b"none", b"non-scaling-stroke"])? == Some(1)),
+        };
+    }
+    if let Some(s) = p.miterlimit.as_ref() {
+        budget.spend(cost::OP_STEP)?;
+        c.line.miter_limit = match wide(s) {
+            Some(true) => pl.miter_limit,
+            Some(false) => init.miter_limit,
+            None => {
+                let t = Values::new(bufs.of(s.src), s.value, budget).next()?;
+                if t.kind == Tk::Number && t.finite && t.value >= 0.0 { t.value } else { pl.miter_limit }
+            }
+        };
+    }
+    if let Some(s) = p.dasharray.as_ref() {
+        budget.spend(cost::OP_STEP)?;
+        match wide(s) {
+            Some(true) => {
+                c.line.dash = pl.dash;
+                c.line.dash_src = pl.dash_src;
+                c.line.dash_unitless = pl.dash_unitless;
+            }
+            Some(false) => c.line.dash_src = DASH_NONE,
+            None => {
+                if keyword(s, &[b"none"])? == Some(0) {
+                    c.line.dash_src = DASH_NONE;
+                } else {
+                    c.line.dash = s.value;
+                    c.line.dash_src = s.src;
+                    let unitless =
+                        PROPS.get(usize::from(s.prop)).is_some_and(|p| p.unitless) || s.origin == ORIGIN_ATTR;
+                    c.line.dash_unitless = u8::from(unitless);
+                }
+            }
+        }
+    }
+    if let Some(s) = p.dashoffset.as_ref() {
+        budget.spend(cost::OP_STEP)?;
+        c.line.dash_offset = match wide(s) {
+            Some(true) => pl.dash_offset,
+            Some(false) => init.dash_offset,
+            None => {
+                let unitless = PROPS.get(usize::from(s.prop)).is_some_and(|p| p.unitless) || s.origin == ORIGIN_ATTR;
+                Values::new(bufs.of(s.src), s.value, budget).length(unitless)?.unwrap_or(pl.dash_offset)
+            }
+        };
+    }
+    if let Some(s) = p.paint_order.as_ref() {
+        budget.spend(cost::OP_STEP)?;
+        c.line.stroke_first = match wide(s) {
+            Some(true) => pl.stroke_first,
+            Some(false) => 0,
+            None => paint_order_stroke_first(s, bufs, budget)?.unwrap_or(pl.stroke_first),
+        };
+    }
+    Ok(())
+}
+
+/// `paint-order` の値で線が塗りより先か（`normal` は偽。書いていない言葉は塗り・線・marker の順で後ろに足す。壊れた値は None）。
+fn paint_order_stroke_first(s: &Specified, bufs: &Bufs<'_>, budget: &Budget<'_>) -> Result<Option<u8>, Error> {
+    let budget = budget_ref(budget);
+    let buf = bufs.of(s.src);
+    let mut v = Values::new(buf, s.value, budget);
+    let mut first: Option<u8> = None;
+    let mut any = false;
+    while !v.at_end()? {
+        budget.spend(cost::OP_STEP)?;
+        let t = v.next()?;
+        if t.kind != Tk::Ident {
+            return Ok(None);
+        }
+        let is = |w: &[u8]| ident_is(buf, t.inner, t.escaped, w);
+        any = true;
+        if is(b"normal") {
+            return Ok(Some(0));
+        } else if is(b"stroke") {
+            first.get_or_insert(1);
+        } else if is(b"fill") {
+            first.get_or_insert(0);
+        } else if !is(b"markers") {
+            return Ok(None);
+        }
+    }
+    if !any {
+        return Ok(None);
+    }
+    Ok(Some(first.unwrap_or(0)))
+}
+
+/// 幾何のプロパティ（[`Geo`]）を求める。壊れた値・負の大きさと半径・解けない長さの宣言は初期の値（受け継がないので
+/// 書かなかったのと同じ。SVG 2 §10.2・ADR-90 (3)）。
+fn geometry(
+    c: &mut Computed,
+    parent: &Computed,
+    p: &Picked,
+    bufs: &Bufs<'_>,
+    base: &Base,
+    wide: &dyn Fn(&Specified) -> Option<bool>,
+    budget: &Budget<'_>,
+) -> Result<(), Error> {
+    let budget = budget_ref(budget);
+    let (font, line) = (c.font_size, c.line_height);
+    for (k, sp) in p.geo.iter().enumerate() {
+        let Some(s) = sp.as_ref() else { continue };
+        budget.spend(cost::OP_STEP)?;
+        match wide(s) {
+            Some(true) => c.geo.copy_slot(&parent.geo, k),
+            Some(false) => {}
+            None => {
+                let buf = bufs.of(s.src);
+                let bit = 1u16.checked_shl(k as u32).unwrap_or(0);
+                let can_auto = matches!(k, G_WIDTH | G_HEIGHT | G_RX | G_RY);
+                let mut v = Values::new(buf, s.value, budget);
+                if can_auto && v.eat_ident(b"auto")? {
+                    if v.at_end()? {
+                        c.geo.auto |= bit;
+                    }
+                    continue;
+                }
+                let unitless = PROPS.get(usize::from(s.prop)).is_some_and(|p| p.unitless) || s.origin == ORIGIN_ATTR;
+                let Some(l) = v.length(unitless)? else { continue };
+                if !v.at_end()? {
+                    continue;
+                }
+                let non_neg = matches!(k, G_WIDTH | G_HEIGHT | G_RX | G_RY | G_R);
+                if non_neg && l.value < 0.0 {
+                    continue;
+                }
+                let val = if l.unit == Unit::Percent {
+                    Some((l.value, true))
+                } else {
+                    resolve(l, font, line, base, Axis::X).map(|x| (x, false))
+                };
+                let Some((x, is_pct)) = val else { continue };
+                if let Some(d) = c.geo.v.get_mut(k) {
+                    *d = x;
+                }
+                c.geo.auto &= !bit;
+                if is_pct {
+                    c.geo.pct |= bit;
+                } else {
+                    c.geo.pct &= !bit;
+                }
+            }
+        }
+    }
+    if let Some(s) = p.d.as_ref() {
+        budget.spend(cost::OP_STEP)?;
+        match wide(s) {
+            Some(true) => {
+                c.geo.d = parent.geo.d;
+                c.geo.d_src = parent.geo.d_src;
+                c.geo.d_attr = parent.geo.d_attr;
+            }
+            Some(false) => c.geo.d_src = DASH_NONE,
+            None => {
+                let is_attr = s.origin == ORIGIN_ATTR;
+                if !is_attr && Values::new(bufs.of(s.src), s.value, budget).eat_ident(b"none")? {
+                    c.geo.d_src = DASH_NONE;
+                } else {
+                    c.geo.d = s.value;
+                    c.geo.d_src = s.src;
+                    c.geo.d_attr = u8::from(is_attr);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// M2 でまだ描かない効果の印（[`FX_CLIP`] など）を求める。
+fn effects(
+    c: &mut Computed,
+    parent: &Computed,
+    p: &Picked,
+    bufs: &Bufs<'_>,
+    wide: &dyn Fn(&Specified) -> Option<bool>,
+    budget: &Budget<'_>,
+) -> Result<(), Error> {
+    let budget = budget_ref(budget);
+    // 値が none（か normal・auto）でも url だけでもないか
+    let other = |s: &Specified, keep: &[u8]| -> Result<bool, Error> {
+        let buf = bufs.of(s.src);
+        let mut v = Values::new(buf, s.value, budget);
+        let t = v.next()?;
+        if t.kind == Tk::Ident && ident_is(buf, t.inner, t.escaped, keep) && v.at_end()? {
+            return Ok(false);
+        }
+        if t.kind == Tk::Url && v.at_end()? {
+            return Ok(false);
+        }
+        if t.kind == Tk::Function && ident_is(buf, t.inner, t.escaped, b"url") {
+            let a = v.next()?;
+            let b = v.next()?;
+            if a.kind == Tk::Str && b.kind == Tk::RParen && v.at_end()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    for (sp, bit, keep) in [
+        (p.clip_path, FX_CLIP, b"none".as_slice()),
+        (p.filter, FX_FILTER, b"none"),
+        (p.mask, FX_MASK, b"none"),
+        (p.blend, FX_BLEND, b"normal"),
+        (p.isolation, FX_ISOLATE, b"auto"),
+    ] {
+        let Some(s) = sp.as_ref() else { continue };
+        budget.spend(cost::OP_STEP)?;
+        let on = match wide(s) {
+            Some(true) => parent.fx & bit != 0,
+            Some(false) => false,
+            None => other(s, keep)?,
+        };
+        if on {
+            c.fx |= bit;
+        }
+    }
+    Ok(())
 }
 
 /// 数か割合を 0〜1 に収める。

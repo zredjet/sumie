@@ -15,13 +15,14 @@ use crate::geom::{PathWriter, Rect, bounds, ellipse, rect};
 use crate::render::{PixelRect, PixmapMut};
 use crate::report::ReportBuilder;
 use crate::tree::{CAP_BUTT, JOIN_MITER, PathNode};
+use crate::values::Length;
 
 /// 試しの木を組む口。
 struct Builder {
     nodes: Vec<PathNode>,
     verbs: Vec<u8>,
     coords: Vec<f64>,
-    dashes: Vec<f64>,
+    dashes: Vec<Length>,
 }
 
 fn node() -> PathNode {
@@ -34,6 +35,9 @@ fn node() -> PathNode {
         miter_limit: 4.0,
         dash_offset: 0.0,
         path_length: 0.0,
+        font_size: 16.0,
+        line_height: 19.2,
+        viewport: [0.0, 0.0],
         verbs: [0, 0],
         coords: [0, 0],
         dashes: [0, 0],
@@ -71,7 +75,7 @@ impl Builder {
 
     fn dashes(&mut self, d: &[f64]) -> [u32; 2] {
         let start = self.dashes.len() as u32;
-        self.dashes.extend_from_slice(d);
+        self.dashes.extend(d.iter().map(|&v| Length::new(v, crate::values::Unit::None)));
         [start, d.len() as u32]
     }
 
@@ -93,6 +97,9 @@ impl Builder {
             verbs: verbs.freeze(),
             coords: coords.freeze(),
             dashes: dashes.freeze(),
+            root_font: 16.0,
+            root_line: 19.2,
+            doc_size: None,
             report,
         }
     }

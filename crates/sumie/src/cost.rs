@@ -125,9 +125,54 @@ pub(crate) const OP_STEP: u64 = 4;
 /// ≈ 1 ns になるように。M7 で校正する）。
 pub(crate) const TOKEN: u64 = 16;
 
-/// 木を作る段の、展開したあとの要素 1 つあたりの手間と確保（M1 の仮の値。木を作る段（M2）で式に置き換える）。
-pub(crate) const BUILD_PER_INSTANCE: u64 = 256;
-pub(crate) const BUILD_BYTES_PER_INSTANCE: u64 = 128;
+/// 木を作る段（M2 の仮の係数。ADR-93）：展開した要素 1 つの決まった手間（たどる段の積み上げ・計算した値の始まり・効果の
+/// 確かめ・節を作る分）。
+pub(crate) const BUILD_NODE: u64 = 256;
+/// 指定の値 1 つの決まった手間（選ぶ・全体の言葉を見る・字句の始まりと終わり）と、値・属性の 1 バイトの手間（1 バイトが
+/// 1 字句でも足りる：字句 16・数 8・読み 1）。
+pub(crate) const BUILD_SPEC: u64 = 64;
+pub(crate) const BUILD_BYTE: u64 = 24;
+/// 図形の塗り 1 つを解く決まった手間（url の中身の写し・空白の除き・id の表を引く始まり・確かめ）と、文書に url の塗りが
+/// なければ（色か none だけ）の手間。
+pub(crate) const BUILD_PAINT: u64 = 4 * ALLOC_STEP;
+pub(crate) const BUILD_PAINT_COLOR: u64 = 2 * OP_STEP;
+/// 図形（rect・circle・ellipse・line）の節ごとに書く命令と座標の上限（角の丸い rect：移動・線 4・弧 4・閉じ）。
+pub(crate) const SHAPE_VERBS: u64 = 10;
+pub(crate) const SHAPE_COORDS: u64 = 50;
+/// 外接矩形の区間 1 つの手間（写して、曲線は導関数の根を求める）。
+pub(crate) const BOUNDS_SEGMENT: u64 = 16;
+/// パスのデータ・`points`・破線の宣言の 1 バイトを読む手間の上限（字句・数・置き場に書く分。パスのデータは敵対的な形で
+/// 1 バイトあたり 14.4 単位だった：`values::path` の試験 `work_and_verbs_per_byte`）。
+pub(crate) const DECL_BYTE: u64 = 32;
+/// パスのデータの 1 バイトを読む手間の上限（敵対的な形で 14.4。`values::path` の試験）。
+pub(crate) const PATH_BYTE: u64 = 16;
+
+/// 木を作る段の、展開した要素 1 つの手間（要素の形だけで決まる分。文脈に依る塗りと外接矩形は呼び手が足す）。
+/// `children` は子の節の数（文字も）、`probes` は名前で属性を引くときに見る属性の数（引く回数 × 属性の数）、`attr_bytes` は
+/// 引いて読む属性の値のバイト数、`specs`・`spec_bytes` は指定の値の数とバイト数、`edges` は参照の辺の数。
+pub(crate) const fn build_node(
+    children: u64,
+    probes: u64,
+    attr_bytes: u64,
+    specs: u64,
+    spec_bytes: u64,
+    edges: u64,
+) -> u64 {
+    BUILD_NODE
+        .saturating_add(OP_STEP.saturating_mul(children.saturating_add(2)))
+        .saturating_add(specs.saturating_mul(BUILD_SPEC.saturating_add(2 * OP_STEP)))
+        .saturating_add(spec_bytes.saturating_mul(BUILD_BYTE))
+        .saturating_add(probes.saturating_mul(OP_STEP))
+        .saturating_add(attr_bytes.saturating_mul(BUILD_BYTE))
+        .saturating_add(edges.saturating_mul(4 * OP_STEP))
+}
+
+/// 図形の塗り 1 つを解く手間の上限（`href` は url の中身のバイト数の上限、`ids` は id の表の大きさ）。
+pub(crate) const fn build_paint(href: u64, ids: u64) -> u64 {
+    let steps = ceil_log2(ids.saturating_add(1)).saturating_add(1);
+    let step = SEARCH_STEP.saturating_add(id_probe(ids)).saturating_add(2 * OP_STEP).saturating_add(copy(href));
+    BUILD_PAINT.saturating_add(href.saturating_mul(16)).saturating_add(steps.saturating_mul(step))
+}
 
 /// プロパティの表を名前で引く手間（名前を小文字にして写し、表を二分探索する。表は 100 の内なので 7 回ほど比べる）。
 pub(crate) const LOOKUP: u64 = 32;
