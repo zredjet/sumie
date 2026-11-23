@@ -547,6 +547,9 @@ pub(crate) struct Parsed {
     pub(crate) first: u32,
     /// 当てない選択子（`:has()`・`of S` を含む）を捨てた
     pub(crate) unsupported: bool,
+    /// 寛容な並び（`:is()`・`:where()`）の中の壊れた選択子を捨てた（`@supports selector()` は偽。Chrome と同じ。単位 3 の
+    /// 10 回目のレビュー）
+    pub(crate) dropped: bool,
 }
 
 /// 選択子の並び `range` を読む（壊れていれば None。表に足した分は捨てずに残る）。並びの選択子は `next` でつなぐ。
@@ -572,6 +575,7 @@ fn parse_list(s: &[u8], range: Span, ns: NsTable<'_>, t: &mut Tables<'_>, budget
     let mut frames: MVec<'_, Frame> = MVec::new(budget);
     frames.push(Frame::new(S_NEVER, true, false, false, false))?;
     cur.skip_ws()?;
+    let mut dropped = false;
     loop {
         budget.spend(cost::OP_STEP)?;
         let tok = cur.peek()?;
@@ -596,6 +600,7 @@ fn parse_list(s: &[u8], range: Span, ns: NsTable<'_>, t: &mut Tables<'_>, budget
             if let Some(x) = frames.last_mut() {
                 *x = f;
             }
+            dropped |= f.broken && f.forgiving;
             if f.broken && !f.forgiving {
                 // 壊れた並び：外へ上げる
                 if f.top {
@@ -628,7 +633,7 @@ fn parse_list(s: &[u8], range: Span, ns: NsTable<'_>, t: &mut Tables<'_>, budget
                 if tok.kind != Kind::Eof || f.count == 0 {
                     return Err(invalid());
                 }
-                return Ok(Parsed { first: f.first_sel, unsupported: f.any_unsupported });
+                return Ok(Parsed { first: f.first_sel, unsupported: f.any_unsupported, dropped });
             }
             frames.pop();
             close_list(&f, t, frames.last_mut())?;

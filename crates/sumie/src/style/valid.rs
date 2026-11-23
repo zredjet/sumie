@@ -367,8 +367,8 @@ fn css_path_ok(s: &[u8], a: crate::css::lex::Token, budget: &Budget<'_>) -> Resu
 }
 
 /// sumie が読まないので壊れた値にした形か（関数（calc・var・env・attr・読まない色の関数・3 次元の変形など）か、長さとして
-/// 読まない単位（dvw・cqw など）の次元を含む）。`@supports` では偽でなく分からない（Chrome は受けうる。ADR-106 (4)(b)。
-/// 単位 3 の 9 回目のレビュー）。字句ごとに払う。
+/// 読まない単位（dvw・cqw など）の次元、システムの色と `-webkit-` の言葉（ADR-66 (4)）、有限でない数（ADR-32）を含む）。
+/// `@supports` では偽でなく分からない（Chrome は受けうる。ADR-106 (4)(b)。単位 3 の 9・10 回目のレビュー）。字句ごとに払う。
 pub(crate) fn unread(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<bool, Error> {
     const OTHER_UNITS: &[&[u8]] =
         &[b"deg", b"grad", b"rad", b"turn", b"s", b"ms", b"hz", b"khz", b"dpi", b"dpcm", b"dppx", b"x", b"fr"];
@@ -379,6 +379,13 @@ pub(crate) fn unread(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<bool,
         let t = lex.next()?;
         match t.kind {
             Tk::Eof => return Ok(false),
+            Tk::Number | Tk::Percentage | Tk::Dimension if !t.finite => return Ok(true),
+            Tk::Ident
+                if SYSTEM_COLORS.iter().any(|w| ident_is(s, t.inner, t.escaped, w))
+                    || t.inner.of(s).get(..8).is_some_and(|h| h.eq_ignore_ascii_case(b"-webkit-")) =>
+            {
+                return Ok(true);
+            }
             // url() と path()（CSS の d の文字列は最後まで読む）のほかの関数は、sumie が読み切らない形がある（calc-size()・
             // anchor-size() の式・色の関数の `from` なども）
             Tk::Function if !ident_is(s, t.inner, t.escaped, b"url") && !ident_is(s, t.inner, t.escaped, b"path") => {
@@ -394,6 +401,52 @@ pub(crate) fn unread(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<bool,
         }
     }
 }
+
+/// システムの色（CSS Color 4 §6.2 と、古いシステムの色 §6.2.1。sumie は読まない：ADR-66 (4)）。
+const SYSTEM_COLORS: &[&[u8]] = &[
+    b"accentcolor",
+    b"accentcolortext",
+    b"activetext",
+    b"buttonborder",
+    b"buttonface",
+    b"buttontext",
+    b"canvas",
+    b"canvastext",
+    b"field",
+    b"fieldtext",
+    b"graytext",
+    b"highlight",
+    b"highlighttext",
+    b"linktext",
+    b"mark",
+    b"marktext",
+    b"selecteditem",
+    b"selecteditemtext",
+    b"visitedtext",
+    b"activeborder",
+    b"activecaption",
+    b"appworkspace",
+    b"background",
+    b"buttonhighlight",
+    b"buttonshadow",
+    b"captiontext",
+    b"inactiveborder",
+    b"inactivecaption",
+    b"inactivecaptiontext",
+    b"infobackground",
+    b"infotext",
+    b"menu",
+    b"menutext",
+    b"scrollbar",
+    b"threeddarkshadow",
+    b"threedface",
+    b"threedhighlight",
+    b"threedlightshadow",
+    b"threedshadow",
+    b"window",
+    b"windowframe",
+    b"windowtext",
+];
 
 /// 値に `url()` でない関数があるか。字句ごとに払う。
 fn has_function(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<bool, Error> {
@@ -642,12 +695,14 @@ pub(crate) fn offset_form(s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) -
         }
     }
     // anchor（`auto` か位置。`normal` は書けない。前に位置も道もなければ壊れた値：`]!`。単位 3 の 9 回目のレビュー）
+    let mut anchored = false;
     if v.peek()?.is_delim(b'/') {
         v.next()?;
         if !(placed || func || none || boxed) {
             return Ok(None);
         }
         if !v.eat_ident(b"auto")? {
+            anchored = true;
             match position(&mut v, false)? {
                 None | Some(Some(false)) => return Ok(if func { Some(true) } else { None }),
                 Some(None) => unsure = true,
@@ -659,8 +714,9 @@ pub(crate) fn offset_form(s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) -
         return Ok(if func { Some(true) } else { None });
     }
     // 箱の言葉と距離だけなら Chrome でも動かない（単位 3 の 7 回目のレビュー）。`none` のあとの距離・回転と、箱の言葉のあとの
-    // 回転は確かめていないので、動かしうるとみなす
-    Ok(Some(func || unsure || (none && (distance || rotate)) || (boxed && rotate)))
+    // 回転は確かめていないので、動かしうるとみなす。箱の言葉に auto でない anchor を添えると Chrome は動かす（単位 3 の 10 回目の
+    // レビュー）
+    Ok(Some(func || unsure || (none && (distance || rotate)) || (boxed && (rotate || anchored))))
 }
 
 /// `url()` か、決まった名前の関数の並び（1 つ以上）。
@@ -700,10 +756,11 @@ fn font_style(v: &mut Values<'_, '_>) -> Result<bool, Error> {
 
 /// `display`（CSS Display 3）：昔の 1 つの言葉か、外の言葉・中の言葉（・`list-item`）を 1 つずつ順を問わずに。
 fn display(v: &mut Values<'_, '_>, budget: &Budget<'_>) -> Result<bool, Error> {
-    const OUTSIDE: &[&[u8]] = &[b"block", b"inline", b"run-in"];
+    // `run-in` と ruby の内側の `ruby-base`・`ruby-base-container`・`ruby-text-container` は Chrome が壊れた値にする（Chrome に
+    // 寄せる。ADR-74 (5) を改める。単位 3 の 10 回目のレビュー）
+    const OUTSIDE: &[&[u8]] = &[b"block", b"inline"];
     const INSIDE: &[&[u8]] = &[b"flow", b"flow-root", b"table", b"flex", b"grid", b"ruby", b"math"];
-    const SINGLE: &[&[u8]] =
-        &[b"ruby", b"ruby-base", b"ruby-text", b"ruby-base-container", b"ruby-text-container", b"math", b"flow"];
+    const SINGLE: &[&[u8]] = &[b"ruby", b"ruby-text", b"math", b"flow"];
     let s = v.s;
     let first = v.peek()?;
     if first.kind != Tk::Ident {

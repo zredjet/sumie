@@ -1222,6 +1222,75 @@ fn unit3_round9() {
     assert_eq!(fill(&format!("<style>@media (inverted-colors: none) {{ rect {{ fill: red }} }}</style>{rect}")), green);
 }
 
+/// 単位 3 の 10 回目のレビュー：@media の入れ子のかっこの中の `,`・箱の言葉と anchor の offset・読まない色の言葉と有限でない
+/// 数の @supports・寛容な並びで捨てた selector()・vector-effect と display の言葉。
+#[test]
+fn unit3_round10() {
+    let rect = "<rect width=\"40\" height=\"40\" fill=\"green\"/>";
+    let fill = |src: &str| {
+        let t = build(&svg(src)).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        t.nodes.as_slice().first().map(|n| n.fill)
+    };
+    let green = fill(rect);
+    for q in [
+        "@media ((min-width: 1px), print)",
+        "@media not ((max-width: 1px), print)",
+        "@media screen and ((min-width: 1px), print)",
+        "@media (((min-width: 1px)), (max-width: 1px))",
+        "@media ((min-width: 1px) and (min-height: 1px), print)",
+    ] {
+        assert_eq!(fill(&format!("<style>{q} {{ rect {{ fill: red }} }}</style>{rect}")), green, "{q}");
+    }
+    assert_eq!(fill(&format!("<style media=\"((min-width: 1px), print)\">rect {{ fill: red }}</style>{rect}")), green);
+    assert_ne!(fill(&format!("<style>@media (min-width: 1px), print {{ rect {{ fill: red }} }}</style>{rect}")), green);
+    // offset：箱の言葉に auto でない anchor を添えると Chrome は動かす
+    let r = "<rect x=\"100\" y=\"100\" width=\"10\" height=\"10\"";
+    for css in ["view-box / 50% 50%", "fill-box / center", "border-box / right bottom", "fill-box / 1px 0"] {
+        assert_eq!(not_yet(&format!("{r} style=\"offset: {css}\"/>")), Later::CssTransform, "{css}");
+    }
+    for css in ["fill-box", "fill-box 10px", "fill-box / auto", "none / center", "10px 10px fill-box"] {
+        assert!(build(&svg(&format!("{r} style=\"offset: {css}\"/>"))).is_ok(), "{css}");
+    }
+    // @supports：システムの色・-webkit- の言葉・有限でない数は分からない
+    for cond in [
+        "(fill: Canvas)",
+        "(color: CanvasText)",
+        "(fill: ActiveBorder)",
+        "(fill: url(#a) Canvas)",
+        "(fill-opacity: 1e400)",
+    ] {
+        assert_eq!(
+            not_yet(&format!("<style>@supports {cond} {{ rect {{ fill: red }} }}</style>{rect}")),
+            Later::Supports,
+            "{cond}"
+        );
+    }
+    // selector()：寛容な並びで捨てた選択子があれば偽
+    for cond in ["selector(:is(:foo))", "selector(:where(a, :foo))"] {
+        assert_eq!(fill(&format!("<style>@supports {cond} {{ rect {{ fill: red }} }}</style>{rect}")), green, "{cond}");
+    }
+    assert_ne!(fill(&format!("<style>@supports selector(:is(rect)) {{ rect {{ fill: red }} }}</style>{rect}")), green);
+    // vector-effect の SVG 2 の 3 つは壊れた値（前の宣言が生きる）、display の -webkit- の 4 つは none でない
+    let thick = |ve: &str| {
+        let src = format!(
+            "<style>rect {{ vector-effect: {ve} }}</style><rect x=\"2\" y=\"2\" width=\"9\" height=\"9\" transform=\"scale(3)\" fill=\"none\" stroke=\"black\" stroke-width=\"2\" vector-effect=\"non-scaling-stroke\"/>"
+        );
+        build(&svg(&src)).unwrap().nodes.as_slice().first().map(|n| n.flags & crate::tree::NON_SCALING != 0)
+    };
+    for ve in ["non-rotation", "fixed-position", "non-scaling-size"] {
+        assert_eq!(thick(ve), Some(true), "{ve}");
+    }
+    assert_eq!(thick("none"), Some(false));
+    for d in ["-webkit-box", "-webkit-inline-box", "-webkit-flex", "-webkit-inline-flex"] {
+        let src = format!("<rect width=\"40\" height=\"40\" fill=\"red\" display=\"none\" style=\"display: {d}\"/>");
+        assert_eq!(build(&svg(&src)).unwrap().nodes.len(), 1, "{d}");
+    }
+    for d in ["run-in", "ruby-base", "-webkit-grid"] {
+        let src = format!("<rect width=\"40\" height=\"40\" fill=\"red\" display=\"none\" style=\"display: {d}\"/>");
+        assert_eq!(build(&svg(&src)).unwrap().nodes.len(), 0, "{d}");
+    }
+}
+
 /// 根の svg の display: none と偽の条件は描くことを止めない（Chrome と同じ。ADR-102。子の display: none は効く）。
 #[test]
 fn root_display_and_conditions_are_ignored() {

@@ -314,6 +314,10 @@ fn condition(c: &mut Cur<'_, '_>, budget: &Budget<'_>, leaf: Leaf<'_>, mode: Mod
             }
             Ok(true)
         };
+        // 入れ子のかっこの中の `,` は問いの区切りでない：そのかっこは知らない形（単位 3 の 10 回目のレビュー）
+        if stop_at_comma && t.kind == Kind::Comma && stack.len() > 1 && fallback(c, &mut stack)? {
+            continue;
+        }
         let end_here = t.kind == Kind::Eof || (stop_at_comma && t.kind == Kind::Comma);
         if t.kind == Kind::RParen && stack.len() > 1 {
             c.next()?;
@@ -406,6 +410,8 @@ fn function_leaf(s: &[u8], f: Token, inner: Span, mode: Mode<'_>, budget: &Budge
     // 読む。単位 3 の 9 回目のレビュー）
     let mut t = Tables::new(budget_ref(budget));
     Ok(match parse_selector_list(s, inner, mode.ns, &mut t, budget)? {
+        // 寛容な並びで捨てた選択子があれば支えない（Chrome と同じ。単位 3 の 10 回目のレビュー）
+        Some(p) if p.dropped => Tri::False,
         Some(p) if p.unsupported => Tri::Unknown,
         Some(p) => Tri::of(t.selectors.get(p.first as usize).is_some_and(|x| x.next == crate::css::select::NONE)),
         None => Tri::False,

@@ -188,7 +188,6 @@ pub(crate) const DISPLAY: &[&[u8]] = &[
     b"none",
     b"inline-block",
     b"list-item",
-    b"run-in",
     b"table",
     b"inline-table",
     b"table-row-group",
@@ -205,13 +204,20 @@ pub(crate) const DISPLAY: &[&[u8]] = &[
     b"inline-grid",
     b"contents",
     b"flow-root",
+    // Compatibility Standard の値（Chrome も Firefox も受ける。none でない。単位 3 の 10 回目のレビュー）
+    b"-webkit-box",
+    b"-webkit-inline-box",
+    b"-webkit-flex",
+    b"-webkit-inline-flex",
 ];
 pub(crate) const OVERFLOW: &[&[u8]] = &[b"visible", b"hidden", b"scroll", b"auto", b"clip", b"overlay"];
 const RENDERING: &[&[u8]] = &[b"auto", b"optimizespeed", b"crispedges", b"geometricprecision"];
 const COLOR_RENDERING: &[&[u8]] = &[b"auto", b"optimizespeed", b"optimizequality"];
 const TEXT_RENDERING: &[&[u8]] = &[b"auto", b"optimizespeed", b"optimizelegibility", b"geometricprecision"];
+// `smooth`・`high-quality` は CSS Images 4 にあるが Chrome は壊れた値、`-webkit-optimize-contrast` は Chrome が受ける（Chrome に
+// 寄せる。画像の描き方は M3 で決める。単位 3 の 10 回目のレビュー）
 const IMAGE_RENDERING: &[&[u8]] =
-    &[b"auto", b"optimizespeed", b"optimizequality", b"smooth", b"high-quality", b"crisp-edges", b"pixelated"];
+    &[b"auto", b"optimizespeed", b"optimizequality", b"crisp-edges", b"pixelated", b"-webkit-optimize-contrast"];
 const INTERPOLATION: &[&[u8]] = &[b"auto", b"srgb", b"linearrgb"];
 const ISOLATION: &[&[u8]] = &[b"auto", b"isolate"];
 const BLEND: &[&[u8]] = &[
@@ -231,12 +237,13 @@ const BLEND: &[&[u8]] = &[
     b"saturation",
     b"color",
     b"luminosity",
-    b"plus-darker",
+    // `plus-darker` は Chrome が壊れた値にする（単位 3 の 10 回目のレビュー）
     b"plus-lighter",
 ];
 const MASK_TYPE: &[&[u8]] = &[b"luminance", b"alpha"];
-const VECTOR_EFFECT: &[&[u8]] =
-    &[b"none", b"non-scaling-stroke", b"non-scaling-size", b"non-rotation", b"fixed-position"];
+// `non-scaling-size`・`non-rotation`・`fixed-position` は SVG 2 にあるが、Chrome と同じく壊れた値にする（宣言を無視して前の
+// 宣言を生かす。ADR-91 (1) の miter-clip と同じ。単位 3 の 10 回目のレビュー）
+const VECTOR_EFFECT: &[&[u8]] = &[b"none", b"non-scaling-stroke"];
 const TEXT_ANCHOR: &[&[u8]] = &[b"start", b"middle", b"end"];
 const WRITING_MODE: &[&[u8]] = &[
     b"horizontal-tb",
@@ -292,10 +299,21 @@ const ALIGNMENT: &[&[u8]] = &[
     b"alphabetic",
     b"hanging",
     b"mathematical",
-    b"text-top",
+    // `text-top` は Chrome が壊れた値にする（単位 3 の 10 回目のレビュー）
     b"text-bottom",
 ];
-const UNICODE_BIDI: &[&[u8]] = &[b"normal", b"embed", b"isolate", b"bidi-override", b"isolate-override", b"plaintext"];
+// `-webkit-` の 3 つは Chrome が受ける別名（文字を描く M5 で isolate などと同じに扱う。単位 3 の 10 回目のレビュー）
+const UNICODE_BIDI: &[&[u8]] = &[
+    b"normal",
+    b"embed",
+    b"isolate",
+    b"bidi-override",
+    b"isolate-override",
+    b"plaintext",
+    b"-webkit-isolate",
+    b"-webkit-isolate-override",
+    b"-webkit-plaintext",
+];
 const WHITE_SPACE: &[&[u8]] = &[b"normal", b"pre", b"nowrap", b"pre-wrap", b"break-spaces", b"pre-line"];
 const CONTENT_VISIBILITY: &[&[u8]] = &[b"visible", b"auto", b"hidden"];
 const TRANSFORM_BOX: &[&[u8]] = &[b"content-box", b"border-box", b"fill-box", b"stroke-box", b"view-box"];
