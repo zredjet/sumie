@@ -224,8 +224,14 @@ impl ArcSeg {
     /// sin((θ−θ1)/2)`・`sin θ − sin θ1 = 2 cos((θ+θ1)/2) sin((θ−θ1)/2)`。半径が座標より桁違いに大きくても桁が落ちない。
     /// 単位 1 の 2 回目のレビュー）。
     pub(crate) fn at_from(&self, from: Point, theta: f64) -> Point {
-        let h = (theta - self.theta1) / 2.0;
-        let mid = (theta + self.theta1) / 2.0;
+        self.at_offset(from, theta - self.theta1)
+    }
+
+    /// [`ArcSeg::at_from`] を、始めの角からの差 `d` で（掃く角が θ1 の ulp より小さい弧でも、点が始めと終わりの間に並ぶ。
+    /// 平坦化はこちらを使う。単位 4 の 2 回目のレビュー）。
+    pub(crate) fn at_offset(&self, from: Point, d: f64) -> Point {
+        let h = d / 2.0;
+        let mid = self.theta1 + h;
         let sh = math::sin(h);
         let (dc, ds) = (-2.0 * math::sin(mid) * sh, 2.0 * math::cos(mid) * sh);
         let [m0, m1, m2, m3] = self.m;
@@ -653,7 +659,12 @@ pub(crate) fn add_bounds(r: &mut Rect, seg: &PathSeg) {
             // 角の丸め（±π/2 の近くで 10⁻¹⁶ ほど）は、掃く角がそれに近いほど細い弧で、平坦化の点の位置を動かす（細長い
             // 楕円の小さな弧で、点の動く量の 0.1% ほど）。その上限 Σ|m| × |Δθ| × 2⁻⁴⁴ が座標に比べて意味のある大きさの
             // ときだけ広げる（ふつうの弧の外接矩形と、中身で決まる大きさは変えない。ファズの path が見つけた）
-            let pad = (m0.abs() + m1.abs() + m2.abs() + m3.abs()) * a.dtheta.abs() * ARC_PAD;
+            // 掃く角が極の角を見分けられないほど小さい（10⁻⁹ 未満）と、極を入れられないので、弦からの膨らみの上限
+            // Σ|m| × Δθ² / 4 も足す（単位 4 の 2 回目のレビュー）
+            let norm = m0.abs() + m1.abs() + m2.abs() + m3.abs();
+            let dt = a.dtheta.abs();
+            let bulge = if dt < 1e-9 { norm * dt * dt / 4.0 } else { 0.0 };
+            let pad = norm * dt * ARC_PAD + bulge;
             let scale = 1.0 + math::max(math::max(ar.x0.abs(), ar.x1.abs()), math::max(ar.y0.abs(), ar.y1.abs()));
             if pad.is_finite() && pad > 1e-9 * scale && !ar.is_empty() {
                 ar = Rect { x0: ar.x0 - pad, y0: ar.y0 - pad, x1: ar.x1 + pad, y1: ar.y1 + pad };
