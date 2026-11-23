@@ -708,8 +708,14 @@ pub(crate) fn stroke_mode(n: &PathNode, t: &Transform, scale: f64) -> StrokeMode
         }
         return StrokeMode { device: true, half: wd / 2.0, alpha: 1.0, dash_unit: scale, sigma: 1.0, hair: false };
     }
-    let len0 = math::hypot(t.a * w, t.b * w);
-    let len1 = math::hypot(t.c * w, t.d * w);
+    // 変形した太さの長さは Skia と同じく max(|x|, |y|) ＋ min(|x|, |y|) / 2 で測る（細い線にするかの判定と α の両方。
+    // 回した細い線が 10〜14% 薄かった。ユーザーの判断。ADR-106）
+    let skia_len = |x: f64, y: f64| {
+        let (ax, ay) = (x.abs(), y.abs());
+        math::max(ax, ay) + math::min(ax, ay) / 2.0
+    };
+    let len0 = skia_len(t.a * w, t.b * w);
+    let len1 = skia_len(t.c * w, t.d * w);
     if aa && len0 <= 1.0 && len1 <= 1.0 {
         let geo = t.det().abs().sqrt();
         return StrokeMode { device: true, half: 0.5, alpha: (len0 + len1) / 2.0, dash_unit: geo, sigma: 1.0, hair };
@@ -763,7 +769,8 @@ pub(crate) fn reach_factor(pen: &Pen) -> f64 {
     if pen.join == Join::Miter && pen.miter_limit > f {
         f = pen.miter_limit;
     }
-    if pen.cap == Cap::Square && core::f64::consts::SQRT_2 > f {
+    // 四角い端と、細い線の round の端（太さの半分の矩形で延ばす）は角が √2 倍まで届く
+    if (pen.cap == Cap::Square || (pen.major && pen.cap != Cap::Butt)) && core::f64::consts::SQRT_2 > f {
         f = core::f64::consts::SQRT_2;
     }
     f
@@ -908,12 +915,14 @@ fn bound_node(
     let c = count(path, &t, &stroke_space, q, reach_dev, &view, &band, has_stroke, budget)?;
     let bx = node_box(n, scale, reach_dev, canvas);
     let (rows, width) = (bx.height(), bx.width());
-    // 箱の境で辺が分かれうるか（x の箱の外に出る節だけ。y は切っても分かれない）。点は節の変形で写すので、外接矩形 ×
-    // 倍率との丸めの差を 1 画素の余白で吸う（単位 2 のレビュー）
+    // 箱の境で辺が分かれうるか（x の箱の外に出る節だけ。y は切っても分かれない）。左右の外の部分はどちらも縦の辺に
+    // なるので、左と右の両方へ出る節の線分は 3 本まで（ADR-105 (2)。単位 1 の 10 回目・単位 2 の 8 回目のレビュー）。点は
+    // 節の変形で写すので、外接矩形 × 倍率との丸めの差を 1 画素の余白で吸う（単位 2 のレビュー）
     let b = n.bounds;
     let edge = BOX - 1.0;
-    let crosses = b.x0 * scale - reach_dev < -edge || b.x1 * scale + reach_dev > edge;
-    let split: u64 = if crosses { 2 } else { 1 };
+    let left_out = b.x0 * scale - reach_dev < -edge;
+    let right_out = b.x1 * scale + reach_dev > edge;
+    let split: u64 = 1u64.saturating_add(u64::from(left_out)).saturating_add(u64::from(right_out));
     out.scratch_points = c.max_sub.saturating_add(4);
     if has_stroke {
         out.buffers |= BUF_STROKE;
@@ -1141,7 +1150,8 @@ impl Tree {
         let px = self.pixel_size(scale)?;
         let lim = &opts.limits;
         let side = px.width.max(px.height);
-        // 1 辺は決まった箱（±2²² 画素）の内（箱の外の辺は落とすので、それより大きなキャンバスは描けない。単位 2 のレビュー）
+        // 1 辺は決まった箱（±2²² 画素）の内（箱の外の部分は箱の縁の縦の辺にするので、それより大きなキャンバスは描けない。
+        // 単位 2 のレビュー）
         let max_side = lim.canvas_side.min(BOX as u32);
         if side > max_side {
             return Err(Error::limit(Resource::CanvasSide, u64::from(side), u64::from(max_side), Stage::Estimate));

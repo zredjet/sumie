@@ -567,7 +567,8 @@ fn vertex(
         }
     }
     e.point(end_in)?;
-    if cross > 0.0 && smooth {
+    // 細い線は滑らかな点でも区間ごとの帯の和（頂点を通す。近道は帯の和からずれる。単位 1 の 10 回目のレビュー）
+    if cross > 0.0 && smooth && !pen.major {
         // 曲線の内側の点で交わる点が区間に収まらない（曲がりの半径が太さの半分より小さい）：頂点を通さずに縁の点どうしを
         // つなぐ（縁は曲線を写したものになり、折り返した所の巻き数で中に穴が残る。Chrome・resvg（Skia）は曲線の縁を曲線の
         // まま写すので同じ。ADR-99 (2)）
@@ -641,11 +642,13 @@ fn cap(e: &mut Emit<'_, '_>, pen: &Pen, p: Point, d: Point) -> Result<(), Error>
             e.point(left)?;
             e.point(right)
         }
-        // 細い線の round と square の端は、端を太さの半分だけ延ばす（Skia の細い線と同じ）
+        // 細い線の端は Skia の細い線と同じく延ばす：square は太さの半分、round は π/8（太さ 1 の画素の円の面積 π/4 を
+        // 両端で分けた長さ。ADR-106）
         Cap::Square | Cap::Round if pen.major => {
+            let ext = if pen.cap == Cap::Round { pen.half * core::f64::consts::FRAC_PI_4 } else { pen.half };
             e.point(left)?;
-            e.point(add(left, d, pen.half))?;
-            e.point(add(right, d, pen.half))?;
+            e.point(add(left, d, ext))?;
+            e.point(add(right, d, ext))?;
             e.point(right)
         }
         Cap::Square => {
@@ -673,6 +676,15 @@ fn zero_length(e: &mut Emit<'_, '_>, pen: &Pen, p: Point) -> Result<(), Error> {
             e.point(Point::new(p.x + h, p.y - h))?;
             e.point(Point::new(p.x + h, p.y + h))?;
             e.point(Point::new(p.x - h, p.y + h))
+        }
+        // 細い線の長さ 0 の round の点は、Skia の細い線と同じく横向きの帯（長さ π/4・太さ 1。ADR-106）
+        Cap::Round if pen.major => {
+            e.begin()?;
+            let (hx, hy) = (pen.half * core::f64::consts::FRAC_PI_4, pen.half);
+            e.point(Point::new(p.x - hx, p.y - hy))?;
+            e.point(Point::new(p.x + hx, p.y - hy))?;
+            e.point(Point::new(p.x + hx, p.y + hy))?;
+            e.point(Point::new(p.x - hx, p.y + hy))
         }
         Cap::Round => {
             e.begin()?;

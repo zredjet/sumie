@@ -1137,10 +1137,12 @@ pub fn stroke_ops(data: &[u8]) -> Check {
         1 => Cap::Round,
         _ => Cap::Square,
     };
-    let join = match (head[0] / 3) % 3 {
+    // 継ぎ目なし（細い線：区間の主軸の方向の太さと細い線の端。ADR-105 (1)・ADR-106）も選ぶ（単位 2 の 8 回目のレビュー）
+    let join = match (head[0] / 3) % 4 {
         0 => Join::Miter,
         1 => Join::Round,
-        _ => Join::Bevel,
+        2 => Join::Bevel,
+        _ => Join::None,
     };
     let half = [0.5, 3.0, 40.0, 1e6, 1e-6, 1e300].get(usize::from(head[1] % 6)).copied().unwrap_or(1.0);
     let limit = [4.0, 0.5, 1.0, 50.0].get(usize::from(head[1] / 6 % 4)).copied().unwrap_or(4.0);
@@ -1172,7 +1174,7 @@ pub fn stroke_ops(data: &[u8]) -> Check {
             crate::values::path::path_data(text, &mut w, &b)?;
         }
         // 計画と同じ許し（ADR-97 (1)）と、計画と同じ部分パスの集め方（滑らかな点の印とつなぎ目の判定を含む）
-        let pen = Pen { half, cap, join, miter_limit: limit, scale: 1.0, tol: 0.1, major: false };
+        let pen = Pen { half, cap, join, miter_limit: limit, scale: 1.0, tol: 0.1, major: join == Join::None };
         let dashes = Dashes::new(dash, offset, &b)?;
         let mut poly = PolyBuf::new(&b);
         let mut scratch = PolyBuf::new(&b);

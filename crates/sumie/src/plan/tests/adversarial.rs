@@ -1066,3 +1066,74 @@ fn shapes_beyond_the_right_of_the_box_are_drawn() {
         draws_regions(&t, 1.0);
     }
 }
+
+/// 箱の左右の両方の外をまたぐ線分は 3 本の辺に分かれる。見積もりもそう数え、計画が見積もりの内で描ける（単位 1 の 10 回目・
+/// 単位 2 の 8 回目のレビュー：2 本で数えて計画が Limit で断った）。
+#[test]
+fn zigzags_across_both_sides_of_the_box_stay_within_the_estimate() {
+    for turns in [4usize, 50] {
+        let mut b = Builder::new();
+        b.add(
+            |w| {
+                w.move_to(Point::new(-1e7, 0.0)).unwrap();
+                for k in 1..=turns {
+                    let x = if k % 2 == 1 { 1e7 } else { -1e7 };
+                    w.line_to(Point::new(x, 100.0 * k as f64 / turns as f64)).unwrap();
+                }
+            },
+            |node| {
+                node.flags = HAS_FILL;
+                node.fill = GREEN;
+            },
+        );
+        let t = b.tree(100.0, 100.0);
+        let _ = draw(&t, 1.0);
+        draws_regions(&t, 1.0);
+    }
+}
+
+/// 細い線の round の端は π/8 延ばし、長さ 0 の round の点は π/4 × 1 の帯（Skia と同じ。ADR-106）。回した細い線の太さは
+/// max ＋ min/2 で測る。
+#[test]
+fn thin_round_caps_dots_and_rotated_widths_follow_skia() {
+    let thin = |build: &dyn Fn(&mut PathWriter<'_, '_>), dashes: &[f64]| {
+        let mut b = Builder::new();
+        let d = b.dashes(dashes);
+        b.add(build, |node| {
+            node.flags = HAS_STROKE;
+            node.stroke = GREEN;
+            node.stroke_width = 1.0;
+            node.cap = crate::tree::CAP_ROUND;
+            if !dashes.is_empty() {
+                node.dashes = d;
+            }
+        });
+        let (w, _, px) = draw(&b.tree(60.0, 30.0), 1.0);
+        move |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize]
+    };
+    // 横の線 x 10.3〜50.6：round の端は 10.3 − π/8 ≈ 9.907 まで（列 9 に 0.093。Chrome 23）
+    let a = thin(
+        &|w| {
+            w.move_to(Point::new(10.3, 20.5)).unwrap();
+            w.line_to(Point::new(50.6, 20.5)).unwrap();
+        },
+        &[],
+    );
+    assert!((20..=28).contains(&a(9, 20)), "{}", a(9, 20));
+    // 長さ 0 の round の点（画素の真ん中）：π/4 の被覆（Chrome 203）
+    let a = thin(
+        &|w| {
+            w.move_to(Point::new(10.5, 10.5)).unwrap();
+            w.line_to(Point::new(40.5, 10.5)).unwrap();
+        },
+        &[0.0, 3.0],
+    );
+    assert!((195..=205).contains(&a(10, 10)), "{}", a(10, 10));
+    // 回した細い線：30° の太さ 0.88 は細い線（max ＋ min/2 = 0.982）、0.91 は本当の太さの線
+    let n = PathNode { stroke_width: 0.88, flags: HAS_STROKE, ..node() };
+    let (c30, s30) = (0.75f64.sqrt(), 0.5);
+    let rot = Transform { a: c30, b: s30, c: -s30, d: c30, e: 0.0, f: 0.0 };
+    let m = stroke_mode(&n, &rot, 1.0);
+    assert!(m.hair && (m.alpha - 0.982).abs() < 1e-3, "{}", m.alpha);
+    assert!(!stroke_mode(&PathNode { stroke_width: 0.91, ..n }, &rot, 1.0).hair);
+}

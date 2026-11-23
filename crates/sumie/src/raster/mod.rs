@@ -1,8 +1,9 @@
 //! 段 6 の一部：ラスタライズ（architecture.md §6.1・§6.2・§8・ADR-15・ADR-30・ADR-38）。
 //!
 //! - 辺は描く座標系の線分を、決まった箱（±2²² 画素。キャンバスにも範囲にも依らない）で切ってから、1/256 画素の固定小数に
-//!   直したもの。箱の左の外の部分は同じ y の縦の線（x = −箱）にし、右・上・下の外は落とす（右の外の辺はキャンバスの画素に
-//!   効かない）。y は下向きに揃え、向きは `dir`（±1）に持つ。水平な辺は持たない
+//!   直したもの。箱の左右の外の部分は同じ y の縦の線（x = ±箱）にし、上・下の外は落とす（右の外の縦の辺は項目の矩形を
+//!   右へ広げるだけで、描く段は範囲の右の外の辺を足さない。ADR-105 (2)）。y は下向きに揃え、向きは `dir`（±1）に持つ。
+//!   水平な辺は持たない
 //! - 反エイリアス：行ごとに、辺がかかる画素（セル）に整数の `cover`（縦の通過）と `area`（面積の重み）を積み、左から掃いて
 //!   被覆を決める。行の境と列の境を横切る点は、辺の元の両端から整数の閉じた式（床の割り算）で求めるので、どの行・列から
 //!   始めても同じ値になる。範囲の左の外のセルは、左の 1 列に cover だけを足す（和は同じ整数）。右の外は落とす
@@ -445,10 +446,10 @@ impl<'a> Payer<'a> {
         Ok(())
     }
 
-    /// 塊を半分にする（同じループで別の Payer と前払いを持つとき、中止の印を読む間を間隔の 2 倍の内に保つ。単位 2 の
-    /// 7 回目のレビュー）。
-    pub(crate) fn halved(mut self) -> Payer<'a> {
-        self.chunk = (self.chunk / 2).max(1);
+    /// 塊を 4 分の 1 にする（同じループで別の Payer や塗る払いと前払いを持つとき、残る前払いの和を間隔の内に保ち、中止の
+    /// 印を読む間を間隔の 2 倍の内に保つ。単位 2 の 7・8 回目のレビュー）。
+    pub(crate) fn quartered(mut self) -> Payer<'a> {
+        self.chunk = (self.chunk / 4).max(1);
         self
     }
 
@@ -875,7 +876,8 @@ pub(crate) fn fill_region(
         if let Some((lo, hi)) = scan.cells.touched() {
             let width = scan.cells.width();
             let x0 = scan.cells.x0();
-            let mut pay = Payer::new(budget, (hi.saturating_sub(lo) as u64).saturating_add(1), cost::RASTER_SWEEP);
+            let mut pay =
+                Payer::new(budget, (hi.saturating_sub(lo) as u64).saturating_add(1), cost::RASTER_SWEEP).quartered();
             let mut acc: i64 = 0;
             let mut run_start: i64 = 0;
             let mut run_len: u64 = 0;
@@ -891,7 +893,8 @@ pub(crate) fn fill_region(
             };
             // 副走査線ごとの左の境の巻き数と、交わりのない画素がそれだけで区間をまたぐか（またげばその被覆。ADR-103）。
             // 交わりのある列の手間は掃きながら塊ごとに払う（交わり 1 つにつき SUB_SWEEP まで。ADR-104）
-            let mut spay = Payer::new(budget, scan.subs.count.saturating_mul(cost::SUB_SWEEP), cost::SUB_STEP).halved();
+            let mut spay =
+                Payer::new(budget, scan.subs.count.saturating_mul(cost::SUB_SWEEP), cost::SUB_STEP).quartered();
             let mut w = [0i64; SUB_ROWS];
             let mut uniform: Option<i64> = None;
             for idx in lo..=hi {

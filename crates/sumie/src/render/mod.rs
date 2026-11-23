@@ -212,8 +212,9 @@ impl Plan {
                     let col = usize::try_from(x.saturating_sub(r.x0)).unwrap_or(0).saturating_mul(4);
                     let mut start = row.saturating_add(col);
                     let mut left = usize::try_from(len).unwrap_or(0);
-                    // 塊ごとに払ってから合成する（中止を見ない間を間隔の内に）
-                    let step = crate::budget::chunk_len(cost::PAINT_PIXEL);
+                    // 塊ごとに払ってから合成する（中止を見ない間を間隔の内に。掃く・副走査線の前払いと同時に残るので塊は
+                    // 4 分の 1。単位 2 の 8 回目のレビュー）
+                    let step = (crate::budget::chunk_len(cost::PAINT_PIXEL) / 4).max(1);
                     while left > 0 {
                         let k = left.min(step);
                         budget.spend((k as u64).saturating_mul(cost::PAINT_PIXEL))?;
