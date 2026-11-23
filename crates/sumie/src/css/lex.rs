@@ -559,7 +559,9 @@ pub(crate) fn number_value(
         budget.spend(cost::number(text.len() as u64))?;
         Ok(parse_f64(text))
     } else {
-        budget.spend(cost::number(NUM_BUF as u64))?;
+        // 長い字句は短い形（NUM_BUF まで）に揃えてから読むので、手間は字句の長さと NUM_BUF の小さい方に比例する（字句の
+        // 長さを超えて払わない：パスのデータの 1 バイトあたりの見積もり `PATH_BYTE` の内に収める。ファズで見つけた）
+        budget.spend(cost::number(text.len().min(NUM_BUF) as u64))?;
         let v = d.long_value(s);
         Ok(if neg { -v } else { v })
     }

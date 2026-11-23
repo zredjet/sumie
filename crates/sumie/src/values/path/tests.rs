@@ -246,8 +246,13 @@ fn work_and_verbs_per_byte() {
         " ",
         ",",
     ];
-    for u in unit {
-        let s = format!("M0 0{}", u.repeat(2000));
+    // 64 字を超える数（短い形に揃えて読む：字句の長さで払う。ファズで見つけた）
+    let long65 = format!("h{} ", "8".repeat(65));
+    let long900 = format!("h{} ", "9".repeat(900));
+    let long_frac = format!("h.{}1 ", "0".repeat(70));
+    let longs = [long65.as_str(), long900.as_str(), long_frac.as_str()];
+    for u in unit.iter().copied().chain(longs) {
+        let s = format!("M0 0{}", u.repeat(if u.len() > 50 { 20 } else { 2000 }));
         let b = Budget::new(Stage::Build, u64::MAX, u64::MAX, &Never);
         let mut verbs = MVec::new(&b);
         let mut coords = MVec::new(&b);

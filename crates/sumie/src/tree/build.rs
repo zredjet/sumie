@@ -181,7 +181,7 @@ pub(crate) fn build_tree(d: &Document<'_>, budget: &Budget<'_>) -> Result<Tree, 
         points: MVec::new(budget),
         bbox: Rect::EMPTY,
         root: None,
-        bbox_only: crate::doc::walk::bbox_only_root(d, budget)?,
+        bbox_only: crate::doc::walk::bbox_only_root(d),
     };
     // 背景は、根が svg なら塗る（display: none・偽の条件の根も、viewBox の幅か高さが 0・変形が逆にできないなどで中身を
     // 描かない根も。Chrome と同じ。ADR-101 (8)・ADR-102）

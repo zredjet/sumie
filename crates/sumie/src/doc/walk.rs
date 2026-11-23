@@ -592,13 +592,10 @@ fn attr_len(
 
 /// 大きさを中身で決める文書で、根の viewBox の幅か高さが 0 か（大きさは viewBox がないものとして中身の外接矩形で決め、
 /// 何も描かない。ADR-78 (7)。描く木を作る段は外接矩形だけを集める）。
-pub(crate) fn bbox_only_root(d: &Document<'_>, budget: &Budget<'_>) -> Result<bool, Error> {
-    if d.size.known().is_some() {
-        return Ok(false);
-    }
-    let doc = &d.xml;
-    let Some(root) = doc.nodes.as_slice().first().filter(|n| n.kind == KIND_ELEMENT) else { return Ok(false) };
-    Ok(view_box_of(doc, d.input, root, budget)?.is_some_and(|(vb, _)| vb.w <= 0.0 || vb.h <= 0.0))
+/// 読む段が大きさの規則と一緒に求めたもの（木を作る段で viewBox を読み直さない。読み直す手間は木を作る段の見積もりに
+/// 入らない：根が SVG でない文書の長い viewBox でファズが見つけた）。
+pub(crate) fn bbox_only_root(d: &Document<'_>) -> bool {
+    d.size.zero_view_box()
 }
 
 /// 要素の `viewBox`（負の幅・高さの壊れたものは None。幅か高さが 0 のものは返し、呼び手が描かない）と
