@@ -5,7 +5,13 @@
 //! 1 件ごとに、読む・木を作る・計画・描く（全体）の時間（`--repeat` 回の最小）と、`estimate_parse`・`estimate_build`・
 //! `Tree::estimate` の手間を並べ、時間 ÷ 手間（ns／単位）を出す。`--tile N` なら N × N のタイルで描いた合計の時間も
 //! （範囲の描画。ADR-13）。見積もりが上限を超えれば、どの段で断ったかを書く（描く前に断る）。
+//!
+//! 見積もりの段（`estimate_parse`・`estimate_build`・`Tree::estimate`・全体の `estimate_region`）も時間を測り、その段が
+//! 自分で払った手間の下限（中止の印を読んだ回数 × 2¹⁶。印は払った手間が 2¹⁶ の倍数を越えるたびに読む）で割った ns／単位の
+//! 上限を出す（見積もりの段の時間が `estimate_work` の上限で抑えられているか。単位 4 のレビュー）。払った手間が 2¹⁶ に
+//! 満たない段は、ns／単位を出さない。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use sumie_testkit::jsonl::Line;
@@ -22,6 +28,40 @@ fn min_time<T>(repeat: u32, mut f: impl FnMut() -> Result<T, String>) -> Result<
         out = Some(r);
     }
     out.map(|o| (o, best)).ok_or_else(|| "回数が 0".to_string())
+}
+
+/// 中止の印を読んだ回数を数える（印は立てない）。
+#[derive(Default)]
+struct Polls(AtomicU64);
+
+impl sumie::Cancel for Polls {
+    fn cancelled(&self) -> bool {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+/// 中止の印を読む手間の間隔（sumie の `CANCEL_INTERVAL`）。
+const POLL_INTERVAL: u64 = 1 << 16;
+
+/// 見積もりの段を `repeat` 回呼んだ最小の時間と、1 回で払った手間の下限（印を読んだ回数 × 間隔）を行に足す。
+fn estimate_stage<T>(
+    l: Line,
+    key: &str,
+    repeat: u32,
+    f: impl Fn(&dyn sumie::Cancel) -> Result<T, sumie::Error>,
+) -> Line {
+    let polls = Polls::default();
+    let _ = f(&polls);
+    let work = polls.0.load(Ordering::Relaxed).saturating_mul(POLL_INTERVAL);
+    let Ok(((), ms)) = min_time(repeat, || {
+        let _ = f(&sumie::Never);
+        Ok(())
+    }) else {
+        return l;
+    };
+    let l = l.str(&format!("{key}_ms"), format!("{ms:.3}")).int(&format!("{key}_self_work_min"), work);
+    if work > 0 { l.str(&format!("{key}_ns_per_unit_max"), format!("{:.3}", ms * 1e6 / work as f64)) } else { l }
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -62,6 +102,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 }
             };
         let parse_work = pe.map(|e| e.work).unwrap_or(0);
+        l = estimate_stage(l, "estimate_parse", repeat, |c| sumie::estimate_parse(&svg, &popts, c));
+        l = estimate_stage(l, "estimate_build", repeat, |c| doc.estimate_build(c));
         l = l
             .int("parse_work", parse_work)
             .str("parse_ms", format!("{parse_ms:.3}"))
@@ -85,6 +127,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .str("build_ms", format!("{build_ms:.3}"))
             .str("build_ns_per_unit", format!("{:.3}", build_ms * 1e6 / be.work.max(1) as f64));
         let ropts = sumie::RenderOptions { scale, ..sumie::RenderOptions::DEFAULT };
+        l = estimate_stage(l, "estimate_render", repeat, |c| tree.estimate(&ropts, c));
         let re = match tree.estimate(&ropts, &sumie::Never) {
             Ok(e) => e,
             Err(e) => {
@@ -106,6 +149,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
         };
         let size = plan.pixel_size();
+        let full = sumie::PixelRect { x: 0, y: 0, width: size.width, height: size.height };
+        l = estimate_stage(l, "estimate_region", repeat, |c| plan.estimate_region(full, c));
         let mut px = vec![0u8; size.width as usize * size.height as usize * 4];
         let ((), render_ms) = min_time(repeat, || {
             let mut out = sumie::PixmapMut::new(&mut px, size.width, size.height, size.width as usize * 4)
