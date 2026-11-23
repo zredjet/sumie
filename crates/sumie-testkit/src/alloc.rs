@@ -54,8 +54,9 @@ mod tests {
 
     #[test]
     fn counts_this_thread() {
+        // 使わない確保は release の最適化で消されうるので、black_box で残す
         let (v, h) = measure(|| {
-            let v: Vec<u64> = Vec::with_capacity(1000);
+            let v: Vec<u64> = std::hint::black_box(Vec::with_capacity(1000));
             v.capacity()
         });
         assert!(v >= 1000);

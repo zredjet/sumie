@@ -112,9 +112,17 @@ impl<'s> Document<'s> {
 
     /// 木を作る（architecture.md §3）。見積もり（上限を超えれば `Limit`）の値を上限にして作る。
     pub fn build(&self, cancel: &dyn Cancel) -> Result<Tree, Error> {
+        self.build_limited(cancel, &mut crate::doc::Watch::default())
+    }
+
+    /// [`Document::build`] と同じに（見積もりを上限にして）作り、勘定の見張りの値を `watch` に書く（試験とファズが
+    /// 確保の合計と山を照らす）。
+    pub(crate) fn build_limited(&self, cancel: &dyn Cancel, watch: &mut crate::doc::Watch) -> Result<Tree, Error> {
         let est = self.estimate_build(cancel)?;
         let budget = Budget::new(Stage::Build, est.work, est.peak_bytes, cancel);
-        build_tree(self, &budget)
+        let r = build_tree(self, &budget);
+        *watch = crate::doc::Watch::of(&budget);
+        r
     }
 
     /// [`Document::build`] と同じに、見積もりの上限を外して作り、勘定の見張りの値を `watch` に書く（試験とファズが
@@ -123,10 +131,7 @@ impl<'s> Document<'s> {
         self.check_build()?;
         let budget = Budget::new(Stage::Build, u64::MAX, u64::MAX, cancel);
         let r = build_tree(self, &budget);
-        watch.work = budget.work();
-        watch.peak = budget.peak();
-        watch.max_spend = budget.max_spend();
-        watch.over_released = budget.over_released();
+        *watch = crate::doc::Watch::of(&budget);
         r
     }
 

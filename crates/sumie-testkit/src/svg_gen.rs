@@ -6,8 +6,10 @@
 //! 出すもの：根の svg（幅・高さ・viewBox・preserveAspectRatio・background-color）・`<style>`・rect・circle・ellipse・line・
 //! polyline・polygon・path（全命令・弧・極端な数）・g・defs・use・symbol・入れ子の svg・switch。値は transform（極端な倍率・
 //! 回転・skew）・塗り・線・不透明度・線の太さ・端・継ぎ目・miterlimit・破線・位相・pathLength・vector-effect・
-//! shape-rendering・fill-rule・style 属性。まだ描かない機能（グラデーション・opacity < 1 など）はまれにしか出さない（描く段
-//! まで届く割合を保つ）。
+//! shape-rendering・fill-rule・paint-order・style 属性・CSS の transform・transform-origin・transform-box・% の長さ・
+//! 根の transform・長いパス。まだ描かない機能（グラデーション・opacity < 1 など）はまれにしか出さない（描く段まで届く割合を
+//! 保つ）。`chance` は上のバイトで真になるので、0 のバイト（libFuzzer がよく入れる）は普通の枝を選ぶ（ファズの作り直しの
+//! 2 回目のレビュー）。
 
 use std::fmt::Write as _;
 
@@ -30,9 +32,9 @@ impl Src<'_> {
         if n == 0 { 0 } else { usize::from(self.byte()) % n }
     }
 
-    /// 確率およそ k/256 で真。
+    /// 確率およそ k/256 で真（上の k 個のバイトで真。0 のバイトは偽）。
     fn chance(&mut self, k: u8) -> bool {
-        self.byte() < k
+        u16::from(self.byte()) + u16::from(k) > 255
     }
 
     fn pick<'b>(&mut self, xs: &'b [&'b str]) -> &'b str {
@@ -64,15 +66,21 @@ const EXTREME: &[&str] = &[
     "-.5",
     "1e-300",
     "2147483647",
+    // 決まった箱（±2²²）の近く
+    "4194304",
+    "-4194303.75",
+    "4194305",
 ];
 
-/// キャンバスの中の座標（キャンバスの −5%〜105%）か、まれに極端な数。
+/// キャンバスの中の座標（キャンバスの −5%〜105%。たいていは 4 分の 1 の格子、ときどき細かい端数）か、まれに極端な数。
 fn coord(s: &mut Src<'_>) -> String {
-    if s.chance(6) {
+    if s.chance(4) {
         return s.pick(EXTREME).to_string();
     }
-    let v = (f64::from(s.byte()) / 255.0 * 1.1 - 0.05) * s.span;
-    format!("{}", (v * 4.0).round() / 4.0)
+    // 0 のバイトがキャンバスの中に来るようにずらす
+    let v = (f64::from(s.byte().wrapping_add(40)) / 255.0 * 1.1 - 0.05) * s.span;
+    let v = (v * 4.0).round() / 4.0;
+    if s.chance(48) { format!("{}", v + f64::from(s.byte()) / 1024.0) } else { format!("{v}") }
 }
 
 /// 曲線の制御点（極端な数をさらにまれに。キャンバスにまたがる巨大な曲線は見積もりを上限まで回して遅い）。
@@ -87,16 +95,24 @@ fn control(s: &mut Src<'_>) -> String {
 /// 正の大きさ（線の太さ・半径など。キャンバスの 1/2 まで）。
 fn size(s: &mut Src<'_>) -> String {
     match s.below(10) {
-        0 => s.pick(&["0", "0.3", "0.5", "0.8", "1"]).to_string(),
-        1 if s.chance(64) => s.pick(EXTREME).to_string(),
-        _ => format!("{}", ((f64::from(s.byte()) / 255.0 * 0.5 * s.span) * 4.0).round() / 4.0 + 0.25),
+        9 => s.pick(&["0", "0.3", "0.5", "0.8", "1"]).to_string(),
+        8 if s.chance(64) => s.pick(EXTREME).to_string(),
+        _ => format!("{}", ((f64::from(s.byte().wrapping_add(40)) / 255.0 * 0.5 * s.span) * 4.0).round() / 4.0 + 0.25),
     }
 }
 
-/// 線の太さ（細い線から、キャンバスの 1/5 まで）。
+/// 図形の大きさ（幅・高さ・半径）。まれに % を付ける。
+fn size_len(s: &mut Src<'_>) -> String {
+    let v = size(s);
+    if s.chance(30) { format!("{}%", s.byte() % 120) } else { v }
+}
+
+/// 線の太さ（ごく細い線から、キャンバスの 1/5 まで。まれに %）。
 fn stroke_width(s: &mut Src<'_>) -> String {
-    match s.below(6) {
-        0 => s.pick(&["0.3", "0.5", "0.8", "1"]).to_string(),
+    match s.below(8) {
+        7 => s.pick(&["0.3", "0.5", "0.8", "1"]).to_string(),
+        6 => s.pick(&["0.05", "0.1", "0.2", "0.25"]).to_string(),
+        5 if s.chance(80) => format!("{}%", 1 + s.byte() % 10),
         _ => format!("{}", ((f64::from(s.byte()) / 255.0 * 0.2 * s.span) * 4.0).round() / 4.0 + 0.5),
     }
 }
@@ -185,6 +201,8 @@ fn paint_props(s: &mut Src<'_>) -> Vec<(String, String)> {
         "color",
         "visibility",
         "display",
+        "paint-order",
+        "transform-origin",
     ];
     for _ in 0..s.below(6) {
         let name = s.pick(pool);
@@ -203,13 +221,15 @@ fn paint_props(s: &mut Src<'_>) -> Vec<(String, String)> {
             "fill-opacity" | "stroke-opacity" => s.pick(&["0.5", "1", "0", "0.25"]).to_string(),
             // 1 未満はまだ描かない（NotYet）ので、まれに
             "opacity" => {
-                if s.chance(16) {
+                if s.chance(4) {
                     "0.5".to_string()
                 } else {
                     "1".to_string()
                 }
             }
             "visibility" => s.pick(&["visible", "hidden", "visible"]).to_string(),
+            "paint-order" => s.pick(&["stroke", "normal", "markers stroke", "fill stroke", "stroke fill"]).to_string(),
+            "transform-origin" => s.pick(&["center", "50% 50%", "10px 20px", "left top", "0 0"]).to_string(),
             _ => s.pick(&["inline", "inline", "inline", "none"]).to_string(),
         };
         // 同じ属性を 2 度書くと XML として壊れるので、名前の重なりは捨てる
@@ -222,7 +242,9 @@ fn paint_props(s: &mut Src<'_>) -> Vec<(String, String)> {
 
 fn path_data(s: &mut Src<'_>) -> String {
     let mut d = format!("M{} {}", coord(s), coord(s));
-    for _ in 0..s.below(12) {
+    // たいていは 12 区間まで、ときどき長いパス
+    let n = if s.chance(20) { 40 + s.below(60) } else { s.below(12) };
+    for _ in 0..n {
         let cmd = s.pick(&[
             "L", "l", "H", "h", "V", "v", "C", "c", "S", "s", "Q", "q", "T", "t", "A", "a", "Z", "z", "M", "m",
         ]);
@@ -253,7 +275,8 @@ fn path_data(s: &mut Src<'_>) -> String {
 }
 
 fn points(s: &mut Src<'_>) -> String {
-    (0..1 + s.below(8)).map(|_| format!("{},{}", coord(s), coord(s))).collect::<Vec<_>>().join(" ")
+    let n = if s.chance(20) { 20 + s.below(60) } else { 1 + s.below(8) };
+    (0..n).map(|_| format!("{},{}", coord(s), coord(s))).collect::<Vec<_>>().join(" ")
 }
 
 /// 生成の状態（付けた id の数・深さ・要素の数）。
@@ -304,18 +327,37 @@ impl Gen<'_, '_> {
                 }
             }
             if self.s.chance(100) {
-                let j = self.s.pick(&["round", "bevel", "miter"]).to_string();
+                let j = self.s.pick(&["round", "bevel", "miter", "miter-clip"]).to_string();
                 put("stroke-linejoin", j);
                 let c = self.s.pick(&["round", "square", "butt"]).to_string();
                 put("stroke-linecap", c);
+                if self.s.chance(80) {
+                    let m = self.s.pick(&["1", "1.5", "4", "10", "0.5"]).to_string();
+                    put("stroke-miterlimit", m);
+                }
             }
         }
+        // CSS のプロパティとしてだけ書く宣言（変形と、その原点と箱）
+        let mut css: Vec<(String, String)> = Vec::new();
+        if self.s.chance(24) {
+            let t = self.s.pick(&["rotate(30deg)", "translate(5px, 3px)", "scale(2)", "skewX(10deg)", "none"]);
+            css.push(("transform".to_string(), t.to_string()));
+        }
+        // 外接矩形の要る箱はまだ描かない（NotYet）ので、まれに
+        if self.s.chance(6) {
+            let b = self.s.pick(&["view-box", "view-box", "fill-box", "stroke-box"]);
+            css.push(("transform-box".to_string(), b.to_string()));
+        }
         if self.s.chance(64) {
-            let decls: Vec<String> = props.iter().map(|(n, v)| format!("{n}: {v}")).collect();
+            let decls: Vec<String> = props.iter().chain(&css).map(|(n, v)| format!("{n}: {v}")).collect();
             self.attr("style", &decls.join("; "));
         } else {
             for (n, v) in &props {
                 self.attr(n, v);
+            }
+            if !css.is_empty() {
+                let decls: Vec<String> = css.iter().map(|(n, v)| format!("{n}: {v}")).collect();
+                self.attr("style", &decls.join("; "));
             }
         }
         if shape && self.s.chance(24) {
@@ -334,11 +376,11 @@ impl Gen<'_, '_> {
                     self.attr(a, &v);
                 }
                 for a in ["width", "height"] {
-                    let v = size(self.s);
+                    let v = size_len(self.s);
                     self.attr(a, &v);
                 }
                 if self.s.chance(80) {
-                    let v = size(self.s);
+                    let v = size_len(self.s);
                     self.attr("rx", &v);
                 }
                 if self.s.chance(60) {
@@ -351,7 +393,7 @@ impl Gen<'_, '_> {
                     let v = length(self.s);
                     self.attr(a, &v);
                 }
-                let v = size(self.s);
+                let v = size_len(self.s);
                 self.attr("r", &v);
             }
             "ellipse" => {
@@ -360,7 +402,7 @@ impl Gen<'_, '_> {
                     self.attr(a, &v);
                 }
                 for a in ["rx", "ry"] {
-                    let v = if self.s.chance(30) { "auto".to_string() } else { size(self.s) };
+                    let v = if self.s.chance(30) { "auto".to_string() } else { size_len(self.s) };
                     self.attr(a, &v);
                 }
             }
@@ -428,7 +470,7 @@ impl Gen<'_, '_> {
                     }
                 }
                 // 見えない overflow の入れ子の svg・symbol はまだ描かない（NotYet）ので、たいていは visible
-                let o = if self.s.chance(24) {
+                let o = if self.s.chance(10) {
                     "hidden"
                 } else if self.s.chance(64) {
                     "auto"
@@ -469,7 +511,8 @@ pub fn svg(data: &[u8]) -> Vec<u8> {
     let mut g = Gen { s: &mut src, ids: 0, count: 0, out: String::new() };
     let wn = *[16u32, 32, 64, 100, 128, 50, 20].get(g.s.below(7)).unwrap_or(&64);
     let hn = *[16u32, 32, 64, 100, 128, 40, 25].get(g.s.below(7)).unwrap_or(&64);
-    g.s.span = f64::from(wn.max(hn));
+    // 座標と大きさは短い辺に合わせる（長い辺に合わせると、細長いキャンバスで図形が短い辺の外に出る）
+    g.s.span = f64::from(wn.min(hn));
     // 根の大きさ：たいていは px、まれに % か書かない（viewBox か中身で決まる大きさ。ADR-58）
     let size_attrs = match g.s.below(10) {
         0 => String::new(),
@@ -488,6 +531,11 @@ pub fn svg(data: &[u8]) -> Vec<u8> {
         g.attr("viewBox", &vb);
         let par = g.s.pick(&["none", "xMidYMid meet", "xMinYMax slice", "xMaxYMin meet"]).to_string();
         g.attr("preserveAspectRatio", &par);
+    }
+    if g.s.chance(30) {
+        // 根の変形（SVG 2）
+        let t = transform(g.s);
+        g.attr("transform", &t);
     }
     if g.s.chance(40) {
         let c = color(g.s);
@@ -512,6 +560,9 @@ pub fn svg(data: &[u8]) -> Vec<u8> {
         }
         g.out.push_str("</style>");
     }
+    // 根の直下に図形を 1 つは置く（defs・symbol の中だけの、何も描かない文書ばかりにしない）
+    g.count += 1;
+    g.shape();
     while g.count < 24 {
         g.element(0);
         if g.s.done() || g.s.chance(40) {

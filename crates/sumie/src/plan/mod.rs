@@ -1178,10 +1178,7 @@ impl Tree {
         let (est, px, tot) = self.estimate_with(opts, q, cancel)?;
         let budget = Budget::new(Stage::Plan, est.plan.work, est.plan.peak_bytes, cancel);
         let r = self.plan_in(&budget, px, tot, opts, q);
-        watch.work = budget.work();
-        watch.peak = budget.peak();
-        watch.max_spend = budget.max_spend();
-        watch.over_released = budget.over_released();
+        *watch = crate::doc::Watch::of(&budget);
         r
     }
 

@@ -146,6 +146,24 @@ pub(crate) struct Watch {
     /// 1 回の払いの最大と、返しすぎ
     pub(crate) max_spend: u64,
     pub(crate) over_released: bool,
+    /// 数えた確保の合計（バイト）と回数（試験が、ヒープの確保の合計・回数と照らす）
+    pub(crate) charged: u64,
+    pub(crate) charges: u64,
+}
+
+impl Watch {
+    /// 段を終えた Budget の勘定。
+    pub(crate) fn of(budget: &Budget<'_>) -> Watch {
+        let (charged, charges) = budget.charged();
+        Watch {
+            work: budget.work(),
+            peak: budget.peak(),
+            max_spend: budget.max_spend(),
+            over_released: budget.over_released(),
+            charged,
+            charges,
+        }
+    }
 }
 
 /// 読む段の道。
@@ -422,10 +440,7 @@ pub(crate) fn parse_watch<'s>(
 ) -> Result<Document<'s>, Error> {
     let budget = Budget::new(Stage::Parse, opts.limits.parse_work, opts.limits.parse_bytes, cancel);
     let r = pipeline(svg, opts, &budget);
-    watch.work = budget.work();
-    watch.peak = budget.peak();
-    watch.max_spend = budget.max_spend();
-    watch.over_released = budget.over_released();
+    *watch = Watch::of(&budget);
     r
 }
 

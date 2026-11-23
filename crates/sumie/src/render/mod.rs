@@ -137,10 +137,7 @@ impl Plan {
         }
         let budget = Budget::new(Stage::Render, est.work, est.peak_bytes, cancel);
         let res = self.render_in(&budget, r, out);
-        watch.work = budget.work();
-        watch.peak = budget.peak();
-        watch.max_spend = budget.max_spend();
-        watch.over_released = budget.over_released();
+        *watch = crate::doc::Watch::of(&budget);
         res
     }
 

@@ -12,9 +12,10 @@ fuzz_target!(|data: &[u8]| {
     let mut input = head.to_vec();
     input.resize(4, 0);
     input.extend_from_slice(&svg);
-    for (stage, check) in
-        [("render", render_ops(&input).check), ("tree", build_ops(&svg).check), ("document", document_parse(&svg).check)]
-    {
+    // 読む段の全体（`document_parse`。重い）は頭の 2 バイト目で 8 件に 1 回（読む段は `document` の対象が受け持つ。ファズの
+    // 作り直しの 2 回目のレビュー）
+    let doc = if input[1] & 7 == 0 { document_parse(&svg).check } else { Check::Ok };
+    for (stage, check) in [("render", render_ops(&input).check), ("tree", build_ops(&svg).check), ("document", doc)] {
         if let Check::Violation(what) = check {
             panic!("render_gen（{stage}）：{what}");
         }

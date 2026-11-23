@@ -15,8 +15,8 @@ architecture.md §9）。種は `seeds/<対象>/`（コミットする）、育�
 | `path` | パスのデータと `points` の読み（`values::path`）と平坦化（`geom::flatten`）。頭の 1 バイトで読む口（パスのデータか `points`）と変形を選ぶ。置き場に書く量が入力の 1 バイトあたり `cost::PATH_GEOMETRY_BYTES` 以下・1 回の払い・同じ入力で同じ結果・平坦化の点の数が分ける数の和（見積もりと同じ式）・点が区間の厳密な外接矩形の中 | `sumie::fuzzing::path_ops` |
 | `stroke` | 線の外形と破線（`geom::stroke`）。頭の 4 バイトで端・継ぎ目・太さ・miterlimit・破線と位相を選び、残りをパスのデータとして読む。1 回の払い・同じ入力で同じ結果・点ごとに払う（手間 ≥ 平坦化の点の数）・有限な入力の外形の点が有限 | `sumie::fuzzing::stroke_ops` |
 | `tree` | 木を作る段（`Document::estimate_build`・`build`）。木を作る手間の上限を 2²⁴ にして読む。見積もりが断れば `build` も同じ誤りで断る（D2・architecture.md §3.1）。見積もりが通れば、見積もり ≥ 実際（手間・確保の山・持ち続ける量）・1 回の払い・返しすぎ・同じ入力で同じ木か同じ断り・上限か中止で断らない・見積もりの上限で作っても同じ木。数えた山（生きている段の結果と走る段の山の和の最大）を返し、`crates/sumie/tests/mutate.rs` がヒープの山と照らす | `sumie::fuzzing::build_ops` |
-| `render` | 木を作る段から描く段まで（`estimate_build`・`build`・`Tree::estimate`・`plan`・`Plan::render_region`・`estimate_region`）。頭の 4 バイトで倍率と範囲を選び、残りを SVG として読む（256 × 256 以内のキャンバス。木を作る手間の上限は 2²⁴、計画と描く手間は 2²³、見積もりの段は 2²¹：既定と同じく見積もりの段がいちばん小さい）。見積もりが断れば次の段も同じ誤りで断る・見積もりが通れば次の段が上限か中止で断らない（描く段は範囲の見積もりを Budget の上限にして描き、`Limit` は見積もりの下回りとして落とす。ADR-100 (3)）・段ごとに手間・確保の山・持ち続ける量 ≤ 見積もり、1 回の払いが中止の間隔を超えない、返しすぎない・計画を 2 度作っても辺と勘定が同じ・範囲の見積もりが全体を超えない・範囲の描画が全体の同じ矩形とビット単位で同じ・同じ入力で同じ画素。数えた山（段ごとの実際の山）と届き具合（描いた・線・破線）を返す | `sumie::fuzzing::render_ops` |
-| `render_gen` | 構造から組み立てた SVG（`sumie_testkit::svg_gen`。バイト列を選択の並びに読み替え、必ず整った SVG を書き出す。要素・属性・値は ADR-100 (3) (b)）を `render`・`tree`・`document` と同じに確かめる。頭の 4 バイトは倍率と範囲。`crates/sumie/tests/mutate.rs` の `generated_documents_render` が同じ生成器で `seeds/render_gen` と種を固定した入力を流す（描く段の終わりまで届く割合 8 割以上、描いた・線・破線が 4 割・3 割・2 割以上） | `sumie::fuzzing::render_ops`・`build_ops`・`document_parse` ＋ `sumie_testkit::svg_gen::svg` |
+| `render` | 木を作る段から描く段まで（`estimate_build`・`build`・`Tree::estimate`・`plan`・`Plan::render_region`・`estimate_region`）。頭の 4 バイトで倍率と範囲を選び、残りを SVG として読む（倍率は 1 バイト目の下の 3 ビットで 1・0.5・2・0.25・0.3・0.7・1.1・2.5、8 の位が立てば範囲を右下の角まで広げる。256 × 256 を超えるキャンバスは全体を描かず、見積もり・計画・範囲の描画までを確かめる。木を作る手間の上限は 2²⁴、計画と描く手間は 2²³、見積もりの段は 2²¹：既定と同じく見積もりの段がいちばん小さい）。見積もりが断れば次の段も同じ誤りで断る・見積もりが通れば次の段が上限か中止で断らない（描く段は範囲の見積もりを Budget の上限にして描き、`Limit` は見積もりの下回りとして落とす。ADR-100 (3)）・段ごとに手間・確保の山・持ち続ける量 ≤ 見積もり、1 回の払いが中止の間隔を超えない、返しすぎない・計画を 2 度作っても辺と勘定が同じ・範囲の見積もりが全体を超えない・範囲の描画が全体の同じ矩形とビット単位で同じ・同じ入力で同じ画素。数えた山と確保の合計・回数（段ごとの実際の値）と届き具合（描く項目がある・背景のほかを描いた・線・破線）を返す | `sumie::fuzzing::render_ops` |
+| `render_gen` | 構造から組み立てた SVG（`sumie_testkit::svg_gen`。バイト列を選択の並びに読み替え、必ず整った SVG を書き出す。要素・属性・値は ADR-100 (3) (b)）を `render`・`tree`・`document` と同じに確かめる。頭の 4 バイトは倍率と範囲。読む段の全体（`document_parse`）は 2 バイト目で 8 件に 1 回。`crates/sumie/tests/mutate.rs` の `generated_documents_render` が同じ生成器で `seeds/render_gen` と種を固定した入力を流す（描く項目のある文書で描く段の終わりまで届く割合 7 割以上（いまは 8 割）、背景のほかを描いた・線・破線が 6 割・5 割・3 割以上） | `sumie::fuzzing::render_ops`・`build_ops`・`document_parse` ＋ `sumie_testkit::svg_gen::svg` |
 
 種は `crates/sumie/tests/mutate.rs` の `MEM_SEEDS` と同じにする（試験 `fuzz_seeds_match_mem_seeds` が照らす）。
 `xml`・`dtd`・`css`・`values`・`document`・`path`・`stroke`・`tree`・`render`・`render_gen` の種は `crates/sumie/tests/mutate.rs` の種つきの変異の試験も使う（`dtd` は DTD の、`css` は
@@ -47,21 +47,31 @@ cargo fuzz run mem_ops seeds/mem_ops -- -runs=0
 scripts/fuzz-corpus.sh
 cd fuzz
 mkdir -p corpus/render_gen
-cargo fuzz run render_gen corpus/render_gen seeds/render_gen -- -max_len=2048 -max_total_time=3600 -rss_limit_mb=4096 -timeout=20
-cargo fuzz run render corpus/render seeds/render -- -dict=dict/svg.dict -max_total_time=3600 -rss_limit_mb=4096 -timeout=20
-cargo fuzz run tree corpus/tree seeds/tree -- -dict=dict/svg.dict -max_total_time=3600 -rss_limit_mb=4096 -timeout=20
+cargo fuzz run -s none render_gen corpus/render_gen seeds/render_gen -- -max_len=2048 -max_total_time=3600 -rss_limit_mb=4096 -timeout=20
+cargo fuzz run -s none render corpus/render seeds/render -- -dict=dict/svg.dict -max_total_time=3600 -rss_limit_mb=4096 -timeout=20
+cargo fuzz run -s none tree corpus/tree seeds/tree -- -dict=dict/svg.dict -max_total_time=3600 -rss_limit_mb=4096 -timeout=20
 ```
 
-`render_gen` の入力は生成器の選択の並びなので、2 KiB を超えても文書は大きくならない（`-max_len=2048`）。
+`-s none` は AddressSanitizer を外す（ライブラリは `forbid(unsafe_code)` で依存は libm だけなので、拾うものがほぼなく、
+1 秒あたりの回数が約 2 倍になる。debug-assertions と overflow-checks は残る）。`render_gen` の入力は生成器の選択の並び
+なので、2 KiB を超えても文書は大きくならない（`-max_len=2048`）。
 
-回したあとは届き具合を測る（ADR-100 (3) (e)）。育ったコーパスで描く段の終わりまで届いた件数と、描いた・線・破線のある件数を
-数える試験と、行の覆い（`cargo fuzz coverage`。llvm-tools の部品が要る：`rustup component add llvm-tools-preview` を
-fuzz の nightly に入れる。取り込みは手で行う）：
+回したあとは届き具合を測る（ADR-100 (3) (e)）。育ったコーパスを流してヒープの照らし（山と確保の合計・回数 ≤ 数えた量）と
+届いた・描いた・線・破線のある件数を出す試験（回している間に流すと、縮めて消えたファイルは飛ばす）と、行の覆い
+（`cargo fuzz coverage`。llvm-tools の部品が要る：`rustup component add llvm-tools-preview` を fuzz の nightly に入れる。
+取り込みは手で行う）。覆いは `llvm-cov report` で数を、`llvm-cov show` で plan・raster・geom/stroke の枝を見る：
 
 ```bash
 cargo test -p sumie --release --test mutate -- --ignored corpus_reach --nocapture
 cd fuzz
-cargo fuzz coverage render corpus/render
+for t in render render_gen; do cargo fuzz coverage $t corpus/$t; done
+LLVM=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin
+for t in render render_gen; do
+  $LLVM/llvm-cov report target/*/coverage/*/release/$t -instr-profile=coverage/$t/coverage.profdata \
+    --ignore-filename-regex='/.cargo/|/rustc/|sumie-testkit' | tail -1
+done
+$LLVM/llvm-cov show target/*/coverage/*/release/render -instr-profile=coverage/render/coverage.profdata \
+  ../crates/sumie/src/plan/mod.rs ../crates/sumie/src/raster/mod.rs ../crates/sumie/src/geom/stroke.rs > ../local/coverage-render.txt
 ```
 
 `cargo fuzz` の既定（debug-assertions と overflow-checks が入る）で回し、示しそこなったあふれを panic として見つける
