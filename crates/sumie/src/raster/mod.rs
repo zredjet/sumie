@@ -10,8 +10,6 @@
 //!   巻き数を足す
 //! - 被覆の値は `2 · ONE · Σcover − area`（全面で `FULL`）。非ゼロは `min(|v|, FULL)`、偶奇は `|v|` を `2 · FULL` で折り返す
 
-#![allow(dead_code, reason = "計画と描く段（M2）から使う。単位ごとに足していく")]
-
 use crate::error::Error;
 use crate::geom::Point;
 use crate::geom::flatten::BOX;
@@ -214,7 +212,6 @@ impl<'b> RowCells<'b> {
         Ok(RowCells { cover, area, x0, width, lo: 0, hi: 0, touched: false })
     }
 
-    /// 触れたセルを 0 に戻す（手間は触れた幅の分。呼び手が払う）。
     /// 触れたセルを 0 に戻す（触れた範囲の分を塊ごとに払う）。
     pub(crate) fn clear(&mut self, budget: &crate::budget::Budget<'_>) -> Result<(), Error> {
         if !self.touched {
@@ -496,6 +493,11 @@ impl<'b> Scan<'b> {
 /// 範囲 `rect` の行ごとに、辺 `edges`（`y0` の順に並べたもの）の被覆を求め、被覆の同じ画素の並びごとに
 /// `span(x, y, 長さ, 被覆)` を呼ぶ（被覆 0 は呼ばない。被覆は 0〜`FULL`）。`rect` の x は `scan` を作った範囲の中。払う手間は
 /// 行・かかる辺・回ったセル・掃いた幅の分（`cost` の式）。
+/// 辺が範囲の右の境（固定小数 `right`）より右にあるか（セルは右の外を捨てるので、画素に効かない）。
+pub(crate) fn skips_right(e: &Edge, right: i64) -> bool {
+    i64::from(e.x0.min(e.x1)) >= right
+}
+
 pub(crate) fn fill_region(
     edges: &[Edge],
     rule: FillRule,
@@ -512,19 +514,24 @@ pub(crate) fn fill_region(
     }
     let mut next = 0usize;
     let mut row = rect.y0;
+    let right = rect.x1.saturating_mul(ONE);
     while row < rect.y1 {
         budget.spend(cost::RASTER_ROW)?;
         let row_start = row.saturating_mul(ONE);
         let row_end = row_start.saturating_add(ONE);
-        // かかり始める辺を足す
+        // かかり始める辺を足す（範囲の右の外にある辺は、どの画素にも効かないので足さない。[`skips_right`]）
         while let Some(e) = edges.get(next) {
             if i64::from(e.y0) >= row_end {
                 break;
             }
-            budget.spend(cost::RASTER_EDGE_ROW)?;
             let idx = u32::try_from(next).map_err(|_| budget.too_large())?;
-            scan.active.push(idx)?;
             next = next.saturating_add(1);
+            if skips_right(e, right) {
+                budget.spend(cost::OP_STEP)?;
+                continue;
+            }
+            budget.spend(cost::RASTER_EDGE_ROW)?;
+            scan.active.push(idx)?;
         }
         // 終わった辺を除く（順は保つ。かかる辺ごとに、塊の頭で払う）
         let mut keep = 0usize;

@@ -1,8 +1,6 @@
 //! 段 6 の一部：塗り（architecture.md §6.3）。画素は RGBA8 の乗算済み。合成は整数で、255 で割る丸めは [`div255`] の 1 つ。
 //! M2 は単色の source-over だけ（グラデーション・pattern・blend は M3）。
 
-#![allow(dead_code, reason = "描く段（M2）から使う")]
-
 /// `x / 255` の四捨五入（`x ≤ 255 · 255`。`(x + 128 + ((x + 128) >> 8)) >> 8` はこの範囲で正しく丸める）。
 pub(crate) fn div255(x: u32) -> u32 {
     let y = x.saturating_add(128);

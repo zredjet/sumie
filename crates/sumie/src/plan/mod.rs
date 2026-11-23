@@ -11,8 +11,6 @@
 //!   (|Δx| + |Δy|) / 1 画素 + 4 と 行の数 × (幅 + 3) の小さい方）から求める。
 //!   同じ形の式なので、全体に含まれる範囲の見積もりは `RenderEstimate.render` を超えない（FR-OUT-06）
 
-#![allow(dead_code, reason = "公開の口（lib）と描く段から使う")]
-
 use crate::budget::{Budget, Estimate};
 use crate::cancel::Cancel;
 use crate::cost;
@@ -23,7 +21,7 @@ use crate::geom::stroke::{Cap, Dashes, Join, LoopSink, Pen, dash_polyline, strok
 use crate::geom::{PathRef, PathSeg, Point, Transform};
 use crate::limits::RenderLimits;
 use crate::math;
-use crate::mem::{Frozen, MVec, Plain, stable_sort};
+use crate::mem::{Frozen, MVec, Plain, lower_bound_try, stable_sort};
 use crate::raster::{Edge, FillRule, ONE, PixelBox, push_segment};
 use crate::tree::{
     CAP_ROUND, CAP_SQUARE, CRISP, EVEN_ODD, HAS_FILL, HAS_STROKE, JOIN_BEVEL, JOIN_ROUND, NON_SCALING,
@@ -79,6 +77,9 @@ pub(crate) struct DrawItem {
     pub(crate) rule: u8,
     pub(crate) aa: u8,
     pub(crate) pad: [u8; 2],
+    /// 辺の高さ（固定小数）の最大（範囲にかかりうる辺の始めを 2 分の探索で求める。§6.1）
+    pub(crate) max_dy: u32,
+    pub(crate) pad2: [u8; 4],
 }
 
 impl Plain for DrawItem {}
@@ -127,6 +128,23 @@ impl Plan {
         let start = it.edges[0] as usize;
         self.edges.as_slice().get(start..start.saturating_add(it.edges[1] as usize)).unwrap_or(&[])
     }
+
+    /// 項目の辺のうち、画素の行の範囲 `b` にかかりうるもの（y0 の順に並んだ辺の、y0 ≥ 範囲の上 − 高さの最大 から y0 < 範囲の
+    /// 下 まで。前の辺は範囲の上で終わり、後の辺は範囲の下で始まる）。2 分の探索を 2 度払う（範囲の描画の手間を範囲の外の
+    /// 辺に比例させない。architecture.md §6.1・単位 2 の 3 回目のレビュー）。
+    pub(crate) fn region_edges(&self, it: &DrawItem, b: &PixelBox, budget: &Budget<'_>) -> Result<&[Edge], Error> {
+        let all = self.edges_of(it);
+        let top = b.y0.saturating_mul(ONE).saturating_sub(i64::from(it.max_dy));
+        let bottom = b.y1.saturating_mul(ONE);
+        let start = lower_bound_try(budget, all, |e| Ok(i64::from(e.y0) < top))?;
+        let end = lower_bound_try(budget, all, |e| Ok(i64::from(e.y0) < bottom))?;
+        Ok(all.get(start..end.max(start)).unwrap_or(&[]))
+    }
+}
+
+/// 項目の範囲の描画の 2 分の探索の手間（[`Plan::region_edges`]。辺 `e` 本）。
+pub(crate) fn region_search(e: u64) -> u64 {
+    cost::search(e).saturating_mul(2)
 }
 
 /// 呼び手の誤り。
@@ -140,6 +158,8 @@ struct Counts {
     /// 平坦化の点（部分パスの始めの点を含む）・曲線（2 次・3 次・弧）の区間の数・部分パスの数・1 つの部分パスの点の最大
     points: u64,
     curves: u64,
+    /// 区間の数（移動と閉じを含む。計画が部分パスを集める歩きで区間ごとに払う分）
+    segs: u64,
     subpaths: u64,
     max_sub: u64,
     /// 描く座標系の制御多角形の長さ（線分・閉じ・曲線の制御多角形・弧は |Δθ| × 最大の半径）
@@ -268,6 +288,7 @@ fn count(
     };
     for seg in path.segments() {
         budget.spend(cost::OP_STEP)?;
+        c.segs = c.segs.saturating_add(1);
         sub_end = match seg {
             PathSeg::Move(_) => sub_end,
             PathSeg::Close(_, b) => Some(b),
@@ -702,18 +723,23 @@ fn bound_node(
     if has_fill {
         let e = c.points.saturating_add(c.subpaths).saturating_mul(split);
         // 描く段の行とセル：行の帯にかかる辺だけ（区間と暗黙の閉じの帯の中の長さ）
-        let e_band = c.pts_band.saturating_add(c.subpaths).saturating_mul(split);
+        // 続く閉じは帯の点を数えても辺を作らないので、辺の数を超えない
+        let e_band = c.pts_band.saturating_add(c.subpaths).saturating_mul(split).min(e);
         let (edge_rows, cells) = raster_bounds(c.len_dev_band, e_band, rows, width);
         out.plan_work = out
             .plan_work
             .saturating_add(c.points.saturating_mul(cost::FLATTEN_POINT.saturating_add(POINT_WORK)))
             .saturating_add(c.curves.saturating_mul(cost::FLATTEN_CURVE))
+            .saturating_add(c.segs.saturating_mul(cost::OP_STEP))
             .saturating_add(e.saturating_mul(EDGE_WORK))
             .saturating_add(cost::stable_sort(e, size_of::<Edge>() as u64));
         out.edges = out.edges.saturating_add(e);
         out.items = out.items.saturating_add(1);
         out.max_item_edges = out.max_item_edges.max(e);
-        out.render_work = out.render_work.saturating_add(render_work(rows, width, e, cells, edge_rows));
+        out.render_work = out
+            .render_work
+            .saturating_add(render_work(rows, width, e, cells, edge_rows))
+            .saturating_add(region_search(e));
     }
     if has_stroke {
         let v = c.points;
@@ -772,8 +798,14 @@ fn bound_node(
         let per_piece = 2u64.saturating_add(cap_pts.saturating_mul(2)).saturating_add(r2).saturating_add(16);
         let out_pts = pieces_n.saturating_mul(per_piece).saturating_add(v.saturating_mul(6)).saturating_add(k_join);
         let e = out_pts.saturating_add(pieces_n.saturating_mul(2)).saturating_mul(split);
-        // 外形の辺の長さの和（描く座標系）：縁の 2 倍と、点ごとに 2r × max(miterlimit, 2)
-        let spread = 2.0 * pen.half * if pen.miter_limit > 2.0 { pen.miter_limit } else { 2.0 };
+        // 外形の辺の長さの和（線を作る座標系。描く座標系へは σ を掛ける）：縁の 2 本と、頂点ごとの継ぎ目（外側は miter なら
+        // 2r × miterlimit、ほかは 2r。内側で頂点を通す分 2r）、部分（か破線）ごとの端・長さ 0 の円・輪の継ぎ（2r × 12 で
+        // 2 つの丸い端と円と四角い端の延びを覆う）、round の継ぎ目の円弧（r × 曲がる角の和）。外形の点ごとに数えると、頂点の
+        // 多い太い線を 50 倍に見積もった（単位 2 の 3 回目のレビュー）
+        let outer = if pen.join == Join::Miter && pen.miter_limit > 1.0 { pen.miter_limit } else { 1.0 };
+        let per_vertex = 2.0 * pen.half * (outer + 1.0);
+        let piece_len = 2.0 * pen.half * 12.0;
+        let round_len = if pen.join == Join::Round { pen.half * c.turning } else { 0.0 };
         // 描く段の行とセル：行の帯にかかる外形の辺だけ（帯の外の頂点の外形は線の届く幅の内なので帯の外）
         let out_band = pieces_n
             .saturating_mul(per_piece)
@@ -781,7 +813,8 @@ fn bound_node(
             .saturating_add(k_join)
             .min(out_pts);
         let e_band = out_band.saturating_add(pieces_n.saturating_mul(2)).saturating_mul(split);
-        let l_dev = sigma * (2.0 * c.len_stroke_band + (out_band as f64) * spread);
+        let l_dev = sigma
+            * (2.0 * c.len_stroke_band + (c.pts_band as f64) * per_vertex + (pieces_n as f64) * piece_len + round_len);
         let (edge_rows, cells) = raster_bounds(l_dev, e_band, rows, width);
         // pathLength の長さを測る平坦化（計画と同じ条件：破線の並びがあり pathLength がある）
         let passes: u64 = if !dashes.is_empty() && n.path_length > 0.0 { 2 } else { 1 };
@@ -799,6 +832,7 @@ fn bound_node(
             .plan_work
             .saturating_add(v.saturating_mul(passes).saturating_mul(cost::FLATTEN_POINT.saturating_add(POINT_WORK)))
             .saturating_add(c.curves.saturating_mul(passes).saturating_mul(cost::FLATTEN_CURVE))
+            .saturating_add(c.segs.saturating_mul(passes).saturating_mul(cost::OP_STEP))
             .saturating_add(if mode.device { v.saturating_mul(POINT_WORK) } else { 0 })
             .saturating_add(dash_pts.saturating_mul(cost::OUTLINE_POINT.saturating_add(POINT_WORK)))
             .saturating_add(dedup.saturating_mul(POINT_WORK.saturating_add(cost::OP_STEP)))
@@ -814,7 +848,10 @@ fn bound_node(
         out.edges = out.edges.saturating_add(e);
         out.items = out.items.saturating_add(1);
         out.max_item_edges = out.max_item_edges.max(e);
-        out.render_work = out.render_work.saturating_add(render_work(rows, width, e, cells, edge_rows));
+        out.render_work = out
+            .render_work
+            .saturating_add(render_work(rows, width, e, cells, edge_rows))
+            .saturating_add(region_search(e));
     }
     out.plan_work = out.plan_work.saturating_add(c.subpaths.saturating_mul(cost::OP_STEP)).saturating_add(64);
     Ok(out)
@@ -986,7 +1023,8 @@ impl Tree {
                 }
                 // 項目の画素の矩形は辺の固定小数の端から（点の浮動小数から求めると、見積もりの節の箱と丸めが 1 ulp ずれて
                 // 1 画素はみ出しうる。単位 2 の 3 回目のレビュー）
-                let bbox = edges_box(edges.as_slice().get(start..end).unwrap_or(&[]), b)?.intersect(&canvas);
+                let (bbox, max_dy) = edges_box(edges.as_slice().get(start..end).unwrap_or(&[]), b)?;
+                let bbox = bbox.intersect(&canvas);
                 let slice = edges.as_mut_slice().get_mut(start..end).unwrap_or(&mut []);
                 stable_sort(b, slice, |x, y| x.y0 < y.y0)?;
                 // 範囲の見積もりの行とセルの上限（辺ごと。項目の矩形の中の行だけ。払う）
@@ -1015,6 +1053,8 @@ impl Tree {
                     rule,
                     aa,
                     pad: [0; 2],
+                    max_dy,
+                    pad2: [0; 4],
                 })?;
             }
         }
@@ -1057,21 +1097,26 @@ fn check(needed: u64, allowed: u64, resource: Resource, stage: Stage) -> Result<
 
 /// 辺の固定小数の端から求める画素の矩形（セルを積む列は x の端の床、行は y の端の床から天井まで。辺 1 本ごとに払う）。
 /// 点は節の外接矩形 × 倍率 ± 届く幅から 1/256 画素と丸めの差しかずれないので、見積もりの節の箱（1 画素の余白）の内。
-fn edges_box(edges: &[Edge], budget: &Budget<'_>) -> Result<PixelBox, Error> {
+/// あわせて辺の高さの最大（固定小数）も返す。
+fn edges_box(edges: &[Edge], budget: &Budget<'_>) -> Result<(PixelBox, u32), Error> {
     let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+    let mut dy = 0i64;
     for e in edges {
         budget.spend(cost::OP_STEP)?;
         x0 = x0.min(i64::from(e.x0.min(e.x1)));
         x1 = x1.max(i64::from(e.x0.max(e.x1)));
         y0 = y0.min(i64::from(e.y0));
         y1 = y1.max(i64::from(e.y1));
+        dy = dy.max(i64::from(e.y1).saturating_sub(i64::from(e.y0)));
     }
     if x0 > x1 {
-        return Ok(PixelBox { x0: 0, y0: 0, x1: 0, y1: 0 });
+        return Ok((PixelBox { x0: 0, y0: 0, x1: 0, y1: 0 }, 0));
     }
     let floor = |v: i64| crate::raster::floor_div(v, ONE);
     let ceil = |v: i64| floor(v.saturating_add(ONE - 1));
-    Ok(PixelBox { x0: floor(x0), y0: floor(y0), x1: floor(x1).saturating_add(1), y1: ceil(y1) })
+    // 辺は ±2³⁰ の固定小数の内なので、高さは u32 に入る
+    let max_dy = u32::try_from(dy).unwrap_or(u32::MAX);
+    Ok((PixelBox { x0: floor(x0), y0: floor(y0), x1: floor(x1).saturating_add(1), y1: ceil(y1) }, max_dy))
 }
 
 /// 部分パスの点と閉じたかを受け取る口。
@@ -1090,6 +1135,8 @@ fn subpaths(
     poly.clear();
     let mut open = false;
     for seg in path.segments() {
+        // 区間ごとに払う（続く閉じ（`ZZZ…`）も。単位 2 の 3 回目のレビュー）
+        budget.spend(cost::OP_STEP)?;
         match seg {
             PathSeg::Move(p) => {
                 if open {

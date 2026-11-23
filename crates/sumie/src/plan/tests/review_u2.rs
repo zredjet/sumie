@@ -501,3 +501,36 @@ fn r2b_butt() {
         Err(e) => panic!("r2b_butt: 見積もり {:?} の内で計画が作れない：{e:?}", est.plan),
     }
 }
+
+/// 続く閉じ（`M5 5ZZZ…`）：計画は区間ごとに払い（中止を見る）、見積もりは区間を数える。帯の辺の数は辺の数を超えない
+/// （単位 2 の 3 回目のレビュー）。
+#[test]
+fn r11_repeated_closes_are_paid() {
+    let n = 200_000usize;
+    let src = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><path stroke=\"black\" stroke-linecap=\"round\" d=\"M5 5{}\"/></svg>",
+        "Z".repeat(n)
+    );
+    let d = crate::doc::parse(src.as_bytes(), &crate::style::ParseOptions::DEFAULT, &Never).unwrap();
+    let t = d.build(&Never).unwrap();
+    let est = t.estimate(&RenderOptions::DEFAULT, &Never).unwrap();
+    // 塗りと線の 2 度の歩きの分
+    assert!(est.plan.work >= 2 * n as u64 * cost::OP_STEP, "{}", est.plan.work);
+    assert!(est.render.work < 1_000_000, "{}", est.render.work);
+    // 計画は区間ごとに払うので、中止の印を何度も見る（見積もりの分を除いて数える）
+    use core::sync::atomic::{AtomicU64, Ordering};
+    struct Count(AtomicU64);
+    impl crate::cancel::Cancel for Count {
+        fn cancelled(&self) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+    let c = Count(AtomicU64::new(0));
+    t.estimate(&RenderOptions::DEFAULT, &c).unwrap();
+    let e = c.0.load(Ordering::Relaxed);
+    let plan = t.plan(&RenderOptions::DEFAULT, &c).unwrap();
+    assert!(!plan.items.is_empty());
+    let looks = c.0.load(Ordering::Relaxed) - 2 * e;
+    assert!(looks >= 10, "計画が中止の印を見た回数 {looks}");
+}
