@@ -791,6 +791,29 @@ fn css_box_properties() {
     assert_eq!(build(&svg("<rect width=\"stretch\" height=\"5\" style=\"width: 5px\"/>")).unwrap().nodes.len(), 1);
 }
 
+/// switch は SVG の名前空間の子から最初の 1 つを選ぶ：条件の属性を持つ要素は条件が通れば、持たない要素（title・知らない
+/// 要素など）はそのまま選んで何も描かない。ほかの名前空間の要素と foreignObject（ADR-78 (6)）は飛ばす（Chrome と同じ。
+/// resvg の structure/switch/non-SVG-child。ADR-103）。
+#[test]
+fn switch_selects_like_chrome() {
+    let r = "<rect width=\"5\" height=\"5\"/>";
+    let count = |first: &str| build(&svg(&format!("<switch>{first}{r}</switch>"))).unwrap().nodes.len();
+    for first in
+        ["<random/>", "<title>t</title>", "<desc/>", "<linearGradient id=\"g\"/>", "<random systemLanguage=\"xx\"/>"]
+    {
+        assert_eq!(count(first), 0, "{first}");
+    }
+    for first in [
+        "<foo:bar xmlns:foo=\"http://x\"/>",
+        "<rect width=\"5\" height=\"5\" systemLanguage=\"xx\"/>",
+        "<g requiredExtensions=\"http://x\"/>",
+        "<foreignObject width=\"5\" height=\"5\"/>",
+        "text ",
+    ] {
+        assert_eq!(count(first), 1, "{first}");
+    }
+}
+
 /// 根の svg の display: none と偽の条件は描くことを止めない（Chrome と同じ。ADR-102。子の display: none は効く）。
 #[test]
 fn root_display_and_conditions_are_ignored() {

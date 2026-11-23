@@ -384,13 +384,16 @@ pub(crate) fn build(
         // 条件と switch（自分の印。switch の選び方は switch が描かれるかに依らない：use から参照されても同じ子を選ぶ）
         let own_false = svg && !conditions_pass(doc, input, node, languages, budget)?;
         let mut bits = if own_false { HIDDEN_SELF } else { 0 };
+        // switch は SVG の名前空間の子の要素から最初の 1 つを選ぶ：条件の属性を持つ要素（描く要素・入れ物など）は条件が
+        // 通れば、持たない要素（title・desc・グラデーション・知らない要素など）はそのまま選ぶ（何も描かない）。ほかの
+        // 名前空間の要素は飛ばす。foreignObject は選ばない（ADR-78 (6)）。Chrome と同じ（ユーザーの判断。ADR-103）
         if parent != NONE
             && let Some(p) = nodes.get(parent as usize)
             && p.ns == NS_SVG
             && p.local.of(input) == b"switch"
             && svg
-            && switch_candidate(local)
-            && !own_false
+            && local != b"foreignObject"
+            && !(switch_conditional(local) && own_false)
         {
             // 通る最初の子の要素だけを描く
             if switch_chosen.get(parent as usize).copied().unwrap_or(0) == 0 {
@@ -683,9 +686,9 @@ fn attr_buf<'a>(doc: &'a XmlDoc, input: &'a [u8], a: &xml::Attr) -> (&'a [u8], S
     }
 }
 
-/// `switch` が選ぶ子（描く要素。`desc`・`title` などは選ばず、隠しもしない）。`foreignObject` は描かないので選ばない
-/// （draw.io の書き出しの代わりの中身を描く。resvg と同じ。ADR-78 (6)）。
-fn switch_candidate(local: &[u8]) -> bool {
+/// `switch` の子で条件の属性を照らす要素（Chrome の SVGTests を持つ要素：描く要素・入れ物・参照される入れ物・文字の中の
+/// 要素・動き）。ほかの SVG の要素は条件を照らさずに選ぶ（ADR-103）。
+fn switch_conditional(local: &[u8]) -> bool {
     matches!(
         local,
         b"a" | b"g"
@@ -701,6 +704,17 @@ fn switch_candidate(local: &[u8]) -> bool {
             | b"polyline"
             | b"polygon"
             | b"path"
+            | b"defs"
+            | b"clipPath"
+            | b"mask"
+            | b"pattern"
+            | b"tspan"
+            | b"textPath"
+            | b"animate"
+            | b"animateMotion"
+            | b"animateTransform"
+            | b"set"
+            | b"discard"
     )
 }
 

@@ -140,8 +140,13 @@ fn switch_and_conditions() {
         r##"<switch><desc id="d"/><rect id="fr" systemLanguage="fr"/><rect id="en" systemLanguage="de, en-US"/><rect id="late"/></switch>
         <rect id="ext" requiredExtensions=""/><g id="g" systemLanguage="ja"><rect id="inner"/></g><rect id="feat" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Shape"/>"##,
     );
-    // 印は自分のものだけ（g の中の inner は、たどる側が g から受け継ぐ）
-    assert_eq!(hidden, ["fr", "late", "ext", "g"]);
+    // 印は自分のものだけ（g の中の inner は、たどる側が g から受け継ぐ）。switch は条件の属性を持たない desc を選ぶので、
+    // 後ろの子はみな選ばれない（Chrome と同じ。ADR-103）
+    assert_eq!(hidden, ["fr", "en", "late", "ext", "g"]);
+    let (_, hidden, _, _) = run(
+        r##"<switch><rect id="fr" systemLanguage="fr"/><rect id="en" systemLanguage="de, en-US"/><rect id="late"/></switch>"##,
+    );
+    assert_eq!(hidden, ["fr", "late"]);
 }
 
 /// switch は foreignObject を選ばない（draw.io の書き出しの代わりの中身。ADR-78 (6)）。
