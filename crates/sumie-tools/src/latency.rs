@@ -220,6 +220,18 @@ fn cases(scale: usize) -> Vec<(&'static str, Vec<u8>)> {
         }
         format!("{SVG}{body}</defs><rect mask=\"url(#k8)\"/></svg>").into_bytes()
     }));
+    // 文書の段の 5 回目のレビューの形（値の前後の長い空白と、`-` のない長い言語）
+    let ws = " ".repeat(n(8_000_000));
+    out.push(("use の href の長い空白", format!("{SVG}<rect id=\"a\"/><use href=\"{ws}#a\"/></svg>").into_bytes()));
+    out.push((
+        "塗りの url の長い空白",
+        format!("{SVG}<pattern id=\"p\"/><rect style='fill:url(\"{ws}#p\")'/></svg>").into_bytes(),
+    ));
+    out.push(("systemLanguage の長い空白", format!("{SVG}<rect systemLanguage=\"{ws}en\"/></svg>").into_bytes()));
+    out.push((
+        "- のない長い systemLanguage",
+        format!("{SVG}<rect systemLanguage=\"{}\"/></svg>", "e".repeat(n(8_000_000))).into_bytes(),
+    ));
     out.push(("深い入れ子", format!("{SVG}{}{}</svg>", "<g>".repeat(1000), "</g>".repeat(1000)).into_bytes()));
     out.push(("参照の多い文書（use の鎖）", {
         let mut body = String::from("<defs><rect id=\"r0\"/>");
@@ -251,6 +263,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
         let r = sumie::parse(&data, &opts, &meter);
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        // 最後に印を読んでから終わりまでの間も締める（終わり近くの払わない走査を見落とさない。文書の 5 回目のレビュー）
+        sumie::Cancel::cancelled(&meter);
         let gap = meter.state.lock().map(|s| s.1).unwrap_or(0.0);
         let (work, result) = match (&est, &r) {
             (Ok(e), Ok(_)) => (e.work, "読む".to_string()),
