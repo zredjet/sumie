@@ -13,8 +13,12 @@
 //! - 測るもの：sumie と resvg・sumie と Chrome・resvg と Chrome の差（`compare::measure`）。合否は sumie と resvg に
 //!   ADR-15 の図形と単色の基準（8/255・2%・平らな所 2/255）を当てる。resvg と Chrome が基準の内なのに sumie が両方から
 //!   外れるものを不具合の候補にする。Chrome が撮れなければ sumie と resvg の合否は測り、Chrome との差だけを空にする。
-//!   resvg が断ったものも sumie を走らせ、両方が断ったか片方だけかを書く
-//! - 出力：`<out>/report.jsonl`・`<out>/summary.txt`・`<out>/index.html`（sumie と resvg の差の大きい順。絵は `<out>/img/`）
+//!   sumie と resvg の大きさが違うものは測れたものに入れて外れに数える。resvg が断ったものも sumie を走らせ、両方が
+//!   断ったか片方だけかを書く（両方が断るものは集まりの外として分ける）
+//! - M2 の合否（ADR-101。ユーザーの判断）：Chrome を撮れたもののうち、sumie と Chrome が通る数 ≥ resvg と Chrome が通る数、
+//!   かつ不具合の候補がすべて既知の差（[`KNOWN`]。ADR に方式の差の理由を書いたもの）なら合格
+//! - 出力：`<out>/report.jsonl`・`<out>/summary.txt`・`<out>/index.html`（sumie と resvg の差の大きい順。絵は `<out>/img/`）。
+//!   `--out` は `--cache` のフォルダと同じにできない（初めに絵を消すので）
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -46,6 +50,10 @@ const LATER: &[&str] = &[
     "script",
 ];
 
+/// 既知の差（道と、方式の差の理由を書いた ADR）：resvg と Chrome は近いのに sumie が両方から外れるが、方式の差として認めた
+/// もの（ADR-101）。ここにない不具合の候補が 1 つでもあれば M2 の合否は不合格。
+const KNOWN: &[(&str, &str)] = &[];
+
 /// 照合の集まりの 1 件。
 #[derive(Debug, Clone)]
 struct Item {
@@ -64,6 +72,11 @@ struct Outcome {
     error: String,
     /// Chrome が撮れなかった理由（sumie と resvg の差は測る）
     chrome_error: String,
+    /// sumie と resvg の大きさが違う（測れたものに入れて外れに数える）
+    size_mismatch: String,
+    /// Chrome を撮った回数（やり直し）と、CSS の大きさが整数でないか（Chrome が引き伸ばす。`compare` と同じ）
+    chrome_attempts: u32,
+    fractional: bool,
     sr: Option<Metrics>,
     sc: Option<Metrics>,
     rc: Option<Metrics>,
@@ -177,6 +190,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let cache_dirs: Vec<PathBuf> =
         arg(args, "--cache").map(|c| c.split(',').map(PathBuf::from).collect()).unwrap_or_default();
     let cache = load_cache(&cache_dirs)?;
+    // 出力のフォルダは初めに絵を消すので、写しのフォルダと同じにしない
+    if let Ok(out) = out_dir.canonicalize()
+        && cache_dirs.iter().any(|d| d.canonicalize().is_ok_and(|d| d == out))
+    {
+        return Err(format!(
+            "--out（{}）が --cache のフォルダと同じ（初めに絵を消すので写しを失う）",
+            out_dir.display()
+        ));
+    }
     let items = load_items(&root, args)?;
     for f in ["report.jsonl", "summary.txt", "index.html"] {
         let _ = std::fs::remove_file(out_dir.join(f));
@@ -213,6 +235,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
     results.sort_by_key(|o| o.id);
     write_outputs(&out_dir, &results, &chrome.version)?;
     println!("{} に report.jsonl・summary.txt・index.html を書いた", out_dir.display());
+    if let Ok(text) = std::fs::read_to_string(out_dir.join("summary.txt"))
+        && let Some(i) = text.find("## M2 の合否")
+    {
+        println!("{}", text[i..].lines().take(3).collect::<Vec<_>>().join("\n"));
+    }
     Ok(())
 }
 
@@ -244,9 +271,9 @@ fn one(
     let (k, css) = match resvg.tree(&svg) {
         Ok(t) => {
             let (w, h) = Resvg::size(&t);
-            let long = w.max(h).max(1);
-            let k = if min_side == 0 || long >= min_side { 1 } else { min_side.div_ceil(long) };
+            let k = crate::compare::scale_for(w, h, min_side);
             let (cw, ch) = Resvg::css_size(&t);
+            o.fractional = cw.fract() != 0.0 || ch.fract() != 0.0;
             (k, (cw * k as f32, ch * k as f32))
         }
         Err(e) => {
@@ -294,7 +321,10 @@ fn one(
     let b = match from_cache("b").filter(|b| b.w == a.w && b.h == a.h) {
         Some(b) => Some(b),
         None => match chrome.render(&path, a.w, a.h, css, work) {
-            Ok((b, _)) => Some(b),
+            Ok((b, attempts)) => {
+                o.chrome_attempts = attempts;
+                Some(b)
+            }
             Err(e) => {
                 o.chrome_error = format!("chrome：{e}");
                 None
@@ -312,7 +342,7 @@ fn one(
             let _ = image::write_png(&img.join(format!("{id}-d.png")), &d);
             o.sr = Some(m);
         }
-        None => o.error = format!("大きさが違う（sumie {}×{}・resvg {}×{}）", c.w, c.h, a.w, a.h),
+        None => o.size_mismatch = format!("大きさが違う（sumie {}×{}・resvg {}×{}）", c.w, c.h, a.w, a.h),
     }
     if let Some(b) = &b {
         o.sc = measure(&c, b).map(|x| x.0);
@@ -349,7 +379,10 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
         l = l
             .str("excluded", o.excluded.as_str())
             .str("error", o.error.as_str())
-            .str("chrome_error", o.chrome_error.as_str());
+            .str("size_mismatch", o.size_mismatch.as_str())
+            .str("chrome_error", o.chrome_error.as_str())
+            .int("chrome_attempts", u64::from(o.chrome_attempts))
+            .bool("fractional_size", o.fractional);
         jsonl.push_str(&l.to_json());
         jsonl.push('\n');
     }
@@ -374,19 +407,42 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
     for (r, n) in &reasons {
         let _ = writeln!(s, "  {r}：{n}");
     }
-    let measured: Vec<&Outcome> = set.iter().copied().filter(|o| o.sr.is_some()).collect();
+    // 測れたもの：sumie と resvg の差を測ったものと、大きさが違ったもの（外れに数える）
+    let measured: Vec<&Outcome> =
+        set.iter().copied().filter(|o| o.sr.is_some() || !o.size_mismatch.is_empty()).collect();
     let no_chrome = measured.iter().filter(|o| !o.chrome_error.is_empty()).count();
-    let errors: Vec<&Outcome> = set.iter().copied().filter(|o| o.sr.is_none()).collect();
+    let unmeasured: Vec<&Outcome> =
+        set.iter().copied().filter(|o| o.sr.is_none() && o.size_mismatch.is_empty()).collect();
+    let both: Vec<&&Outcome> = unmeasured.iter().filter(|o| o.error.starts_with("両方が断る")).collect();
+    let resvg_only: Vec<&&Outcome> = unmeasured.iter().filter(|o| o.error.starts_with("resvg だけが断る")).collect();
+    let errors: Vec<&&Outcome> = unmeasured
+        .iter()
+        .filter(|o| !o.error.starts_with("両方が断る") && !o.error.starts_with("resvg だけが断る"))
+        .collect();
     let _ = writeln!(
         s,
         "\n## sumie と resvg（ADR-15 の図形と単色の基準：8/255 を超える画素が 2% 以下・平らな所の差 2/255 以下）"
     );
     let pass = measured.iter().filter(|o| o.sr.as_ref().is_some_and(passes)).count();
-    let _ =
-        writeln!(s, "測れた {} 件・描けない {} 件・基準で通る {pass}/{}", measured.len(), errors.len(), measured.len());
+    let mismatched = measured.iter().filter(|o| !o.size_mismatch.is_empty()).count();
+    let _ = writeln!(
+        s,
+        "測れた {} 件（うち大きさが違う {mismatched} 件は外れ）・sumie が描けない {} 件・両方が断る {} 件・resvg だけが断る {} 件",
+        measured.len(),
+        errors.len(),
+        both.len(),
+        resvg_only.len()
+    );
+    let _ = writeln!(s, "基準で通る {pass}/{}", measured.len());
     if no_chrome > 0 {
         let _ = writeln!(s, "Chrome が撮れなかった {no_chrome} 件（sumie と resvg の合否には入れ、Chrome との差は空）");
     }
+    let retried = measured.iter().filter(|o| o.chrome_attempts > 1).count();
+    let fractional = measured.iter().filter(|o| o.fractional).count();
+    let _ = writeln!(
+        s,
+        "Chrome をやり直して撮れたもの：{retried} 件・大きさが整数でないもの（Chrome が引き伸ばす）：{fractional} 件"
+    );
     let goal = measured.iter().filter(|o| o.sr.as_ref().is_some_and(|m| ratio8(m) <= 0.005 && m.flat_max <= 2)).count();
     let _ = writeln!(s, "目標（0.5%）で通る {goal}/{}", measured.len());
     let mut r: Vec<f64> = measured.iter().filter_map(|o| o.sr.as_ref().map(ratio8)).collect();
@@ -404,11 +460,13 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
     }
     let flat_bad = measured.iter().filter(|o| o.sr.as_ref().is_some_and(|m| m.flat_max > 2)).count();
     let _ = writeln!(s, "平らな所の差が 2/255 を超える：{flat_bad} 件");
-    let pass_c = measured.iter().filter(|o| o.sc.as_ref().is_some_and(passes)).count();
-    let _ = writeln!(s, "\n## 参考：sumie と Chrome が同じ基準で通る {pass_c}/{}", measured.len());
-    let rc_pass = measured.iter().filter(|o| o.rc.as_ref().is_some_and(passes)).count();
-    let _ = writeln!(s, "参考：resvg と Chrome が同じ基準で通る {rc_pass}/{}", measured.len());
-    let cand: Vec<&&Outcome> = measured
+    // Chrome を撮れたものの中で比べる（M2 の合否）
+    let with_chrome: Vec<&&Outcome> = measured.iter().filter(|o| o.chrome_error.is_empty()).collect();
+    let pass_c = with_chrome.iter().filter(|o| o.sc.as_ref().is_some_and(passes)).count();
+    let rc_pass = with_chrome.iter().filter(|o| o.rc.as_ref().is_some_and(passes)).count();
+    let _ = writeln!(s, "\n## Chrome との差（Chrome を撮れた {} 件）", with_chrome.len());
+    let _ = writeln!(s, "sumie と Chrome が同じ基準で通る {pass_c}・resvg と Chrome が通る {rc_pass}");
+    let cand: Vec<&&&Outcome> = with_chrome
         .iter()
         .filter(|o| {
             o.rc.as_ref().is_some_and(passes)
@@ -416,14 +474,63 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
                 && !o.sc.as_ref().is_some_and(passes)
         })
         .collect();
-    let _ = writeln!(s, "\n## 不具合の候補（resvg と Chrome は近いのに sumie が両方から外れる）：{} 件", cand.len());
+    let known = |o: &Outcome| KNOWN.iter().find(|(p, _)| *p == o.path).map(|(_, r)| *r);
+    let unknown: Vec<&&&&Outcome> = cand.iter().filter(|o| known(o).is_none()).collect();
+    let _ = writeln!(
+        s,
+        "\n## 不具合の候補（resvg と Chrome は近いのに sumie が両方から外れる）：{} 件（既知の差 {}・理由のないもの {}）",
+        cand.len(),
+        cand.len() - unknown.len(),
+        unknown.len()
+    );
     for o in &cand {
-        let _ = writeln!(s, "  {}（id {}）", o.path, o.id);
+        match known(o) {
+            Some(r) => {
+                let _ = writeln!(s, "  {}（id {}）：既知の差：{r}", o.path, o.id);
+            }
+            None => {
+                let _ = writeln!(s, "  {}（id {}）：理由なし", o.path, o.id);
+            }
+        }
     }
+    // KNOWN に挙げたのに候補でなくなったもの（直ったか、集まりから外れた。一覧を見直す）
+    let stale: Vec<&str> = KNOWN.iter().map(|(p, _)| *p).filter(|p| !cand.iter().any(|o| o.path == *p)).collect();
+    if !stale.is_empty() {
+        let _ = writeln!(s, "既知の差に挙げたが候補でないもの（一覧を見直す）：");
+        for p in &stale {
+            let _ = writeln!(s, "  {p}");
+        }
+    }
+    let ok_count = pass_c >= rc_pass;
+    let ok_known = unknown.is_empty();
+    let _ = writeln!(
+        s,
+        "\n## M2 の合否（ADR-101）：{}\n  sumie と Chrome が通る数 {pass_c} ≥ resvg と Chrome が通る数 {rc_pass}：{}\n  理由のない不具合の候補 0 件（{} 件）：{}",
+        if ok_count && ok_known { "合格" } else { "不合格" },
+        if ok_count { "満たす" } else { "満たさない" },
+        unknown.len(),
+        if ok_known { "満たす" } else { "満たさない" }
+    );
     if !errors.is_empty() {
-        let _ = writeln!(s, "\n## 描けない（集まりの中）");
+        let _ = writeln!(s, "\n## sumie が描けない（集まりの中）");
         for o in &errors {
             let _ = writeln!(s, "  {}：{}", o.path, o.error);
+        }
+    }
+    for (title, list) in [("両方が断る（照合の外）", &both), ("resvg だけが断る（sumie は描く）", &resvg_only)]
+    {
+        if !list.is_empty() {
+            let _ = writeln!(s, "\n## {title}");
+            for o in list.iter() {
+                let _ = writeln!(s, "  {}：{}", o.path, o.error);
+            }
+        }
+    }
+    let mism: Vec<&&Outcome> = measured.iter().filter(|o| !o.size_mismatch.is_empty()).collect();
+    if !mism.is_empty() {
+        let _ = writeln!(s, "\n## 大きさが違う（外れ）");
+        for o in &mism {
+            let _ = writeln!(s, "  {}：{}", o.path, o.size_mismatch);
         }
     }
     std::fs::write(out_dir.join("summary.txt"), &s).map_err(|e| e.to_string())?;

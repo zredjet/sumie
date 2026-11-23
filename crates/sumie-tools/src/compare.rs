@@ -242,7 +242,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
 }
 
 /// 長い辺が `min_side` に満たないときの整数の倍率（0 なら 1）。
-fn scale_for(w: u32, h: u32, min_side: u32) -> u32 {
+pub(crate) fn scale_for(w: u32, h: u32, min_side: u32) -> u32 {
     let long = w.max(h).max(1);
     if min_side == 0 || long >= min_side { 1 } else { min_side.div_ceil(long) }
 }
