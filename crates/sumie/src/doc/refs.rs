@@ -141,7 +141,11 @@ fn paints(local: &[u8]) -> bool {
 
 /// marker を付ける要素。
 fn markable(local: &[u8]) -> bool {
-    matches!(local, b"line" | b"polyline" | b"polygon" | b"path" | b"use" | b"feImage")
+    // 図形のすべて（SVG 2・resvg と同じ。Chrome は path・line・polyline・polygon だけ。ADR-87 (3)）と、中身が受け継ぐ use・feImage
+    matches!(
+        local,
+        b"rect" | b"circle" | b"ellipse" | b"line" | b"polyline" | b"polygon" | b"path" | b"use" | b"feImage"
+    )
 }
 
 /// 受け継ぐ参照のプロパティ（順は INH_KINDS と同じ）。
@@ -582,6 +586,8 @@ pub(crate) fn build(
         }
     }
     start.push(edges.len() as u32)?;
+    // 要素の辺を作るだけの入れ物は、輪の取り除きと数えの前に捨てる（確保の山を小さくする。文書の 6 回目のレビュー）
+    drop((cx, inh, inh_cache, own_lists, switch_chosen, sheet_keys, inh_keys));
     let parts = Parts { start, edges, ledges, notes, hidden, inherit_bits };
     finish(doc, input, parts, lists.as_slice(), budget)
 }
@@ -975,9 +981,122 @@ fn count_instances(
     budget: &Budget<'_>,
 ) -> Result<u64, Error> {
     let budget = budget_ref(budget);
+    let nodes = doc.nodes.as_slice();
+    let n = nodes.len();
     let first = count_pass(doc, input, start, edges, inherit_bits, None, budget)?;
-    let second = count_pass(doc, input, start, edges, inherit_bits, Some(first.as_slice()), budget)?;
+    // 2 度目に要るのは取り除いた辺の行き先の 1 度目の数だけ（1 度目の表を先に捨てて確保の山を小さくする）
+    let mut targets: MVec<'_, u32> = MVec::new(budget);
+    for e in edges {
+        budget.spend(cost::OP_STEP)?;
+        if e.removed != 0 {
+            targets.push(e.target)?;
+        }
+    }
+    let kept = sort_dedup(budget, &mut targets)?;
+    let mut tallies: MVec<'_, Tally> = MVec::with_capacity(budget, kept)?;
+    for &t in targets.as_slice() {
+        budget.spend(cost::OP_STEP)?;
+        tallies
+            .push(first.as_slice().get(t as usize).copied().filter(|x| x.count != NOT_YET).unwrap_or(Tally::ZERO))?;
+    }
+    drop(first);
+    // 本当の輪を見分ける表：中身を作る参照の辺（取り除いたものも）が入ってくる節と、部分木の終わり
+    let mut is_in: MVec<'_, u8> = MVec::with_capacity(budget, n)?;
+    is_in.resize_to(n, 0)?;
+    for e in edges {
+        budget.spend(cost::OP_STEP)?;
+        if instancing(e, nodes, input)
+            && let Some(x) = is_in.get_mut(e.target as usize)
+        {
+            *x = 1;
+        }
+    }
+    let mut end: MVec<'_, u32> = MVec::with_capacity(budget, n)?;
+    let mut entered: MVec<'_, u32> = MVec::with_capacity(budget, n)?;
+    for (i, x) in nodes.iter().enumerate() {
+        budget.spend(cost::OP_STEP)?;
+        end.push(i as u32)?;
+        let own = is_in.get(i).copied().unwrap_or(0) != 0;
+        let up = if x.parent == NONE { NONE } else { entered.get(x.parent as usize).copied().unwrap_or(NONE) };
+        entered.push(if own { i as u32 } else { up })?;
+    }
+    // 子は親より後ろ（行きがけの順）なので、後ろから親へ終わりを伝える
+    for i in (0..n).rev() {
+        budget.spend(cost::OP_STEP)?;
+        let p = nodes.get(i).map_or(NONE, |x| x.parent);
+        let e = end.get(i).copied().unwrap_or(0);
+        if let Some(x) = end.get_mut(p as usize) {
+            *x = (*x).max(e);
+        }
+    }
+    let prev = Prev {
+        targets: targets.as_slice(),
+        tallies: tallies.as_slice(),
+        end: end.as_slice(),
+        entered: entered.as_slice(),
+        start,
+        edges,
+        n,
+    };
+    let second = count_pass(doc, input, start, edges, inherit_bits, Some(&prev), budget)?;
     Ok(second.as_slice().first().map_or(0, |t| t.count))
+}
+
+/// 2 度目の数えに渡す、取り除いた辺の行き先の 1 度目の数と、本当の輪を見分ける表。
+struct Prev<'a> {
+    /// 取り除いた辺の行き先（並べて重なりを除いたもの）と、その 1 度目の数
+    targets: &'a [u32],
+    tallies: &'a [Tally],
+    /// 節ごとの、部分木の終わり（行きがけの順で最後の子孫の番号）
+    end: &'a [u32],
+    /// 節ごとの、自分か最も近い祖先のうち、中身を作る参照の辺が入ってくる節（なければ NONE）
+    entered: &'a [u32],
+    start: &'a [u32],
+    edges: &'a [Edge],
+    /// XML の節の数（ここから後ろは並びの節）
+    n: usize,
+}
+
+impl Prev<'_> {
+    fn tally(&self, t: u32, budget: &Budget<'_>) -> Result<Tally, Error> {
+        let j = crate::mem::lower_bound_try(budget, self.targets, |&x| Ok(x < t))?;
+        Ok(match (self.targets.get(j), self.tallies.get(j)) {
+            (Some(&x), Some(&y)) if x == t => y,
+            _ => Tally::ZERO,
+        })
+    }
+
+    /// 要素 `x` から要素 `t` への取り除いた辺が本当の輪か：`t` が `x` 自身か祖先で、その間（`t` を除き `x` を含む）に
+    /// 参照の辺で入る節がない。このとき `x` はいつも `t` の中身として作られ、M2 は `t` を描いている途中なので描かない
+    /// （文書の 6 回目のレビュー）。
+    fn true_cycle_element(&self, x: u32, t: u32) -> bool {
+        if x as usize >= self.n || t as usize >= self.n {
+            return false;
+        }
+        let end = self.end.get(t as usize).copied().unwrap_or(0);
+        if t > x || x > end {
+            return false;
+        }
+        let a = self.entered.get(x as usize).copied().unwrap_or(NONE);
+        a == NONE || a <= t
+    }
+
+    /// 取り除いた辺 `x` → `t` が本当の輪か（`t` が並びの節なら、行き先のすべてが本当の輪のとき）。
+    fn true_cycle(&self, x: u32, t: u32, budget: &Budget<'_>) -> Result<bool, Error> {
+        if (t as usize) < self.n {
+            return Ok(self.true_cycle_element(x, t));
+        }
+        let a = self.start.get(t as usize).copied().unwrap_or(0);
+        let b = self.start.get((t as usize).saturating_add(1)).copied().unwrap_or(0);
+        for k in a..b {
+            budget.spend(cost::OP_STEP)?;
+            let Some(e) = self.edges.get(k as usize) else { continue };
+            if !self.true_cycle_element(x, e.target) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// 展開の数を 1 度数え、節ごとの数を返す（`prev` は 1 度目の数。あれば取り除いた辺の先をそれで足す）。
@@ -987,7 +1106,7 @@ fn count_pass<'b>(
     start: &[u32],
     edges: &[Edge],
     inherit_bits: &[u8],
-    prev: Option<&[Tally]>,
+    prev: Option<&Prev<'_>>,
     budget: &'b Budget<'b>,
 ) -> Result<MVec<'b, Tally>, Error> {
     let nodes = doc.nodes.as_slice();
@@ -1117,19 +1236,31 @@ fn count_pass<'b>(
                         let k = frame.edge;
                         frame.edge = frame.edge.saturating_add(1);
                         let Some(e) = edges.get(k as usize) else { continue };
-                        // 輪として取り除いた辺：1 度目は飛ばし、2 度目は先の 1 度目の数を足す（行き先へは入らない）
-                        let removed = e.removed != 0;
-                        if (removed && prev.is_none()) || !instancing(e, nodes, input) {
+                        if !instancing(e, nodes, input) {
                             continue;
                         }
-                        let prev_of = |t: u32| prev.and_then(|p| p.get(t as usize)).copied().unwrap_or(Tally::ZERO);
                         let from_use = is_use(top.node);
+                        // 輪として取り除いた辺：1 度目は飛ばす。2 度目は、本当の輪でなければ先の 1 度目の数を足す（行き先へは
+                        // 入らない。本当の輪は M2 も描かない。ADR-87 (1)）
+                        let removed = e.removed != 0;
+                        let prev_t = match prev {
+                            _ if !removed => None,
+                            None => continue,
+                            Some(p) if p.true_cycle(top.node, e.target, budget)? => {
+                                if e.kind == EDGE_USE && from_use {
+                                    frame.content = NONE;
+                                    frame.content_prev = 0;
+                                }
+                                continue;
+                            }
+                            Some(p) => Some(p.tally(e.target, budget)?),
+                        };
                         if e.kind == EDGE_USE && from_use {
                             frame.content = e.target;
                             frame.content_prev = u8::from(removed);
-                            if removed {
+                            if let Some(t) = prev_t {
                                 if let Some(a) = acc.last_mut() {
-                                    add(a, prev_of(e.target), 1, 1, 0, bits(top.node));
+                                    add(a, t, 1, 1, 0, bits(top.node));
                                 }
                                 continue;
                             }
@@ -1140,7 +1271,10 @@ fn count_pass<'b>(
                         // 辺は use の中身、marker、塗りの順に張るので、ここまでに数え終えている）。use の marker は中身の marker を
                         // 付ける要素の数の倍
                         let content = if frame.content_prev != 0 {
-                            Some(prev_of(frame.content))
+                            match prev {
+                                Some(p) => Some(p.tally(frame.content, budget)?),
+                                None => None,
+                            }
                         } else {
                             done.get(frame.content as usize).copied().filter(|t| t.count != NOT_YET)
                         };
@@ -1166,9 +1300,9 @@ fn count_pass<'b>(
                             }
                             _ => (2, 1, 0),
                         };
-                        if removed {
+                        if let Some(t) = prev_t {
                             if let Some(a) = acc.last_mut() {
-                                add(a, prev_of(e.target), link, mult, mult2, bits(top.node));
+                                add(a, t, link, mult, mult2, bits(top.node));
                             }
                             continue;
                         }

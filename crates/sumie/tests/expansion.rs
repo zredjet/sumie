@@ -245,8 +245,8 @@ fn count(defs: &[Def], e: &Elem, ctx: Ctx) -> u64 {
                 n = sat(n, count(defs, c, inner));
             }
         }
-        Kind::Rect => shape(&mut n),
-        Kind::Path => {
+        // marker は図形のすべてに付く（SVG 2・resvg と同じ）
+        Kind::Rect | Kind::Path => {
             shape(&mut n);
             // marker の中身の context-fill・context-stroke はこの要素の塗りと線
             if let Some(k) = marker {

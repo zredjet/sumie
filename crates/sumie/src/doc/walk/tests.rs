@@ -346,3 +346,34 @@ fn root_transform_origin_is_center() {
     assert!(root.1.ctm_known);
     ctm_is(root, [0.0, 1.0, -1.0, 0.0, 100.0, -100.0]);
 }
+
+/// `transform-origin: inherit`・`transform: inherit` は割合を割合のまま受け継ぎ、自分の参照の箱（最も近い表示の領域）で
+/// 解く（CSS Transforms 1・Chrome と同じ。根の inherit は初期の値 50% 50%。文書の 6 回目のレビュー。ADR-87 (2)）。
+#[test]
+fn percentages_inherit_as_percentages() {
+    // 根の viewBox の 50% は (50, 50)（文書の画素の (100, 100) でない）
+    let rows = run(&format!(
+        r##"<svg {X} width="200" height="200" viewBox="0 0 100 100"><rect id="r" style="transform-origin: inherit; transform: rotate(90deg)"/></svg>"##
+    ));
+    ctm_is(get(&rows, "r"), [0.0, 2.0, -2.0, 0.0, 200.0, 0.0]);
+    // 入れ子の svg の 50% 50% を受け継いだ子は、入れ子の viewBox（10 × 10）で解く
+    let rows = run(&format!(
+        r##"<svg {X} width="100" height="100"><svg width="100" height="100" viewBox="0 0 10 10" style="transform-origin: 50% 50%"><rect id="r" style="transform-origin: inherit; transform: rotate(90deg)"/></svg></svg>"##
+    ));
+    ctm_is(get(&rows, "r"), [0.0, 10.0, -10.0, 0.0, 100.0, 0.0]);
+    // 割合の平行移動も受け継いだ要素の箱で解く：入れ子の svg の 20% は外の 100 の 20、中の rect の 20% は 10 の 2
+    let rows = run(&format!(
+        r##"<svg {X} width="100" height="100"><svg width="100" height="100" viewBox="0 0 10 10" style="transform: translate(20%, 0)"><rect id="r" style="transform: inherit"/></svg></svg>"##
+    ));
+    ctm_is(get(&rows, "r"), [10.0, 0.0, 0.0, 10.0, 40.0, 0.0]);
+    // 根の inherit は初期の値 50% 50%
+    let rows = run(&format!(
+        r##"<svg {X} id="root" width="200" height="200" style="transform: scale(.5); transform-origin: inherit"/>"##
+    ));
+    ctm_is(get(&rows, "root"), [0.5, 0.0, 0.0, 0.5, 50.0, 50.0]);
+    // 割合を解く箱のない要素（fill-box）が割合を受け継ぐと解けない
+    let rows = run(&format!(
+        r##"<svg {X} width="100" height="100"><g style="transform: translate(20%, 0)"><rect id="r" style="transform-box: fill-box; transform: inherit"/></g></svg>"##
+    ));
+    assert!(!get(&rows, "r").1.ctm_known);
+}

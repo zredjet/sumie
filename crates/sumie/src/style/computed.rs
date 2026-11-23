@@ -137,11 +137,17 @@ pub(crate) struct Computed {
     pub(crate) sw_pct: f64,
     /// 要素の変形（`transform-origin` を含む。受け継がない）
     pub(crate) transform: Transform,
-    /// `transform` の計算した値の行列（原点を掛ける前。`transform: inherit` が受け継ぐ）
+    /// `transform` の計算した値の行列（原点を掛ける前。割合の平行移動は 0 にしたもの。`transform: inherit` が受け継ぐ）
     pub(crate) transform_raw: Transform,
-    /// `transform-origin` の点（ユーザー単位。受け継がない。`transform-origin: inherit` が受け継ぐ）
+    /// 割合の平行移動の係数（参照の箱の幅・高さ 1 あたり：[e の幅, e の高さ, f の幅, f の高さ]。受け継いだ要素が自分の
+    /// 参照の箱で解く。CSS Transforms 1・Chrome と同じ。文書の 6 回目のレビュー）
+    pub(crate) raw_coef: [f64; 4],
+    /// `transform-origin` の使う点（ユーザー単位。受け継がない）
     pub(crate) origin_x: f64,
     pub(crate) origin_y: f64,
+    /// `transform-origin` の計算した値（[横の長さ, 横の割合, 縦の長さ, 縦の割合]。割合のまま持ち、`transform-origin:
+    /// inherit` が受け継いで自分の参照の箱で解く。文書の 6 回目のレビュー）
+    pub(crate) origin_spec: [f64; 4],
     pub(crate) visibility: u8,
     pub(crate) display_none: u8,
     /// 変形が解けた（0 なら外接矩形が要る：木を作る段で解く）
@@ -150,11 +156,17 @@ pub(crate) struct Computed {
     pub(crate) sw_is_pct: u8,
     /// `transform-box` が view-box（初期の値。ほかは外接矩形が要る）
     pub(crate) box_vb: u8,
-    /// `transform-origin` の点が解けた（0 なら % を解く表示の領域がない。`transform-origin: inherit` が受け継ぐ。文書の 5 回目の
-    /// レビュー）
+    /// `transform-origin` の計算した値の長さが解けた（`transform-origin: inherit` が受け継ぐ。文書の 5 回目のレビュー）
     pub(crate) origin_known: u8,
-    pub(crate) pad: [u8; 1],
+    /// `transform_raw` の長さが解けた（割合を除く。`transform: inherit` が受け継ぐ）
+    pub(crate) raw_known: u8,
+    /// `transform_raw` に割合の平行移動がある（`raw_coef` を使う）
+    pub(crate) raw_pct: u8,
+    pub(crate) pad: [u8; 7],
 }
+
+/// `transform-origin` の 50% 50%（CSS の初期の値・根の svg の既定）。
+const ORIGIN_CENTER: [f64; 4] = [0.0, 50.0, 0.0, 50.0];
 
 impl Plain for Computed {}
 
@@ -179,8 +191,11 @@ impl Computed {
             sw_pct: 0.0,
             transform: Transform::IDENTITY,
             transform_raw: Transform::IDENTITY,
+            raw_coef: [0.0; 4],
             origin_x: 0.0,
             origin_y: 0.0,
+            // 根の `transform-origin: inherit` は CSS の初期の値
+            origin_spec: ORIGIN_CENTER,
             visibility: VISIBLE,
             display_none: 0,
             transform_known: 1,
@@ -188,7 +203,9 @@ impl Computed {
             sw_is_pct: 0,
             box_vb: 1,
             origin_known: 1,
-            pad: [0; 1],
+            raw_known: 1,
+            raw_pct: 0,
+            pad: [0; 7],
         }
     }
 }
@@ -393,9 +410,13 @@ pub(crate) fn compute(
         display_none: initial.display_none,
         transform: initial.transform,
         transform_raw: initial.transform_raw,
+        raw_coef: [0.0; 4],
         origin_x: 0.0,
         origin_y: 0.0,
+        origin_spec: [0.0; 4],
         origin_known: 1,
+        raw_known: 1,
+        raw_pct: 0,
         transform_known: initial.transform_known,
         box_vb: initial.box_vb,
         ..*parent
@@ -672,8 +693,10 @@ fn opacity(s: &Specified, bufs: &Bufs<'_>, budget: &Budget<'_>) -> Result<Option
     Ok(Some(math::clamp(v, 0.0, 1.0)))
 }
 
-/// `transform`・`transform-origin`・`transform-box` から要素の変形を求める。`transform: inherit` は親の原点を掛ける前の
-/// 行列を受け継ぎ、この要素の原点を掛ける。`transform-box: inherit` は親の箱（文書の 1 回目のレビュー）。
+/// `transform`・`transform-origin`・`transform-box` から要素の変形を求める。`transform: inherit` は親の計算した値（原点を
+/// 掛ける前の行列と割合の平行移動の係数）を、`transform-origin: inherit` は親の計算した値（長さと割合）を受け継ぎ、割合は
+/// この要素の参照の箱で解いてこの要素の原点を掛ける（ADR-87 (2)）。`transform-box: inherit` は親の箱（文書の 1 回目の
+/// レビュー）。
 fn transform(
     c: &mut Computed,
     parent: &Computed,
@@ -699,71 +722,116 @@ fn transform(
     let view_box = c.box_vb != 0 || base.outermost;
     let font = c.font_size;
     let line = c.line_height;
-    // 変形の原点（受け継がない。inherit は親の点。解けなければ (0, 0) で、変形があれば「解けない」印）
-    let mut origin_known = true;
-    // 根の svg の既定は表示の領域の真ん中（ADR-85 (1)）
-    let center = |known: &mut bool| match base.viewport {
-        Some((w, h)) => (w / 2.0, h / 2.0),
-        None => {
-            *known = false;
-            (0.0, 0.0)
-        }
-    };
-    if p.transform_origin.is_none() && base.outermost {
-        (c.origin_x, c.origin_y) = center(&mut origin_known);
-    }
+    // 変形の原点の計算した値（長さと割合。受け継がない。inherit は親の計算した値で、割合はこの要素の参照の箱で解く。
+    // CSS Transforms 1・Chrome と同じ。文書の 6 回目のレビュー）。既定は UA の規則の 0 0、根の svg は 50% 50%（ADR-85 (1)）
+    let mut og = if base.outermost { ORIGIN_CENTER } else { [0.0; 4] };
+    let mut og_known = true;
     if let Some(o) = p.transform_origin.as_ref() {
         budget.spend(cost::OP_STEP)?;
-        let (x, y) = match o.wide {
+        match o.wide {
             WIDE_INHERIT => {
-                origin_known = parent.origin_known != 0;
-                (parent.origin_x, parent.origin_y)
+                og = parent.origin_spec;
+                og_known = parent.origin_known != 0;
             }
             WIDE_NONE => match origin(o, bufs, font, line, base, budget)? {
-                Some(pt) => pt,
+                Some(v) => og = v,
                 None => {
-                    origin_known = false;
-                    (0.0, 0.0)
+                    og = [0.0; 4];
+                    og_known = false;
                 }
             },
             // initial・unset は CSS の初期の値 50% 50%（SVG の要素の 0 0 は UA の規則の値で、initial はそれを上書きする。
-            // Chrome と同じ。文書の 4 回目のレビュー）。参照の箱は view-box（最も近い表示の領域）
-            _ => center(&mut origin_known),
-        };
-        c.origin_x = x;
-        c.origin_y = y;
+            // Chrome と同じ。文書の 4 回目のレビュー）
+            _ => og = ORIGIN_CENTER,
+        }
     }
-    c.origin_known = u8::from(origin_known);
+    c.origin_spec = og;
+    c.origin_known = u8::from(og_known);
+    // 使う点（割合は参照の箱で解く。view-box は最も近い表示の領域。解けなければ (0, 0) で、変形があれば「解けない」印）
+    let (ox, oy, origin_known) = match place(og, base.viewport) {
+        Some((x, y)) => (x, y, og_known),
+        None => (0.0, 0.0, false),
+    };
+    c.origin_x = ox;
+    c.origin_y = oy;
     let Some(s) = p.transform.as_ref() else { return Ok(()) };
     budget.spend(cost::OP_STEP)?;
+    // 計算した値：原点を掛ける前の行列と、割合の平行移動の係数（受け継いだ要素が自分の参照の箱で解く）
+    let mut raw = (Transform::IDENTITY, [0.0; 4], true, false);
     let (m, mut known) = match s.wide {
-        WIDE_INHERIT => (parent.transform_raw, parent.transform_known != 0),
+        WIDE_INHERIT => {
+            raw = (parent.transform_raw, parent.raw_coef, parent.raw_known != 0, parent.raw_pct != 0);
+            let (rm, coef, rk, pct) = raw;
+            match base.viewport {
+                _ if !pct => (rm, rk),
+                Some((w, h)) if view_box => {
+                    let e = rm.e + coef[0] * w + coef[1] * h;
+                    let f = rm.f + coef[2] * w + coef[3] * h;
+                    (Transform { e, f, ..rm }, rk)
+                }
+                _ => (rm, false),
+            }
+        }
         WIDE_INITIAL | WIDE_UNSET => (Transform::IDENTITY, true),
-        _ if s.origin == ORIGIN_ATTR => match values::transform_attr(bufs.of(s.src), s.value, budget)? {
-            Some(m) => (m, true),
-            None => (Transform::IDENTITY, true),
-        },
+        _ if s.origin == ORIGIN_ATTR => {
+            let m = values::transform_attr(bufs.of(s.src), s.value, budget)?.unwrap_or(Transform::IDENTITY);
+            raw.0 = m;
+            (m, true)
+        }
         _ => {
+            let mut saw_pct = false;
             let mut res = |l: Length, horizontal: bool| {
                 let axis = if horizontal { Axis::X } else { Axis::Y };
-                if l.unit == Unit::Percent && !view_box {
-                    return None;
+                if l.unit == Unit::Percent {
+                    saw_pct = true;
+                    if !view_box {
+                        return None;
+                    }
                 }
                 resolve(l, font, line, base, axis)
             };
-            match values::transform_css(bufs.of(s.src), s.value, base.doc.is_some(), &mut res, budget)? {
-                Some((m, ok)) => (m, ok),
-                None => (Transform::IDENTITY, true),
+            let (m, ok) = values::transform_css(bufs.of(s.src), s.value, base.doc.is_some(), &mut res, budget)?
+                .unwrap_or((Transform::IDENTITY, true));
+            raw = (m, [0.0; 4], ok, false);
+            if saw_pct {
+                // 割合を 0・幅 1・高さ 1 で解いた行列から係数を求める
+                let eval = |wx: f64, hy: f64| {
+                    let mut r = |l: Length, horizontal: bool| {
+                        if l.unit == Unit::Percent {
+                            let k = if horizontal { wx } else { hy };
+                            return Some(l.value * k / 100.0);
+                        }
+                        resolve(l, font, line, base, if horizontal { Axis::X } else { Axis::Y })
+                    };
+                    values::transform_css(bufs.of(s.src), s.value, base.doc.is_some(), &mut r, budget)
+                };
+                if let (Some((m0, ok0)), Some((mx, _)), Some((my, _))) =
+                    (eval(0.0, 0.0)?, eval(1.0, 0.0)?, eval(0.0, 1.0)?)
+                {
+                    let coef = [mx.e - m0.e, my.e - m0.e, mx.f - m0.f, my.f - m0.f];
+                    raw = if m0.finite() && coef.iter().all(|x| x.is_finite()) {
+                        (m0, coef, ok0, true)
+                    } else {
+                        (Transform::IDENTITY, [0.0; 4], false, false)
+                    };
+                }
             }
+            (m, ok)
         }
     };
     if !m.finite() {
         c.transform = Transform::IDENTITY;
         c.transform_raw = Transform::IDENTITY;
+        c.raw_coef = [0.0; 4];
+        c.raw_known = 0;
+        c.raw_pct = 0;
         c.transform_known = 0;
         return Ok(());
     }
-    c.transform_raw = m;
+    c.transform_raw = raw.0;
+    c.raw_coef = raw.1;
+    c.raw_known = u8::from(raw.2);
+    c.raw_pct = u8::from(raw.3);
     if m == Transform::IDENTITY {
         c.transform = m;
         c.transform_known = u8::from(known);
@@ -776,7 +844,6 @@ fn transform(
     if !origin_known {
         known = false;
     }
-    let (ox, oy) = (c.origin_x, c.origin_y);
     let to = Transform { e: ox, f: oy, ..Transform::IDENTITY };
     let back = Transform { e: -ox, f: -oy, ..Transform::IDENTITY };
     let t = to.then(&m).then(&back);
@@ -785,7 +852,23 @@ fn transform(
     Ok(())
 }
 
-/// `transform-origin` の点（参照の箱は view-box：原点は 0, 0、大きさは最も近い表示の領域）。3 つめ（z）は使わない。
+/// 原点の計算した値を参照の箱（幅・高さ）で解く（割合のない成分は箱が要らない）。有限でなければ None。
+fn place(o: [f64; 4], viewport: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    let [ax, px, ay, py] = o;
+    let comp = |a: f64, p: f64, r: Option<f64>| -> Option<f64> {
+        if p == 0.0 {
+            return Some(a);
+        }
+        let v = p * r? / 100.0;
+        Some(if a == 0.0 { v } else { a + v })
+    };
+    let x = comp(ax, px, viewport.map(|v| v.0))?;
+    let y = comp(ay, py, viewport.map(|v| v.1))?;
+    (x.is_finite() && y.is_finite()).then_some((x, y))
+}
+
+/// `transform-origin` の計算した値（[横の長さ, 横の割合, 縦の長さ, 縦の割合]。割合は参照の箱で解く。3 つめ（z）は使わない）。
+/// 形が壊れているか長さが解けなければ None。
 fn origin(
     s: &Specified,
     bufs: &Bufs<'_>,
@@ -793,7 +876,7 @@ fn origin(
     line: f64,
     base: &Base,
     budget: &Budget<'_>,
-) -> Result<Option<(f64, f64)>, Error> {
+) -> Result<Option<[f64; 4]>, Error> {
     let budget = budget_ref(budget);
     let mut v = Values::new(bufs.of(s.src), s.value, budget);
     let pct = |p: f64| Length::new(p, Unit::Percent);
@@ -834,7 +917,13 @@ fn origin(
         _ if a.0 == 1 || b.0 == 0 => (b.1, a.1),
         _ => (a.1, b.1),
     };
-    Ok(resolve(x, font, line, base, Axis::X).zip(resolve(y, font, line, base, Axis::Y)))
+    let split = |l: Length, axis: Axis| -> Option<(f64, f64)> {
+        if l.unit == Unit::Percent {
+            return Some((0.0, l.value));
+        }
+        resolve(l, font, line, base, axis).map(|a| (a, 0.0))
+    };
+    Ok(split(x, Axis::X).zip(split(y, Axis::Y)).map(|((ax, px), (ay, py))| [ax, px, ay, py]))
 }
 
 fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {

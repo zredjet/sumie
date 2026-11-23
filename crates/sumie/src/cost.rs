@@ -16,6 +16,16 @@ pub(crate) const COPY_BYTES_PER_UNIT: u64 = 16;
 pub(crate) const MERGE_STEP: u64 = 4;
 /// 2 分の探索の 1 歩の手間。
 pub(crate) const SEARCH_STEP: u64 = 8;
+/// id の表の 2 分の探索で、表が大きいとき 1 歩に足す手間（1 歩で表・属性・入力の 3 か所を散らばって読み、表が大きいと
+/// キャッシュに乗らず 1 歩が数十 ns になる。id 20 万を散らばった順に引くと 2.2 ns／単位だった。文書の 6 回目のレビュー）。
+pub(crate) const ID_PROBE_LARGE: u64 = 64;
+/// 足さない表の大きさ（id の数）。
+pub(crate) const ID_PROBE_SMALL: u64 = 4096;
+
+/// `n` 個の id の表を引く 1 歩に足す手間。
+pub(crate) const fn id_probe(n: u64) -> u64 {
+    if n > ID_PROBE_SMALL { ID_PROBE_LARGE } else { 0 }
+}
 
 /// 切り上げの割り算（`b` が 0 なら `a`）。
 const fn ceil_div(a: u64, b: u64) -> u64 {

@@ -561,8 +561,55 @@ fn removed_cycle_edges_count_one_level() {
         run(&format!("<pattern id=\"p\"><use href=\"#r\"/>{rects}</pattern><g fill=\"url(#p)\"><rect id=\"r\"/></g>"));
     assert!(cycles > 0);
     assert!(n >= 100, "{n}");
-    // 本当の輪（use が自分を含む g を指す）も 1 段だけ足す（M2 は文脈で輪と確かめて描かない。数えすぎの側）
+    // 本当の輪（use が自分を含む g を指す）は足さない（M2 も描かない。文書の 6 回目のレビュー）：根・g・use・rect 100
     let (_, _, n, cycles) = run(&format!("<g id=\"g\"><use href=\"#g\"/>{rects}</g>"));
     assert!(cycles > 0);
-    assert!((100..=1000).contains(&n), "{n}");
+    assert_eq!(n, 3 + 100);
+}
+
+/// 本当の輪（取り除いた辺の行き先が自分か祖先で、その間に参照で入る節がない）は、2 度目の数えで先を足さない。足すと
+/// 「中の要素の数 × 参照の数」に数えすぎ、resvg が描く文書を断っていた（文書の 6 回目のレビュー。ADR-87 (1)）。
+#[test]
+fn true_cycles_are_not_counted_twice() {
+    // marker の中の path にも規則で marker が付く：根・style・marker と、矢印ごとに path 1 ＋ marker 1 ＋ 中の path 20
+    let inner = "<path d=\"M0 0L1 1\"/>".repeat(20);
+    let arrows = "<path d=\"M0 0L1 1\"/>".repeat(100);
+    let (_, _, n, cycles) =
+        run(&format!("<style>path{{marker-end:url(#m)}}</style><marker id=\"m\">{inner}</marker>{arrows}"));
+    assert!(cycles > 0);
+    assert_eq!(n, 3 + 100 * 22);
+    // pattern の中の rect にも規則で同じ pattern の塗り：rect ごとに 1 ＋ pattern 1 ＋ 中の rect 10
+    let inner = "<rect/>".repeat(10);
+    let rects = "<rect/>".repeat(100);
+    let (_, _, n, cycles) =
+        run(&format!("<style>rect{{fill:url(#p)}}</style><pattern id=\"p\">{inner}</pattern>{rects}"));
+    assert!(cycles > 0);
+    assert_eq!(n, 3 + 100 * 12);
+    // mask も同じ
+    let (_, _, n, _) = run(&format!("<style>rect{{mask:url(#k)}}</style><mask id=\"k\">{inner}</mask>{rects}"));
+    assert_eq!(n, 3 + 100 * 12);
+    // 自分を含む g を指す use が 15：根・g・use 15
+    let uses = "<use href=\"#g\"/>".repeat(15);
+    let (_, _, n, _) = run(&format!("<g id=\"g\">{uses}</g>"));
+    assert_eq!(n, 2 + 15);
+    // 間の節が参照で入るなら輪でない実体があるので足す：use が中の g を指すと、その中の rect は p の中身でない
+    let (_, _, n, _) =
+        run(&format!("<pattern id=\"p\"><g id=\"q\"><rect fill=\"url(#p)\"/></g>{inner}</pattern><use href=\"#q\"/>"));
+    assert!(n >= 2 + 1 + 2 + 12, "{n}");
+}
+
+/// marker は図形のすべてに付く（SVG 2・resvg と同じ。rect・circle・ellipse も数える。ADR-87 (3)）。
+#[test]
+fn markers_on_all_shapes() {
+    let inner = "<rect/>".repeat(10);
+    for shape in
+        ["<rect marker-end=\"url(#m)\"/>", "<circle marker-end=\"url(#m)\"/>", "<ellipse marker-end=\"url(#m)\"/>"]
+    {
+        let (_, _, n, _) = run(&format!("<marker id=\"m\">{inner}</marker>{}", shape.repeat(5)));
+        // 根・marker と、図形ごとに 1 ＋ marker 1 ＋ 中の rect 10
+        assert_eq!(n, 2 + 5 * 12, "{shape}");
+    }
+    // 文字には付かない
+    let (_, _, n, _) = run(&format!("<marker id=\"m\">{inner}</marker><text marker-end=\"url(#m)\">a</text>"));
+    assert_eq!(n, 3);
 }

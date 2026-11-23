@@ -820,6 +820,8 @@ pub fn document_parse_cancel(data: &[u8], cancel: &dyn Cancel) -> DocOutcome {
                 let t = [c.transform, c.transform_raw, v.ctm];
                 let ok = [c.font_size, c.line_height, c.stroke_width, c.opacity, c.origin_x, c.origin_y]
                     .iter()
+                    .chain(c.raw_coef.iter())
+                    .chain(c.origin_spec.iter())
                     .all(|x| x.is_finite())
                     && t.iter().all(|m| [m.a, m.b, m.c, m.d, m.e, m.f].iter().all(|x| x.is_finite()));
                 if !ok {
@@ -982,6 +984,9 @@ pub fn computed_values(d: &crate::Document<'_>, f: &mut dyn FnMut(&ComputedItem<
                     id: attr_id(t)?.unwrap_or(&[]),
                 },
                 Used::Cut => UsedPaint::Cut,
+                // 描く木の要素（walk は use・marker の中身を展開しない）には文脈の要素がないので none（FR-PT-01。文書の
+                // 6 回目のレビュー）。描かない要素（marker の中など）は文脈の印のまま
+                Used::ContextFill | Used::ContextStroke if v.rendered => UsedPaint::None,
                 Used::ContextFill => UsedPaint::ContextFill,
                 Used::ContextStroke => UsedPaint::ContextStroke,
             })
