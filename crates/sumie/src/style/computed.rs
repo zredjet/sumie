@@ -981,15 +981,12 @@ fn line_style(
             }
             Some(false) => c.line.dash_src = DASH_NONE,
             None => {
-                if keyword(s, &[b"none"])? == Some(0) {
-                    c.line.dash_src = DASH_NONE;
-                } else {
-                    c.line.dash = s.value;
-                    c.line.dash_src = s.src;
-                    let unitless =
-                        PROPS.get(usize::from(s.prop)).is_some_and(|p| p.unitless) || s.origin == ORIGIN_ATTR;
-                    c.line.dash_unitless = u8::from(unitless);
-                }
+                // 値は読まずに宣言の場所だけを持つ（`none` も。木を作る段が宣言ごとに 1 度だけ読み、none と読めない値は
+                // 実線にする。展開した要素ごとに字句を読まない：単位 3 のレビュー）
+                c.line.dash = s.value;
+                c.line.dash_src = s.src;
+                let unitless = PROPS.get(usize::from(s.prop)).is_some_and(|p| p.unitless) || s.origin == ORIGIN_ATTR;
+                c.line.dash_unitless = u8::from(unitless);
             }
         }
     }
@@ -1113,14 +1110,10 @@ fn geometry(
             }
             Some(false) => c.geo.d_src = DASH_NONE,
             None => {
-                let is_attr = s.origin == ORIGIN_ATTR;
-                if !is_attr && Values::new(bufs.of(s.src), s.value, budget).eat_ident(b"none")? {
-                    c.geo.d_src = DASH_NONE;
-                } else {
-                    c.geo.d = s.value;
-                    c.geo.d_src = s.src;
-                    c.geo.d_attr = u8::from(is_attr);
-                }
+                // 値は読まずに宣言の場所だけを持つ（CSS の `none` は木を作る段が path() でないとして何も描かない）
+                c.geo.d = s.value;
+                c.geo.d_src = s.src;
+                c.geo.d_attr = u8::from(s.origin == ORIGIN_ATTR);
             }
         }
     }

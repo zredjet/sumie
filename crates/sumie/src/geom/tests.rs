@@ -207,3 +207,31 @@ fn rect_ops() {
     let t = Transform { a: 0.0, b: 1.0, c: -1.0, d: 0.0, e: 0.0, f: 0.0 };
     assert_eq!(u.transformed(&t), Rect { x0: -5.0, y0: -1.0, x1: 0.0, y1: 1.0 });
 }
+
+/// ほぼ 2 次の 3 次曲線でも極を落とさない（桁の落ちない根の公式。単位 1 の 3 回目のレビュー）。
+#[test]
+fn nearly_quadratic_cubic_bounds() {
+    let seg = PathSeg::Cubic(
+        Point::new(0.0, 0.0),
+        Point::new(1e6, 0.0),
+        Point::new(0.0, 0.0),
+        Point::new(-2.9999999999999995e6, 0.0),
+    );
+    let mut r = Rect::EMPTY;
+    add_bounds(&mut r, &seg);
+    assert!(r.x1 > 374_000.0, "{r:?}");
+    let seg =
+        PathSeg::Cubic(Point::new(0.0, 10.0), Point::new(-8e6, 40.0), Point::new(-8e6, 60.0), Point::new(5e-10, 90.0));
+    let mut r = Rect::EMPTY;
+    add_bounds(&mut r, &seg);
+    assert!(r.x0 < -5.9e6, "{r:?}");
+    let seg = PathSeg::Cubic(
+        Point::new(0.0, 0.0),
+        Point::new(0.0, 2000.0),
+        Point::new(1000.0, 0.0),
+        Point::new(1000.0, -5999.999999999999),
+    );
+    let mut r = Rect::EMPTY;
+    add_bounds(&mut r, &seg);
+    assert!(r.y1 > 400.0, "{r:?}");
+}

@@ -230,6 +230,8 @@ const POINTER_EVENTS: &[&[u8]] = &[
 /// 表（名前のバイトの順）。
 pub(crate) const PROPS: &[Prop] = &[
     p(b"alignment-baseline", false, true, Kind::Keywords(ALIGNMENT)),
+    // 根の svg の背景（CSS のプロパティとしてだけ。属性は読まない。resvg・Chrome と同じく描く。ADR-97 (4)）
+    p(b"background-color", false, false, Kind::Color),
     pu(b"baseline-shift", false, true, Kind::BaselineShift),
     p(b"clip", false, true, Kind::Raw),
     p(b"clip-path", false, true, Kind::ClipPath),

@@ -103,6 +103,7 @@
 | FR-PT-02 | M | 色：SVG の 147 の名前・`#rgb`・`#rgba`・`#rrggbb`・`#rrggbbaa`・`rgb()`・`rgba()`・`hsl()`・`hsla()`・`transparent`。CSS Color 4 の `/` の α と `hwb()` も読む。システムの色は読まない。`lab()`・`oklch()` などは M1 では読まずに警告し、照らしてから決める（ADR-66 (4)） |
 | FR-PT-03 | M | `fill-rule`・`fill-opacity`・`stroke-opacity`・`stroke-width`・`stroke-linecap`・`stroke-linejoin`（`miter`・`round`・`bevel`。SVG 2 の `miter-clip`・`arcs` は Chrome と同じく壊れた値。ADR-91 (1)）・`stroke-miterlimit`（負だけが壊れた値。1 未満は継ぎ目がいつも bevel。ADR-76）・`stroke-dasharray`（奇数個は 2 度並べる・% ・負や合計 0 は実線）・`stroke-dashoffset` |
 | FR-PT-04 | M | `paint-order`・`vector-effect: non-scaling-stroke`・`shape-rendering`（`crispEdges` は反エイリアスなし。`optimizeSpeed` は resvg と同じ扱い。M2 で照らす） |
+| FR-PT-04b | M | 描く座標系の太さが 1 画素以下の反エイリアスの線は、描く座標系の 1 画素の線を太さ（2 つの軸の太さの平均）の α で描く（Chrome・resvg の細い線と同じ。ADR-97 (2)） |
 | FR-PT-05 | M | `linearGradient`・`radialGradient`：`gradientUnits`・`gradientTransform`・`spreadMethod`（pad・reflect・repeat）・`href` の鎖での属性と stop の受け継ぎ（輪は FR-CO-05）・焦点（`fx`・`fy`・SVG 2 の `fr`）・stop の offset の切り詰めと単調化・`stop-color`・`stop-opacity`。stop が 1 つなら単色、0 なら塗らない。stop が多くても・同じ offset が多くても、画素ごとの仕事は stop の数に比例しない（Kura の S2・S3） |
 | FR-PT-06 | M | `pattern`：`patternUnits`・`patternContentUnits`・`patternTransform`・`viewBox`・`preserveAspectRatio`・`x`・`y`・`width`・`height`・`href` の鎖での受け継ぎ・入れ子の pattern |
 | FR-PT-07 | M | `marker`：`marker-start`・`marker-mid`・`marker-end` と CSS の `marker`、`orient`（角度・`auto`・`auto-start-reverse`）・`markerUnits`・`refX`・`refY`・`viewBox`・`preserveAspectRatio`・`markerWidth`・`markerHeight`・切り取り。付ける図形は SVG 2・resvg と同じ図形のすべて（`path`・`line`・`polyline`・`polygon`・`rect`・`circle`・`ellipse`。Chrome は前の 4 つだけ。ADR-87 (3)）。marker の中の marker は描かない |
@@ -214,6 +215,7 @@
 | FR-OUT-02 | M | 大きさは、照合の集まりのすべての入力で resvg 0.48.1 と同じ画素になる（Kura の編集の文書は画素の座標を持つので、大きさが変わると壊れる）。resvg の 32 ビットの丸めに合わせる必要があれば、大きさの計算だけ合わせる（M1 で確かめる） |
 | FR-OUT-03 | M | 倍率（正の有限の数）。描く座標系は「ユーザー単位 × 倍率」。倍率・出力のバッファの大きさと行のバイト数・範囲が正しくなければ `Invalid`（理由は呼び手の誤り。位置なし） |
 | FR-OUT-04 | M | 出力は呼び手が渡す RGBA8 の乗算済みのバッファ（幅・高さ・行のバイト数）。描く前に全体を透明にする。色は sRGB のまま（色の管理をしない。ADR-17） |
+| FR-OUT-04b | M | 根の svg の CSS の `background-color`（属性でなくプロパティ。`currentColor` は根の `color`）で、描く前にキャンバスの全体を塗る（resvg・Chrome と同じ。`background` のまとめは読まない。ADR-97 (4)） |
 | FR-OUT-05 | M | 範囲の描画（`render_region`・`estimate_region`）：全体を描いて同じ範囲を切り出したものとビット単位で同じ（ADR-13） |
 | FR-OUT-06 | M | 形（§1.3）を通ったものは、同じ上限・同じ資源・同じ倍率なら、計画と描く段で `Limit`・`Unsupported` にならない（確保の失敗と中止を除く）。どの誤りをどの段で決めるかは architecture.md §3.1（ADR-37）。範囲が全体に含まれるなら、範囲の見積もりは全体の描画の見積もりを超えない |
 

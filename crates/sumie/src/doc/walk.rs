@@ -307,7 +307,10 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
             return Ok(true);
         }
         let Some(n) = nodes.get(next as usize) else { return Ok(true) };
-        let hidden = d.refs.hidden.as_slice().get(next as usize).copied().unwrap_or(0) != 0;
+        // 自分の条件が偽なら描かない。親の switch が選ばない印は、use の参照先として入ったときは効かない（Chrome・usvg と
+        // 同じ。refs の HIDDEN_SWITCH。単位 3 のレビュー）
+        let mark = d.refs.hidden.as_slice().get(next as usize).copied().unwrap_or(0);
+        let hidden = if top.single != 0 { mark & crate::doc::refs::HIDDEN_SELF != 0 } else { mark != 0 };
         let vp = (top.has_vp != 0).then_some((top.vp_w, top.vp_h));
         let b = Base { viewport: vp, ..self.base };
         let comp = compute(&top.computed, d.styles.of(next), &self.ids, &self.bufs, &b, budget)?;
@@ -362,7 +365,8 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
             let y = len0(b"y", Axis::Y)?;
             let full =
                 |axis: Axis| resolve(Length::new(100.0, Unit::Percent), comp.font_size, comp.line_height, &b, axis);
-            let use_node = if symbol_instance { nodes.get(top.node as usize) } else { None };
+            // use の参照先の svg と symbol は use の width・height が勝つ（SVG 2 §5.6）
+            let use_node = if top.single != 0 { nodes.get(top.node as usize) } else { None };
             let size_of = |name: &[u8], axis: Axis| -> Result<Option<f64>, Error> {
                 if let Some(u) = use_node
                     && let Some(v) = attr_len(doc, input, u, name, &comp, &b, axis, budget)?
@@ -516,11 +520,26 @@ fn overflow_visible(
     let budget = budget_ref(budget);
     for s in d.styles.of(node) {
         budget.spend(cost::OP_STEP)?;
-        if Some(s.prop) != id || s.wide != crate::style::cascade::WIDE_NONE {
+        if Some(s.prop) != id {
             continue;
         }
+        // initial・unset は初期の値 visible（受け継がない）。inherit は切るとみなす（M2 は描かない側に倒す）
+        match s.wide {
+            crate::style::cascade::WIDE_NONE => {}
+            crate::style::cascade::WIDE_INHERIT => return Ok(false),
+            _ => return Ok(true),
+        }
+        // 1 つか 2 つの言葉（横・縦）がどれも visible か auto なら見える
         let mut v = Values::new(bufs.of(s.src), s.value, budget);
-        return Ok(v.eat_ident(b"visible")? || v.eat_ident(b"auto")?);
+        let mut any = false;
+        while !v.at_end()? {
+            budget.spend(cost::OP_STEP)?;
+            if !(v.eat_ident(b"visible")? || v.eat_ident(b"auto")?) {
+                return Ok(false);
+            }
+            any = true;
+        }
+        return Ok(any);
     }
     Ok(false)
 }

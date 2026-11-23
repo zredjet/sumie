@@ -18,6 +18,8 @@ use crate::tree::{CAP_BUTT, JOIN_MITER, PathNode};
 use crate::values::Length;
 
 mod adversarial;
+mod review_u1;
+mod review_u2;
 
 /// 試しの木を組む口。
 struct Builder {
@@ -102,6 +104,7 @@ impl Builder {
             root_font: 16.0,
             root_line: 19.2,
             doc_size: None,
+            background: [0.0; 4],
             report,
         }
     }

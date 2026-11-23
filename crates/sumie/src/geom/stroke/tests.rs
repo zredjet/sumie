@@ -321,3 +321,17 @@ fn direction_of_huge_coordinates() {
     assert!(seg_len(Point::new(-1.5e308, 0.0), Point::new(1.5e308, 0.0)).is_infinite());
     assert_eq!(seg_len(Point::new(1.0, 1.0), Point::new(4.0, 5.0)), 5.0);
 }
+
+/// 境の足し算が進まない小さな隙間は長さ 0 の部分と同じに扱い、残りを捨てない（単位 1 の 3 回目のレビュー）。
+#[test]
+fn tiny_gaps_do_not_drop_the_rest() {
+    let p = pieces(&[(0.0, 50.0), (200.0, 50.0)], false, &[30.0, 1e-15, 30.0, 1e-15], 0.0);
+    let last = p.last().unwrap();
+    assert_eq!(last.last().unwrap().x, 200.0);
+    // 遠い所で隙間が小さすぎて進まない：隙間は長さ 0 と同じで、残りを描く
+    let p = pieces(&[(-99950.0, 50.0), (100050.0, 50.0)], false, &[99999.0, 1e-12], 0.0);
+    assert_eq!(p.last().unwrap().last().unwrap().x, 100050.0);
+    // 線の部分も隙間も小さすぎて 1 周しても進まない：残りは線（区間の中の位置が大きくなってから）
+    let p = pieces(&[(0.0, 0.0), (1e6, 0.0)], false, &[999_999.0, 1e-12, 1e-12, 1e-12], 0.0);
+    assert_eq!(p.last().unwrap().last().unwrap().x, 1e6);
+}

@@ -49,13 +49,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
         let mut l = Line::new().str("file", f.as_str());
         let popts = sumie::ParseOptions::DEFAULT;
         let pe = sumie::estimate_parse(&svg, &popts, &sumie::Never);
-        let (doc, parse_ms) = match min_time(repeat, || sumie::parse(&svg, &popts, &sumie::Never).map_err(|e| format!("{e:?}"))) {
-            Ok(x) => x,
-            Err(e) => {
-                println!("{}", l.str("refused", format!("parse：{e}")).to_json());
-                continue;
-            }
-        };
+        let (doc, parse_ms) =
+            match min_time(repeat, || sumie::parse(&svg, &popts, &sumie::Never).map_err(|e| format!("{e:?}"))) {
+                Ok(x) => x,
+                Err(e) => {
+                    println!("{}", l.str("refused", format!("parse：{e}")).to_json());
+                    continue;
+                }
+            };
         l = l.int("parse_work", pe.map(|e| e.work).unwrap_or(0)).str("parse_ms", format!("{parse_ms:.3}"));
         let be = match doc.estimate_build(&sumie::Never) {
             Ok(e) => e,
@@ -83,7 +84,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 continue;
             }
         };
-        let (plan, plan_ms) = match min_time(repeat, || tree.plan(&ropts, &sumie::Never).map_err(|e| format!("{e:?}"))) {
+        let (plan, plan_ms) = match min_time(repeat, || tree.plan(&ropts, &sumie::Never).map_err(|e| format!("{e:?}")))
+        {
             Ok(x) => x,
             Err(e) => {
                 println!("{}", l.int("plan_work", re.plan.work).str("refused", format!("plan：{e}")).to_json());

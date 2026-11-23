@@ -9,13 +9,17 @@
 use crate::budget::Budget;
 use crate::cost;
 use crate::error::Error;
-use crate::mem::{MVec, Plain};
-use crate::style::cascade::{ORIGIN_ATTR, Styles, WIDE_NONE};
+use crate::mem::{MVec, Plain, lower_bound_try, stable_sort};
+use crate::style::cascade::{ORIGIN_ATTR, SRC_SHEET, Styles, WIDE_NONE};
 use crate::style::props::lookup;
+use crate::xml::lex::Span;
 use crate::xml::{KIND_ELEMENT, NONE, NS_NONE, NS_SVG, XmlDoc};
 
-/// 木のパスの節（`tree::PathNode`）の大きさ（doc は層の下なので木の型を見ない。木の試験が同じことを確かめる）。
+/// 木のパスの節（`tree::PathNode`）と、木を作る段の宣言の鍵と読んだ結果の大きさ（doc は層の下なので木の型を見ない。木の
+/// 試験が同じことを確かめる）。
 pub(crate) const PATH_NODE_BYTES: u64 = 240;
+pub(crate) const KEY_BYTES: u64 = 12;
+pub(crate) const SLOT_BYTES: u64 = 20;
 
 /// 木を作る段の見積もり（`Document::estimate_build` が返す元）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -46,8 +50,9 @@ pub(crate) struct Globals {
     /// CSS の `d` の値・`points` の値の最大のバイト数（escape を解いた写しと点の一時の置き場）
     max_css_d: u64,
     max_points: u64,
-    /// 塗りの値の最大のバイト数（受け継いだ url の中身の上限）
+    /// url の塗りの値の最大のバイト数（受け継いだ url の中身の上限）と、escape があるか
     max_paint: u64,
+    paint_escaped: bool,
     max_depth: u64,
     uses: u64,
 }
@@ -117,13 +122,93 @@ pub(crate) fn path_scan(v: &[u8], budget: &Budget<'_>) -> Result<(u64, u64), Err
     Ok((verbs, coords))
 }
 
-/// `d` の宣言が書く命令と座標の上限（属性は字句をなめて数え、CSS の `path("…")` は escape があるのでバイト数から）。
-fn d_bound(buf: &[u8], s: &crate::style::cascade::Specified, budget: &Budget<'_>) -> Result<(u64, u64), Error> {
-    if s.origin == ORIGIN_ATTR {
-        return path_scan(s.value.of(buf), budget);
+/// `d` の宣言が書く命令と座標の上限（属性と、escape のない CSS の `path("…")` は字句をなめて数え（`path` の字も命令として
+/// 数えるので多めになる）、escape のある CSS は解くと 1.5 倍まで長くなるのでバイト数の 2 倍から）。
+fn d_bound(buf: &[u8], value: Span, css: bool, budget: &Budget<'_>) -> Result<(u64, u64), Error> {
+    let v = value.of(buf);
+    if !css || !contains(v, b'\\', budget)? {
+        return path_scan(v, budget);
     }
-    let eff = (s.value.len() as u64).saturating_mul(2);
+    let eff = (value.len() as u64).saturating_mul(2);
     Ok((path_verbs(eff), path_coords(eff)))
+}
+
+/// 値にバイト `c` があるか（読むバイトを塊ずつ払う）。
+fn contains(v: &[u8], c: u8, budget: &Budget<'_>) -> Result<bool, Error> {
+    let mut meter = crate::xml::lex::ScanMeter::new(0, v.len());
+    for (k, &b) in v.iter().enumerate() {
+        meter.pay(budget, k)?;
+        if b == c {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 宣言の種類（塗り・`d`・`stroke-dasharray`）。
+const DECL_PAINT: u8 = 0;
+const DECL_D: u8 = 1;
+const DECL_DASH: u8 = 2;
+
+/// 規則の並びの宣言（重なりを除いて 1 度だけ数える）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct SheetDecl {
+    start: u32,
+    end: u32,
+    kind: u8,
+    pad: [u8; 7],
+    /// `d` の命令の数の上限
+    verbs: u64,
+}
+
+impl Plain for SheetDecl {}
+
+/// 宣言 1 つを全体の量に足す（`d` なら命令の数の上限を返す）。
+fn decl(
+    g: &mut Globals,
+    max_d: &mut u64,
+    buf: &[u8],
+    value: Span,
+    css: bool,
+    kind: u8,
+    budget: &Budget<'_>,
+) -> Result<u64, Error> {
+    let bytes = value.len() as u64;
+    match kind {
+        DECL_PAINT => {
+            // url の塗り（受け継いだ url の中身を引く手間の上限。色の塗りは引かない。escape で書いた url の関数もあるので、
+            // `\` があれば url とみなし、解く手間で数える。単位 3 のレビュー）
+            let v = value.of(buf);
+            let escaped = contains(v, b'\\', budget)?;
+            if escaped || has_url(buf, value, budget)? {
+                g.max_paint = g.max_paint.max(bytes);
+                g.paint_escaped |= escaped;
+            }
+            Ok(0)
+        }
+        DECL_D => {
+            let eff = if css { bytes.saturating_mul(2) } else { bytes };
+            let (verbs, coords) = d_bound(buf, value, css, budget)?;
+            *max_d = (*max_d).max(verbs);
+            if css {
+                g.max_css_d = g.max_css_d.max(eff);
+            }
+            g.keys = g.keys.saturating_add(1);
+            g.decl_work =
+                g.decl_work.saturating_add(eff.saturating_mul(cost::PATH_BYTE)).saturating_add(cost::BUILD_SPEC);
+            g.decl_verbs = g.decl_verbs.saturating_add(verbs);
+            g.decl_coords = g.decl_coords.saturating_add(coords);
+            Ok(verbs)
+        }
+        _ => {
+            g.keys = g.keys.saturating_add(1);
+            g.decl_work =
+                g.decl_work.saturating_add(bytes.saturating_mul(cost::DECL_BYTE)).saturating_add(cost::BUILD_SPEC);
+            g.dashes = g.dashes.saturating_add(bytes);
+            Ok(0)
+        }
+    }
 }
 
 /// 小文字にする（ASCII の文字だけ。std の Unicode の表に依らない）。
@@ -209,6 +294,7 @@ pub(crate) fn node_weights<'b>(
     // 1 度目：文書の全体の量（受け継いだ d・塗りの最大、深さ、use の数、宣言の量）
     let mut depth: MVec<'_, u32> = MVec::with_capacity(budget, n)?;
     let mut max_d = 0u64;
+    let mut sheet_decls: MVec<'_, SheetDecl> = MVec::new(budget);
     for (i, node) in nodes.iter().enumerate() {
         budget.spend(cost::OP_STEP)?;
         let dp = if node.parent == NONE { 0 } else { depth.get(node.parent as usize).copied().unwrap_or(0) };
@@ -226,34 +312,25 @@ pub(crate) fn node_weights<'b>(
         for s in styles.of(i as u32) {
             budget.spend(cost::OP_STEP)?;
             g.specs = g.specs.saturating_add(1);
-            let bytes = s.value.len() as u64;
             let p = Some(s.prop);
-            // url の塗り（受け継いだ url の中身を引く手間の上限。色の塗りは引かない）
-            if (p == fill_id || p == stroke_id) && has_url(bufs.of(s.src), s.value, budget)? {
-                g.max_paint = g.max_paint.max(bytes);
-            }
-            if s.wide != WIDE_NONE {
+            let kind = if p == fill_id || p == stroke_id {
+                DECL_PAINT
+            } else if s.wide != WIDE_NONE {
+                continue;
+            } else if p == d_id {
+                DECL_D
+            } else if p == dash_id {
+                DECL_DASH
+            } else {
+                continue;
+            };
+            // 規則の並びの宣言は当たる要素で共有するので、宣言ごとに 1 度だけ数える（並べて重なりを除いてから。単位 3 の
+            // レビュー）
+            if s.src == SRC_SHEET {
+                sheet_decls.push(SheetDecl { start: s.value.start, end: s.value.end, kind, pad: [0; 7], verbs: 0 })?;
                 continue;
             }
-            if p == d_id {
-                let css = s.origin != ORIGIN_ATTR;
-                let eff = if css { bytes.saturating_mul(2) } else { bytes };
-                let (verbs, coords) = d_bound(bufs.of(s.src), s, budget)?;
-                max_d = max_d.max(verbs);
-                if css {
-                    g.max_css_d = g.max_css_d.max(eff);
-                }
-                g.keys = g.keys.saturating_add(1);
-                g.decl_work =
-                    g.decl_work.saturating_add(eff.saturating_mul(cost::PATH_BYTE)).saturating_add(cost::BUILD_SPEC);
-                g.decl_verbs = g.decl_verbs.saturating_add(verbs);
-                g.decl_coords = g.decl_coords.saturating_add(coords);
-            } else if p == dash_id {
-                g.keys = g.keys.saturating_add(1);
-                g.decl_work =
-                    g.decl_work.saturating_add(bytes.saturating_mul(cost::DECL_BYTE)).saturating_add(cost::BUILD_SPEC);
-                g.dashes = g.dashes.saturating_add(bytes);
-            }
+            decl(&mut g, &mut max_d, bufs.of(s.src), s.value, s.origin != ORIGIN_ATTR, kind, budget)?;
         }
         if svg && matches!(local, b"polyline" | b"polygon") {
             g.poly_attrs = g.poly_attrs.saturating_add(node.attrs.len() as u64);
@@ -269,9 +346,25 @@ pub(crate) fn node_weights<'b>(
         }
     }
     drop(depth);
+    // 規則の並びの宣言を 1 度ずつ
+    stable_sort(budget, sheet_decls.as_mut_slice(), |a, b| (a.start, a.kind) < (b.start, b.kind))?;
+    let mut keep = 0usize;
+    for k in 0..sheet_decls.len() {
+        budget.spend(cost::OP_STEP)?;
+        let Some(mut x) = sheet_decls.get(k).copied() else { break };
+        if keep > 0 && sheet_decls.get(keep.saturating_sub(1)).is_some_and(|y| (y.start, y.kind) == (x.start, x.kind)) {
+            continue;
+        }
+        x.verbs = decl(&mut g, &mut max_d, sheet, Span { start: x.start, end: x.end }, true, x.kind, budget)?;
+        if let Some(y) = sheet_decls.get_mut(keep) {
+            *y = x;
+        }
+        keep = keep.saturating_add(1);
+    }
+    sheet_decls.truncate(keep);
     // 2 度目：要素ごとの重み
     let paint =
-        if g.max_paint == 0 { cost::BUILD_PAINT_COLOR } else { cost::build_paint(g.max_paint.saturating_mul(2), ids) };
+        if g.max_paint == 0 { cost::BUILD_PAINT_COLOR } else { cost::build_paint(g.max_paint, g.paint_escaped, ids) };
     let lookups = cost::search(g.keys).saturating_mul(2);
     let node_push = cost::OP_STEP.saturating_add(cost::copy(PATH_NODE_BYTES));
     let mut w: MVec<'_, u64> = MVec::with_capacity(budget, n)?;
@@ -313,7 +406,19 @@ pub(crate) fn node_weights<'b>(
                 spec_bytes = spec_bytes.saturating_add(s.value.len() as u64);
             }
             if Some(s.prop) == d_id {
-                own_d = Some(if s.wide != WIDE_NONE { max_d } else { d_bound(bufs.of(s.src), s, budget)?.0 });
+                own_d = Some(if s.wide != WIDE_NONE {
+                    max_d
+                } else if s.src == SRC_SHEET {
+                    let j = lower_bound_try(budget, sheet_decls.as_slice(), |x| {
+                        Ok((x.start, x.kind) < (s.value.start, DECL_D))
+                    })?;
+                    sheet_decls
+                        .get(j)
+                        .filter(|x| x.start == s.value.start && x.kind == DECL_D)
+                        .map_or(max_d, |x| x.verbs)
+                } else {
+                    d_bound(bufs.of(s.src), s.value, s.origin != ORIGIN_ATTR, budget)?.0
+                });
             }
         }
         let a = start.get(i).copied().unwrap_or(0);
@@ -331,11 +436,7 @@ pub(crate) fn node_weights<'b>(
             } else {
                 points_verbs(doc.attr(input, node, NS_NONE, b"points", budget)?.map_or(0, |v| v.len() as u64))
             };
-            let write = if basic_shape(local) {
-                cost::SHAPE_VERBS.saturating_mul(cost::OP_STEP.saturating_mul(2).saturating_add(1))
-            } else {
-                0
-            };
+            let write = if basic_shape(local) { cost::SHAPE_WRITE } else { 0 };
             x = x
                 .saturating_add(paint.saturating_mul(2))
                 .saturating_add(segs.saturating_mul(cost::BOUNDS_SEGMENT))
@@ -391,8 +492,8 @@ pub(crate) fn close_weights(g: &Globals, e: &Expanded, report_bytes: u64) -> Bui
     // たどる段の積み上げ：展開の深さまで（use の文脈の積み上げはその内）
     let frames = e.depth.saturating_add(1);
     let ctxs = e.depth.saturating_add(1);
-    let key_size = 12u64;
-    let slot_size = 20u64;
+    let key_size = KEY_BYTES;
+    let slot_size = SLOT_BYTES;
     let keys = g.keys;
     let work = e
         .work

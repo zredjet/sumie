@@ -27,8 +27,20 @@ pub(crate) const RASTER_ROW: u64 = 8;
 pub(crate) const RASTER_EDGE_ROW: u64 = 8;
 pub(crate) const RASTER_CELL: u64 = 4;
 pub(crate) const RASTER_SWEEP: u64 = 1;
+/// 描く段の、辺 1 本を行にかける手間（かかる辺の並びに足す（push：決まった分と 4 バイトの写し）・最後に終わったと見る）と、
+/// 辺 1 本の 1 行の手間（セルを積む・終わったかを見る）。範囲の見積もりと描く段の払いの式。
+pub(crate) const RASTER_EDGE_START: u64 = RASTER_EDGE_ROW + OP_STEP + OP_STEP + copy(4);
+pub(crate) const RASTER_EDGE_ROW_WORK: u64 = RASTER_EDGE_ROW + OP_STEP;
+
+/// 描く段の 1 行の手間（行の決まった分・掃く・セルを 0 に戻す・塗る。項目の矩形の幅 `width`。掃く範囲と戻す範囲は左の外の
+/// 1 列と右の 1 列を含みうるので 2 列多く数える）。
+pub(crate) const fn raster_row(width: u64) -> u64 {
+    RASTER_ROW
+        .saturating_add(RASTER_SWEEP.saturating_mul(6))
+        .saturating_add(width.saturating_mul(2 * RASTER_SWEEP + PAINT_PIXEL))
+}
+
 /// 塗り：画素 1 つを合成する手間。
-#[allow(dead_code, reason = "塗る段（paint）から使う")]
 pub(crate) const PAINT_PIXEL: u64 = 2;
 /// 2 分の探索の 1 歩の手間。
 pub(crate) const SEARCH_STEP: u64 = 8;
@@ -139,6 +151,9 @@ pub(crate) const BUILD_PAINT_COLOR: u64 = 2 * OP_STEP;
 /// 図形（rect・circle・ellipse・line）の節ごとに書く命令と座標の上限（角の丸い rect：移動・線 4・弧 4・閉じ）。
 pub(crate) const SHAPE_VERBS: u64 = 10;
 pub(crate) const SHAPE_COORDS: u64 = 50;
+/// 図形を置き場に書く手間の上限（`append` の式で、角の丸い rect：移動 10・線 4 × 10・弧 4 × 14・閉じ 9 ＝ 115。命令 1 つは
+/// 決まった分 2 つと 1 バイトと座標の写し）。
+pub(crate) const SHAPE_WRITE: u64 = 120;
 /// 外接矩形の区間 1 つの手間（写して、曲線は導関数の根を求める）。
 pub(crate) const BOUNDS_SEGMENT: u64 = 16;
 /// パスのデータ・`points`・破線の宣言の 1 バイトを読む手間の上限（字句・数・置き場に書く分。パスのデータは敵対的な形で
@@ -167,11 +182,15 @@ pub(crate) const fn build_node(
         .saturating_add(edges.saturating_mul(4 * OP_STEP))
 }
 
-/// 図形の塗り 1 つを解く手間の上限（`href` は url の中身のバイト数の上限、`ids` は id の表の大きさ）。
-pub(crate) const fn build_paint(href: u64, ids: u64) -> u64 {
+/// 図形の塗り 1 つを解く手間の上限（`href` は url の値のバイト数の上限、`escaped` は escape があるか、`ids` は id の表の
+/// 大きさ）。1 バイトの手間は、escape を解くなら 16（解く 9・写し・空白の除き）、ほかは 4（写し・空白の除き・比べ）。
+/// 解いた url は 1.5 倍まで長くなる。
+pub(crate) const fn build_paint(href: u64, escaped: bool, ids: u64) -> u64 {
+    let per = if escaped { 16 } else { 4 };
+    let decoded = href.saturating_add(href / 2);
     let steps = ceil_log2(ids.saturating_add(1)).saturating_add(1);
-    let step = SEARCH_STEP.saturating_add(id_probe(ids)).saturating_add(2 * OP_STEP).saturating_add(copy(href));
-    BUILD_PAINT.saturating_add(href.saturating_mul(16)).saturating_add(steps.saturating_mul(step))
+    let step = SEARCH_STEP.saturating_add(id_probe(ids)).saturating_add(2 * OP_STEP).saturating_add(copy(decoded));
+    BUILD_PAINT.saturating_add(href.saturating_mul(per)).saturating_add(steps.saturating_mul(step))
 }
 
 /// プロパティの表を名前で引く手間（名前を小文字にして写し、表を二分探索する。表は 100 の内なので 7 回ほど比べる）。

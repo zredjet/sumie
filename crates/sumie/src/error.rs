@@ -126,6 +126,8 @@ pub enum Later {
     Viewport,
     /// filter（M4）
     Filter,
+    /// 外接矩形の要る `transform-box`（fill-box など）の変形と、表示の領域の決まらない % の位置（M3）
+    TransformBox,
 }
 
 /// 壊れた入力・呼び手の誤り。

@@ -72,7 +72,8 @@ impl Plan {
         }
         let (frame, peak_bytes) =
             crate::plan::render_frame(r.width(), r.height(), self.max_item_edges, self.items.len() as u64);
-        Ok(Estimate { work: work.saturating_add(frame), peak_bytes, result_bytes: 0 })
+        let bg = crate::plan::background_work(self.background, r.width().saturating_mul(r.height()));
+        Ok(Estimate { work: work.saturating_add(frame).saturating_add(bg), peak_bytes, result_bytes: 0 })
     }
 
     /// 全体を描く（出力は計画の大きさ）。
@@ -100,14 +101,39 @@ impl Plan {
             ));
         }
         let budget = Budget::new(Stage::Render, est.work, est.peak_bytes, cancel);
-        // 出力を透明にする（行ごとに払う）
+        // 出力を透明にする（行ごとに、塊に分けて払う）
         let row_len = (out.width as usize).saturating_mul(4);
+        let step = crate::budget::chunk_len(1).saturating_mul(cost::FILL_BYTES_PER_UNIT as usize);
         for y in 0..out.height as usize {
-            budget.spend(cost::fill(row_len as u64).saturating_add(cost::OP_STEP))?;
+            budget.spend(cost::OP_STEP)?;
             let start = y.saturating_mul(out.stride);
-            if let Some(row) = out.data.get_mut(start..start.saturating_add(row_len)) {
-                for b in row.iter_mut() {
-                    *b = 0;
+            let mut i = 0usize;
+            while i < row_len {
+                let end = i.saturating_add(step).min(row_len);
+                budget.spend(cost::fill((end.saturating_sub(i)) as u64))?;
+                if let Some(part) = out.data.get_mut(start.saturating_add(i)..start.saturating_add(end)) {
+                    for b in part.iter_mut() {
+                        *b = 0;
+                    }
+                }
+                i = end;
+            }
+        }
+        // 背景（根の svg の background-color。透明な出力の上なので置くだけ。塊ごとに払う。ADR-97 (4)）
+        if self.background[3] != 0 {
+            let px_step = crate::budget::chunk_len(cost::PAINT_PIXEL);
+            for y in 0..out.height as usize {
+                let start = y.saturating_mul(out.stride);
+                let mut x = 0usize;
+                while x < out.width as usize {
+                    let end = x.saturating_add(px_step).min(out.width as usize);
+                    budget.spend((end.saturating_sub(x) as u64).saturating_mul(cost::PAINT_PIXEL))?;
+                    let a = start.saturating_add(x.saturating_mul(4));
+                    let b = start.saturating_add(end.saturating_mul(4));
+                    for (k, v) in out.data.get_mut(a..b).into_iter().flatten().enumerate() {
+                        *v = self.background.get(k & 3).copied().unwrap_or(0);
+                    }
+                    x = end;
                 }
             }
         }
@@ -136,13 +162,21 @@ impl Plan {
                     if a == 0 {
                         return Ok(());
                     }
-                    budget.spend_units(len, cost::PAINT_PIXEL)?;
                     let row = usize::try_from(y.saturating_sub(r.y0)).unwrap_or(0).saturating_mul(stride);
                     let col = usize::try_from(x.saturating_sub(r.x0)).unwrap_or(0).saturating_mul(4);
-                    let start = row.saturating_add(col);
-                    let n = usize::try_from(len).unwrap_or(0).saturating_mul(4);
-                    if let Some(px) = data.get_mut(start..start.saturating_add(n)) {
-                        crate::paint::blend_span(px, color, a);
+                    let mut start = row.saturating_add(col);
+                    let mut left = usize::try_from(len).unwrap_or(0);
+                    // 塊ごとに払ってから合成する（中止を見ない間を間隔の内に）
+                    let step = crate::budget::chunk_len(cost::PAINT_PIXEL);
+                    while left > 0 {
+                        let k = left.min(step);
+                        budget.spend((k as u64).saturating_mul(cost::PAINT_PIXEL))?;
+                        let n = k.saturating_mul(4);
+                        if let Some(px) = data.get_mut(start..start.saturating_add(n)) {
+                            crate::paint::blend_span(px, color, a);
+                        }
+                        start = start.saturating_add(n);
+                        left = left.saturating_sub(k);
                     }
                     Ok(())
                 },

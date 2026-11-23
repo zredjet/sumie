@@ -195,18 +195,27 @@ impl<'b> RowCells<'b> {
     }
 
     /// 触れたセルを 0 に戻す（手間は触れた幅の分。呼び手が払う）。
-    pub(crate) fn clear(&mut self) {
+    /// 触れたセルを 0 に戻す（触れた範囲の分を塊ごとに払う）。
+    pub(crate) fn clear(&mut self, budget: &crate::budget::Budget<'_>) -> Result<(), Error> {
         if !self.touched {
-            return;
+            return Ok(());
         }
         let (lo, hi) = (self.lo, self.hi);
-        for slot in self.cover.as_mut_slice().get_mut(lo..=hi).into_iter().flatten() {
-            *slot = 0;
-        }
-        for slot in self.area.as_mut_slice().get_mut(lo..=hi).into_iter().flatten() {
-            *slot = 0;
+        let step = crate::budget::chunk_len(crate::cost::RASTER_SWEEP);
+        let mut i = lo;
+        while i <= hi {
+            let end = i.saturating_add(step).min(hi.saturating_add(1));
+            budget.spend((end.saturating_sub(i) as u64).saturating_mul(crate::cost::RASTER_SWEEP))?;
+            for slot in self.cover.as_mut_slice().get_mut(i..end).into_iter().flatten() {
+                *slot = 0;
+            }
+            for slot in self.area.as_mut_slice().get_mut(i..end).into_iter().flatten() {
+                *slot = 0;
+            }
+            i = end;
         }
         self.touched = false;
+        Ok(())
     }
 
     /// 触れたセルの番号の範囲（触れていなければ None）。
@@ -262,14 +271,15 @@ impl<'b> RowCells<'b> {
         u64::try_from(hi.saturating_sub(lo)).unwrap_or(0).saturating_add(1)
     }
 
-    /// 辺の、行 `row`（画素）の中の部分のセルを積む（反エイリアス）。回ったセルの数を返す（手間の勘定）。
-    pub(crate) fn add_edge(&mut self, e: &Edge, row: i64) -> u64 {
+    /// 辺の、行 `row`（画素）の中の部分のセルを積む（反エイリアス）。セルを回るたびに `pay` で払い（塊の頭で塊の分を前払い）、
+    /// 回ったセルの数を返す。
+    pub(crate) fn add_edge(&mut self, e: &Edge, row: i64, pay: &mut Payer<'_>) -> Result<u64, Error> {
         let ry0 = row.saturating_mul(ONE);
         let ry1 = ry0.saturating_add(ONE);
         let ya = i64::from(e.y0).max(ry0);
         let yb = i64::from(e.y1).min(ry1);
         if ya >= yb {
-            return 0;
+            return Ok(0);
         }
         let dir = i64::from(e.dir);
         let xa = x_at(e, ya);
@@ -278,6 +288,7 @@ impl<'b> RowCells<'b> {
         let cb = floor_div(xb, ONE);
         if ca == cb {
             let base = ca.saturating_mul(ONE);
+            pay.step()?;
             if let Some(i) = self.index(ca) {
                 let dy = yb.saturating_sub(ya);
                 self.add(
@@ -286,7 +297,7 @@ impl<'b> RowCells<'b> {
                     cell_area(dir, dy, xa.saturating_sub(base), xb.saturating_sub(base)),
                 );
             }
-            return 1;
+            return Ok(1);
         }
         // 列の境を横切る y（閉じた式。行の中に切り詰める）
         let cross = |x: i64| y_at(e, x).max(ya).min(yb);
@@ -312,6 +323,7 @@ impl<'b> RowCells<'b> {
                 let (target_x, target_last) =
                     if step > 0 && cb >= left_col { (left_col.saturating_mul(ONE), false) } else { (xb, true) };
                 let y_to = if target_last { yb } else { cross(target_x) };
+                pay.step()?;
                 if let Some(i) = self.index(col) {
                     self.add(i, dir.saturating_mul(y_to.saturating_sub(y_enter)), 0);
                 }
@@ -339,6 +351,7 @@ impl<'b> RowCells<'b> {
                 continue;
             }
             let base = col.saturating_mul(ONE);
+            pay.step()?;
             if let Some(i) = self.index(col) {
                 let dy = y_exit.saturating_sub(y_enter);
                 self.add(
@@ -355,7 +368,7 @@ impl<'b> RowCells<'b> {
             x_enter = x_exit;
             col = col.saturating_add(step);
         }
-        count
+        Ok(count)
     }
 
     /// 辺が画素の中心の行を横切れば、その点より右の画素から巻き数を足す（crispEdges）。
@@ -384,6 +397,34 @@ impl<'b> RowCells<'b> {
 
     pub(crate) fn x0(&self) -> i64 {
         self.x0
+    }
+}
+
+/// 回る前に塊ごとに払う口（`left` 個（1 つ `per` 単位）までを、`CANCEL_INTERVAL` 未満の塊に分け、塊を回り始める前に
+/// 払う。ループの全体を一度に前払いしない：中止を見ない間の手間を間隔の内に保つ。単位 2 のレビュー）。
+pub(crate) struct Payer<'a> {
+    budget: &'a crate::budget::Budget<'a>,
+    left: u64,
+    per: u64,
+    chunk: u64,
+    credit: u64,
+}
+
+impl<'a> Payer<'a> {
+    pub(crate) fn new(budget: &'a crate::budget::Budget<'a>, left: u64, per: u64) -> Payer<'a> {
+        Payer { budget, left, per, chunk: crate::budget::chunk_len(per) as u64, credit: 0 }
+    }
+
+    /// 1 つ回る（塊の頭なら塊の分を払う。数えた数を超えたら 1 つずつ払う）。
+    pub(crate) fn step(&mut self) -> Result<(), Error> {
+        if self.credit == 0 {
+            let k = self.chunk.min(self.left).max(1);
+            self.budget.spend(k.saturating_mul(self.per))?;
+            self.left = self.left.saturating_sub(k);
+            self.credit = k;
+        }
+        self.credit = self.credit.saturating_sub(1);
+        Ok(())
     }
 }
 
@@ -465,11 +506,12 @@ pub(crate) fn fill_region(
             scan.active.push(idx)?;
             next = next.saturating_add(1);
         }
-        // 終わった辺を除く（順は保つ。かかる辺ごとに払う）
+        // 終わった辺を除く（順は保つ。かかる辺ごとに、塊の頭で払う）
         let mut keep = 0usize;
         let n = scan.active.len();
-        budget.spend_units(n as u64, cost::OP_STEP)?;
+        let mut pay = Payer::new(budget, n as u64, cost::OP_STEP);
         for k in 0..n {
+            pay.step()?;
             let Some(&i) = scan.active.get(k) else { continue };
             let alive = edges.get(i as usize).is_some_and(|e| i64::from(e.y1) > row_start);
             if alive {
@@ -484,17 +526,18 @@ pub(crate) fn fill_region(
             break;
         }
         // セルを積む
-        scan.cells.clear();
+        scan.cells.clear(budget)?;
         for k in 0..scan.active.len() {
             let Some(&i) = scan.active.get(k) else { continue };
             let Some(e) = edges.get(i as usize) else { continue };
-            // 回る前に払う（1 行の中で全部の列を回る辺でも、1 回の払いは中止の間隔の内。単位 2 のレビュー）
+            // セルは回りながら塊ごとに払う（1 行の中で全部の列を回る辺でも、中止を見ない間は間隔の内。単位 2 のレビュー）
             budget.spend(cost::RASTER_EDGE_ROW)?;
-            let bound = if aa { scan.cells.cells_bound(e, row) } else { 1 };
-            budget.spend_units(bound, cost::RASTER_CELL)?;
             if aa {
-                scan.cells.add_edge(e, row);
+                let bound = scan.cells.cells_bound(e, row);
+                let mut pay = Payer::new(budget, bound, cost::RASTER_CELL);
+                scan.cells.add_edge(e, row, &mut pay)?;
             } else {
+                budget.spend(cost::RASTER_CELL)?;
                 scan.cells.add_edge_center(e, row);
             }
         }
@@ -502,7 +545,7 @@ pub(crate) fn fill_region(
         if let Some((lo, hi)) = scan.cells.touched() {
             let width = scan.cells.width();
             let x0 = scan.cells.x0();
-            budget.spend_units((hi.saturating_sub(lo) as u64).saturating_add(1), cost::RASTER_SWEEP)?;
+            let mut pay = Payer::new(budget, (hi.saturating_sub(lo) as u64).saturating_add(1), cost::RASTER_SWEEP);
             let mut acc: i64 = 0;
             let mut run_start: i64 = 0;
             let mut run_len: u64 = 0;
@@ -517,6 +560,7 @@ pub(crate) fn fill_region(
                 }
             };
             for idx in lo..=hi {
+                pay.step()?;
                 let (c, a) = scan.cells.cell(idx);
                 acc = acc.saturating_add(c);
                 if idx == 0 {

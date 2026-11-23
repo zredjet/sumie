@@ -360,3 +360,75 @@ fn render_ops_on_random_documents() {
     }
     assert!(drawn > 150, "{drawn}");
 }
+
+/// use で指した svg にも use の width・height が勝ち、switch に選ばれない子も use で指せば描く。外接矩形の要る
+/// transform-box の変形は描かずに断る（単位 3 のレビュー）。
+#[test]
+fn walk_follows_use_context() {
+    let t = build(&svg(
+        "<defs><svg id=\"s\" viewBox=\"0 0 10 10\" overflow=\"visible\"><rect width=\"10\" height=\"10\" fill=\"red\"/></svg></defs>\
+         <use href=\"#s\" width=\"50\" height=\"50\"/>\
+         <switch><rect width=\"1\" height=\"1\" fill=\"blue\"/><rect id=\"b\" x=\"20\" width=\"10\" height=\"10\" fill=\"red\"/></switch>\
+         <use href=\"#b\" y=\"30\"/>",
+    ))
+    .unwrap();
+    let n = t.nodes.as_slice();
+    assert_eq!(n.len(), 3);
+    assert_eq!(n[0].bounds.x1, 50.0);
+    assert_eq!((n[2].bounds.x0, n[2].bounds.y0), (20.0, 30.0));
+    assert_eq!(
+        not_yet(
+            "<rect x=\"10\" y=\"10\" width=\"20\" height=\"20\" style=\"transform-box: fill-box; transform-origin: center; transform: rotate(90deg)\"/>"
+        ),
+        Later::TransformBox
+    );
+}
+
+/// 見積もり ≥ 実際：use で展開した長い破線・escape で書いた url の塗り・規則で共有する長い宣言（単位 3 のレビューの再現）。
+#[test]
+fn adversarial_estimates_hold() {
+    let long_dash: String = (0..3000).map(|_| "5 5 ").collect();
+    let mut a = format!("<path id=\"p\" d=\"M0 0 L10 10\" stroke=\"red\" stroke-dasharray=\"{long_dash}\"/>");
+    for _ in 0..300 {
+        a.push_str("<use href=\"#p\"/>");
+    }
+    build(&svg(&a)).unwrap();
+    let id: String = (0..2000).map(|_| 'a').collect();
+    let mut b = format!("<g style=\"fill: \\75 rl(#{id}) red\">");
+    for _ in 0..200 {
+        b.push_str("<rect width=\"5\" height=\"5\"/>");
+    }
+    b.push_str("</g>");
+    build(&svg(&b)).unwrap();
+    let mut c = format!(
+        "<style>path{{stroke-dasharray:{long_dash};stroke:red}} .k{{d:path('M0 0 L5 5 {}')}}</style>",
+        "L1 1 ".repeat(500)
+    );
+    for _ in 0..300 {
+        c.push_str("<path class=\"k\"/>");
+    }
+    let t = build(&svg(&c)).unwrap();
+    // 規則の宣言は 1 度だけ置き場に書く
+    assert!(t.held_bytes() < 200_000, "{}", t.held_bytes());
+}
+
+/// 読む段の見積もりが使う宣言の鍵と読んだ結果の大きさが、木の型と同じ。
+#[test]
+fn decl_sizes_match_the_estimate() {
+    assert_eq!(size_of::<super::DeclKey>() as u64, crate::doc::weights::KEY_BYTES);
+    assert_eq!(size_of::<super::DeclSlot>() as u64, crate::doc::weights::SLOT_BYTES);
+}
+
+/// 根の svg の background-color を描く（resvg・Chrome と同じ。ADR-97 (4)）。1 画素より細い線は 1 画素の線を太さの α で
+/// 描く（Chrome・resvg の細い線。ADR-97 (2)）。
+#[test]
+fn background_and_hairlines() {
+    let a = alpha_at(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\" style=\"background-color: #0000ff80\"><rect x=\"20\" y=\"20\" width=\"10\" height=\"10\"/></svg>",
+    );
+    assert_eq!((a(5, 5), a(25, 25)), (128, 255));
+    let a = alpha_at(&svg("<path d=\"M10 50.5 H90\" stroke=\"black\" stroke-width=\"0.3\"/>"));
+    // 1 画素の幅で、α は太さ（0.3 × 255 ≈ 77）
+    assert!((70..=80).contains(&a(50, 50)), "{}", a(50, 50));
+    assert_eq!(a(50, 49), 0);
+}

@@ -427,7 +427,12 @@ pub(crate) fn dash_polyline(
         buf.push(first)?;
     }
     let count = if closed { pts.len() } else { pts.len().saturating_sub(1) };
-    'segs: for k in 0..count {
+    // 境の足し算が進まない（今の位置に比べて値が小さすぎる）ときは長さ 0 の部分と同じに切り替えて続け、並びを 1 周しても
+    // 進まなければ、部分パスの残りを線の部分の和が正なら線、0 なら隙間として扱う（残りを捨てない。Skia は破線が多すぎると
+    // 実線で描く。単位 1 の 3 回目のレビュー。ADR-97 (5)）
+    let mut stall = 0usize;
+    let on_sum_positive = dashes.dashes.iter().enumerate().any(|(i, &d)| i.is_multiple_of(2) && d > 0.0);
+    for k in 0..count {
         budget.spend(cost::OP_STEP)?;
         let (Some(&a), Some(&b)) = (pts.get(k), pts.get(ring_next(k, pts.len()))) else { continue };
         let seg = seg_len(a, b);
@@ -440,9 +445,24 @@ pub(crate) fn dash_polyline(
         while seg - t0 > remain {
             budget.spend(cost::OUTLINE_POINT)?;
             let next_t = t0 + remain;
-            if next_t == t0 && remain > 0.0 {
-                // 足しても進まない
-                break 'segs;
+            if next_t > t0 {
+                stall = 0;
+            } else {
+                stall = stall.saturating_add(1);
+                if stall > n.saturating_add(1) {
+                    // 1 周しても進まない：残りは線か隙間のどちらか 1 つ
+                    let u = t0 / seg;
+                    let at = Point::new(a.x + dx * u, a.y + dy * u);
+                    if on_sum_positive && !on {
+                        buf.clear();
+                        buf.push(at)?;
+                    } else if !on_sum_positive {
+                        buf.clear();
+                    }
+                    on = on_sum_positive;
+                    remain = f64::INFINITY;
+                    break;
+                }
             }
             t0 = next_t;
             let u = t0 / seg;

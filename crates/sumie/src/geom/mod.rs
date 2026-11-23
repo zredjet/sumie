@@ -11,7 +11,7 @@
 //!   中心の形で直に作る（端点の形からの変換の丸めがない）
 //! - 計算で有限でない値が出たら、その弧は線にする（数の大きさの上限を持たない。ADR-32）
 
-#![allow(dead_code, reason = "木を作る段・計画（M2）から使う。単位ごとに足していく")]
+#![allow(dead_code, reason = "試験と M3 の外接矩形（objectBoundingBox）から使う口がある")]
 
 pub(crate) mod flatten;
 pub(crate) mod stroke;
@@ -636,26 +636,31 @@ fn quad_extremum(a: f64, b: f64, c: f64) -> Option<f64> {
 
 /// 3 次曲線の 1 つの軸の極の t（0 と 1 の間のもの、多くて 2 つ）。導関数 3[(b−a)(1−t)² + 2(c−b)(1−t)t + (d−c)t²] の根。
 fn cubic_extrema(a: f64, b: f64, c: f64, d: f64) -> [Option<f64>; 2] {
-    let p = b - a;
-    let q = c - b;
-    let r = d - c;
+    // 差の大きさの最大で割ってから解く（2 乗があふれない）
+    let (p, q, r) = (b / 2.0 - a / 2.0, c / 2.0 - b / 2.0, d / 2.0 - c / 2.0);
+    let m = math::max(math::max(p.abs(), q.abs()), r.abs());
+    if !(m > 0.0 && m.is_finite()) {
+        return [None, None];
+    }
+    let (p, q, r) = (p / m, q / m, r / m);
     // p − 2qt + ... を t の 2 次式に：(p − 2q + r) t² + 2(q − p) t + p
     let qa = p - 2.0 * q + r;
     let qb = 2.0 * (q - p);
     let qc = p;
     let inside = |t: f64| (t.is_finite() && t > 0.0 && t < 1.0).then_some(t);
-    if qa == 0.0 {
-        if qb == 0.0 {
-            return [None, None];
-        }
-        return [inside(-qc / qb), None];
-    }
     let disc = qb * qb - 4.0 * qa * qc;
     if disc < 0.0 {
         return [None, None];
     }
-    let s = disc.sqrt();
-    [inside((-qb + s) / (2.0 * qa)), inside((-qb - s) / (2.0 * qa))]
+    // 桁の落ちない根の公式（`k = −(b + sign(b)√D) / 2`、根は `k / a` と `c / k`。ほぼ 2 次の 3 次曲線で a が小さくても
+    // 極を落とさない。単位 1 の 3 回目のレビュー）
+    let k = -(qb + if qb < 0.0 { -disc.sqrt() } else { disc.sqrt() }) / 2.0;
+    if k == 0.0 {
+        // b = 0 かつ D = 0（a c = 0）：根は 0（区間の外）
+        return [None, None];
+    }
+    let r1 = if qa == 0.0 { None } else { inside(k / qa) };
+    [r1, inside(qc / k)]
 }
 
 /// 2 次曲線の t の点。

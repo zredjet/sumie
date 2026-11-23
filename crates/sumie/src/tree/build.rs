@@ -173,9 +173,11 @@ pub(crate) fn build_tree(d: &Document<'_>, budget: &Budget<'_>) -> Result<Tree, 
         bbox: Rect::EMPTY,
         root: None,
     };
+    let mut root_drawn = false;
     walk_with(d, WalkOptions { build: true }, budget, &mut |item| {
         if item.node == 0 {
             out.root = Some(item.computed);
+            root_drawn = item.rendered;
         }
         if !item.rendered {
             return Ok(());
@@ -189,6 +191,7 @@ pub(crate) fn build_tree(d: &Document<'_>, budget: &Budget<'_>) -> Result<Tree, 
         None => content_size(&bbox)?,
     };
     let root = root.unwrap_or(Computed::initial(d.font_size));
+    let background = if root_drawn { background_of(d, &root, budget)? } else { [0.0; 4] };
     let report = d.report.copy_in(budget)?;
     Ok(Tree {
         size,
@@ -199,8 +202,30 @@ pub(crate) fn build_tree(d: &Document<'_>, budget: &Budget<'_>) -> Result<Tree, 
         root_font: root.font_size,
         root_line: root.line_height,
         doc_size: d.media_size,
+        background,
         report,
     })
+}
+
+/// 根の要素の `background-color`（`currentColor` は根の `color`。書いていない・読めなければ透明。resvg・Chrome と同じく描く。
+/// ADR-97 (4)）。
+fn background_of(d: &Document<'_>, root: &Computed, budget: &Budget<'_>) -> Result<[f64; 4], Error> {
+    let budget = budget_ref(budget);
+    let Some(id) = lookup(b"background-color", false) else { return Ok([0.0; 4]) };
+    let bufs = Bufs { input: d.input, store: d.xml.store.as_slice(), sheet: d.sheet.text.as_slice() };
+    for s in d.styles.of(0) {
+        budget.spend(cost::OP_STEP)?;
+        if s.prop != id || s.wide != WIDE_NONE {
+            continue;
+        }
+        let c = match Values::new(bufs.of(s.src), s.value, budget).color()? {
+            Some(crate::values::ColorValue::Color(c)) => c,
+            Some(crate::values::ColorValue::CurrentColor) => root.color,
+            None => return Ok([0.0; 4]),
+        };
+        return Ok(with_opacity(c, 1.0));
+    }
+    Ok([0.0; 4])
 }
 
 /// 中身で決まる文書の大きさ（外接矩形の右下。中身がなければ 100 × 100。幅か高さが 0 以下なら `Invalid`。FR-OUT-01）。
@@ -362,6 +387,10 @@ fn visit(
     }
     if item.clips {
         return not_yet(Later::Viewport);
+    }
+    // 変形が解けない（外接矩形の要る transform-box・表示の領域の決まらない %）：黙って違う所に描かない（単位 3 のレビュー）
+    if !item.ctm_known {
+        return not_yet(Later::TransformBox);
     }
     if n.ns != NS_SVG {
         return Ok(());

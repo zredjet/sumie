@@ -81,6 +81,8 @@ pub struct Tree {
     pub(crate) root_font: f64,
     pub(crate) root_line: f64,
     pub(crate) doc_size: Option<(f64, f64)>,
+    /// 根の svg の背景の色（r・g・b は 0〜255、α は 0〜1。乗算しない。なければ透明。ADR-97 (4)）
+    pub(crate) background: [f64; 4],
     pub(crate) report: Report,
 }
 

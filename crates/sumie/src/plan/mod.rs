@@ -7,7 +7,8 @@
 //!   曲がる角の和以上（内接する折れ線の曲がる角は曲線の全曲率以下、Bézier の全曲率は制御多角形の曲がる角以下）なので、
 //!   round の継ぎ目の円弧の点の和の上限になる
 //! - 辺の置き場は見積もりの上限の数で最初に取る（伸ばさない。持ち続ける量と山は見積もりと同じ）
-//! - 範囲の見積もり（`Plan::estimate_region`）は、計画で持った辺ごとの上限（セル ≤ (|Δx| + |Δy|) / 1 画素 + 2）から求める。
+//! - 範囲の見積もり（`Plan::estimate_region`）は、計画で持った辺ごとの上限（辺を項目の矩形の行で切った部分の、セル ≤
+//!   (|Δx| + |Δy|) / 1 画素 + 4 と 行の数 × (幅 + 3) の小さい方）から求める。
 //!   同じ形の式なので、全体に含まれる範囲の見積もりは `RenderEstimate.render` を超えない（FR-OUT-06）
 
 #![allow(dead_code, reason = "公開の口（lib）と描く段から使う")]
@@ -102,6 +103,13 @@ pub struct Plan {
     /// 1 つの項目の辺の数の最大（描く段の、行にかかる辺の置き場の大きさ）
     pub(crate) max_item_edges: u64,
     pub(crate) limits: RenderLimits,
+    /// 背景（乗算済み。透明なら塗らない。ADR-97 (4)）
+    pub(crate) background: [u8; 4],
+}
+
+/// 背景を塗る手間（`pixels` 画素。透明なら 0。描く段と範囲の見積もりの式）。
+pub(crate) const fn background_work(background: [u8; 4], pixels: u64) -> u64 {
+    if background[3] == 0 { 0 } else { pixels.saturating_mul(cost::PAINT_PIXEL) }
 }
 
 impl Plan {
@@ -491,10 +499,45 @@ fn up(x: f64) -> u64 {
     if x <= 0.0 { 0 } else { x.ceil() as u64 }
 }
 
-/// 節の線のペン（太さの半分は線を作る座標系。`scale` は描く座標系への最大の倍率）。
-fn pen_of(n: &PathNode, t: &Transform, scale: f64, q: Quality) -> Pen {
-    let non_scaling = n.flags & NON_SCALING != 0;
-    let half = if non_scaling { n.stroke_width / 2.0 * scale } else { n.stroke_width / 2.0 };
+/// 節の線を作る形（計画と見積もりが同じ口で決める）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StrokeMode {
+    /// 外形を描く座標系で作る（non-scaling と細い線）。偽ならユーザー単位で作って変形で写す
+    pub(crate) device: bool,
+    /// 外形を作る座標系の太さの半分
+    pub(crate) half: f64,
+    /// 線の色の α に掛ける（細い線の被覆。ほかは 1）
+    pub(crate) alpha: f64,
+    /// 破線の長さ 1 の、外形を作る座標系の長さ（pathLength の倍は別に掛ける）
+    pub(crate) dash_unit: f64,
+    /// 外形を作る座標系から描く座標系への最大の倍率
+    pub(crate) sigma: f64,
+}
+
+/// 節の線の形を決める（`t` は描く座標系への変形）。描く座標系の太さが 1 画素以下の反エイリアスの線は、描く座標系の 1 画素の
+/// 線を太さ（2 つの軸の太さの平均）の α で描く（Chrome・resvg の細い線と同じ。ADR-97 (2)）。細い線の破線の長さは、変形の
+/// 面積の倍の平方根（相似の変形なら倍率そのもの）で描く座標系の長さにする。
+pub(crate) fn stroke_mode(n: &PathNode, t: &Transform, scale: f64) -> StrokeMode {
+    let w = n.stroke_width;
+    let aa = n.flags & CRISP == 0;
+    if n.flags & NON_SCALING != 0 {
+        let wd = w * scale;
+        if aa && wd <= 1.0 {
+            return StrokeMode { device: true, half: 0.5, alpha: wd, dash_unit: scale, sigma: 1.0 };
+        }
+        return StrokeMode { device: true, half: wd / 2.0, alpha: 1.0, dash_unit: scale, sigma: 1.0 };
+    }
+    let len0 = math::hypot(t.a * w, t.b * w);
+    let len1 = math::hypot(t.c * w, t.d * w);
+    if aa && len0 <= 1.0 && len1 <= 1.0 {
+        let geo = t.det().abs().sqrt();
+        return StrokeMode { device: true, half: 0.5, alpha: (len0 + len1) / 2.0, dash_unit: geo, sigma: 1.0 };
+    }
+    StrokeMode { device: false, half: w / 2.0, alpha: 1.0, dash_unit: 1.0, sigma: t.max_scale() }
+}
+
+/// 節の線のペン（太さの半分は線を作る座標系。`mode` は [`stroke_mode`]）。
+fn pen_of(n: &PathNode, t: &Transform, mode: &StrokeMode, q: Quality) -> Pen {
     let cap = match n.cap {
         CAP_ROUND => Cap::Round,
         CAP_SQUARE => Cap::Square,
@@ -506,13 +549,22 @@ fn pen_of(n: &PathNode, t: &Transform, scale: f64, q: Quality) -> Pen {
         _ => Join::Miter,
     };
     Pen {
-        half,
+        half: mode.half,
         cap,
         join,
         miter_limit: n.miter_limit,
-        scale: if non_scaling { 1.0 } else { t.max_scale() },
+        scale: if mode.device { 1.0 } else { t.max_scale() },
         tol: q.tol,
     }
+}
+
+/// 節を描くか（倍率を掛けた変形と、外接矩形 × 倍率が有限：有限でない点を含む節は途中まで描かずに丸ごと落とす。計画と
+/// 見積もりの両方が使う。単位 2 のレビュー）。
+fn drawable(n: &PathNode, scale: f64) -> Option<Transform> {
+    let t = n.transform.scaled(scale);
+    let b = n.bounds;
+    let ok = t.finite() && [b.x0 * scale, b.y0 * scale, b.x1 * scale, b.y1 * scale].iter().all(|v| v.is_finite());
+    ok.then_some(t)
 }
 
 /// 線の外形の点の外への広がり（線を作る座標系の太さの半分の倍）。
@@ -561,18 +613,10 @@ const EDGE_WORK: u64 = push_cost(size_of::<Edge>() as u64).saturating_add(2 * co
 /// 点 1 つを置き場に足す手間。
 const POINT_WORK: u64 = push_cost(size_of::<Point>() as u64);
 
-/// 描く段の、辺 1 本を行にかける手間（かかる辺の並びに足す・最後に終わったと見る）と、辺 1 本の 1 行の手間（セルを積む・
-/// 終わったかを見る）。
-pub(crate) const EDGE_START_WORK: u64 = cost::RASTER_EDGE_ROW + cost::OP_STEP + push_cost(size_of::<u32>() as u64);
-pub(crate) const EDGE_ROW_WORK: u64 = cost::RASTER_EDGE_ROW + cost::OP_STEP;
-
-/// 描く段の 1 行の手間（行の決まった分・掃く・塗る。項目の矩形の幅 `width`。掃く範囲は左の外の 1 列と右の 1 列を含みうる
-/// ので 2 列多く数える）。
-pub(crate) const fn row_work(width: u64) -> u64 {
-    cost::RASTER_ROW
-        .saturating_add(cost::RASTER_SWEEP.saturating_mul(3))
-        .saturating_add(width.saturating_mul(cost::RASTER_SWEEP + cost::PAINT_PIXEL))
-}
+/// 描く段の手間の式（`cost` に置いたもの。範囲の見積もりと同じ口）。
+pub(crate) use cost::{
+    RASTER_EDGE_ROW_WORK as EDGE_ROW_WORK, RASTER_EDGE_START as EDGE_START_WORK, raster_row as row_work,
+};
 
 /// 描く手間の上限（項目 1 つ。行・辺の行・セル・掃く幅と塗る画素）。
 fn render_work(rows: u64, width: u64, edges: u64, cells: u64, edge_rows: u64) -> u64 {
@@ -625,17 +669,14 @@ fn bound_node(
     budget: &Budget<'_>,
 ) -> Result<Bounds, Error> {
     let mut out = Bounds::default();
-    let t = n.transform.scaled(scale);
-    if !t.finite() {
-        return Ok(out);
-    }
+    let Some(t) = drawable(n, scale) else { return Ok(out) };
     let path = tree.path(n);
     let has_fill = n.flags & HAS_FILL != 0;
     let has_stroke = n.flags & HAS_STROKE != 0 && n.stroke_width > 0.0;
-    let non_scaling = n.flags & NON_SCALING != 0;
-    let stroke_space = if non_scaling { t } else { Transform::IDENTITY };
-    let sigma = if non_scaling { 1.0 } else { t.max_scale() };
-    let pen = pen_of(n, &t, scale, q);
+    let mode = stroke_mode(n, &t, scale);
+    let stroke_space = if mode.device { t } else { Transform::IDENTITY };
+    let sigma = mode.sigma;
+    let pen = pen_of(n, &t, &mode, q);
     let reach_dev = if has_stroke { pen.half * sigma * reach_factor(&pen) } else { 0.0 };
     // 平坦化の点は外形の届く距離で数える（塗りの点の数以上なので、塗りの上限にも使える）
     let view = View::new(canvas, reach_dev);
@@ -694,20 +735,30 @@ fn bound_node(
                 }
             }
         }
-        let factor = if n.path_length > 0.0 { c.len_user / n.path_length } else { 1.0 };
-        let dash_scale = if non_scaling { factor * scale } else { factor };
         // 破線の部分の数：作る（なめる）分は道の全体の長さで、外形を作る分は見る箱にかかる長さとかかる区間の数で（箱に
-        // かからない部分は作らない。ADR-30 (4)）
-        let period = total * dash_scale;
-        let (dash_pieces, dash_vis) = if dashes.is_empty() || period.is_nan() || period <= 0.0 {
+        // かからない部分は作らない。ADR-30 (4)）。pathLength があれば、倍は計画が平坦化した長さで決めるので閉じた式の上限に
+        // する（ユーザー単位で作る線は ⌈pathLength / 合計⌉、描く座標系で作る線は変形の最大の倍 ÷ 破線の長さ 1 の倍を掛ける。
+        // 箱の効き目は数えない。単位 1・2 のレビュー）
+        let half_k = (dashes.len() as u64).saturating_add(1).max(2) / 2;
+        let (dash_pieces, dash_vis) = if dashes.is_empty() || total.is_nan() || total <= 0.0 {
             (0, 0)
+        } else if n.path_length > 0.0 {
+            let sig = if mode.device { t.max_scale() / mode.dash_unit } else { 1.0 };
+            let all = up(n.path_length * sig / total).saturating_add(s.saturating_mul(2)).saturating_add(1);
+            let all = all.saturating_mul(half_k);
+            (all, all)
         } else {
-            let half_k = (dashes.len() as u64).saturating_add(1).max(2) / 2;
-            let all = up(c.len_stroke / period).saturating_add(s.saturating_mul(2)).saturating_add(1);
-            let vis = up(c.len_stroke_in / period).saturating_add(c.segs_in.saturating_mul(2)).saturating_add(1);
-            (all.saturating_mul(half_k), vis.min(all).saturating_mul(half_k))
+            let period = total * mode.dash_unit;
+            if period.is_nan() || period <= 0.0 {
+                (0, 0)
+            } else {
+                let all = up(c.len_stroke / period).saturating_add(s.saturating_mul(2)).saturating_add(1);
+                let vis = up(c.len_stroke_in / period).saturating_add(c.segs_in.saturating_mul(2)).saturating_add(1);
+                (all.saturating_mul(half_k), vis.min(all).saturating_mul(half_k))
+            }
         };
-        let pieces_n = if dash_pieces > 0 { dash_vis } else { s };
+        // 計画が破線の並びを断って実線にしても足りるように、部分パスの数を下限にする
+        let pieces_n = if dash_pieces > 0 { dash_vis.max(s) } else { s };
         // 外形の点：部分パス（か破線）ごとに輪 2 つと端 2 つと長さ 0 の円、頂点ごとに 6、round の継ぎ目の円弧
         let per_piece = 2u64.saturating_add(cap_pts.saturating_mul(2)).saturating_add(r2).saturating_add(16);
         let out_pts = pieces_n.saturating_mul(per_piece).saturating_add(v.saturating_mul(6)).saturating_add(k_join);
@@ -738,7 +789,7 @@ fn bound_node(
         out.plan_work = out
             .plan_work
             .saturating_add(v.saturating_mul(passes).saturating_mul(cost::FLATTEN_POINT.saturating_add(POINT_WORK)))
-            .saturating_add(if non_scaling { v.saturating_mul(POINT_WORK) } else { 0 })
+            .saturating_add(if mode.device { v.saturating_mul(POINT_WORK) } else { 0 })
             .saturating_add(dash_pts.saturating_mul(cost::OUTLINE_POINT.saturating_add(POINT_WORK)))
             .saturating_add(dedup.saturating_mul(POINT_WORK.saturating_add(cost::OP_STEP)))
             .saturating_add(vertex_calls.saturating_mul(cost::OP_STEP))
@@ -793,13 +844,10 @@ impl Tree {
         let px = self.pixel_size(scale)?;
         let lim = &opts.limits;
         let side = px.width.max(px.height);
-        if side > lim.canvas_side {
-            return Err(Error::limit(
-                Resource::CanvasSide,
-                u64::from(side),
-                u64::from(lim.canvas_side),
-                Stage::Estimate,
-            ));
+        // 1 辺は決まった箱（±2²² 画素）の内（箱の外の辺は落とすので、それより大きなキャンバスは描けない。単位 2 のレビュー）
+        let max_side = lim.canvas_side.min(BOX as u32);
+        if side > max_side {
+            return Err(Error::limit(Resource::CanvasSide, u64::from(side), u64::from(max_side), Stage::Estimate));
         }
         let pixels = u64::from(px.width).saturating_mul(u64::from(px.height));
         if pixels > lim.canvas_pixels {
@@ -815,7 +863,8 @@ impl Tree {
         for n in self.nodes.as_slice() {
             budget.spend(cost::OP_STEP)?;
             let b = bound_node(self, n, scale, canvas, q, &budget)?;
-            tot.plan_work = tot.plan_work.saturating_add(b.plan_work);
+            // 計画が節ごとに払う分（描かない節も）
+            tot.plan_work = tot.plan_work.saturating_add(b.plan_work).saturating_add(cost::OP_STEP);
             tot.edges = tot.edges.saturating_add(b.edges);
             tot.items = tot.items.saturating_add(b.items);
             tot.scratch_points = tot.scratch_points.max(b.scratch_points);
@@ -842,13 +891,18 @@ impl Tree {
             work: tot
                 .plan_work
                 .saturating_add(tot.items.saturating_mul(push_cost(size_of::<DrawItem>() as u64)))
+                // 辺を詰めて写す
+                .saturating_add(cost::ALLOC_STEP.saturating_add(cost::OP_STEP).saturating_add(cost::copy(edge_bytes)))
                 .saturating_add(PLAN_FRAME),
-            peak_bytes: held.saturating_add(scratch).saturating_add(sort),
+            // 詰めて写す間は上限の容量と写しの両方が生きる
+            peak_bytes: held.saturating_add(scratch).saturating_add(sort).saturating_add(edge_bytes),
             result_bytes: held,
         };
         // 描く段：出力を透明にする手間と、行の置き場（セルの cover と area）と行にかかる辺の番号
         let (work, peak_bytes) = render_frame(u64::from(px.width), u64::from(px.height), tot.max_item_edges, tot.items);
-        let render = Estimate { work: tot.render_work.saturating_add(work), peak_bytes, result_bytes: 0 };
+        let bg = background_work(crate::paint::premultiply(self.background), pixels);
+        let render =
+            Estimate { work: tot.render_work.saturating_add(work).saturating_add(bg), peak_bytes, result_bytes: 0 };
         Ok((RenderEstimate { plan, render }, px, tot))
     }
 
@@ -861,7 +915,8 @@ impl Tree {
         let (est, px, tot) = self.estimate_with(opts, q, cancel)?;
         let lim = &opts.limits;
         check(est.plan.work, lim.plan_work, Resource::Work, Stage::Plan)?;
-        check(est.plan.peak_bytes, lim.plan_bytes, Resource::Memory, Stage::Plan)?;
+        // plan_bytes は Plan が持ち続ける量（architecture.md §3）
+        check(est.plan.result_bytes, lim.plan_bytes, Resource::Memory, Stage::Plan)?;
         check(est.render.work, lim.render_work, Resource::Work, Stage::Render)?;
         check(est.render.peak_bytes, lim.temp_bytes, Resource::Memory, Stage::Render)?;
         let budget = Budget::new(Stage::Plan, est.plan.work, est.plan.peak_bytes, cancel);
@@ -880,16 +935,19 @@ impl Tree {
         let mut max_item = 0u64;
         for n in self.nodes.as_slice() {
             b.spend(cost::OP_STEP)?;
-            let t = n.transform.scaled(opts.scale);
-            if !t.finite() {
-                continue;
-            }
+            let Some(t) = drawable(n, opts.scale) else { continue };
+            let mode = stroke_mode(n, &t, opts.scale);
             let order: [u8; 2] =
                 if n.flags & STROKE_FIRST != 0 { [HAS_STROKE, HAS_FILL] } else { [HAS_FILL, HAS_STROKE] };
             for what in order {
                 let start = edges.len();
                 let mut dev = DevBox::new();
-                let color = if what == HAS_FILL { n.fill } else { n.stroke };
+                let color = if what == HAS_FILL {
+                    n.fill
+                } else {
+                    let c = n.stroke;
+                    [c[0], c[1], c[2], c[3] * mode.alpha]
+                };
                 if n.flags & what == 0 || color[3].is_nan() || color[3] <= 0.0 {
                     continue;
                 }
@@ -908,7 +966,7 @@ impl Tree {
                         dash_scaled: &mut dash_scaled,
                         canvas,
                     };
-                    stroke_edges(self, n, &t, opts.scale, q, parts, &mut edges, &mut dev, b)?;
+                    stroke_edges(self, n, &t, &mode, q, parts, &mut edges, &mut dev, b)?;
                 }
                 let end = edges.len();
                 if end == start {
@@ -947,13 +1005,21 @@ impl Tree {
             }
         }
         drop((poly, scratch, dashbuf, devbuf, head, dash_scaled));
+        // 上限の容量で取った置き場を、使った長さに詰めて写す（計画が持ち続ける量を実際の量にする。単位 2 のレビュー）
+        let exact = |v: MVec<'_, Edge>| -> Result<Frozen<Edge>, Error> {
+            let mut e: MVec<'_, Edge> = MVec::with_capacity(b, v.len())?;
+            e.append_slice(v.as_slice())?;
+            Ok(e.freeze())
+        };
+        let edges = exact(edges)?;
         Ok(Plan {
             width: px.width,
             height: px.height,
             items: items.freeze(),
-            edges: edges.freeze(),
+            edges,
             max_item_edges: max_item,
             limits: opts.limits,
+            background: crate::paint::premultiply(self.background),
         })
     }
 }
@@ -1142,19 +1208,18 @@ fn stroke_edges(
     tree: &Tree,
     n: &PathNode,
     t: &Transform,
-    scale: f64,
+    mode: &StrokeMode,
     q: Quality,
     parts: StrokeParts<'_, '_>,
     edges: &mut MVec<'_, Edge>,
     dev: &mut DevBox,
     budget: &Budget<'_>,
 ) -> Result<(), Error> {
-    let non_scaling = n.flags & NON_SCALING != 0;
-    let pen = pen_of(n, t, scale, q);
-    // 外形を作る座標系：ふつうはユーザー単位（描く座標系へは t）、non-scaling は描く座標系（そのまま）
-    let to_dev = if non_scaling { Transform::IDENTITY } else { *t };
-    let sigma = if non_scaling { 1.0 } else { t.max_scale() };
-    let reach = pen.half * sigma * reach_factor(&pen);
+    let device = mode.device;
+    let pen = pen_of(n, t, mode, q);
+    // 外形を作る座標系：ふつうはユーザー単位（描く座標系へは t）、non-scaling と細い線は描く座標系（そのまま）
+    let to_dev = if device { Transform::IDENTITY } else { *t };
+    let reach = pen.half * mode.sigma * reach_factor(&pen);
     let path = tree.path(n);
     let dashes_src = tree.dash_list(n);
     // pathLength の倍（要素の座標系（ユーザー単位）の道の長さの和 / pathLength。non-scaling はその長さを画面の座標系の長さと
@@ -1182,7 +1247,7 @@ fn stroke_edges(
         })?;
         factor = total / n.path_length;
     }
-    let dash_scale = if non_scaling { factor * scale } else { factor };
+    let dash_scale = factor * mode.dash_unit;
     let StrokeParts { poly, scratch, dashbuf, devbuf, head, dash_scaled, canvas } = parts;
     dash_scaled.clear();
     // pathLength="0" は倍が無限：正の長さはみな無限になり、実線（SVG 2 §10.2・Chrome と同じ。ADR-95 (2)）
@@ -1212,8 +1277,8 @@ fn stroke_edges(
     // 破線の部分は見る箱にかかるものだけを作る（ADR-30 (4)。見積もりと同じ箱）
     let cull = Cull { to_dev, view: View::new(canvas, reach) };
     subpaths(path, t, q, reach, poly, budget, &mut |pts, closed| {
-        if non_scaling {
-            // non-scaling は描く座標系の点にしてから線を作る
+        if device {
+            // non-scaling と細い線は描く座標系の点にしてから線を作る
             devbuf.clear();
             for &p in pts {
                 devbuf.push(t.apply(p))?;
@@ -1251,7 +1316,9 @@ struct Cull {
 }
 
 impl Cull {
-    /// 部分の折れ線のどれかの区間が見る箱にかかるか（点ごとに払う）。
+    /// 部分の折れ線のどれかの区間が見る箱にかかるか（点ごとに払う）。見積もりの数え（[`in_view`]）と同じく、区間そのものが
+    /// 箱と交わるかで見る（外接矩形で見ると、箱の角の外を斜めに通る区間を作ってしまい、見積もりを超える。単位 1・2 の
+    /// レビュー）。箱にかからない区間の外形は、キャンバスから 2 画素より外にある。
     fn visible(&self, piece: &[Point], closed: bool, budget: &Budget<'_>) -> Result<bool, Error> {
         let n = piece.len();
         let count = if closed { n } else { n.saturating_sub(1) };
@@ -1265,7 +1332,7 @@ impl Cull {
             let next = k.saturating_add(1);
             let (Some(&a), Some(&b)) = (piece.get(k), piece.get(if next >= n { 0 } else { next })) else { continue };
             let (a, b) = (self.to_dev.apply(a), self.to_dev.apply(b));
-            if self.view.meets(math::min(a.x, b.x), math::min(a.y, b.y), math::max(a.x, b.x), math::max(a.y, b.y)) {
+            if self.view.inside_fraction(a, b) > 0.0 || (a == b && self.view.meets(a.x, a.y, a.x, a.y)) {
                 return Ok(true);
             }
         }
