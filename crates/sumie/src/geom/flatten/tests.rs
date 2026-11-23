@@ -15,7 +15,7 @@ use crate::geom::{ArcKind, ArcSeg, endpoint_to_center};
 fn flat(seg: &PathSeg, t: &Transform, tol: f64) -> Vec<Point> {
     let b = Budget::new(Stage::Plan, u64::MAX, u64::MAX, &Never);
     let mut v = Vec::new();
-    flatten_seg(seg, t, tol, &b, &mut |p| {
+    flatten_seg(seg, t, tol, 0.0, &b, &mut |p| {
         v.push(p);
         Ok(())
     })
@@ -42,19 +42,19 @@ fn dist_to_polyline(p: Point, from: Point, pts: &[Point]) -> f64 {
 fn counts_follow_the_formulas() {
     let id = Transform::IDENTITY;
     // 線は 1
-    assert_eq!(pieces(&PathSeg::Line(Point::new(0.0, 0.0), Point::new(1e9, 0.0)), &id, 0.1), 1);
+    assert_eq!(pieces(&PathSeg::Line(Point::new(0.0, 0.0), Point::new(1e9, 0.0)), &id, 0.1, 0.0), 1);
     // 2 次曲線：|P0 − 2P1 + P2| = 20 → √(20 / 0.4) = √50 → 8
     let q = PathSeg::Quad(Point::new(0.0, 0.0), Point::new(5.0, 10.0), Point::new(10.0, 0.0));
-    assert_eq!(pieces(&q, &id, 0.1), 8);
+    assert_eq!(pieces(&q, &id, 0.1, 0.0), 8);
     // 倍率 4 で点の数はおよそ 2 倍（√）
-    assert_eq!(pieces(&q, &id.scaled(4.0), 0.1), 15);
+    assert_eq!(pieces(&q, &id.scaled(4.0), 0.1, 0.0), 15);
     // 半径 100 の半円：π √(100 / 0.8) = 35.1 → 36
     let ArcKind::Curve(a) =
         endpoint_to_center(Point::new(0.0, 0.0), 100.0, 100.0, 0.0, false, true, Point::new(200.0, 0.0))
     else {
         panic!()
     };
-    assert_eq!(pieces(&PathSeg::ArcTo(Point::new(0.0, 0.0), a), &id, 0.1), 36);
+    assert_eq!(pieces(&PathSeg::ArcTo(Point::new(0.0, 0.0), a), &id, 0.1, 0.0), 36);
 }
 
 #[test]
@@ -67,13 +67,13 @@ fn far_curves_are_not_split() {
         Point::new(far + 1e8, 1e8),
         Point::new(far + 1e8, 0.0),
     );
-    assert_eq!(pieces(&c, &Transform::IDENTITY, 0.1), 1);
+    assert_eq!(pieces(&c, &Transform::IDENTITY, 0.1, 0.0), 1);
     let pts = flat(&c, &Transform::IDENTITY, 0.1);
     assert_eq!(pts, [Point::new(far + 1e8, 0.0)]);
     // 箱をまたぐなら分ける（片側だけでない）
     let wide =
         PathSeg::Cubic(Point::new(-far, 0.0), Point::new(-far, 10.0), Point::new(far, 10.0), Point::new(far, 0.0));
-    assert!(pieces(&wide, &Transform::IDENTITY, 0.1) > 1);
+    assert!(pieces(&wide, &Transform::IDENTITY, 0.1, 0.0) > 1);
     // 箱の外の弧（楕円の外接矩形がすべて外）
     let a = ArcSeg {
         c: Point::new(far, far),
@@ -82,7 +82,7 @@ fn far_curves_are_not_split() {
         dtheta: 6.0,
         end: Point::new(far + 1e6, far),
     };
-    assert_eq!(pieces(&PathSeg::ArcTo(Point::new(far + 1e6, far), a), &Transform::IDENTITY, 0.1), 1);
+    assert_eq!(pieces(&PathSeg::ArcTo(Point::new(far + 1e6, far), a), &Transform::IDENTITY, 0.1, 0.0), 1);
     // 有限でない・大きすぎる数は u64::MAX（見積もりが断る）
     let huge = PathSeg::Cubic(
         Point::new(-1e300, 0.0),
@@ -90,7 +90,7 @@ fn far_curves_are_not_split() {
         Point::new(-1e300, -1e300),
         Point::new(1e300, 0.0),
     );
-    assert_eq!(pieces(&huge, &Transform::IDENTITY, 0.1), u64::MAX);
+    assert_eq!(pieces(&huge, &Transform::IDENTITY, 0.1, 0.0), u64::MAX);
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn points_end_exactly_and_stay_within_tolerance() {
     let p0 = Point::new(0.0, 0.0);
     let c = PathSeg::Cubic(p0, Point::new(10.0, 40.0), Point::new(50.0, -30.0), Point::new(60.0, 10.0));
     let pts = flat(&c, &t, tol);
-    assert_eq!(pts.len() as u64, pieces(&c, &t, tol));
+    assert_eq!(pts.len() as u64, pieces(&c, &t, tol, 0.0));
     assert_eq!(*pts.last().unwrap(), Point::new(60.0, 10.0));
     // 曲線の点（細かく取ったもの）は、描く座標系で折れ線から誤差の内
     let dev: Vec<Point> = pts.iter().map(|&p| t.apply(p)).collect();
@@ -129,9 +129,18 @@ fn flattening_pays_per_point() {
     let b = Budget::new(Stage::Plan, u64::MAX, u64::MAX, &Never);
     // 2 階の差は √2 · 10⁷ なので n = ⌈√(3 · √2 · 10⁷ / 0.4)⌉ ≈ 10,300（塊を 2 つ以上に分ける）
     let c = PathSeg::Cubic(Point::new(0.0, 0.0), Point::new(0.0, 1e7), Point::new(1e7, 1e7), Point::new(1e7, 0.0));
-    let n = pieces(&c, &Transform::IDENTITY, 0.1);
+    let n = pieces(&c, &Transform::IDENTITY, 0.1, 0.0);
     assert!(n > 10_000, "{n}");
-    flatten_seg(&c, &Transform::IDENTITY, 0.1, &b, &mut |_| Ok(())).unwrap();
+    flatten_seg(&c, &Transform::IDENTITY, 0.1, 0.0, &b, &mut |_| Ok(())).unwrap();
     assert_eq!(b.work(), n * cost::FLATTEN_POINT);
     assert!(b.max_spend() < crate::budget::CANCEL_INTERVAL);
+}
+
+/// 線の外形が箱の中に届くなら、箱の外の曲線も分ける（届く距離だけ箱を広げて見る。単位の 1 回目のレビュー）。
+#[test]
+fn far_curves_with_wide_strokes_are_split() {
+    let c =
+        PathSeg::Cubic(Point::new(5e6, -2e6), Point::new(4.2e6, -2e6), Point::new(4.2e6, 2e6), Point::new(5e6, 2e6));
+    assert_eq!(pieces(&c, &Transform::IDENTITY, 0.1, 0.0), 1);
+    assert!(pieces(&c, &Transform::IDENTITY, 0.1, 4.45e6) > 1);
 }

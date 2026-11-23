@@ -156,6 +156,7 @@ fn count(
     t: &Transform,
     stroke_space: &Transform,
     q: Quality,
+    reach: f64,
     budget: &Budget<'_>,
 ) -> Result<Counts, Error> {
     let mut c = Counts::default();
@@ -202,7 +203,7 @@ fn count(
                 last_dir = None;
                 continue;
             }
-            _ => pieces(&seg, t, q.tol),
+            _ => pieces(&seg, t, q.tol, reach),
         };
         c.points = c.points.saturating_add(n);
         sub = sub.saturating_add(n);
@@ -366,7 +367,7 @@ const fn push_cost(size: u64) -> u64 {
 /// 辺 1 本が回るセルの数の上限の足し分（行ごとに「列の差 + 1」を回るので、全体で |Δx| + |Δy| の画素の数 + 3）。
 pub(crate) const CELLS_PER_EDGE: u64 = 4;
 /// 計画の決まった手間（置き場を取る 8 回分と、そのほか）。
-pub(crate) const PLAN_FRAME: u64 = 8 * cost::ALLOC_STEP + 256;
+pub(crate) const PLAN_FRAME: u64 = 9 * cost::ALLOC_STEP + 256;
 /// 描く段の決まった手間の足し分（行の置き場を作る・項目を選ぶ）。
 pub(crate) const RENDER_SLACK: u64 = 1024;
 
@@ -405,10 +406,11 @@ fn bound_node(
     let has_stroke = n.flags & HAS_STROKE != 0 && n.stroke_width > 0.0;
     let non_scaling = n.flags & NON_SCALING != 0;
     let stroke_space = if non_scaling { t } else { Transform::IDENTITY };
-    let c = count(path, &t, &stroke_space, q, budget)?;
     let sigma = if non_scaling { 1.0 } else { t.max_scale() };
     let pen = pen_of(n, &t, scale, q);
     let reach_dev = if has_stroke { pen.half * sigma * reach_factor(&pen) } else { 0.0 };
+    // 平坦化の点は外形の届く距離で数える（塗りの点の数以上なので、塗りの上限にも使える）
+    let c = count(path, &t, &stroke_space, q, reach_dev, budget)?;
     let bx = node_box(n, scale, reach_dev, canvas);
     let (rows, width) = (bx.height(), bx.width());
     // 箱の境で辺が分かれうるか（x の箱の外に出る節だけ。y は切っても分かれない）
@@ -478,13 +480,20 @@ fn bound_node(
         // 破線の部分の点（区間の境の 2 つと、部分の中の頂点）と、まとめる写し（部分ごとに端の 2 つ）
         let dash_pts = if dash_pieces > 0 { v.saturating_add(dash_pieces.saturating_mul(4)) } else { 0 };
         let dedup = v.saturating_add(dash_pieces.saturating_mul(2)).saturating_add(s.saturating_mul(2));
+        // 頂点の継ぎ目を見る回（両側）と、破線の区間ごとの払い・閉じた部分パスの最初の部分をつなぐ写し
+        let vertex_calls = dedup.saturating_mul(2);
+        let dash_segs = if dash_pieces > 0 { v.saturating_add(s).saturating_mul(passes) } else { 0 };
+        let joins = if dash_pieces > 0 { v.saturating_add(dash_pieces.saturating_mul(2)) } else { 0 };
         let phase_steps = s.saturating_add(dash_pieces).saturating_mul(dashes.len() as u64);
         out.plan_work = out
             .plan_work
             .saturating_add(v.saturating_mul(passes).saturating_mul(cost::FLATTEN_POINT.saturating_add(POINT_WORK)))
             .saturating_add(if non_scaling { v.saturating_mul(POINT_WORK) } else { 0 })
             .saturating_add(dash_pts.saturating_mul(cost::OUTLINE_POINT.saturating_add(POINT_WORK)))
-            .saturating_add(dedup.saturating_mul(POINT_WORK))
+            .saturating_add(dedup.saturating_mul(POINT_WORK.saturating_add(cost::OP_STEP)))
+            .saturating_add(vertex_calls.saturating_mul(cost::OP_STEP))
+            .saturating_add(dash_segs.saturating_mul(cost::OP_STEP))
+            .saturating_add(joins.saturating_mul(POINT_WORK.saturating_add(cost::OP_STEP)))
             .saturating_add(phase_steps.saturating_mul(cost::OP_STEP))
             .saturating_add(out_pts.saturating_mul(cost::OUTLINE_POINT.saturating_add(cost::OP_STEP)))
             .saturating_add(pieces_n.saturating_mul(2).saturating_mul(cost::OP_STEP))
@@ -572,7 +581,7 @@ impl Tree {
         let scratch = tot
             .scratch_points
             .saturating_mul(size_of::<Point>() as u64)
-            .saturating_mul(4)
+            .saturating_mul(5)
             .saturating_add(tot.max_dashes.saturating_mul(8));
         let sort = cost::stable_sort_bytes(tot.max_item_edges, size_of::<Edge>() as u64);
         let held = edge_bytes.saturating_add(item_bytes);
@@ -613,6 +622,7 @@ impl Tree {
         let mut scratch: MVec<'_, Point> = MVec::with_capacity(b, sp)?;
         let mut dashbuf: MVec<'_, Point> = MVec::with_capacity(b, sp)?;
         let mut devbuf: MVec<'_, Point> = MVec::with_capacity(b, sp)?;
+        let mut head: MVec<'_, Point> = MVec::with_capacity(b, sp)?;
         let mut dash_scaled: MVec<'_, f64> = MVec::with_capacity(b, cap(tot.max_dashes)?)?;
         let mut max_item = 0u64;
         for n in self.nodes.as_slice() {
@@ -641,6 +651,7 @@ impl Tree {
                         scratch: &mut scratch,
                         dashbuf: &mut dashbuf,
                         devbuf: &mut devbuf,
+                        head: &mut head,
                         dash_scaled: &mut dash_scaled,
                     };
                     stroke_edges(self, n, &t, opts.scale, q, parts, &mut edges, &mut dev, b)?;
@@ -676,7 +687,7 @@ impl Tree {
                 })?;
             }
         }
-        drop((poly, scratch, dashbuf, devbuf, dash_scaled));
+        drop((poly, scratch, dashbuf, devbuf, head, dash_scaled));
         Ok(Plan {
             width: px.width,
             height: px.height,
@@ -750,6 +761,7 @@ fn subpaths(
     path: PathRef<'_>,
     t: &Transform,
     q: Quality,
+    reach: f64,
     poly: &mut MVec<'_, Point>,
     budget: &Budget<'_>,
     f: &mut SubpathFn<'_>,
@@ -774,7 +786,7 @@ fn subpaths(
                 open = false;
             }
             _ => {
-                flatten_seg(&seg, t, q.tol, budget, &mut |p| poly.push(p))?;
+                flatten_seg(&seg, t, q.tol, reach, budget, &mut |p| poly.push(p))?;
             }
         }
     }
@@ -794,7 +806,7 @@ fn fill_edges(
     dev: &mut DevBox,
     budget: &Budget<'_>,
 ) -> Result<(), Error> {
-    subpaths(path, t, q, poly, budget, &mut |pts, _| {
+    subpaths(path, t, q, 0.0, poly, budget, &mut |pts, _| {
         let Some(&first) = pts.first() else { return Ok(()) };
         let mut prev = t.apply(first);
         dev.add(prev);
@@ -816,6 +828,7 @@ struct StrokeParts<'a, 'b> {
     scratch: &'a mut MVec<'b, Point>,
     dashbuf: &'a mut MVec<'b, Point>,
     devbuf: &'a mut MVec<'b, Point>,
+    head: &'a mut MVec<'b, Point>,
     dash_scaled: &'a mut MVec<'b, f64>,
 }
 
@@ -879,13 +892,15 @@ fn stroke_edges(
     let pen = pen_of(n, t, scale, q);
     // 外形を作る座標系：ふつうはユーザー単位（描く座標系へは t）、non-scaling は描く座標系（そのまま）
     let to_dev = if non_scaling { Transform::IDENTITY } else { *t };
+    let sigma = if non_scaling { 1.0 } else { t.max_scale() };
+    let reach = pen.half * sigma * reach_factor(&pen);
     let path = tree.path(n);
     let dashes_src = tree.dash_list(n);
     // pathLength の倍（線を作る座標系の長さの和 / pathLength）
     let mut factor = 1.0;
     if n.path_length > 0.0 && !dashes_src.is_empty() {
         let mut total = 0.0;
-        subpaths(path, t, q, parts.poly, budget, &mut |pts, closed| {
+        subpaths(path, t, q, reach, parts.poly, budget, &mut |pts, closed| {
             let m = |p: Point| if non_scaling { t.apply(p) } else { p };
             let mut a = match pts.first() {
                 Some(&p) => m(p),
@@ -905,7 +920,7 @@ fn stroke_edges(
         factor = total / n.path_length;
     }
     let dash_scale = if non_scaling { factor * scale } else { factor };
-    let StrokeParts { poly, scratch, dashbuf, devbuf, dash_scaled } = parts;
+    let StrokeParts { poly, scratch, dashbuf, devbuf, head, dash_scaled } = parts;
     dash_scaled.clear();
     for &d in dashes_src {
         budget.spend(cost::OP_STEP)?;
@@ -913,36 +928,51 @@ fn stroke_edges(
     }
     let dashes = Dashes::new(dash_scaled.as_slice(), n.dash_offset * dash_scale);
     let mut sink = EdgeSink { edges, dev, t: to_dev, first: None, prev: None, budget: budget_ref(budget) };
-    subpaths(path, t, q, poly, budget, &mut |pts, closed| {
+    subpaths(path, t, q, reach, poly, budget, &mut |pts, closed| {
         if non_scaling {
             // non-scaling は描く座標系の点にしてから線を作る
             devbuf.clear();
             for &p in pts {
                 devbuf.push(t.apply(p))?;
             }
-            stroke_one(devbuf.as_slice(), closed, &pen, dashes.as_ref(), dashbuf, scratch, &mut sink, budget)
+            stroke_one(
+                devbuf.as_slice(),
+                closed,
+                &pen,
+                dashes.as_ref(),
+                [&mut *dashbuf, &mut *head, &mut *scratch],
+                &mut sink,
+                budget,
+            )
         } else {
-            stroke_one(pts, closed, &pen, dashes.as_ref(), dashbuf, scratch, &mut sink, budget)
+            stroke_one(
+                pts,
+                closed,
+                &pen,
+                dashes.as_ref(),
+                [&mut *dashbuf, &mut *head, &mut *scratch],
+                &mut sink,
+                budget,
+            )
         }
     })?;
     sink.close_loop()
 }
 
-/// 1 本の部分パスの線（破線があれば部分ごと）。
-#[allow(clippy::too_many_arguments, reason = "置き場を分けて渡す")]
+/// 1 本の部分パスの線（破線があれば部分ごと）。`bufs` は破線の部分・最初の部分・まとめた点の置き場。
 fn stroke_one(
     pts: &[Point],
     closed: bool,
     pen: &Pen,
     dashes: Option<&Dashes<'_>>,
-    dashbuf: &mut MVec<'_, Point>,
-    scratch: &mut MVec<'_, Point>,
+    bufs: [&mut MVec<'_, Point>; 3],
     sink: &mut EdgeSink<'_, '_>,
     budget: &Budget<'_>,
 ) -> Result<(), Error> {
+    let [dashbuf, head, scratch] = bufs;
     match dashes {
         None => stroke_polyline(pts, closed, pen, scratch, budget, sink),
-        Some(d) => dash_polyline(pts, closed, d, dashbuf, budget, &mut |piece| {
+        Some(d) => dash_polyline(pts, closed, d, dashbuf, head, budget, &mut |piece| {
             stroke_polyline(piece, false, pen, scratch, budget, sink)
         }),
     }

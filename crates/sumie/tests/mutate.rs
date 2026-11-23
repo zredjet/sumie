@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use sumie::Cancel;
 use sumie::fuzzing::{
     CSS_HEAD, CSS_TAIL, Check, css_parse, document_parse, document_parse_cancel, dtd_parse, math_ops, mem_ops,
-    mem_ops_with, path_ops, values_parse, xml_parse,
+    mem_ops_with, path_ops, stroke_ops, values_parse, xml_parse,
 };
 use sumie_testkit::alloc::{assert_heap_within, measure};
 use sumie_testkit::mutate::cases;
@@ -407,6 +407,17 @@ fn path_survives_seeded_mutations() {
     let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
     for (n, case) in cases(0x5eed_0009, 4000, &refs, PATH_DICT, 512).iter().enumerate() {
         let (out, heap) = measure(|| path_ops(case));
+        assert_eq!(out, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
+        assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
+    }
+}
+
+#[test]
+fn stroke_survives_seeded_mutations() {
+    let seeds = fuzz_seeds("stroke");
+    let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
+    for (n, case) in cases(0x5eed_000a, 3000, &refs, PATH_DICT, 256).iter().enumerate() {
+        let (out, heap) = measure(|| stroke_ops(case));
         assert_eq!(out, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
         assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
     }

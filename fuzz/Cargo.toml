@@ -73,3 +73,10 @@ path = "fuzz_targets/path.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "stroke"
+path = "fuzz_targets/stroke.rs"
+test = false
+doc = false
+bench = false

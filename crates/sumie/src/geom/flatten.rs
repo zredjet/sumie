@@ -33,25 +33,27 @@ fn norm(x: f64, y: f64) -> f64 {
     math::hypot(x, y)
 }
 
-/// 点がすべて箱の外の同じ側にあるか。
-fn outside_one_side(pts: &[Point]) -> bool {
+/// 点がすべて、箱を `reach` だけ広げた矩形の外の同じ側にあるか（線は外形が中心の線から `reach` まで届くので、その分を
+/// 広げて見る。塗りは 0。単位の 1 回目のレビュー）。
+fn outside_one_side(pts: &[Point], reach: f64) -> bool {
+    let b = BOX + reach;
     let all = |f: &dyn Fn(&Point) -> bool| pts.iter().all(f);
-    all(&|p| p.x < -BOX) || all(&|p| p.x > BOX) || all(&|p| p.y < -BOX) || all(&|p| p.y > BOX)
+    all(&|p| p.x < -b) || all(&|p| p.x > b) || all(&|p| p.y < -b) || all(&|p| p.y > b)
 }
 
-/// 描く座標系の区間を分ける数（1 以上）。線・閉じ・始まりは 1。
-pub(crate) fn pieces_device(seg: &PathSeg, tol: f64) -> u64 {
+/// 描く座標系の区間を分ける数（1 以上）。線・閉じ・始まりは 1。`reach` は外形が届く距離（画素。塗りは 0）。
+pub(crate) fn pieces_device(seg: &PathSeg, tol: f64, reach: f64) -> u64 {
     match *seg {
         PathSeg::Move(_) | PathSeg::Line(..) | PathSeg::Close(..) => 1,
         PathSeg::Quad(p0, p1, p2) => {
-            if outside_one_side(&[p0, p1, p2]) {
+            if outside_one_side(&[p0, p1, p2], reach) {
                 return 1;
             }
             let m = norm(p0.x - 2.0 * p1.x + p2.x, p0.y - 2.0 * p1.y + p2.y);
             to_count((m / (4.0 * tol)).sqrt())
         }
         PathSeg::Cubic(p0, p1, p2, p3) => {
-            if outside_one_side(&[p0, p1, p2, p3]) {
+            if outside_one_side(&[p0, p1, p2, p3], reach) {
                 return 1;
             }
             let a = norm(p0.x - 2.0 * p1.x + p2.x, p0.y - 2.0 * p1.y + p2.y);
@@ -63,7 +65,7 @@ pub(crate) fn pieces_device(seg: &PathSeg, tol: f64) -> u64 {
             let ex = norm(m0, m1);
             let ey = norm(m2, m3);
             let corners = [Point::new(a.c.x - ex, a.c.y - ey), Point::new(a.c.x + ex, a.c.y + ey), p, a.end];
-            if outside_one_side(&corners) {
+            if outside_one_side(&corners, reach) {
                 return 1;
             }
             let r = a.max_radius();
@@ -73,8 +75,8 @@ pub(crate) fn pieces_device(seg: &PathSeg, tol: f64) -> u64 {
 }
 
 /// ユーザー単位の区間を、変形 `t` の下で分ける数。
-pub(crate) fn pieces(seg: &PathSeg, t: &Transform, tol: f64) -> u64 {
-    pieces_device(&transform_seg(seg, t), tol)
+pub(crate) fn pieces(seg: &PathSeg, t: &Transform, tol: f64, reach: f64) -> u64 {
+    pieces_device(&transform_seg(seg, t), tol, reach)
 }
 
 /// 区間を平坦化した点（ユーザー単位）を、始めの点を除いて順に `out` に渡す（最後は終わりの点）。分ける数は描く座標系で
@@ -83,6 +85,7 @@ pub(crate) fn flatten_seg(
     seg: &PathSeg,
     t: &Transform,
     tol: f64,
+    reach: f64,
     budget: &Budget<'_>,
     out: &mut dyn FnMut(Point) -> Result<(), Error>,
 ) -> Result<(), Error> {
@@ -92,7 +95,7 @@ pub(crate) fn flatten_seg(
             budget.spend(cost::FLATTEN_POINT)?;
             return out(*b);
         }
-        _ => pieces(seg, t, tol),
+        _ => pieces(seg, t, tol, reach),
     };
     let step = chunk_len(cost::FLATTEN_POINT) as u64;
     let nf = n as f64;

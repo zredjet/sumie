@@ -1063,16 +1063,28 @@ pub fn path_ops(data: &[u8]) -> Check {
             if matches!(seg, PathSeg::Move(_) | PathSeg::Close(..)) {
                 continue;
             }
-            total = total.saturating_add(pieces(&seg, &t, 0.1));
+            total = total.saturating_add(pieces(&seg, &t, 0.1, 0.0));
         }
         let mut emitted = 0u64;
         let mut inside = true;
+        // 弧の始めの点と終わりの点は、書いた点に半径に対して近い（端点の形から中心の形への変換。単位の 1 回目のレビュー）
+        for seg in path.segments() {
+            if let PathSeg::ArcTo(from, a) = seg {
+                let r = a.max_radius();
+                let (p0, p1) = (a.at(a.theta1), a.at(a.theta1 + a.dtheta));
+                let near = |p: Point, q: Point| {
+                    let d = math::hypot(p.x - q.x, p.y - q.y);
+                    !(d.is_finite() && r.is_finite()) || d <= 1e-6 * (r + from.x.abs() + from.y.abs() + 1.0)
+                };
+                inside &= near(p0, from) && near(p1, a.end);
+            }
+        }
         if total <= 200_000 {
             for seg in path.segments() {
                 let mut r = Rect::EMPTY;
                 add_bounds(&mut r, &seg);
                 let pad = |v: f64| 1e-9 * (1.0 + v.abs());
-                flatten_seg(&seg, &t, 0.1, &b, &mut |p| {
+                flatten_seg(&seg, &t, 0.1, 0.0, &b, &mut |p| {
                     emitted = emitted.saturating_add(1);
                     if p.finite() && !r.is_empty() {
                         let ok = p.x >= r.x0 - pad(r.x0)
@@ -1104,5 +1116,116 @@ pub fn path_ops(data: &[u8]) -> Check {
         (Err(Error::Limit(_)), _) => Check::Violation("置き場に書く量が入力の 12 倍を超えた"),
         (Err(Error::Cancelled), _) => Check::Violation("平坦化の点の数が分ける数の和と違うか、勘定が崩れた"),
         _ => Check::Violation("同じ入力で結果が違う"),
+    }
+}
+
+/// 線の外形と破線を通す（ファズの `stroke` の対象）。頭の 4 バイトで端・継ぎ目・太さ・miterlimit・破線を選び、残りを
+/// パスのデータとして読む。確かめること：1 回の払いが中止の間隔を超えない・同じ入力で同じ結果・点ごとに払う（手間 ≥ 点の数）・
+/// 外形の点が有限（入力が有限なら）。手間の上限は 2²⁴（速く回すため。超えれば `Limit` で、両方の回で同じなら良い）。
+pub fn stroke_ops(data: &[u8]) -> Check {
+    use crate::geom::flatten::flatten_seg;
+    use crate::geom::stroke::{Cap, Dashes, Join, LoopSink, Pen, dash_polyline, stroke_polyline};
+    use crate::geom::{PathRef, PathSeg, PathWriter, Point, Transform};
+    let Some((head, text)) = data.split_first_chunk::<4>() else { return Check::Ok };
+    let cap = match head[0] % 3 {
+        0 => Cap::Butt,
+        1 => Cap::Round,
+        _ => Cap::Square,
+    };
+    let join = match (head[0] / 3) % 3 {
+        0 => Join::Miter,
+        1 => Join::Round,
+        _ => Join::Bevel,
+    };
+    let half = [0.5, 3.0, 40.0, 1e6, 1e-6, 1e300].get(usize::from(head[1] % 6)).copied().unwrap_or(1.0);
+    let limit = [4.0, 0.5, 1.0, 50.0].get(usize::from(head[1] / 6 % 4)).copied().unwrap_or(4.0);
+    let dash_sets: [&[f64]; 5] = [&[], &[5.0, 3.0], &[0.0, 7.0], &[1.0, 1e30], &[0.01, 0.02, 3.0, 0.5]];
+    let dash = dash_sets.get(usize::from(head[2] % 5)).copied().unwrap_or(&[]);
+    let offset = f64::from(head[3]) - 100.0;
+    struct Count {
+        loops: u64,
+        points: u64,
+        finite: bool,
+    }
+    impl LoopSink for Count {
+        fn begin(&mut self) -> Result<(), Error> {
+            self.loops = self.loops.saturating_add(1);
+            Ok(())
+        }
+        fn point(&mut self, p: Point) -> Result<(), Error> {
+            self.points = self.points.saturating_add(1);
+            self.finite &= p.finite();
+            Ok(())
+        }
+    }
+    let run = || -> Result<(u64, u64, bool, u64), Error> {
+        let b = Budget::new(Stage::Plan, 1 << 24, 1 << 28, &Never);
+        let mut verbs: MVec<'_, u8> = MVec::new(&b);
+        let mut coords: MVec<'_, f64> = MVec::new(&b);
+        {
+            let mut w = PathWriter::new(&mut verbs, &mut coords);
+            crate::values::path::path_data(text, &mut w, &b)?;
+        }
+        let pen = Pen { half, cap, join, miter_limit: limit, scale: 1.0, tol: 0.25 };
+        let dashes = Dashes::new(dash, offset);
+        let mut poly: MVec<'_, Point> = MVec::new(&b);
+        let mut scratch: MVec<'_, Point> = MVec::new(&b);
+        let mut buf: MVec<'_, Point> = MVec::new(&b);
+        let mut hd: MVec<'_, Point> = MVec::new(&b);
+        let mut sink = Count { loops: 0, points: 0, finite: true };
+        let mut input_points = 0u64;
+        let mut all_finite = true;
+        let path = PathRef { verbs: verbs.as_slice(), coords: coords.as_slice() };
+        let mut flush = |poly: &mut MVec<'_, Point>, closed: bool, sink: &mut Count| -> Result<(), Error> {
+            match &dashes {
+                None => stroke_polyline(poly.as_slice(), closed, &pen, &mut scratch, &b, sink)?,
+                Some(d) => dash_polyline(poly.as_slice(), closed, d, &mut buf, &mut hd, &b, &mut |piece| {
+                    stroke_polyline(piece, false, &pen, &mut scratch, &b, sink)
+                })?,
+            }
+            poly.clear();
+            Ok(())
+        };
+        for seg in path.segments() {
+            match seg {
+                PathSeg::Move(p) => {
+                    if !poly.is_empty() {
+                        flush(&mut poly, false, &mut sink)?;
+                    }
+                    poly.push(p)?;
+                }
+                PathSeg::Close(..) => flush(&mut poly, true, &mut sink)?,
+                _ => flatten_seg(&seg, &Transform::IDENTITY, 0.25, half, &b, &mut |p| {
+                    input_points = input_points.saturating_add(1);
+                    all_finite &= p.finite();
+                    poly.push(p)
+                })?,
+            }
+        }
+        if !poly.is_empty() {
+            flush(&mut poly, false, &mut sink)?;
+        }
+        if b.max_spend() >= CANCEL_INTERVAL || b.over_released() {
+            return Err(Error::Cancelled);
+        }
+        if b.work() < input_points.saturating_mul(cost::OP_STEP) {
+            return Err(Error::Cancelled);
+        }
+        let finite_ok = !all_finite || half >= 1e300 || sink.finite;
+        Ok((sink.loops, sink.points, finite_ok, b.work()))
+    };
+    match (run(), run()) {
+        (Ok(a), Ok(b)) if a == b => {
+            if a.2 {
+                Check::Ok
+            } else {
+                Check::Violation("有限な入力の外形に有限でない点がある")
+            }
+        }
+        (Err(Error::Limit(_)), Err(Error::Limit(_))) => Check::Ok,
+        (Err(Error::Cancelled), _) | (_, Err(Error::Cancelled)) => {
+            Check::Violation("線の勘定が崩れたか、点ごとに払っていない")
+        }
+        _ => Check::Violation("同じ入力で線の結果が違う"),
     }
 }

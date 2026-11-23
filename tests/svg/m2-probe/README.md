@@ -25,6 +25,8 @@
 | `d-first-not-m` | M で始まらない（何も描かない） | 効かない | 効かない |
 | `d-double-comma` | 続く `,,`（誤り） | 効かない | 効かない |
 | `d-leading-comma` | 命令のすぐあとの `,`（誤り） | 効かない | 効かない |
+| `d-comma-before-command` | 最後の引数のあとの `,` を受けて次の命令へ続けるか | 効く | 効く |
+| `d-trailing-dot-mid` | 途中の末尾の `.`（前の区間は描くか） | 効く | 効く |
 | `d-css-path` | CSS の `d: path()` | 効かない | 効く |
 | `d-css-over-attr` | CSS の `d` が属性に勝つ | 効かない | 効く |
 
@@ -41,20 +43,9 @@
 | `ellipse-rx-auto` | ellipse の `rx` の auto は `ry`（円） | 効く | 効く |
 | `polygon-odd` | 数が奇数の points は最後を捨てる（三角。左下は描かない） | 効かない | 効かない |
 | `polygon-odd-keeps` | 数が奇数の points でも残りの点は描く（三角の右上） | 効く | 効く |
-
-## パスの文法
-
-| 試し | 何を見るか | resvg | Chrome |
-|---|---|---|---|
-| `d-comma-before-command` | 最後の引数のあとの `,` を受けて次の命令へ続けるか | 効く | 効く |
-| `d-trailing-dot-mid` | 途中の末尾の `.`（前の区間は描くか） | 効く | 効く |
-
-## 図形
-
-| 試し | 何を見るか | resvg | Chrome |
-|---|---|---|---|
 | `polygon-error` | 壊れた points は誤りの前まで（三角。左下は描かない） | 効かない | 効かない |
 | `polygon-error-keeps` | 壊れた points の前の点は描く（三角の右上） | 効く | 効かない |
+| `points-trailing-comma` | points の終わりの `,` を受ける（三角を描く。ADR-92 (3)） | 効く | 効く |
 | `polyline-fill` | polyline も塗る（閉じない形を閉じて塗る） | 効く | 効く |
 | `line-no-fill` | line は塗らない（線だけ） | 効かない | 効かない |
 
@@ -81,7 +72,7 @@
 | `dash-odd` | 奇数個の stroke-dasharray は 2 度並べる（`10` は 10 10。20〜30 は隙間） | 効く | 効く |
 | `dash-percent` | % の stroke-dasharray（対角の √2 で割ったものに対して。10% は 10） | 効く | 効く |
 | `dash-subpath-reset` | 破線は部分パスごとに始め直す（2 本目の頭も線） | 効く | 効く |
-| `dash-offset` | stroke-dashoffset（5 ずらすと 15〜20 の隙間が 10〜15 に） | 効かない | 効かない |
+| `dash-offset` | stroke-dashoffset（5 ずらすと 15〜20 は隙間：効けば 17 は背景） | 効かない | 効かない |
 | `dash-path-length` | pathLength が破線の長さに効く（長さ 80 を 4 とみなすと 1 1 は 20 20。30〜50 は隙間） | 効かない | 効く |
 | `non-scaling-stroke` | non-scaling-stroke は画面の太さ（縦 4 倍でも太さ 2） | 効かない | 効く |
 | `crisp-edges` | crispEdges は反エイリアスなし（縁 10.3 の画素 10 は全部塗る） | 効く | 効く |
@@ -90,3 +81,6 @@
 | `closed-join` | 閉じたパスの始めの点も継ぎ目（miter の角を描く） | 効く | 効く |
 | `paint-order-stroke` | paint-order: stroke は塗りを線の上に描く（線の内側の半分は緑の塗り） | 効く | 効く |
 | `stroke-width-zero` | 太さ 0 の線は描かない | 効く | 効く |
+| `dash-closed-join` | 閉じた形の最初と最後の破線をつなぐ（始めの角を miter の継ぎ目で描く。ADR-92 (1)） | 効く | 効く |
+| `arc-zero-length` | 始めと終わりが同じ弧は長さ 0 の線（丸い端の点を描く。ADR-92 (2)） | 効く | 効く |
+| `dash-zero-closed` | 閉じた長さ 0 の部分パス（M z）に破線を付けると描かない（Chrome と同じ） | 効く | 効く |

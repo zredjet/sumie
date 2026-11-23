@@ -159,10 +159,11 @@ fn round_pieces_follow_the_arc_formula() {
 fn pieces(pts: &[(f64, f64)], closed: bool, dashes: &[f64], offset: f64) -> Vec<Vec<Point>> {
     let budget = Budget::new(Stage::Plan, u64::MAX, u64::MAX, &Never);
     let mut buf = MVec::new(&budget);
+    let mut head = MVec::new(&budget);
     let v: Vec<Point> = pts.iter().map(|&(x, y)| Point::new(x, y)).collect();
     let d = Dashes::new(dashes, offset).unwrap();
     let mut out = Vec::new();
-    dash_polyline(&v, closed, &d, &mut buf, &budget, &mut |s| {
+    dash_polyline(&v, closed, &d, &mut buf, &mut head, &budget, &mut |s| {
         out.push(s.to_vec());
         Ok(())
     })
@@ -194,10 +195,24 @@ fn dashes_split_by_length() {
     let p = pieces(&line, false, &[0.0, 50.0], 0.0);
     assert_eq!(p.len(), 2);
     assert_eq!(p[1], [Point::new(50.0, 0.0), Point::new(50.0, 0.0)]);
-    // 閉じた折れ線は閉じる区間も分ける
+    // 閉じた折れ線は閉じる区間も分け、頭が線の中なら最初の部分を最後の部分につなぐ（resvg・Chrome と同じ。ADR-92 (1)）
     let sq = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
     let p = pieces(&sq, true, &[35.0, 1.0], 0.0);
-    assert_eq!(*p.last().unwrap().last().unwrap(), Point::new(0.0, 0.0));
+    // 線 0〜35・隙間 35〜36・線 36〜40（始めの点で終わり、最初の部分 0〜35 につながる）
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0][0], Point::new(0.0, 4.0));
+    assert_eq!(p[0][1], Point::new(0.0, 0.0));
+    assert_eq!(*p[0].last().unwrap(), Point::new(0.0, 5.0));
+    // 頭が隙間ならつながない
+    let p = pieces(&sq, true, &[5.0, 5.0], 5.0);
+    assert!(p.iter().all(|s| s[0] != Point::new(0.0, 0.0) || s.len() > 1));
+    // 全体が線（最初の部分が終わらない）は 1 つの部分
+    let p = pieces(&sq, true, &[100.0, 1.0], 0.0);
+    assert_eq!(p.len(), 1);
+    // 閉じた長さ 0 の部分パスは描かない（Chrome と同じ）
+    assert!(pieces(&[(5.0, 5.0)], true, &[5.0, 5.0], 0.0).is_empty());
+    // 開いた長さ 0 は端を描く（同じ 2 点）
+    assert_eq!(pieces(&[(5.0, 5.0), (5.0, 5.0)], false, &[5.0, 5.0], 0.0).len(), 1);
 }
 
 #[test]
@@ -209,4 +224,44 @@ fn bad_dash_lists_are_solid() {
     assert!(Dashes::new(&[f64::NAN, 1.0], 0.0).is_none());
     let d = Dashes::new(&[2.0, 3.0], 12.0).unwrap();
     assert_eq!(d.phase, 2.0);
+}
+
+/// 長い隙間の下の折れ線・同じ点の続き・有限でない向きの頂点も、点ごとに払う（単位の 1 回目のレビュー）。
+#[test]
+fn every_point_is_paid() {
+    let n = 50_000usize;
+    let v: Vec<Point> = (0..n).map(|i| Point::new(i as f64, (i % 2) as f64)).collect();
+    let budget = Budget::new(Stage::Plan, u64::MAX, u64::MAX, &Never);
+    let mut buf = MVec::new(&budget);
+    let mut head = MVec::new(&budget);
+    let d = Dashes::new(&[1.0, 1e30], 0.0).unwrap();
+    dash_polyline(&v, false, &d, &mut buf, &mut head, &budget, &mut |_| Ok(())).unwrap();
+    assert!(budget.work() >= n as u64 * crate::cost::OP_STEP, "{}", budget.work());
+    assert!(budget.max_spend() < crate::budget::CANCEL_INTERVAL);
+    let same: Vec<Point> = vec![Point::new(1.0, 1.0); n];
+    let budget = Budget::new(Stage::Plan, u64::MAX, u64::MAX, &Never);
+    let mut scratch = MVec::new(&budget);
+    let mut out = Loops::default();
+    stroke_polyline(&same, false, &pen(Cap::Round, Join::Round), &mut scratch, &budget, &mut out).unwrap();
+    assert!(budget.work() >= n as u64 * crate::cost::OP_STEP, "{}", budget.work());
+}
+
+/// 差があふれる 2 点でも向きが出る。破線の区間の長さが有限でなければ、その先を分けない（終わる）。
+#[test]
+fn huge_differences() {
+    let far = [(-1.5e308, 0.0), (1.5e308, 1.5e308)];
+    let s = stroke(&far, false, &pen(Cap::Butt, Join::Miter));
+    assert!(!s.0.is_empty());
+    let budget = Budget::new(Stage::Plan, 1 << 24, u64::MAX, &Never);
+    let mut buf = MVec::new(&budget);
+    let mut head = MVec::new(&budget);
+    let v: Vec<Point> = far.iter().map(|&(x, y)| Point::new(x, y)).collect();
+    let d = Dashes::new(&[1.0, 1.0], 0.0).unwrap();
+    dash_polyline(&v, false, &d, &mut buf, &mut head, &budget, &mut |_| Ok(())).unwrap();
+    // 区間に比べて細かすぎる破線は境が多すぎるので、手間の上限で止まる（見積もりが先に断る）
+    let v = [Point::new(1e17, 0.0), Point::new(2e17, 0.0)];
+    let d = Dashes::new(&[1.0, 1.0], 0.0).unwrap();
+    let budget = Budget::new(Stage::Plan, 1 << 24, u64::MAX, &Never);
+    let r = dash_polyline(&v, false, &d, &mut buf, &mut head, &budget, &mut |_| Ok(()));
+    assert!(matches!(r, Err(Error::Limit(_))));
 }

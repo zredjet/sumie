@@ -43,8 +43,11 @@ fn transform_basics() {
     let r = Transform { a: 0.6, b: 0.8, c: -0.8, d: 0.6, e: 0.0, f: 0.0 };
     assert!(close(r.max_scale(), 1.0));
     assert!(close(t.scaled(2.0).max_scale(), 6.0));
-    // あふれれば ∞
-    assert_eq!(max_singular(1e200, 0.0, 0.0, 1e200), f64::INFINITY);
+    // 大きな行列でも正しい（最大の成分で割ってから求める）
+    assert!((max_singular(1e80, 0.0, 0.0, 1e79) / 1e80 - 1.0).abs() < 1e-12);
+    assert!((max_singular(3e77, 0.0, 0.0, 1e77) / 3e77 - 1.0).abs() < 1e-12);
+    assert_eq!(max_singular(f64::INFINITY, 0.0, 0.0, 1.0), f64::INFINITY);
+    assert_eq!(max_singular(0.0, 0.0, 0.0, 0.0), 0.0);
 }
 
 /// SVG 1.1 付録 F.6.5：半円（始めと終わりが直径の両端）は中心が真ん中、旗で向きと大小が決まる。
@@ -75,7 +78,7 @@ fn arc_endpoint_to_center() {
     assert!(small.dtheta.abs() < core::f64::consts::PI && large.dtheta.abs() > core::f64::consts::PI);
     assert!(close(small.dtheta.abs() + large.dtheta.abs(), 2.0 * core::f64::consts::PI));
     // 同じ点・半径 0・負の半径
-    assert_eq!(endpoint_to_center(p1, 5.0, 5.0, 0.0, false, true, p1), ArcKind::Omit);
+    assert_eq!(endpoint_to_center(p1, 5.0, 5.0, 0.0, false, true, p1), ArcKind::Line);
     assert_eq!(endpoint_to_center(p1, 0.0, 5.0, 0.0, false, true, p2), ArcKind::Line);
     assert_eq!(
         endpoint_to_center(p1, -5.0, -5.0, 0.0, false, true, p2),
@@ -86,8 +89,22 @@ fn arc_endpoint_to_center() {
     let ArcKind::Curve(r) = endpoint_to_center(p1, 6.0, 2.0, 30.0, true, false, q) else { panic!() };
     assert!(pt_close(r.at(r.theta1), p1) && pt_close(r.at(r.theta1 + r.dtheta), q));
     assert_eq!(r.end, q);
-    // あふれる半径は線
-    assert_eq!(endpoint_to_center(p1, 1e300, 1e300, 0.0, false, true, Point::new(1e300, 0.0)), ArcKind::Line);
+    // 巨大な半径（2 乗があふれる）の弧は、ほぼ線なので線（F.6.5 の正規化した形。単位の 1 回目のレビュー）
+    for end in [Point::new(10.0, 0.0), Point::new(10.0, 3.0)] {
+        match endpoint_to_center(p1, 1e200, 1e200, 0.0, false, true, end) {
+            ArcKind::Line => {}
+            ArcKind::Curve(a) => {
+                // 弧のままなら、始めと終わりの点を通る
+                assert!(pt_close(a.at(a.theta1), p1) && pt_close(a.at(a.theta1 + a.dtheta), end), "{a:?}");
+            }
+        }
+    }
+    // 小さな半径は広げて半円（2 乗が 0 にならない）
+    let ArcKind::Curve(tiny) = endpoint_to_center(p1, 1e-200, 1e-200, 0.0, false, true, Point::new(10.0, 0.0)) else {
+        panic!()
+    };
+    assert!(close(tiny.max_radius(), 5.0), "{}", tiny.max_radius());
+    assert!(pt_close(tiny.at(tiny.theta1), p1));
 }
 
 #[test]

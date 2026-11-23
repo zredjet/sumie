@@ -71,7 +71,8 @@ pub(crate) trait LoopSink {
 
 /// 点の向き（単位の長さ。長さ 0 なら None）。
 fn direction(a: Point, b: Point) -> Option<Point> {
-    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    // 差を半分にしてから求める（どちらの点も有限なら差の半分は有限。差があふれても向きが出る。単位の 1 回目のレビュー）
+    let (dx, dy) = (b.x / 2.0 - a.x / 2.0, b.y / 2.0 - a.y / 2.0);
     let l = math::hypot(dx, dy);
     (l > 0.0 && l.is_finite()).then(|| Point::new(dx / l, dy / l))
 }
@@ -126,9 +127,10 @@ impl Emit<'_, '_> {
 }
 
 /// 続く同じ点をまとめた折れ線の点を `out` に入れ直す（`out` は呼び手の置き場）。
-fn dedup(pts: &[Point], out: &mut crate::mem::MVec<'_, Point>) -> Result<(), Error> {
+fn dedup(pts: &[Point], out: &mut crate::mem::MVec<'_, Point>, budget: &Budget<'_>) -> Result<(), Error> {
     out.clear();
     for &p in pts {
+        budget.spend(cost::OP_STEP)?;
         if out.last() != Some(&p) {
             out.push(p)?;
         }
@@ -149,7 +151,7 @@ pub(crate) fn stroke_polyline(
     if pts.is_empty() || (pts.len() == 1 && !closed) {
         return Ok(());
     }
-    dedup(pts, scratch)?;
+    dedup(pts, scratch, budget)?;
     // 閉じた折れ線の終わりが始めと同じなら 1 つにする
     if closed && scratch.len() > 1 && scratch.last() == scratch.as_slice().first() {
         let n = scratch.len().saturating_sub(1);
@@ -214,6 +216,7 @@ fn ring_next(i: usize, n: usize) -> usize {
 
 /// 頂点 `p`（前の点 `a`・次の点 `b`）の左の縁の点：入る区間の終わりの縁・継ぎ目・出る区間の始めの縁。
 fn vertex(e: &mut Emit<'_, '_>, pen: &Pen, a: Point, p: Point, b: Point) -> Result<(), Error> {
+    e.budget.spend(cost::OP_STEP)?;
     let (Some(d1), Some(d2)) = (direction(a, p), direction(p, b)) else { return Ok(()) };
     let (n1, n2) = (normal(d1), normal(d2));
     let end_in = add(p, n1, pen.half);
@@ -325,16 +328,25 @@ impl<'a> Dashes<'a> {
     }
 }
 
-/// 部分パスの折れ線 `pts` を破線に分け、線の部分ごとに `piece`（その部分の折れ線）を呼ぶ。`buf` は部分の点の置き場。
+/// 部分パスの折れ線 `pts` を破線に分け、線の部分ごとに `piece`（その部分の折れ線）を呼ぶ。`buf` は部分の点の置き場、
+/// `head` は閉じた部分パスの最初の部分を最後の部分につなぐための置き場（resvg・Chrome と同じ。ADR-92 (1)）。閉じた長さ 0 の
+/// 部分パスは描かない（Chrome と同じ）。区間の長さが有限でないか、境の足し算が進まなければ（破線の値が区間の長さに比べて
+/// 小さすぎる）、その部分パスの残りを分けない。
+#[allow(clippy::too_many_arguments, reason = "置き場を分けて渡す")]
 pub(crate) fn dash_polyline(
     pts: &[Point],
     closed: bool,
     dashes: &Dashes<'_>,
     buf: &mut crate::mem::MVec<'_, Point>,
+    head: &mut crate::mem::MVec<'_, Point>,
     budget: &Budget<'_>,
     piece: &mut dyn FnMut(&[Point]) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let Some(&first) = pts.first() else { return Ok(()) };
+    if closed && pts.iter().all(|&p| p == first) {
+        budget.spend(cost::OP_STEP)?;
+        return Ok(());
+    }
     let n = dashes.dashes.len();
     // 位相を並びの番号と、その中の残りに
     let mut idx = 0usize;
@@ -350,25 +362,43 @@ pub(crate) fn dash_polyline(
     }
     let mut remain = dashes.dashes.get(idx).copied().unwrap_or(0.0) - left;
     let mut on = idx.is_multiple_of(2);
+    // 閉じた部分パスで頭が線の中なら、最初の部分は最後の部分につなぐ（最初の部分が終わるまで head に貯める）
+    let hold_head = closed && on;
+    let mut holding = hold_head;
+    head.clear();
     buf.clear();
     if on {
         buf.push(first)?;
     }
     let count = if closed { pts.len() } else { pts.len().saturating_sub(1) };
-    for k in 0..count {
+    'segs: for k in 0..count {
+        budget.spend(cost::OP_STEP)?;
         let (Some(&a), Some(&b)) = (pts.get(k), pts.get(ring_next(k, pts.len()))) else { continue };
         let (dx, dy) = (b.x - a.x, b.y - a.y);
         let seg = math::hypot(dx, dy);
+        if !seg.is_finite() {
+            break;
+        }
         let mut t0 = 0.0;
         // 区間の中の破線の境
         while seg - t0 > remain {
             budget.spend(cost::OUTLINE_POINT)?;
-            t0 += remain;
+            let next_t = t0 + remain;
+            if next_t == t0 && remain > 0.0 {
+                // 足しても進まない
+                break 'segs;
+            }
+            t0 = next_t;
             let u = t0 / seg;
             let at = Point::new(a.x + dx * u, a.y + dy * u);
             if on {
                 buf.push(at)?;
-                piece(buf.as_slice())?;
+                if holding {
+                    head.append_slice(buf.as_slice())?;
+                    holding = false;
+                } else {
+                    piece(buf.as_slice())?;
+                }
                 buf.clear();
             } else {
                 buf.clear();
@@ -384,8 +414,26 @@ pub(crate) fn dash_polyline(
             buf.push(b)?;
         }
     }
+    if holding {
+        // 最初の部分が終わらなかった（全体が線）：1 つの部分として描く
+        if buf.len() > 1 {
+            piece(buf.as_slice())?;
+        }
+        return Ok(());
+    }
     if on && buf.len() > 1 {
+        if hold_head && !head.is_empty() {
+            // 最後の部分（始めの点で終わる）に最初の部分をつなぐ（始めの点を 2 度入れない）
+            for &p in head.as_slice().iter().skip(1) {
+                budget.spend(cost::OP_STEP)?;
+                buf.push(p)?;
+            }
+            head.clear();
+        }
         piece(buf.as_slice())?;
+    }
+    if !head.is_empty() {
+        piece(head.as_slice())?;
     }
     Ok(())
 }

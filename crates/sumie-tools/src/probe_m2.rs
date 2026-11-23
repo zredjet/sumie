@@ -172,7 +172,7 @@ fn stroke_probes() -> Vec<Probe> {
         ),
         stroke(
             "dash-offset",
-            "stroke-dashoffset（5 ずらすと 15〜20 の隙間が 10〜15 に）",
+            "stroke-dashoffset（5 ずらすと 15〜20 は隙間：効けば 17 は背景）",
             &hline("stroke-dasharray=\"10 5\" stroke-dashoffset=\"5\""),
             (17, 50),
             false,
@@ -233,6 +233,29 @@ fn stroke_probes() -> Vec<Probe> {
             (50, 50),
             true,
         ),
+        stroke(
+            "dash-closed-join",
+            "閉じた形の最初と最後の破線をつなぐ（始めの角を miter の継ぎ目で描く。ADR-92 (1)）",
+            "<rect x=\"20\" y=\"20\" width=\"60\" height=\"60\" fill=\"none\" stroke=\"green\" stroke-width=\"20\" stroke-dasharray=\"50 10\" stroke-dashoffset=\"20\"/>",
+            (12, 12),
+            false,
+        ),
+        stroke(
+            "arc-zero-length",
+            "始めと終わりが同じ弧は長さ 0 の線（丸い端の点を描く。ADR-92 (2)）",
+            &format!("<path d=\"M50 50 A10 10 0 0 1 50 50\" {g} stroke-width=\"20\" stroke-linecap=\"round\"/>"),
+            (50, 50),
+            false,
+        ),
+        stroke(
+            "dash-zero-closed",
+            "閉じた長さ 0 の部分パス（M z）に破線を付けると描かない（Chrome と同じ）",
+            &format!(
+                "<path d=\"M50 50 z\" {g} stroke-width=\"20\" stroke-linecap=\"round\" stroke-dasharray=\"5 5\"/>"
+            ),
+            (50, 50),
+            true,
+        ),
     ]
 }
 
@@ -263,6 +286,20 @@ pub(crate) fn probes() -> Vec<Probe> {
         d("d-first-not-m", "M で始まらない（何も描かない）", "L10 10 H90 V90 H10 Z", lower_left),
         d("d-double-comma", "続く `,,`（誤り）", "M10,,10 H90 V90 H10 Z", lower_left),
         d("d-leading-comma", "命令のすぐあとの `,`（誤り）", "M,10 10 H90 V90 H10 Z", lower_left),
+        on_red(
+            "パスの文法",
+            "d-comma-before-command",
+            "最後の引数のあとの `,` を受けて次の命令へ続けるか",
+            "<path fill=\"green\" d=\"M10 10 H90 V90, H10 Z\"/>",
+            lower_left,
+        ),
+        on_red(
+            "パスの文法",
+            "d-trailing-dot-mid",
+            "途中の末尾の `.`（前の区間は描くか）",
+            "<path fill=\"green\" d=\"M10 10 H90 V90 H10. Z\"/>",
+            upper_right,
+        ),
         on_red(
             "パスの文法",
             "d-css-path",
@@ -339,20 +376,6 @@ pub(crate) fn probes() -> Vec<Probe> {
             upper_right,
         ),
         on_red(
-            "パスの文法",
-            "d-comma-before-command",
-            "最後の引数のあとの `,` を受けて次の命令へ続けるか",
-            "<path fill=\"green\" d=\"M10 10 H90 V90, H10 Z\"/>",
-            lower_left,
-        ),
-        on_red(
-            "パスの文法",
-            "d-trailing-dot-mid",
-            "途中の末尾の `.`（前の区間は描くか）",
-            "<path fill=\"green\" d=\"M10 10 H90 V90 H10. Z\"/>",
-            upper_right,
-        ),
-        on_red(
             "図形",
             "polygon-error",
             "壊れた points は誤りの前まで（三角。左下は描かない）",
@@ -365,6 +388,13 @@ pub(crate) fn probes() -> Vec<Probe> {
             "壊れた points の前の点は描く（三角の右上）",
             "<polygon points=\"10,10 90,10 90,90 x 10,90\" fill=\"green\"/>",
             upper_right,
+        ),
+        on_red(
+            "図形",
+            "points-trailing-comma",
+            "points の終わりの `,` を受ける（三角を描く。ADR-92 (3)）",
+            "<polygon points=\"10,10 90,10 90,90,\" fill=\"green\"/>",
+            (70, 30),
         ),
         on_red(
             "図形",

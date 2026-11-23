@@ -78,9 +78,16 @@ fn arcs_with_compact_flags() {
         panic!()
     };
     assert_eq!(s[1], PathSeg::ArcTo(p(10.0, 50.0), want));
-    // 半径 0 は線、同じ点は書かない
+    // 半径 0 は線、始めと終わりが同じ弧は長さ 0 の線（resvg・Chrome と同じ。ADR-92 (2)）
     let (s, _, _) = read("M0 0 A0 5 0 0 1 10 0 A5 5 0 0 1 10 0");
-    assert_eq!(s, [PathSeg::Move(p(0.0, 0.0)), PathSeg::Line(p(0.0, 0.0), p(10.0, 0.0))]);
+    assert_eq!(
+        s,
+        [
+            PathSeg::Move(p(0.0, 0.0)),
+            PathSeg::Line(p(0.0, 0.0), p(10.0, 0.0)),
+            PathSeg::Line(p(10.0, 0.0), p(10.0, 0.0))
+        ]
+    );
     // 旗が 0・1 でなければ誤り（そこまで）
     let (s, r, _) = read("M0 0 L5 0 A5 5 0 2 1 10 0");
     assert_eq!(s.len(), 2);
@@ -194,7 +201,10 @@ fn points_lists() {
     // 途中の誤り・続く `,,`・終わりの `,` は誤り（呼び手は何も描かない）
     assert!(!pts("10,10 90,10 x 10,90").1);
     assert!(!pts("10,,10").1);
-    assert!(!pts("10,10,").1);
+    // 終わりの `,` は受ける（resvg・Chrome と同じ）。頭の `,` は誤り
+    assert_eq!(pts("10,10 90,10 90,90,"), (vec![p(10.0, 10.0), p(90.0, 10.0), p(90.0, 90.0)], true));
+    assert!(pts("10,10 90,10 90,90 ,").1);
+    assert!(!pts(",10,10").1);
     assert_eq!(pts(""), (vec![], true));
     assert_eq!(pts("  "), (vec![], true));
 }

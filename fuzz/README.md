@@ -13,9 +13,10 @@ architecture.md §9）。種は `seeds/<対象>/`（コミットする）、育�
 | `values` | 値の読みの口（style の値の確かめ・values の色・塗り・長さ・変形・viewBox・preserveAspectRatio・`font`・`@media`・`@supports`）。頭の 1 バイトでプロパティと属性かを選ぶ。1 回の払い・同じ入力で同じ結果・手間が長さにおおよそ比例すること | `sumie::fuzzing::values_parse` |
 | `document` | 読む段の全体（公開の `estimate_parse`・`parse`）。2 つの誤りが同じ（D2）・見積もりが通れば読める・持ち続ける量が見積もりと同じ・数える段と本体の勘定（1 回の払い・返しすぎ）・全体の手間と山 ≤ 見積もり・上限を見積もりのちょうどにすれば読め、1 少なければ同じ `Limit` | `sumie::fuzzing::document_parse` |
 | `path` | パスのデータと `points` の読み（`values::path`）と平坦化（`geom::flatten`）。頭の 1 バイトで読む口（パスのデータか `points`）と変形を選ぶ。置き場に書く量が入力の 1 バイトあたり `cost::PATH_GEOMETRY_BYTES` 以下・1 回の払い・同じ入力で同じ結果・平坦化の点の数が分ける数の和（見積もりと同じ式）・点が区間の厳密な外接矩形の中 | `sumie::fuzzing::path_ops` |
+| `stroke` | 線の外形と破線（`geom::stroke`）。頭の 4 バイトで端・継ぎ目・太さ・miterlimit・破線と位相を選び、残りをパスのデータとして読む。1 回の払い・同じ入力で同じ結果・点ごとに払う（手間 ≥ 平坦化の点の数）・有限な入力の外形の点が有限 | `sumie::fuzzing::stroke_ops` |
 
 種は `crates/sumie/tests/mutate.rs` の `MEM_SEEDS` と同じにする（試験 `fuzz_seeds_match_mem_seeds` が照らす）。
-`xml`・`dtd`・`css`・`values`・`document`・`path` の種は `crates/sumie/tests/mutate.rs` の種つきの変異の試験も使う（`dtd` は DTD の、`css` は
+`xml`・`dtd`・`css`・`values`・`document`・`path`・`stroke` の種は `crates/sumie/tests/mutate.rs` の種つきの変異の試験も使う（`dtd` は DTD の、`css` は
 CSS の目印の字句で変異させる）。libFuzzer の既定の長さ（4096 バイト）
 では、長い名前・大きな実体のような長い入力の場合に届かないので、それは `crates/sumie/src/xml/tests.rs` の試験が受け持つ。
 Kura のファズのコーパス（`/Users/redjet/aruma/repos/zredjet/kura/fuzz/corpus/decode_svg/`。

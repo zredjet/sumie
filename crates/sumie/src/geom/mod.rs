@@ -82,11 +82,20 @@ impl Transform {
 /// 2 × 2 の行列 `[a b; c d]` の最大の特異値（`√((q + √(q² − 4Δ²)) / 2)`。q は成分の 2 乗の和、Δ は行列式）。有限で
 /// なければ ∞。
 pub(crate) fn max_singular(a: f64, b: f64, c: f64, d: f64) -> f64 {
+    // 最大の成分の大きさで割ってから求める（2 乗があふれない。単位の 1 回目のレビュー）
+    let m = math::max(math::max(a.abs(), b.abs()), math::max(c.abs(), d.abs()));
+    if !m.is_finite() {
+        return f64::INFINITY;
+    }
+    if m == 0.0 {
+        return 0.0;
+    }
+    let (a, b, c, d) = (a / m, b / m, c / m, d / m);
     let q = a * a + b * b + c * c + d * d;
     let det = a * d - b * c;
     let disc = q * q - 4.0 * det * det;
     let v = (q + math::max(disc, 0.0).sqrt()) / 2.0;
-    let s = math::max(v, 0.0).sqrt();
+    let s = math::max(v, 0.0).sqrt() * m;
     if s.is_finite() { s } else { f64::INFINITY }
 }
 
@@ -382,7 +391,7 @@ impl<'v, 'b> PathWriter<'v, 'b> {
         Ok(())
     }
 
-    /// 端点の形の弧（SVG のパスの `A`。`phi` は x 軸の回転の度）を足す。始めと終わりが同じなら何も足さず、半径の片方が
+    /// 端点の形の弧（SVG のパスの `A`。`phi` は x 軸の回転の度）を足す。始めと終わりが同じなら長さ 0 の線、半径の片方が
     /// 0 か、計算が有限でなければ線にする（SVG 1.1 付録 F.6.2・F.6.5・F.6.6）。
     pub(crate) fn arc_to(
         &mut self,
@@ -394,7 +403,6 @@ impl<'v, 'b> PathWriter<'v, 'b> {
         p: Point,
     ) -> Result<(), Error> {
         match endpoint_to_center(self.cur, rx, ry, phi, large, sweep, p) {
-            ArcKind::Omit => Ok(()),
             ArcKind::Line => self.line_to(p),
             ArcKind::Curve(a) => self.arc(a),
         }
@@ -415,14 +423,14 @@ impl<'v, 'b> PathWriter<'v, 'b> {
 /// 端点の形の弧を直した結果。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum ArcKind {
-    /// 始めと終わりが同じ（区間を書かない）
-    Omit,
     /// 線にする
     Line,
     Curve(ArcSeg),
 }
 
-/// SVG 1.1 付録 F.6.5（端点の形から中心の形へ）と F.6.6（半径を広げる）。
+/// SVG 1.1 付録 F.6.5（端点の形から中心の形へ）と F.6.6（半径を広げる）。始めと終わりが同じなら長さ 0 の線（resvg・Chrome と
+/// 同じ。ADR-92 (2)）。半径で割った形（`xn = x1'/rx`・`yn = y1'/ry`・`s = |(xn, yn)|`）で求めるので、半径の 2 乗を作らない：
+/// `s > 1` なら半径を `s` 倍に広げて中心は真ん中、そうでなければ `coef = ±√(1/s² − 1)`。有限でなければ線にする。
 pub(crate) fn endpoint_to_center(
     p1: Point,
     rx: f64,
@@ -433,7 +441,7 @@ pub(crate) fn endpoint_to_center(
     p2: Point,
 ) -> ArcKind {
     if p1 == p2 {
-        return ArcKind::Omit;
+        return ArcKind::Line;
     }
     let (mut rx, mut ry) = (rx.abs(), ry.abs());
     if rx == 0.0 || ry == 0.0 {
@@ -441,37 +449,36 @@ pub(crate) fn endpoint_to_center(
     }
     let phi = math::rem_euclid(phi_deg, 360.0) * math::DEG_TO_RAD;
     let (sp, cp) = (math::sin(phi), math::cos(phi));
-    // 中点の差を回した座標（F.6.5.1）
-    let dx = (p1.x - p2.x) / 2.0;
-    let dy = (p1.y - p2.y) / 2.0;
+    // 中点の差を回した座標（F.6.5.1。差は半分にしてから）
+    let dx = p1.x / 2.0 - p2.x / 2.0;
+    let dy = p1.y / 2.0 - p2.y / 2.0;
     let x1 = cp * dx + sp * dy;
     let y1 = -sp * dx + cp * dy;
-    // 半径が足りなければ広げる（F.6.6.2）
-    let lambda = (x1 * x1) / (rx * rx) + (y1 * y1) / (ry * ry);
-    if lambda > 1.0 {
-        let k = lambda.sqrt();
-        rx *= k;
-        ry *= k;
+    let (mut xn, mut yn) = (x1 / rx, y1 / ry);
+    let s = math::hypot(xn, yn);
+    let mut coef = 0.0;
+    if s > 1.0 {
+        // 半径が足りない：広げて中心は真ん中（F.6.6.2）
+        rx *= s;
+        ry *= s;
+        xn /= s;
+        yn /= s;
+    } else if s > 0.0 {
+        coef = math::max(1.0 / (s * s) - 1.0, 0.0).sqrt();
+        if large == sweep {
+            coef = -coef;
+        }
     }
-    // 中心（F.6.5.2）
-    let rx2 = rx * rx;
-    let ry2 = ry * ry;
-    let num = rx2 * ry2 - rx2 * y1 * y1 - ry2 * x1 * x1;
-    let den = rx2 * y1 * y1 + ry2 * x1 * x1;
-    let mut coef = if den > 0.0 { math::max(num / den, 0.0).sqrt() } else { 0.0 };
-    if large == sweep {
-        coef = -coef;
-    }
-    let cx1 = coef * (rx * y1 / ry);
-    let cy1 = coef * (-(ry * x1) / rx);
-    // F.6.5.3
-    let cx = cp * cx1 - sp * cy1 + (p1.x + p2.x) / 2.0;
-    let cy = sp * cx1 + cp * cy1 + (p1.y + p2.y) / 2.0;
-    // 角（F.6.5.5・F.6.5.6）
-    let ux = (x1 - cx1) / rx;
-    let uy = (y1 - cy1) / ry;
-    let vx = (-x1 - cx1) / rx;
-    let vy = (-y1 - cy1) / ry;
+    // 中心（F.6.5.2・F.6.5.3）
+    let cx1 = coef * rx * yn;
+    let cy1 = -coef * ry * xn;
+    let cx = cp * cx1 - sp * cy1 + (p1.x / 2.0 + p2.x / 2.0);
+    let cy = sp * cx1 + cp * cy1 + (p1.y / 2.0 + p2.y / 2.0);
+    // 角（F.6.5.5・F.6.5.6。半径で割った形）
+    let ux = xn - coef * yn;
+    let uy = yn + coef * xn;
+    let vx = -xn - coef * yn;
+    let vy = -yn + coef * xn;
     let theta1 = math::atan2(uy, ux);
     let mut dtheta = math::atan2(ux * vy - uy * vx, ux * vx + uy * vy);
     let tau = 2.0 * core::f64::consts::PI;

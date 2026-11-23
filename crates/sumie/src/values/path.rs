@@ -11,7 +11,7 @@
 //!   `m` でなければ何も描かない。`Z` のあとの数は誤り
 //! - `Z` のあとに `M` 以外の命令が来れば、部分パスの始めの点から新しい部分パスを始める（書き手は MOVE を足す）
 //! - `points`：数の組の並び。途中に誤りがあれば何も描かない（Chrome と同じ。ADR-90）。数が奇数なら最後を捨てる
-//!   （SVG 2 §10.6。resvg・Chrome と同じ）
+//!   （SVG 2 §10.6。resvg・Chrome と同じ）。終わりの `,` は受ける（resvg・Chrome と同じ。ADR-92 (3)）
 //!
 //! 置き場に書く量は入力の 1 バイトあたり [`cost::PATH_GEOMETRY_BYTES`] バイト以下（`estimate_build` が使う。最も多いのは
 //! `zh1` の繰り返し：3 バイトで閉じ・始まり・線の 35 バイト）。
@@ -290,10 +290,10 @@ pub(crate) fn points(s: &[u8], out: &mut MVec<'_, Point>, budget: &Budget<'_>) -
     let mut pending: Option<f64> = None;
     loop {
         if !first {
-            let comma = sc.skip_comma_wsp()?;
+            sc.skip_comma_wsp()?;
             if sc.at(sc.i)?.is_none() {
-                // 終わりの `,` は誤り（数のあとの区切りだけ）
-                return Ok(!comma);
+                // 終わりの `,` は受ける（resvg・Chrome と同じ。単位の 1 回目のレビュー）
+                return Ok(true);
             }
         }
         if sc.at(sc.i)?.is_none() {
