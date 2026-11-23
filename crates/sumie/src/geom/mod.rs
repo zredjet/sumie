@@ -607,6 +607,9 @@ pub(crate) fn line(w: &mut PathWriter<'_, '_>, p1: Point, p2: Point) -> Result<(
     w.line_to(p2)
 }
 
+/// 弧の外接矩形の丸めの余白の係数（2⁻⁴⁴）。
+const ARC_PAD: f64 = 1.0 / 17_592_186_044_416.0;
+
 /// 区間の厳密な外接矩形を `r` に足す（始めの点を含む。曲線は導関数の 0 の所、弧は軸に沿う向きの角）。
 pub(crate) fn add_bounds(r: &mut Rect, seg: &PathSeg) {
     match *seg {
@@ -632,8 +635,9 @@ pub(crate) fn add_bounds(r: &mut Rect, seg: &PathSeg) {
             }
         }
         PathSeg::ArcTo(p, a) => {
-            r.add(p);
-            r.add(a.end);
+            let mut ar = Rect::EMPTY;
+            ar.add(p);
+            ar.add(a.end);
             let [m0, m1, m2, m3] = a.m;
             // x = cx + m0 cos θ + m1 sin θ の極は θ = atan2(m1, m0)（と + π）。y も同じ
             for base in [math::atan2(m1, m0), math::atan2(m3, m2)] {
@@ -641,11 +645,20 @@ pub(crate) fn add_bounds(r: &mut Rect, seg: &PathSeg) {
                     if let Some(th) = angle_in_sweep(base + k, a.theta1, a.dtheta) {
                         let q = a.at_from(p, th);
                         if q.finite() {
-                            r.add(q);
+                            ar.add(q);
                         }
                     }
                 }
             }
+            // 角の丸め（±π/2 の近くで 10⁻¹⁶ ほど）は、掃く角がそれに近いほど細い弧で、平坦化の点の位置を動かす（細長い
+            // 楕円の小さな弧で、点の動く量の 0.1% ほど）。その上限 Σ|m| × |Δθ| × 2⁻⁴⁴ が座標に比べて意味のある大きさの
+            // ときだけ広げる（ふつうの弧の外接矩形と、中身で決まる大きさは変えない。ファズの path が見つけた）
+            let pad = (m0.abs() + m1.abs() + m2.abs() + m3.abs()) * a.dtheta.abs() * ARC_PAD;
+            let scale = 1.0 + math::max(math::max(ar.x0.abs(), ar.x1.abs()), math::max(ar.y0.abs(), ar.y1.abs()));
+            if pad.is_finite() && pad > 1e-9 * scale && !ar.is_empty() {
+                ar = Rect { x0: ar.x0 - pad, y0: ar.y0 - pad, x1: ar.x1 + pad, y1: ar.y1 + pad };
+            }
+            *r = r.union(&ar);
         }
     }
 }

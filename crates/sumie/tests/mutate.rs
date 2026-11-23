@@ -406,7 +406,10 @@ const PATH_DICT: &[&[u8]] = &[
 fn path_survives_seeded_mutations() {
     let seeds = fuzz_seeds("path");
     let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
-    for (n, case) in cases(0x5eed_0009, 4000, &refs, PATH_DICT, 512).iter().enumerate() {
+    // 種そのもの（ファズが見つけた入力を含む）と変異
+    let mut all: Vec<Vec<u8>> = seeds.clone();
+    all.extend(cases(0x5eed_0009, 4000, &refs, PATH_DICT, 512));
+    for (n, case) in all.iter().enumerate() {
         let (out, heap) = measure(|| path_ops(case));
         assert_eq!(out, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
         assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
