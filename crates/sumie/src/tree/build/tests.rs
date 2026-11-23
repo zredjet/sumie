@@ -798,20 +798,101 @@ fn css_box_properties() {
 fn switch_selects_like_chrome() {
     let r = "<rect width=\"5\" height=\"5\"/>";
     let count = |first: &str| build(&svg(&format!("<switch>{first}{r}</switch>"))).unwrap().nodes.len();
-    for first in
-        ["<random/>", "<title>t</title>", "<desc/>", "<linearGradient id=\"g\"/>", "<random systemLanguage=\"xx\"/>"]
-    {
+    for first in [
+        "<random/>",
+        "<title>t</title>",
+        "<desc/>",
+        "<linearGradient id=\"g\"/>",
+        "<random systemLanguage=\"xx\"/>",
+        // clipPath と discard は条件を照らさずに選ぶ。XHTML の名前空間の拡張は真（単位 3 の 6 回目のレビュー。ADR-104）
+        "<clipPath id=\"c\" systemLanguage=\"xx\"/>",
+        "<discard systemLanguage=\"xx\"/>",
+        "<g requiredExtensions=\"http://www.w3.org/1999/xhtml\"/>",
+        "<g requiredExtensions=\"http://www.w3.org/1998/Math/MathML http://www.w3.org/1999/xhtml\"/>",
+    ] {
         assert_eq!(count(first), 0, "{first}");
     }
     for first in [
         "<foo:bar xmlns:foo=\"http://x\"/>",
         "<rect width=\"5\" height=\"5\" systemLanguage=\"xx\"/>",
         "<g requiredExtensions=\"http://x\"/>",
+        "<g requiredExtensions=\"\"/>",
+        "<g requiredExtensions=\"http://www.w3.org/1999/xhtml http://x\"/>",
+        "<symbol id=\"s\" systemLanguage=\"xx\"/>",
         "<foreignObject width=\"5\" height=\"5\"/>",
         "text ",
     ] {
         assert_eq!(count(first), 1, "{first}");
     }
+}
+
+/// 単位 3 の 6 回目のレビュー：CSS の箱のプロパティは Chrome と同じ形だけを受け（壊れた値は前の宣言を生かす）、根の中身を
+/// 描かなくても確かめ、rect の論理の大きさは全体の言葉でも勝つ（all の分けたものは除く）。offset は道があるときだけ、
+/// overflow: overlay は auto、CSS の width の大きさの関数は auto、背景の image-set の文字列と tab を含む URL も data:。
+#[test]
+fn unit3_round6() {
+    let root = |attrs: &str| {
+        build(&format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\" {attrs}><rect width=\"5\" height=\"5\"/></svg>"
+        ))
+    };
+    let notyet = |r: Result<Tree, Error>| match r {
+        Err(Error::Unsupported(u)) => match u.feature {
+            Feature::NotYet(l) => Some(l),
+            _ => None,
+        },
+        _ => None,
+    };
+    for style in [
+        "border: 5px solid red; border: 5px soild red",
+        "border-radius: 4px / 2px",
+        "scrollbar-gutter: stable both-edges",
+        "border-image-source: linear-gradient(red, red)",
+        "-webkit-mask-box-image-source: linear-gradient(black, transparent)",
+        "outline: thick dashed",
+    ] {
+        assert_eq!(notyet(root(&format!("style=\"{style}\""))), Some(Later::CssBox), "{style}");
+    }
+    for style in [
+        "border: banana",
+        "padding: banana",
+        "border-radius: 0 / 0",
+        "outline: 2px red",
+        "position: banana",
+        "margin: 0 auto 0",
+        "border: 5px red",
+    ] {
+        assert!(root(&format!("style=\"{style}\"")).is_ok(), "{style}");
+    }
+    // 根の中身を描かない文書（viewBox の幅が 0）でも根の箱を確かめる
+    assert_eq!(notyet(root("viewBox=\"0 0 0 10\" style=\"border: 5px solid red\"")), Some(Later::CssBox));
+    assert_eq!(notyet(root("viewBox=\"0 0 0 10\" style=\"outline: 5px solid red\"")), Some(Later::CssBox));
+    // 論理の大きさは全体の言葉でも幅の属性に勝つ。all の分けたものは勝たない
+    let r = "<rect width=\"5\" height=\"5\"";
+    for w in ["initial", "inherit", "unset", "revert"] {
+        assert_eq!(not_yet(&format!("{r} style=\"inline-size: {w}\"/>")), Later::CssBox, "{w}");
+    }
+    assert_eq!(build(&svg(&format!("{r} style=\"all: initial; width: 5px; height: 5px\"/>"))).unwrap().nodes.len(), 1);
+    // offset は道があるときだけ
+    for css in ["offset: auto", "offset: normal", "offset: 30px 30px none", "offset: none"] {
+        assert!(build(&svg(&format!("{r} style=\"{css}\"/>"))).is_ok(), "{css}");
+    }
+    for css in ["offset: border-box", "offset: path('M0 0 L5 5')", "offset: ray(45deg)"] {
+        assert_eq!(not_yet(&format!("{r} style=\"{css}\"/>")), Later::CssTransform, "{css}");
+    }
+    // overflow: overlay は auto（入れ子の svg を切らない）
+    let nested = "<svg width=\"5\" height=\"5\" style=\"overflow: overlay\"><rect width=\"9\" height=\"9\"/></svg>";
+    assert_eq!(build(&svg(nested)).unwrap().nodes.len(), 1);
+    // width の大きさの関数は auto
+    for f in ["calc-size(auto, size)", "anchor-size(width)", "fit-content(10px)"] {
+        assert_eq!(build(&svg(&format!("{r} style=\"width: {f}\"/>"))).unwrap().nodes.len(), 0, "{f}");
+    }
+    // 背景の image-set の文字列の data: と、tab を含む URL の data:
+    for bg in ["image-set(\"data:image/png;base64,AA\" 1x) lime", "url(\"da\tta:image/png;base64,AA\") lime"] {
+        let doc = svg(&format!("<style>svg {{ background: {bg} }}</style>"));
+        assert_eq!(notyet(build(&doc)), Some(Later::BackgroundImage), "{bg}");
+    }
+    assert!(build(&svg("<style>svg { background: image-set(\"a.png\" 1x) lime }</style>")).is_ok());
 }
 
 /// 根の svg の display: none と偽の条件は描くことを止めない（Chrome と同じ。ADR-102。子の display: none は効く）。

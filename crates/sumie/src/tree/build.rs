@@ -188,6 +188,13 @@ pub(crate) fn build_tree(d: &Document<'_>, budget: &Budget<'_>) -> Result<Tree, 
     let mut paint_background = false;
     walk_with(d, WalkOptions { build: true }, budget, &mut |item| {
         if item.node == 0 {
+            // 根の箱のプロパティは、根の中身を描かない文書（viewBox の幅か高さが 0 など）でも Chrome は描く（単位 3 の 6 回目の
+            // レビュー）
+            use crate::style::props::{BOX_OUTLINE, BOX_ROOT};
+            if item.computed.css_box & (BOX_ROOT | BOX_OUTLINE) != 0 {
+                let pos = d.xml.nodes.as_slice().first().map(|n| u64::from(n.pos));
+                return Err(Error::Unsupported(Unsupported { feature: Feature::NotYet(Later::CssBox), position: pos }));
+            }
             out.root = Some(item.computed);
             paint_background = d
                 .xml
@@ -517,7 +524,9 @@ fn visit(
             };
             let rx = crate::math::min(rx, w / 2.0);
             let ry = crate::math::min(ry, h / 2.0);
-            if rx <= 0.0 || ry <= 0.0 {
+            // Chrome が枠の描き方で描くのは rx と ry の両方が 0 の rect だけ（片方だけ 0 は角の丸みなしでもパスで描く。
+            // 単位 1 の 8 回目・単位 3 の 6 回目のレビュー）
+            if rx <= 0.0 && ry <= 0.0 {
                 shape = crate::tree::SHAPE_RECT;
             }
             budget.spend(cost::OP_STEP)?;

@@ -79,35 +79,47 @@ pub(crate) enum Kind {
     CssBox(BoxRule),
 }
 
-/// CSS の箱のプロパティの、初期の値と同じ絵になる値の決め方。
+/// CSS の箱のプロパティの書き方（Chrome と同じ形だけを受ける：壊れた値は宣言ごと捨てて前の宣言を生かす）と、初期の値と
+/// 同じ絵になる値の決め方。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BoxRule {
-    /// 線の形の言葉（`solid` など。`none`・`hidden` のほか）がなければ同じ（根の border。幅と色だけでは描かない）
-    Border,
-    /// どの値も 0 なら同じ（根の padding・角の丸み）
-    Zero,
-    /// どの値も 0 か `auto` なら同じ（根の margin）
-    ZeroOrAuto,
-    /// `none` だけなら同じ（根の box-shadow・border-image など）
+    /// 線の太さ・形・色をそれぞれ 1 つまで（`border` など）。形が `none`・`hidden` か書いていなければ同じ（幅と色だけでは
+    /// 描かない）
+    BorderLine,
+    /// 線の形の言葉を 1〜n（`border-style` は 4）。どれも `none`・`hidden` なら同じ
+    Styles(u8),
+    /// 長さか割合を 1〜max（`auto` を受けるか・負を受けるか）。どれも 0（か `auto`）なら同じ（padding・margin）
+    Lengths { max: u8, auto: bool, neg: bool },
+    /// 角の丸み：負でない長さか割合を 1〜max、`slash` なら `/` のあとにもう 1〜max。どれも 0 なら同じ
+    Radius { max: u8, slash: bool },
+    /// `none` だけなら同じ（値は細かく確かめない。none でなければ NotYet。box-shadow・border-image など）
     NoneOnly,
-    /// 線の形の言葉（`auto` も）がなければ同じ（要素の outline）
-    Outline,
-    /// どの値も同じでない（rect の論理の大きさ：`auto` も幅・高さの属性に勝つ）
+    /// outline の太さ・形（`auto` も）・色をそれぞれ 1 つまで。形が `none` か書いていなければ同じ
+    OutlineLine,
+    /// outline の形の言葉 1 つ。`none` なら同じ
+    OutlineStyle,
+    /// rect の論理の大きさ（`auto`・負でない長さか割合・大きさの言葉）。どの値も同じでない（`auto` も全体の言葉も幅・高さの
+    /// 属性に勝つ）
     Logical,
-    /// その言葉だけなら同じ（根の `position: static`・`scrollbar-gutter: auto`）
-    Keyword(&'static [u8]),
+    /// 言葉の 1 つ（`position`）。`neutral` なら同じ
+    Keyword { words: &'static [&'static [u8]], neutral: &'static [u8] },
+    /// `scrollbar-gutter`（`auto` か `stable` と `both-edges`）。`auto` なら同じ
+    Gutter,
 }
 
 impl BoxRule {
     /// 効く要素：根だけ（[`BOX_ROOT`]）・どの要素も（[`BOX_OUTLINE`]）・rect（[`BOX_LOGICAL`]）。
     pub(crate) const fn scope(self) -> u8 {
         match self {
-            BoxRule::Outline => BOX_OUTLINE,
+            BoxRule::OutlineLine | BoxRule::OutlineStyle => BOX_OUTLINE,
             BoxRule::Logical => BOX_LOGICAL,
             _ => BOX_ROOT,
         }
     }
 }
+
+/// `position` の言葉。
+pub(crate) const POSITIONS: &[&[u8]] = &[b"static", b"relative", b"absolute", b"fixed", b"sticky"];
 
 /// [`BoxRule::scope`] の印（計算した値の `css_box` の位）。
 pub(crate) const BOX_ROOT: u8 = 1;
@@ -125,6 +137,9 @@ pub(crate) const SIZE_KEYWORDS: &[&[u8]] = &[
     b"-webkit-max-content",
     b"-webkit-fit-content",
 ];
+
+/// CSS の `width`・`height` で `auto` と同じに扱う大きさの関数（Chrome が受けるもの）。
+pub(crate) const SIZE_FUNCTIONS: &[&[u8]] = &[b"calc-size", b"anchor-size", b"fit-content", b"-webkit-fit-content"];
 
 /// プロパティ。
 #[derive(Debug, Clone, Copy)]
@@ -287,20 +302,20 @@ const POINTER_EVENTS: &[&[u8]] = &[
 
 /// 表（名前のバイトの順）。
 pub(crate) const PROPS: &[Prop] = &[
-    p(b"-webkit-border-after", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"-webkit-border-after-style", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"-webkit-border-before", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"-webkit-border-before-style", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"-webkit-border-bottom-left-radius", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"-webkit-border-bottom-right-radius", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"-webkit-border-end", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"-webkit-border-end-style", false, false, Kind::CssBox(BoxRule::Border)),
+    p(b"-webkit-border-after", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"-webkit-border-after-style", false, false, Kind::CssBox(BoxRule::Styles(1))),
+    p(b"-webkit-border-before", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"-webkit-border-before-style", false, false, Kind::CssBox(BoxRule::Styles(1))),
+    p(b"-webkit-border-bottom-left-radius", false, false, Kind::CssBox(BoxRule::Radius { max: 2, slash: false })),
+    p(b"-webkit-border-bottom-right-radius", false, false, Kind::CssBox(BoxRule::Radius { max: 2, slash: false })),
+    p(b"-webkit-border-end", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"-webkit-border-end-style", false, false, Kind::CssBox(BoxRule::Styles(1))),
     p(b"-webkit-border-image", false, false, Kind::CssBox(BoxRule::NoneOnly)),
-    p(b"-webkit-border-radius", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"-webkit-border-start", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"-webkit-border-start-style", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"-webkit-border-top-left-radius", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"-webkit-border-top-right-radius", false, false, Kind::CssBox(BoxRule::Zero)),
+    p(b"-webkit-border-radius", false, false, Kind::CssBox(BoxRule::Radius { max: 4, slash: true })),
+    p(b"-webkit-border-start", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"-webkit-border-start-style", false, false, Kind::CssBox(BoxRule::Styles(1))),
+    p(b"-webkit-border-top-left-radius", false, false, Kind::CssBox(BoxRule::Radius { max: 2, slash: false })),
+    p(b"-webkit-border-top-right-radius", false, false, Kind::CssBox(BoxRule::Radius { max: 2, slash: false })),
     p(b"-webkit-box-shadow", false, false, Kind::CssBox(BoxRule::NoneOnly)),
     // Chrome が SVG の要素に効かせる接頭辞つきの効果（CSS のプロパティとしてだけ。まだ描かないので、none でなければ
     // NotYet。ADR-101）
@@ -308,17 +323,18 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"-webkit-filter", false, false, Kind::Filter),
     p(b"-webkit-logical-height", false, false, Kind::CssBox(BoxRule::Logical)),
     p(b"-webkit-logical-width", false, false, Kind::CssBox(BoxRule::Logical)),
-    p(b"-webkit-margin-after", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
-    p(b"-webkit-margin-before", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
-    p(b"-webkit-margin-end", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
-    p(b"-webkit-margin-start", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
+    p(b"-webkit-margin-after", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: true, neg: true })),
+    p(b"-webkit-margin-before", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: true, neg: true })),
+    p(b"-webkit-margin-end", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: true, neg: true })),
+    p(b"-webkit-margin-start", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: true, neg: true })),
     p(b"-webkit-mask", false, false, Kind::Raw),
     p(b"-webkit-mask-box-image", false, false, Kind::CssBox(BoxRule::NoneOnly)),
+    p(b"-webkit-mask-box-image-source", false, false, Kind::CssBox(BoxRule::NoneOnly)),
     p(b"-webkit-mask-image", false, false, Kind::Raw),
-    p(b"-webkit-padding-after", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"-webkit-padding-before", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"-webkit-padding-end", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"-webkit-padding-start", false, false, Kind::CssBox(BoxRule::Zero)),
+    p(b"-webkit-padding-after", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: false, neg: false })),
+    p(b"-webkit-padding-before", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: false, neg: false })),
+    p(b"-webkit-padding-end", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: false, neg: false })),
+    p(b"-webkit-padding-start", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: false, neg: false })),
     p(b"alignment-baseline", false, true, Kind::Keywords(ALIGNMENT)),
     // 全体の言葉だけを受け、カスケードで長い名前（direction・unicode-bidi を除く）に分ける（Chrome と同じ。ユーザーの判断）
     p(b"all", false, false, Kind::Keywords(&[])),
@@ -331,39 +347,40 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"background-image", false, false, Kind::BackgroundImage),
     pu(b"baseline-shift", false, true, Kind::BaselineShift),
     p(b"block-size", false, false, Kind::CssBox(BoxRule::Logical)),
-    p(b"border", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-block", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-block-end", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-block-end-style", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-block-start", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-block-start-style", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-block-style", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-bottom", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-bottom-left-radius", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"border-bottom-right-radius", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"border-bottom-style", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-end-end-radius", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"border-end-start-radius", false, false, Kind::CssBox(BoxRule::Zero)),
+    p(b"border", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"border-block", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"border-block-end", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"border-block-end-style", false, false, Kind::CssBox(BoxRule::Styles(1))),
+    p(b"border-block-start", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"border-block-start-style", false, false, Kind::CssBox(BoxRule::Styles(1))),
+    p(b"border-block-style", false, false, Kind::CssBox(BoxRule::Styles(2))),
+    p(b"border-bottom", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"border-bottom-left-radius", false, false, Kind::CssBox(BoxRule::Radius { max: 2, slash: false })),
+    p(b"border-bottom-right-radius", false, false, Kind::CssBox(BoxRule::Radius { max: 2, slash: false })),
+    p(b"border-bottom-style", false, false, Kind::CssBox(BoxRule::Styles(1))),
+    p(b"border-end-end-radius", false, false, Kind::CssBox(BoxRule::Radius { max: 2, slash: false })),
+    p(b"border-end-start-radius", false, false, Kind::CssBox(BoxRule::Radius { max: 2, slash: false })),
     p(b"border-image", false, false, Kind::CssBox(BoxRule::NoneOnly)),
-    p(b"border-inline", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-inline-end", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-inline-end-style", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-inline-start", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-inline-start-style", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-inline-style", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-left", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-left-style", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-radius", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"border-right", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-right-style", false, false, Kind::CssBox(BoxRule::Border)),
+    p(b"border-image-source", false, false, Kind::CssBox(BoxRule::NoneOnly)),
+    p(b"border-inline", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"border-inline-end", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"border-inline-end-style", false, false, Kind::CssBox(BoxRule::Styles(1))),
+    p(b"border-inline-start", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"border-inline-start-style", false, false, Kind::CssBox(BoxRule::Styles(1))),
+    p(b"border-inline-style", false, false, Kind::CssBox(BoxRule::Styles(2))),
+    p(b"border-left", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"border-left-style", false, false, Kind::CssBox(BoxRule::Styles(1))),
+    p(b"border-radius", false, false, Kind::CssBox(BoxRule::Radius { max: 4, slash: true })),
+    p(b"border-right", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"border-right-style", false, false, Kind::CssBox(BoxRule::Styles(1))),
     p(b"border-shape", false, false, Kind::CssBox(BoxRule::NoneOnly)),
-    p(b"border-start-end-radius", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"border-start-start-radius", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"border-style", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-top", false, false, Kind::CssBox(BoxRule::Border)),
-    p(b"border-top-left-radius", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"border-top-right-radius", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"border-top-style", false, false, Kind::CssBox(BoxRule::Border)),
+    p(b"border-start-end-radius", false, false, Kind::CssBox(BoxRule::Radius { max: 2, slash: false })),
+    p(b"border-start-start-radius", false, false, Kind::CssBox(BoxRule::Radius { max: 2, slash: false })),
+    p(b"border-style", false, false, Kind::CssBox(BoxRule::Styles(4))),
+    p(b"border-top", false, false, Kind::CssBox(BoxRule::BorderLine)),
+    p(b"border-top-left-radius", false, false, Kind::CssBox(BoxRule::Radius { max: 2, slash: false })),
+    p(b"border-top-right-radius", false, false, Kind::CssBox(BoxRule::Radius { max: 2, slash: false })),
+    p(b"border-top-style", false, false, Kind::CssBox(BoxRule::Styles(1))),
     p(b"box-shadow", false, false, Kind::CssBox(BoxRule::NoneOnly)),
     p(b"clip", false, true, Kind::Raw),
     p(b"clip-path", false, true, Kind::ClipPath),
@@ -409,17 +426,17 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"letter-spacing", true, true, Kind::Spacing),
     p(b"lighting-color", false, true, Kind::Color),
     p(b"line-height", true, false, Kind::LineHeight),
-    p(b"margin", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
-    p(b"margin-block", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
-    p(b"margin-block-end", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
-    p(b"margin-block-start", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
-    p(b"margin-bottom", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
-    p(b"margin-inline", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
-    p(b"margin-inline-end", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
-    p(b"margin-inline-start", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
-    p(b"margin-left", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
-    p(b"margin-right", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
-    p(b"margin-top", false, false, Kind::CssBox(BoxRule::ZeroOrAuto)),
+    p(b"margin", false, false, Kind::CssBox(BoxRule::Lengths { max: 4, auto: true, neg: true })),
+    p(b"margin-block", false, false, Kind::CssBox(BoxRule::Lengths { max: 2, auto: true, neg: true })),
+    p(b"margin-block-end", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: true, neg: true })),
+    p(b"margin-block-start", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: true, neg: true })),
+    p(b"margin-bottom", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: true, neg: true })),
+    p(b"margin-inline", false, false, Kind::CssBox(BoxRule::Lengths { max: 2, auto: true, neg: true })),
+    p(b"margin-inline-end", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: true, neg: true })),
+    p(b"margin-inline-start", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: true, neg: true })),
+    p(b"margin-left", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: true, neg: true })),
+    p(b"margin-right", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: true, neg: true })),
+    p(b"margin-top", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: true, neg: true })),
     p(b"marker", true, false, Kind::UrlOrNone),
     p(b"marker-end", true, true, Kind::UrlOrNone),
     p(b"marker-mid", true, true, Kind::UrlOrNone),
@@ -435,32 +452,32 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"offset", false, false, Kind::Raw),
     p(b"offset-path", false, false, Kind::Raw),
     p(b"opacity", false, true, Kind::Opacity),
-    p(b"outline", false, false, Kind::CssBox(BoxRule::Outline)),
-    p(b"outline-style", false, false, Kind::CssBox(BoxRule::Outline)),
+    p(b"outline", false, false, Kind::CssBox(BoxRule::OutlineLine)),
+    p(b"outline-style", false, false, Kind::CssBox(BoxRule::OutlineStyle)),
     p(b"overflow", false, true, Kind::Overflow),
     // 長い名前（CSS のプロパティとしてだけ）。visible・auto のほかは切る側（NotYet）に倒す（単位 3 の 5 回目のレビュー）
     p(b"overflow-x", false, false, Kind::Keywords(OVERFLOW)),
     p(b"overflow-y", false, false, Kind::Keywords(OVERFLOW)),
-    p(b"padding", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"padding-block", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"padding-block-end", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"padding-block-start", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"padding-bottom", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"padding-inline", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"padding-inline-end", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"padding-inline-start", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"padding-left", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"padding-right", false, false, Kind::CssBox(BoxRule::Zero)),
-    p(b"padding-top", false, false, Kind::CssBox(BoxRule::Zero)),
+    p(b"padding", false, false, Kind::CssBox(BoxRule::Lengths { max: 4, auto: false, neg: false })),
+    p(b"padding-block", false, false, Kind::CssBox(BoxRule::Lengths { max: 2, auto: false, neg: false })),
+    p(b"padding-block-end", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: false, neg: false })),
+    p(b"padding-block-start", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: false, neg: false })),
+    p(b"padding-bottom", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: false, neg: false })),
+    p(b"padding-inline", false, false, Kind::CssBox(BoxRule::Lengths { max: 2, auto: false, neg: false })),
+    p(b"padding-inline-end", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: false, neg: false })),
+    p(b"padding-inline-start", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: false, neg: false })),
+    p(b"padding-left", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: false, neg: false })),
+    p(b"padding-right", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: false, neg: false })),
+    p(b"padding-top", false, false, Kind::CssBox(BoxRule::Lengths { max: 1, auto: false, neg: false })),
     p(b"paint-order", true, true, Kind::PaintOrder),
     p(b"pointer-events", true, true, Kind::Keywords(POINTER_EVENTS)),
-    p(b"position", false, false, Kind::CssBox(BoxRule::Keyword(b"static"))),
+    p(b"position", false, false, Kind::CssBox(BoxRule::Keyword { words: POSITIONS, neutral: b"static" })),
     pu(b"r", false, true, Kind::LengthNonNeg),
     p(b"rotate", false, false, Kind::Raw),
     pu(b"rx", false, true, Kind::LengthAuto),
     pu(b"ry", false, true, Kind::LengthAuto),
     p(b"scale", false, false, Kind::Raw),
-    p(b"scrollbar-gutter", false, false, Kind::CssBox(BoxRule::Keyword(b"auto"))),
+    p(b"scrollbar-gutter", false, false, Kind::CssBox(BoxRule::Gutter)),
     p(b"shape-rendering", true, true, Kind::Keywords(RENDERING)),
     p(b"stop-color", false, true, Kind::Color),
     p(b"stop-opacity", false, true, Kind::Opacity),

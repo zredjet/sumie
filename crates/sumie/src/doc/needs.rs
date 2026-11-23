@@ -83,6 +83,7 @@ pub(crate) fn needs(
         return Ok(out);
     }
     let display = lookup(b"display", false);
+    let content_visibility = lookup(b"content-visibility", false);
     // 節（XML の節と、受け継がない参照の並びの節）
     let total = refs.start.len().saturating_sub(1);
     // 中をたどった印（文脈ごと）：1 子の辺で文字の外・4 子の辺で文字の中・2 参照の辺。印は確かめを通ったときだけ付ける
@@ -163,6 +164,21 @@ pub(crate) fn needs(
                 }
             }
         }
+        // content-visibility: hidden の入れ物の中身は描かない（walk と同じ。単位 3 の 6 回目のレビュー）
+        let mut cv_hidden = false;
+        if !referenced_container {
+            let spec = styles.of(i).iter().find(|s| Some(s.prop) == content_visibility).copied();
+            if let Some(s) = spec
+                && s.wide == WIDE_NONE
+            {
+                let buf = match s.src {
+                    SRC_SHEET => sheet.text.as_slice(),
+                    SRC_STORE => doc.store.as_slice(),
+                    _ => input,
+                };
+                cv_hidden = Values::new(buf, s.value, budget).eat_ident(b"hidden")?;
+            }
+        }
         if let Some(x) = seen.get_mut(i as usize) {
             *x = prev | bit;
         }
@@ -170,7 +186,8 @@ pub(crate) fn needs(
             classify(doc, input, n, local, &mut out, budget)?;
         }
         // 子（描かない入れ物は参照の辺で入ったときだけ。clipPath の中の画像は描かないので入らない。図形などの子は描かない）
-        let into = if not_rendered(local) { via_ref && local != b"clipPath" } else { renders_children(local) };
+        let into =
+            if not_rendered(local) { via_ref && local != b"clipPath" } else { renders_children(local) && !cv_hidden };
         if into {
             let child_text = in_text || local == b"text";
             let child_filter = local == b"filter";

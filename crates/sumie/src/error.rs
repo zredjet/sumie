@@ -128,11 +128,11 @@ pub enum Later {
     Filter,
     /// 外接矩形の要る `transform-box`（fill-box など）の変形と、表示の領域の決まらない % の位置（M3）
     TransformBox,
-    /// CSS の個別の変形（`translate`・`rotate`・`scale`）と `offset-path`（M3）
+    /// CSS の個別の変形（`translate`・`rotate`・`scale`）と `offset-path`・道のある `offset`（M3）
     CssTransform,
     /// `display: contents`（M3）
     DisplayContents,
-    /// 根の背景の画像の層（`data:` の画像。デコーダを渡す口と同じ M3）
+    /// 根の背景の画像の層（`data:` の画像と `image()`。デコーダを渡す口と同じ M3）
     BackgroundImage,
     /// CSS の箱のプロパティ（根の `border`・`padding`・`margin`・`box-shadow`・`position` など、要素の `outline`、rect の
     /// 論理の大きさ `inline-size`・`block-size`）が初期の値と同じ絵にならない（Chrome は描く。M3 で決める。ADR-103）

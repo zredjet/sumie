@@ -686,8 +686,8 @@ fn attr_buf<'a>(doc: &'a XmlDoc, input: &'a [u8], a: &xml::Attr) -> (&'a [u8], S
     }
 }
 
-/// `switch` の子で条件の属性を照らす要素（Chrome の SVGTests を持つ要素：描く要素・入れ物・参照される入れ物・文字の中の
-/// 要素・動き）。ほかの SVG の要素は条件を照らさずに選ぶ（ADR-103）。
+/// `switch` の子で条件の属性を照らす要素（Chrome で確かめた：描く要素・入れ物・defs・symbol・mask・pattern・文字の中の
+/// 要素・動き。clipPath と discard は照らさない）。ほかの SVG の要素は条件を照らさずに選ぶ（ADR-103・ADR-104）。
 fn switch_conditional(local: &[u8]) -> bool {
     matches!(
         local,
@@ -705,7 +705,7 @@ fn switch_conditional(local: &[u8]) -> bool {
             | b"polygon"
             | b"path"
             | b"defs"
-            | b"clipPath"
+            | b"symbol"
             | b"mask"
             | b"pattern"
             | b"tspan"
@@ -714,7 +714,6 @@ fn switch_conditional(local: &[u8]) -> bool {
             | b"animateMotion"
             | b"animateTransform"
             | b"set"
-            | b"discard"
     )
 }
 
@@ -726,9 +725,31 @@ fn conditions_pass(
     languages: &[&str],
     budget: &Budget<'_>,
 ) -> Result<bool, Error> {
-    // 知っている拡張はないので、属性があれば偽（空も偽）
-    if doc.find_attr(input, n, NS_NONE, b"requiredExtensions", budget)?.is_some() {
-        return Ok(false);
+    // 知っている拡張は XHTML と MathML の名前空間だけ（Chrome と同じ。ユーザーの判断。ADR-104）。空白で区切った並びの
+    // どれもそのどちらなら真、空と知らない拡張は偽
+    if let Some(v) = doc.attr(input, n, NS_NONE, b"requiredExtensions", budget)? {
+        const KNOWN: &[&[u8]] = &[b"http://www.w3.org/1999/xhtml", b"http://www.w3.org/1998/Math/MathML"];
+        let mut meter = crate::xml::lex::ScanMeter::new(0, v.len());
+        let (mut any, mut a) = (false, 0usize);
+        for i in 0..=v.len() {
+            meter.pay(budget, i)?;
+            if v.get(i).is_some_and(|c| !c.is_ascii_whitespace()) {
+                continue;
+            }
+            let word = v.get(a..i).unwrap_or(&[]);
+            a = i.saturating_add(1);
+            if word.is_empty() {
+                continue;
+            }
+            budget.spend(cost::OP_STEP)?;
+            if !KNOWN.contains(&word) {
+                return Ok(false);
+            }
+            any = true;
+        }
+        if !any {
+            return Ok(false);
+        }
     }
     let Some(v) = doc.attr(input, n, NS_NONE, b"systemLanguage", budget)? else { return Ok(true) };
     // `,` で区切った言語のどれかが、呼び手の言語のどれかと頭の部分（`-` の前）で同じ（大文字小文字を問わない）

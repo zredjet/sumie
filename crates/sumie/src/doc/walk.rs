@@ -5,8 +5,8 @@
 //! - 根からの変形：根の viewBox の変形 × 祖先の変形 × 要素の変形。use は自分の変形のあとに x・y の平行移動を掛け、入れ子の
 //!   svg は子に x・y の平行移動と viewBox の変形を掛ける（svg 自身の変形には含めない）。根の svg 自身の変形は viewBox の
 //!   変形の外側に掛ける
-//! - 表示の領域（% の基準）：根は文書の大きさ（viewBox があればその幅・高さ。大きさを中身で決める文書は 100 × 100：usvg の
-//!   既定の大きさ。ADR-99 (1)。その根の変形の原点の % は 0 × 0 で解く：ADR-101）。入れ子の svg は `width`・`height`（既定
+//! - 表示の領域（% の基準）：根は文書の大きさ（viewBox があればその幅・高さ。大きさを中身で決める文書は書いた幅・高さ（% は
+//!   100 に対する割合）、ない側は 100：ADR-102 (2)。その根の変形の原点は既定だけ 0 0：ADR-102 (2)）。入れ子の svg は `width`・`height`（既定
 //!   100%。属性だけを読む）と viewBox
 //! - 描く木に入るか：SVG の名前空間の知っている要素で、子を描く入れ物（svg・g・a・switch と文字の要素）の子であり、内容の
 //!   モデルに合い（文字の中は文字の中身の要素と a だけ、文字の外では tspan・stop・fe… を描かない。`refs::fits`）、描かない
@@ -188,7 +188,8 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
         // 根の viewBox の変形と、子の表示の領域
         // 幅か高さが 0 の viewBox の根は描かない（大きさは viewBox がないものとして決める。ADR-78 (7)）
         let mut root_drawn = true;
-        // 大きさが決まる文書だけが viewBox の変形を持つ（中身で決める文書の表示の領域は 100 × 100 で、変形はない）
+        // 大きさが決まる文書だけが viewBox の変形を持つ（中身で決める文書の表示の領域は書いた幅・高さか 100 で、変形はない。
+        // ADR-102 (2)）
         let (root_ctm, root_vp) = match (known, view_box_of(doc, input, root, budget)?) {
             (Some((w, h)), Some((vb, aspect))) => match view_box_transform(&vb, aspect, w, h) {
                 Some(t) => (t, Some((vb.w, vb.h))),
@@ -547,7 +548,8 @@ fn overflow_visible(
             let mut any = false;
             while !v.at_end()? {
                 budget.spend(cost::OP_STEP)?;
-                if !(v.eat_ident(b"visible")? || v.eat_ident(b"auto")?) {
+                // overlay は auto と同じ（Chrome と同じ。単位 3 の 6 回目のレビュー）
+                if !(v.eat_ident(b"visible")? || v.eat_ident(b"auto")? || v.eat_ident(b"overlay")?) {
                     return Ok(Some(false));
                 }
                 any = true;

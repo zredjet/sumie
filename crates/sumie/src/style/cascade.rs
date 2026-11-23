@@ -109,7 +109,10 @@ pub(crate) const BOX_ON: u8 = 1;
 fn box_flag(id: PropertyId, text: &[u8], value: Span, budget: &Budget<'_>) -> Result<Option<u8>, Error> {
     match prop(id).map(|p| p.kind) {
         Some(crate::style::props::Kind::CssBox(rule)) => {
-            Ok(Some(if crate::style::valid::box_neutral(rule, text, value, budget)? { 0 } else { BOX_ON }))
+            // 確かめは済んでいる（壊れた値は候補にならない）。同じ絵にならなければ BOX_ON
+            let cx = crate::style::valid::Ctx { attr: false, unitless: false, viewport: true };
+            let same = crate::style::valid::css_box(rule, text, value, cx, budget)?.unwrap_or(false);
+            Ok(Some(if same { 0 } else { BOX_ON }))
         }
         _ => Ok(None),
     }
@@ -516,7 +519,13 @@ impl Out<'_, '_> {
                     continue;
                 }
                 let Ok(id) = PropertyId::try_from(i) else { continue };
-                self.offer_one(id, key, Specified { prop: id, ..spec }, None)?;
+                // CSS の箱のプロパティは全体の言葉をそのまま置く（`all` の分けた言葉は論理の大きさでも幅の属性に勝たない。
+                // Chrome と同じ）
+                if matches!(p.kind, crate::style::props::Kind::CssBox(_)) {
+                    self.put(id, key, Specified { prop: id, ..spec })?;
+                } else {
+                    self.offer_one(id, key, Specified { prop: id, ..spec }, None)?;
+                }
             }
             return Ok(());
         }
@@ -538,11 +547,17 @@ impl Out<'_, '_> {
         if name == b"background" {
             return self.offer_background(key, spec, font);
         }
-        // CSS の箱のプロパティ：同じ絵にならない印を置く（求めていなければ同じ絵にならないとみなす。値は読み直さない）
-        if spec.wide == WIDE_NONE
-            && matches!(PROPS.get(usize::from(prop)).map(|p| p.kind), Some(crate::style::props::Kind::CssBox(_)))
-        {
-            let flag = font.map_or(BOX_ON, |r| r.pad[0]);
+        // CSS の箱のプロパティ：同じ絵にならない印を置く（求めていなければ同じ絵にならないとみなす。値は読み直さない）。
+        // rect の論理の大きさは全体の言葉（initial・unset・revert・inherit）でも幅・高さの属性に勝つので印を置く（Chrome と
+        // 同じ。単位 3 の 6 回目のレビュー）
+        if let Some(crate::style::props::Kind::CssBox(box_rule)) = PROPS.get(usize::from(prop)).map(|p| p.kind) {
+            let flag = if spec.wide == WIDE_NONE {
+                font.map_or(BOX_ON, |r| r.pad[0])
+            } else if box_rule == crate::style::props::BoxRule::Logical {
+                BOX_ON
+            } else {
+                0
+            };
             return self.put(prop, key, Specified { pad: [flag, 0, 0], ..spec });
         }
         // 長い名前の `background-image`：画像の層の印を置く（まとめから分けたものと同じ形。値は読み直さない）

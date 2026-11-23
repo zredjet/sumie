@@ -68,6 +68,7 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
         Kind::Font => return Ok(font_parts(s, range, cx, budget)?.is_some()),
         Kind::Background => return Ok(background_color(s, range, budget)?.is_some()),
         Kind::BackgroundImage => return Ok(image_list(s, range, budget)?.is_some()),
+        Kind::CssBox(rule) => return Ok(css_box(rule, s, range, cx, budget)?.is_some()),
         _ => {}
     }
     let mut v = Values::new(s, range, budget);
@@ -87,6 +88,7 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
         Kind::SizeAuto => {
             v.eat_ident(b"auto")?
                 || (!cx.attr && eat_any(&mut v, crate::style::props::SIZE_KEYWORDS)?)
+                || (!cx.attr && size_function(&mut v, cx)?)
                 || len_of(&mut v, cx)?.is_some_and(|l| l.value >= 0.0)
         }
         // 負だけが壊れた値（0 以上 1 未満は継ぎ目がいつも bevel になる。SVG 2・Chrome と同じ）
@@ -269,7 +271,7 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
                 }
             }
         }
-        Kind::Raw | Kind::CssBox(_) => {
+        Kind::Raw => {
             while !v.at_end()? {
                 budget.spend(crate::cost::OP_STEP)?;
                 let t = v.next()?;
@@ -279,7 +281,7 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
             }
             true
         }
-        Kind::Transform | Kind::Font | Kind::Background | Kind::BackgroundImage => false,
+        Kind::Transform | Kind::Font | Kind::Background | Kind::BackgroundImage | Kind::CssBox(_) => false,
     };
     Ok(ok && v.at_end()?)
 }
@@ -330,6 +332,19 @@ fn skip_args(v: &mut Values<'_, '_>, cx: Ctx) -> Result<bool, Error> {
         }
         nest.feed(&t)?;
     }
+}
+
+/// width・height の大きさの関数（`calc-size()`・`anchor-size()`・`fit-content()`。Chrome は SVG の rect で auto と同じに
+/// 扱う。単位 3 の 6 回目のレビュー）を 1 つ読む。
+pub(crate) fn size_function(v: &mut Values<'_, '_>, cx: Ctx) -> Result<bool, Error> {
+    let t = v.peek()?;
+    if t.kind == Tk::Function
+        && crate::style::props::SIZE_FUNCTIONS.iter().any(|w| ident_is(v.s, t.inner, t.escaped, w))
+    {
+        v.next()?;
+        return skip_args(v, cx);
+    }
+    Ok(false)
 }
 
 /// `url()` か、決まった名前の関数の並び（1 つ以上）。
@@ -668,33 +683,158 @@ pub(crate) fn font_parts(s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) ->
     Ok(Some(p))
 }
 
-/// CSS の箱のプロパティの値が、初期の値と同じ絵になるか（[`BoxRule`]。宣言ごとに 1 度だけ求める。ADR-103）。字句ごとに
-/// 払う。読めない字句は同じ絵にならないとみなす（NotYet の側）。
-pub(crate) fn box_neutral(rule: BoxRule, s: &[u8], range: Span, budget: &Budget<'_>) -> Result<bool, Error> {
+/// CSS の箱のプロパティの値を Chrome と同じ形で確かめ、初期の値と同じ絵になるかを返す（壊れた値は None：宣言ごと捨てる。
+/// [`BoxRule`]。宣言ごとに 1 度だけ求める。ADR-103）。字句ごとに払う。
+pub(crate) fn css_box(
+    rule: BoxRule,
+    s: &[u8],
+    range: Span,
+    cx: Ctx,
+    budget: &Budget<'_>,
+) -> Result<Option<bool>, Error> {
     let budget = budget_ref(budget);
-    const STYLES: &[&[u8]] = &[b"solid", b"dashed", b"dotted", b"double", b"groove", b"ridge", b"inset", b"outset"];
+    const LINE: &[&[u8]] =
+        &[b"none", b"hidden", b"dotted", b"dashed", b"solid", b"double", b"groove", b"ridge", b"inset", b"outset"];
+    const WIDTHS: &[&[u8]] = &[b"thin", b"medium", b"thick"];
     let mut v = Values::new(s, range, budget);
-    let mut count = 0u32;
-    while !v.at_end()? {
-        budget.spend(crate::cost::OP_STEP)?;
-        let t = v.next()?;
-        count = count.saturating_add(1);
-        let is = |w: &[u8]| t.kind == Tk::Ident && ident_is(s, t.inner, t.escaped, w);
-        let zero = matches!(t.kind, Tk::Number | Tk::Dimension | Tk::Percentage) && t.finite && t.value == 0.0;
-        let neutral = match rule {
-            BoxRule::Border => !STYLES.iter().any(|w| is(w)),
-            BoxRule::Outline => !STYLES.iter().any(|w| is(w)) && !is(b"auto"),
-            BoxRule::Zero => zero,
-            BoxRule::ZeroOrAuto => zero || is(b"auto"),
-            BoxRule::NoneOnly => is(b"none") && count == 1,
-            BoxRule::Keyword(k) => is(k) && count == 1,
-            BoxRule::Logical => false,
-        };
-        if !neutral {
-            return Ok(false);
-        }
+    if v.at_end()? {
+        return Ok(None);
     }
-    Ok(count > 0 || !matches!(rule, BoxRule::Logical))
+    // 線の形の言葉を 1 つ読む（読めたら Some(同じ絵か)）。outline は auto も受け、hidden は受けない
+    let style = |v: &mut Values<'_, '_>, outline: bool| -> Result<Option<bool>, Error> {
+        let t = v.peek()?;
+        if t.kind != Tk::Ident {
+            return Ok(None);
+        }
+        let is = |w: &[u8]| ident_is(s, t.inner, t.escaped, w);
+        if outline && is(b"auto") {
+            v.next()?;
+            return Ok(Some(false));
+        }
+        for w in LINE {
+            if is(w) && !(outline && *w == b"hidden") {
+                v.next()?;
+                return Ok(Some(*w == b"none" || *w == b"hidden"));
+            }
+        }
+        Ok(None)
+    };
+    let nonneg = |v: &mut Values<'_, '_>| -> Result<Option<bool>, Error> {
+        Ok(len_of(v, cx)?.filter(|l| l.value >= 0.0).map(|l| l.value == 0.0))
+    };
+    let out = match rule {
+        BoxRule::BorderLine | BoxRule::OutlineLine => {
+            let outline = rule == BoxRule::OutlineLine;
+            let (mut width, mut line, mut color) = (false, None::<bool>, false);
+            while !v.at_end()? {
+                budget.spend(crate::cost::OP_STEP)?;
+                if line.is_none()
+                    && let Some(n) = style(&mut v, outline)?
+                {
+                    line = Some(n);
+                } else if !width && (eat_any(&mut v, WIDTHS)? || nonneg(&mut v)?.is_some()) {
+                    width = true;
+                } else if !color && (v.color()?.is_some() || (outline && v.eat_ident(b"invert")?)) {
+                    color = true;
+                } else {
+                    return Ok(None);
+                }
+            }
+            Some(line.unwrap_or(true))
+        }
+        BoxRule::Styles(_) | BoxRule::OutlineStyle => {
+            let (max, outline) = match rule {
+                BoxRule::Styles(max) => (max, false),
+                _ => (1, true),
+            };
+            let mut n = 0u8;
+            let mut same = true;
+            while !v.at_end()? {
+                budget.spend(crate::cost::OP_STEP)?;
+                let Some(x) = style(&mut v, outline)? else { return Ok(None) };
+                n = n.saturating_add(1);
+                same &= x;
+            }
+            (n >= 1 && n <= max).then_some(same)
+        }
+        BoxRule::Lengths { max, auto, neg } => {
+            let mut n = 0u8;
+            let mut same = true;
+            while !v.at_end()? {
+                budget.spend(crate::cost::OP_STEP)?;
+                if auto && v.eat_ident(b"auto")? {
+                } else if let Some(l) = len_of(&mut v, cx)?.filter(|l| neg || l.value >= 0.0) {
+                    same &= l.value == 0.0;
+                } else {
+                    return Ok(None);
+                }
+                n = n.saturating_add(1);
+            }
+            (n >= 1 && n <= max).then_some(same)
+        }
+        BoxRule::Radius { max, slash } => {
+            let (mut n, mut m, mut after) = (0u8, 0u8, false);
+            let mut same = true;
+            while !v.at_end()? {
+                budget.spend(crate::cost::OP_STEP)?;
+                let t = v.peek()?;
+                if slash && !after && n >= 1 && t.is_delim(b'/') {
+                    v.next()?;
+                    after = true;
+                    continue;
+                }
+                let Some(z) = nonneg(&mut v)? else { return Ok(None) };
+                same &= z;
+                if after {
+                    m = m.saturating_add(1);
+                } else {
+                    n = n.saturating_add(1);
+                }
+            }
+            (n >= 1 && n <= max && (!after || (m >= 1 && m <= max))).then_some(same)
+        }
+        BoxRule::NoneOnly => {
+            let none = v.eat_ident(b"none")? && v.at_end()?;
+            while !v.at_end()? {
+                budget.spend(crate::cost::OP_STEP)?;
+                if matches!(v.next()?.kind, Tk::BadString | Tk::BadUrl) {
+                    return Ok(None);
+                }
+            }
+            Some(none)
+        }
+        BoxRule::Logical => {
+            let ok = v.eat_ident(b"auto")?
+                || eat_any(&mut v, crate::style::props::SIZE_KEYWORDS)?
+                || size_function(&mut v, cx)?
+                || nonneg(&mut v)?.is_some();
+            ok.then_some(false)
+        }
+        BoxRule::Keyword { words, neutral } => {
+            let t = v.next()?;
+            let ok = t.kind == Tk::Ident && words.iter().any(|w| ident_is(s, t.inner, t.escaped, w));
+            ok.then(|| ident_is(s, t.inner, t.escaped, neutral))
+        }
+        BoxRule::Gutter => {
+            if v.eat_ident(b"auto")? {
+                Some(true)
+            } else {
+                let (mut stable, mut both) = (false, false);
+                while !v.at_end()? {
+                    budget.spend(crate::cost::OP_STEP)?;
+                    if !stable && v.eat_ident(b"stable")? {
+                        stable = true;
+                    } else if !both && v.eat_ident(b"both-edges")? {
+                        both = true;
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                stable.then_some(false)
+            }
+        }
+    };
+    Ok(if v.at_end()? { out } else { None })
 }
 
 #[cfg(test)]
@@ -734,6 +874,29 @@ const GRADIENTS: &[&[u8]] = &[
 /// 壊れた値（単位 3 の 4 回目のレビュー）。
 const IMAGE_WRAPPERS: &[&[u8]] = &[b"image", b"image-set", b"-webkit-image-set", b"-webkit-cross-fade"];
 
+/// URL が `data:` で始まるか（Chrome の URL の読みと同じく、頭の C0 の制御の字と空白を除き、どこにある ASCII の tab・LF・CR も
+/// 除いてから見る。単位 3 の 5 回目・6 回目のレビュー）。
+fn starts_data(b: &[u8], budget: &Budget<'_>) -> Result<bool, Error> {
+    let mut head = [0u8; 5];
+    let mut n = 0usize;
+    let mut leading = true;
+    let mut meter = crate::xml::lex::ScanMeter::new(0, b.len());
+    for (i, &c) in b.iter().enumerate() {
+        meter.pay(budget, i)?;
+        if leading && c <= 0x20 {
+            continue;
+        }
+        leading = false;
+        if matches!(c, b'\t' | b'\n' | b'\r') {
+            continue;
+        }
+        let Some(x) = head.get_mut(n) else { break };
+        *x = c;
+        n = n.saturating_add(1);
+    }
+    Ok(n == 5 && head.eq_ignore_ascii_case(b"data:"))
+}
+
 /// 部分が画像（`none`・url・グラデーション・画像を包む関数）なら、その印（[`IMAGE_GRADIENT`]・[`IMAGE_DATA`]）。画像でなければ
 /// None。包む関数は引数の中のグラデーションの関数と `data:` の url を探す。
 fn image_flags(s: &[u8], p: &Part, budget: &Budget<'_>) -> Result<Option<u8>, Error> {
@@ -744,21 +907,23 @@ fn image_flags(s: &[u8], p: &Part, budget: &Budget<'_>) -> Result<Option<u8>, Er
     // url（字句の url か、文字列の url() 関数）が data: か
     let data_url = |t: &crate::css::lex::Token, lex: &mut Lexer<'_, '_>| -> Result<bool, Error> {
         let text = |sp: Span| s.get(sp.start as usize..sp.end as usize).unwrap_or(&[]);
-        let starts_data = |b: &[u8]| b.len() >= 5 && b.get(..5).is_some_and(|h| h.eq_ignore_ascii_case(b"data:"));
         // escape を含む url は中身を読み直さず、data: とみなす（まだ描かない側に倒す）
         if t.kind == Tk::Url {
-            return Ok(t.escaped || starts_data(text(t.inner).trim_ascii_start()));
+            return Ok(t.escaped || starts_data(text(t.inner), budget)?);
         }
         if is_fn(t, &[b"url"]) {
             loop {
                 let a = lex.next()?;
                 match a.kind {
                     Tk::Whitespace => continue,
-                    // 前の空白は除いて見る（Chrome の URL の読みと同じ。単位 3 の 5 回目のレビュー）
-                    Tk::Str => return Ok(a.escaped || starts_data(text(a.inner).trim_ascii_start())),
+                    Tk::Str => return Ok(a.escaped || starts_data(text(a.inner), budget)?),
                     _ => return Ok(false),
                 }
             }
+        }
+        // 画像を包む関数（image-set など）の引数の文字列も URL（単位 3 の 6 回目のレビュー）
+        if t.kind == Tk::Str {
+            return Ok(t.escaped || starts_data(text(t.inner), budget)?);
         }
         Ok(false)
     };

@@ -570,10 +570,10 @@ fn pick(specs: &[Specified], ids: &PropIds, budget: &Budget<'_>) -> Result<Picke
         } else {
             // CSS の箱のプロパティ：宣言の印（カスケードが宣言ごとに 1 度だけ求めたもの）を効く要素ごとに集める
             if let Some(crate::style::props::Kind::CssBox(rule)) = PROPS.get(usize::from(sp.prop)).map(|q| q.kind) {
-                match sp.wide {
-                    WIDE_NONE if sp.pad[0] & crate::style::cascade::BOX_ON != 0 => p.css_box |= rule.scope(),
-                    WIDE_INHERIT => p.css_box_inherit |= rule.scope(),
-                    _ => {}
+                if sp.pad[0] & crate::style::cascade::BOX_ON != 0 {
+                    p.css_box |= rule.scope();
+                } else if sp.wide == WIDE_INHERIT {
+                    p.css_box_inherit |= rule.scope();
                 }
             }
             continue;
@@ -1142,6 +1142,11 @@ fn geometry(
                 let mut v = Values::new(buf, s.value, budget);
                 let sizing = matches!(k, G_WIDTH | G_HEIGHT) && s.origin != ORIGIN_ATTR;
                 let mut auto = can_auto && v.eat_ident(b"auto")?;
+                if !auto && sizing {
+                    budget.spend(cost::OP_STEP)?;
+                    let cx = crate::style::valid::Ctx { attr: false, unitless: false, viewport: true };
+                    auto = crate::style::valid::size_function(&mut v, cx)?;
+                }
                 for w in crate::style::props::SIZE_KEYWORDS {
                     if auto || !sizing {
                         break;
@@ -1291,12 +1296,33 @@ fn effects(
             c.fx |= FX_CV_HIDDEN;
         }
     }
-    // CSS の個別の変形と offset-path：none でなければまだ描かない（黙って変形なしで描かない。単位 3 の 4 回目のレビュー）
-    for sp in p.css_transform.iter().flatten() {
+    // `offset` のまとめが道を持つか（関数・url・箱の言葉。位置・anchor・回転・距離だけなら道がなく、Chrome でも動かない。
+    // 単位 3 の 6 回目のレビュー）
+    let has_path = |s: &Specified| -> Result<bool, Error> {
+        const BOXES: &[&[u8]] =
+            &[b"content-box", b"padding-box", b"border-box", b"margin-box", b"fill-box", b"stroke-box", b"view-box"];
+        let buf = bufs.of(s.src);
+        let mut v = Values::new(buf, s.value, budget);
+        loop {
+            budget.spend(cost::OP_STEP)?;
+            let t = v.next()?;
+            match t.kind {
+                Tk::Eof => return Ok(false),
+                Tk::Function | Tk::Url => return Ok(true),
+                Tk::Ident if BOXES.iter().any(|w| ident_is(buf, t.inner, t.escaped, w)) => return Ok(true),
+                _ => {}
+            }
+        }
+    };
+    // CSS の個別の変形と offset-path・offset：none でなければ（offset は道があれば）まだ描かない（黙って変形なしで描かない。
+    // 単位 3 の 4 回目のレビュー）
+    for (k, sp) in p.css_transform.iter().enumerate() {
+        let Some(sp) = sp.as_ref() else { continue };
         budget.spend(cost::OP_STEP)?;
         let on = match wide(sp) {
             Some(true) => parent.fx & FX_CSS_TRANSFORM != 0,
             Some(false) => false,
+            None if k == 4 => has_path(sp)?,
             None => !none_only(sp)?,
         };
         if on {
