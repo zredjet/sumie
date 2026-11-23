@@ -1149,11 +1149,11 @@ fn edges_box(edges: &[Edge], budget: &Budget<'_>) -> Result<(PixelBox, u32), Err
 }
 
 /// 部分パスの点と閉じたかを受け取る口。
-type SubpathFn<'a> = dyn FnMut(Poly<'_>, bool) -> Result<(), Error> + 'a;
+pub(crate) type SubpathFn<'a> = dyn FnMut(Poly<'_>, bool) -> Result<(), Error> + 'a;
 
 /// 部分パスごとに平坦化した点（ユーザー単位）を `poly` に集め、`f(点, 閉じたか)` を呼ぶ。
 #[allow(clippy::too_many_arguments, reason = "平坦化の条件と置き場を分けて渡す")]
-fn subpaths(
+pub(crate) fn subpaths(
     path: PathRef<'_>,
     t: &Transform,
     q: Quality,

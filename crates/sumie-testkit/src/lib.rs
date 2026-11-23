@@ -9,6 +9,7 @@
 //! - [`jsonl`]：平らな JSON の行（ゴールデン・一覧）
 //! - [`corpus`]：照合の集まりの一覧（index.jsonl）の読み込み
 //! - [`rustscan`]：Rust のソースの字句（`tests/rules.rs`・`gen-disallowed`）
+//! - [`svg_gen`]：構造から整った SVG を組み立てる生成器（ファズの `render_gen` と試験。ADR-100 (3)）
 
 #[cfg(feature = "count-alloc")]
 pub mod alloc;
@@ -18,3 +19,4 @@ pub mod jsonl;
 pub mod mutate;
 pub mod rustscan;
 pub mod stack;
+pub mod svg_gen;

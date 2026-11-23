@@ -13,6 +13,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "=0.4.13"
 sumie = { path = "../crates/sumie" }
+# 構造から SVG を組み立てる生成器（render_gen。feature なしなら依存を持たない）
+sumie-testkit = { path = "../crates/sumie-testkit" }
 
 [workspace]
 
@@ -91,6 +93,13 @@ bench = false
 [[bin]]
 name = "render"
 path = "fuzz_targets/render.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "render_gen"
+path = "fuzz_targets/render_gen.rs"
 test = false
 doc = false
 bench = false

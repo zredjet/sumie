@@ -1126,10 +1126,10 @@ pub fn path_ops(data: &[u8]) -> Check {
 /// 線の外形と破線を通す（ファズの `stroke` の対象）。頭の 4 バイトで端・継ぎ目・太さ・miterlimit・破線を選び、残りを
 /// パスのデータとして読む。確かめること：1 回の払いが中止の間隔を超えない・同じ入力で同じ結果・点ごとに払う（手間 ≥ 点の数）・
 /// 外形の点が有限（入力が有限なら）。手間の上限は 2²⁴（速く回すため。超えれば `Limit` で、両方の回で同じなら良い）。
+/// 部分パスは計画と同じ口（`plan::subpaths`。滑らかな点とつなぎ目の判定）で集め、許しも計画と同じ 0.1。
 pub fn stroke_ops(data: &[u8]) -> Check {
-    use crate::geom::flatten::flatten_seg;
     use crate::geom::stroke::{Cap, Dashes, Join, LoopSink, Pen, PolyBuf, dash_polyline, stroke_polyline};
-    use crate::geom::{PathRef, PathSeg, PathWriter, Point, Transform};
+    use crate::geom::{PathRef, PathWriter, Point, Transform};
     let Some((head, text)) = data.split_first_chunk::<4>() else { return Check::Ok };
     let cap = match head[0] % 3 {
         0 => Cap::Butt,
@@ -1170,7 +1170,8 @@ pub fn stroke_ops(data: &[u8]) -> Check {
             let mut w = PathWriter::new(&mut verbs, &mut coords);
             crate::values::path::path_data(text, &mut w, &b)?;
         }
-        let pen = Pen { half, cap, join, miter_limit: limit, scale: 1.0, tol: 0.25 };
+        // 計画と同じ許し（ADR-97 (1)）と、計画と同じ部分パスの集め方（滑らかな点の印とつなぎ目の判定を含む）
+        let pen = Pen { half, cap, join, miter_limit: limit, scale: 1.0, tol: 0.1 };
         let dashes = Dashes::new(dash, offset, &b)?;
         let mut poly = PolyBuf::new(&b);
         let mut scratch = PolyBuf::new(&b);
@@ -1182,40 +1183,17 @@ pub fn stroke_ops(data: &[u8]) -> Check {
         let path = PathRef { verbs: verbs.as_slice(), coords: coords.as_slice() };
         // round の継ぎ目の点は抑えない（節の見積もりの式は計画が持つ）
         let mut round = u64::MAX;
-        let mut flush = |poly: &mut PolyBuf<'_>, closed: bool, sink: &mut Count| -> Result<(), Error> {
+        let q = crate::plan::Quality::DEFAULT;
+        crate::plan::subpaths(path, &Transform::IDENTITY, q, half, &mut poly, true, &b, &mut |line, closed| {
+            input_points = input_points.saturating_add(line.pts.len() as u64);
+            all_finite &= line.pts.iter().all(|p| p.finite());
             match &dashes {
-                None => stroke_polyline(poly.view(), closed, &pen, &mut scratch, &b, &mut round, sink)?,
-                Some(d) => dash_polyline(poly.view(), closed, d, &mut buf, &mut hd, &b, None, &mut |piece, pc| {
-                    stroke_polyline(piece, pc, &pen, &mut scratch, &b, &mut round, sink)
-                })?,
+                None => stroke_polyline(line, closed, &pen, &mut scratch, &b, &mut round, &mut sink),
+                Some(d) => dash_polyline(line, closed, d, &mut buf, &mut hd, &b, None, &mut |piece, pc| {
+                    stroke_polyline(piece, pc, &pen, &mut scratch, &b, &mut round, &mut sink)
+                }),
             }
-            poly.clear();
-            Ok(())
-        };
-        for seg in path.segments() {
-            match seg {
-                PathSeg::Move(p) => {
-                    if !poly.is_empty() {
-                        flush(&mut poly, false, &mut sink)?;
-                    }
-                    poly.push(p, false)?;
-                }
-                PathSeg::Close(..) => flush(&mut poly, true, &mut sink)?,
-                _ => {
-                    // 曲線の内側の点は滑らかな点（計画と同じ）
-                    let smooth = !matches!(seg, PathSeg::Line(..));
-                    flatten_seg(&seg, &Transform::IDENTITY, 0.25, half, &b, &mut |p| {
-                        input_points = input_points.saturating_add(1);
-                        all_finite &= p.finite();
-                        poly.push(p, smooth)
-                    })?;
-                    poly.set_last_smooth(false);
-                }
-            }
-        }
-        if !poly.is_empty() {
-            flush(&mut poly, false, &mut sink)?;
-        }
+        })?;
         if b.max_spend() >= CANCEL_INTERVAL || b.over_released() {
             return Err(Error::Cancelled);
         }
@@ -1272,7 +1250,7 @@ impl Live {
 }
 
 /// ファズと変異で使う、木を作る段の上限（時間切れを避ける。見積もりが上限を超えれば作らずに同じ断りを確かめる）。
-const FUZZ_BUILD_WORK: u64 = 1 << 26;
+const FUZZ_BUILD_WORK: u64 = 1 << 24;
 
 /// 木を作る段を通す（ファズの `tree` の対象）。入力を SVG として読み、読めたら `estimate_build` を呼ぶ。確かめること：
 /// 見積もりが断れば `build` も同じ誤りで断る（D2・architecture.md §3.1）。見積もりが通れば、見張りつきの `build` を 2 度
@@ -1280,7 +1258,8 @@ const FUZZ_BUILD_WORK: u64 = 1 << 26;
 /// （Unsupported・Invalid）か木を返す・同じ入力で同じ結果（節の並び）・見積もりの上限で作っても同じ。
 pub fn build_ops(data: &[u8]) -> StageOutcome {
     use crate::doc::{Watch, parse_watch};
-    let limits = crate::limits::Limits { build_work: FUZZ_BUILD_WORK, ..crate::limits::Limits::DEFAULT };
+    let limits =
+        crate::limits::Limits { build_work: FUZZ_BUILD_WORK, estimate_work: 1 << 24, ..crate::limits::Limits::DEFAULT };
     let opts = crate::style::ParseOptions { limits, ..crate::style::ParseOptions::DEFAULT };
     let mut pw = Watch::default();
     let parsed = parse_watch(data, &opts, &Never, &mut pw);
@@ -1340,8 +1319,14 @@ pub fn build_ops(data: &[u8]) -> StageOutcome {
 }
 
 /// ファズと変異で使う、計画と描く段の上限（時間切れを避ける）。
-const FUZZ_RENDER_LIMITS: crate::limits::RenderLimits =
-    crate::limits::RenderLimits { plan_work: 1 << 26, render_work: 1 << 26, ..crate::limits::RenderLimits::DEFAULT };
+/// 見積もりの段の手間も下げる（`Tree::estimate` を 1 回の確かめで 3 度呼ぶので、既定の 2²⁸ では遅い入力で時間切れになる。
+/// 単位 4 の 2 回目のレビュー）。
+const FUZZ_RENDER_LIMITS: crate::limits::RenderLimits = crate::limits::RenderLimits {
+    plan_work: 1 << 23,
+    render_work: 1 << 23,
+    estimate_work: 1 << 24,
+    ..crate::limits::RenderLimits::DEFAULT
+};
 
 /// 描く段までを通す（ファズの `render` の対象）。頭の 4 バイトで倍率と範囲を選び、残りを SVG として読む。読めて木が
 /// できたら、確かめること：見積もりが断れば計画も同じ誤りで断る（D2・architecture.md §3.1）・見積もりが通れば計画と描画が
@@ -1357,7 +1342,8 @@ pub fn render_ops(data: &[u8]) -> StageOutcome {
     let bad = |what: &'static str, m: &Live| StageOutcome::new(Check::Violation(what), m.peak, false);
     let Some((head, svg)) = data.split_first_chunk::<4>() else { return none(&m) };
     let scale = [1.0, 0.5, 2.0, 0.25].get(usize::from(head[0] & 3)).copied().unwrap_or(1.0);
-    let limits = crate::limits::Limits { build_work: FUZZ_BUILD_WORK, ..crate::limits::Limits::DEFAULT };
+    let limits =
+        crate::limits::Limits { build_work: FUZZ_BUILD_WORK, estimate_work: 1 << 24, ..crate::limits::Limits::DEFAULT };
     let opts = crate::style::ParseOptions { limits, ..crate::style::ParseOptions::DEFAULT };
     let mut pw = Watch::default();
     let parsed = parse_watch(svg, &opts, &Never, &mut pw);
@@ -1365,8 +1351,10 @@ pub fn render_ops(data: &[u8]) -> StageOutcome {
     let Ok(d) = parsed else { return none(&m) };
     m.live = d.held_bytes();
     let Ok(be) = d.estimate_build(&Never) else { return none(&m) };
+    // 木を作る段は途中で断っても（NotYet など）見積もりの山まで確保しうる
+    m.run(be.peak_bytes, 0);
     let Ok(tree) = d.build(&Never) else { return none(&m) };
-    m.run(be.peak_bytes, tree.held_bytes());
+    m.live = m.live.saturating_add(tree.held_bytes());
     let ropts = RenderOptions { scale, limits: FUZZ_RENDER_LIMITS };
     let Ok(px) = tree.pixel_size(scale) else { return none(&m) };
     if u64::from(px.width).saturating_mul(u64::from(px.height)) > 256 * 256 {
@@ -1399,8 +1387,9 @@ pub fn render_ops(data: &[u8]) -> StageOutcome {
     let full_rect = PixelRect { x: 0, y: 0, width: w, height: h };
     let full_bytes = u64::from(w).saturating_mul(u64::from(h)).saturating_mul(4);
     m.run(full_bytes.saturating_add(est.render.peak_bytes), full_bytes);
-    let Some(full) = draw_rect(&plan, full_rect, &b) else {
-        return bad("見積もりが通ったのに全体を描けない", &m);
+    let full = match draw_rect(&plan, full_rect, &b) {
+        Ok(f) => f,
+        Err(e) => return bad(draw_violation(&e, "見積もりが通ったのに全体を描けない"), &m),
     };
     match plan.estimate_region(full_rect, &Never) {
         Ok(e) if e.work <= est.render.work && e.peak_bytes <= est.render.peak_bytes => {}
@@ -1419,7 +1408,10 @@ pub fn render_ops(data: &[u8]) -> StageOutcome {
     };
     let part_bytes = u64::from(rect.width).saturating_mul(u64::from(rect.height)).saturating_mul(4);
     m.run(part_bytes.saturating_add(region.peak_bytes), part_bytes);
-    let Some(part) = draw_rect(&plan, rect, &b) else { return bad("範囲を描けない", &m) };
+    let part = match draw_rect(&plan, rect, &b) {
+        Ok(p) => p,
+        Err(e) => return bad(draw_violation(&e, "範囲を描けない"), &m),
+    };
     let (fs, ps) = (full.as_slice(), part.as_slice());
     let n = (rect.width as usize).saturating_mul(4);
     for yy in 0..rect.height as usize {
@@ -1435,18 +1427,32 @@ pub fn render_ops(data: &[u8]) -> StageOutcome {
     }
     m.run(full_bytes.saturating_add(est.render.peak_bytes), 0);
     match draw_rect(&plan, full_rect, &b) {
-        Some(again) if again.as_slice() == fs => StageOutcome::new(Check::Ok, m.peak, true),
-        _ => bad("同じ入力で画素が違う", &m),
+        Ok(again) if again.as_slice() == fs => StageOutcome::new(Check::Ok, m.peak, true),
+        Ok(_) => bad("同じ入力で画素が違う", &m),
+        Err(e) => bad(draw_violation(&e, "同じ入力で描けない"), &m),
     }
 }
 
-/// 計画の範囲 `rect` を描いた画素（描けなければ None）。
-fn draw_rect<'b>(plan: &crate::plan::Plan, rect: crate::render::PixelRect, b: &'b Budget<'b>) -> Option<MVec<'b, u8>> {
-    let n = (rect.width as usize).checked_mul(rect.height as usize)?.checked_mul(4)?;
-    let mut buf: MVec<'_, u8> = MVec::with_capacity(b, n).ok()?;
-    buf.resize_to(n, 0).ok()?;
-    let stride = (rect.width as usize).checked_mul(4)?;
-    let mut out = crate::render::PixmapMut::new(buf.as_mut_slice(), rect.width, rect.height, stride).ok()?;
-    plan.render_region(rect, &mut out, &Never).ok()?;
-    Some(buf)
+/// 計画の範囲 `rect` を描いた画素。描く段は `estimate_region` の値を Budget の上限にして描くので、見積もりが実際を
+/// 下回れば `Limit` が返る（ADR-100 (3) (a)）。出力の置き場は `b` から取る。
+fn draw_rect<'b>(
+    plan: &crate::plan::Plan,
+    rect: crate::render::PixelRect,
+    b: &'b Budget<'b>,
+) -> Result<MVec<'b, u8>, Error> {
+    let n = (rect.width as usize).saturating_mul(rect.height as usize).saturating_mul(4);
+    let mut buf: MVec<'_, u8> = MVec::with_capacity(b, n)?;
+    buf.resize_to(n, 0)?;
+    let stride = (rect.width as usize).saturating_mul(4);
+    let mut out = crate::render::PixmapMut::new(buf.as_mut_slice(), rect.width, rect.height, stride)?;
+    plan.render_region(rect, &mut out, &Never)?;
+    Ok(buf)
+}
+
+/// 描けなかった理由ごとの違反（描く段の `Limit` は見積もりの下回り）。
+fn draw_violation(e: &Error, what: &'static str) -> &'static str {
+    match e {
+        Error::Limit(_) => "描く段が範囲の見積もりの上限を超えた（見積もり < 実際）",
+        _ => what,
+    }
 }

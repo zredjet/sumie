@@ -100,4 +100,9 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "sumie",
+ "sumie-testkit",
 ]
+
+[[package]]
+name = "sumie-testkit"
+version = "0.0.0"

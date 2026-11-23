@@ -420,7 +420,10 @@ fn path_survives_seeded_mutations() {
 fn stroke_survives_seeded_mutations() {
     let seeds = fuzz_seeds("stroke");
     let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
-    for (n, case) in cases(0x5eed_000a, 3000, &refs, PATH_DICT, 256).iter().enumerate() {
+    // 種そのものと変異
+    let mut all: Vec<Vec<u8>> = seeds.clone();
+    all.extend(cases(0x5eed_000a, 3000, &refs, PATH_DICT, 256));
+    for (n, case) in all.iter().enumerate() {
         let (out, heap) = measure(|| stroke_ops(case));
         assert_eq!(out, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
         assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
@@ -488,17 +491,29 @@ fn stage_cases(target: &str, seed: u64, n: usize, run: fn(&[u8]) -> StageOutcome
     let mut all: Vec<Vec<u8>> = seeds.clone();
     all.extend(value_cases(seed, n, &refs, SHAPE_DICT, 4096));
     all.extend(cases(seed ^ 1, n / 4, &refs, SHAPE_DICT, 4096));
+    // 描く段の入力は頭の 4 バイトが倍率と範囲：変異ごとに変える（種の範囲だけを見ない。単位 4 の 2 回目のレビュー）
+    if target == "render" {
+        let mut rng = sumie_testkit::chacha::ChaCha::from_u64(seed ^ 2);
+        for case in all.iter_mut().skip(seeds.len()) {
+            if let Some(head) = case.get_mut(..4) {
+                rng.fill(head);
+            }
+        }
+    }
     let mut reached = 0usize;
+    let mut seeds_reached = 0usize;
     for (i, case) in all.iter().enumerate() {
         let (out, heap) = measure(|| run(case));
         assert_eq!(out.check, Check::Ok, "{target} {i} 件目 {:?}", String::from_utf8_lossy(case));
         assert_heap_within(&heap, out.counted_peak, 0, &format!("{target} {i} 件目"));
         assert_eq!(heap.current, 0, "{target} {i} 件目：返していない確保");
         if i < seeds.len() {
-            assert!(out.reached, "{target} の種 {i} が確かめの終わりまで届かない");
+            seeds_reached += usize::from(out.reached);
         }
         reached += usize::from(out.reached);
     }
+    // 種は 8 割以上が確かめの終わりまで届く（上限を狙った種は、見積もりが安全に断る）
+    assert!(seeds_reached * 10 >= seeds.len() * 8, "{target} の種で届いたのは {seeds_reached}/{}", seeds.len());
     eprintln!("{target}：届いた件 {reached}/{}", all.len());
     (reached, all.len())
 }
@@ -551,4 +566,29 @@ fn fuzz_found_inputs() {
         assert_eq!(out.check, Check::Ok, "{svg}");
         assert_heap_within(&heap, out.counted_peak, 0, "ファズの入力");
     }
+}
+
+/// 構造から組み立てた SVG（`sumie_testkit::svg_gen`。ファズの `render_gen` と同じ生成器）を、描く段まで通す（ADR-100 (3)
+/// (c)）：形の約束・範囲の一致・同じ画素・描く段が範囲の見積もりの上限で断らない・ヒープの山 ≤ 数えた山。描く段の終わり
+/// まで届いた割合が 8 割以上（生成器が届く文書を作っているか）。
+#[test]
+fn generated_documents_render() {
+    let mut rng = sumie_testkit::chacha::ChaCha::from_u64(0x5eed_0010);
+    let n = 200usize;
+    let mut reached = 0usize;
+    for i in 0..n {
+        let len = 64 + (rng.next_u32() as usize % 960);
+        let mut bytes = vec![0u8; len];
+        rng.fill(&mut bytes);
+        let (head, rest) = bytes.split_at(4);
+        let mut data = head.to_vec();
+        data.extend_from_slice(&sumie_testkit::svg_gen::svg(rest));
+        let (out, heap) = measure(|| render_ops(&data));
+        assert_eq!(out.check, Check::Ok, "{i} 件目 {:?}", String::from_utf8_lossy(&data[4..]));
+        assert_heap_within(&heap, out.counted_peak, 0, &format!("生成 {i} 件目"));
+        assert_eq!(heap.current, 0, "生成 {i} 件目：返していない確保");
+        reached += usize::from(out.reached);
+    }
+    eprintln!("生成：描く段の終わりまで届いた件 {reached}/{n}");
+    assert!(reached * 10 >= n * 8, "描く段の終わりまで届いた件 {reached}/{n}");
 }
