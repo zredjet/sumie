@@ -1032,8 +1032,14 @@ fn bound_node(
             .saturating_add(joins.saturating_mul(POINT_WORK.saturating_add(cost::OP_STEP)))
             .saturating_add(phase_steps.saturating_mul(cost::OP_STEP))
             .saturating_add(dash_tangents.saturating_mul(cost::DASH_TANGENT))
-            // 曲線に接する角の曲線の側の向き（角ごとに前へと後ろへの 2 回 × 両側。曲線の端ごとに 4 回）
+            // 曲線に接する角の曲線の側の向き（角ごとに前へと後ろへの 2 回 × 両側。曲線の端ごとに 4 回）と、破線の部分の頭と
+            // 尻の角の向き（部分ごとに 2 回まで）
             .saturating_add(c.curves.saturating_mul(8).saturating_mul(cost::CURVE_SIDE))
+            .saturating_add(if c.curves > 0 {
+                dash_pieces.saturating_mul(2).saturating_mul(cost::CURVE_SIDE)
+            } else {
+                0
+            })
             .saturating_add(cull.saturating_mul(cost::OP_STEP.saturating_mul(2)))
             .saturating_add(out_pts.saturating_mul(cost::OUTLINE_POINT.saturating_add(cost::OP_STEP)))
             .saturating_add(pieces_n.saturating_mul(2).saturating_mul(cost::OP_STEP))

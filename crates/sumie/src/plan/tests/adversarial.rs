@@ -780,6 +780,27 @@ fn dash_ends_after_a_joint_follow_the_curve() {
     assert_eq!(alpha(62, 60), 0);
 }
 
+/// 破線の部分が、曲線に接する角の手前の最後の弦の中で始まって角の先の最初の弦の中で終わるとき、角の継ぎ目は実線と同じく
+/// 曲線の側の外挿の向きで作る（単位 1 の 7 回目のレビュー：部分の中の弦だけでは外挿できず、弦の向きの継ぎ目で miter の
+/// 尖りが出た）。最初の曲線の長さは約 163.17 なので、部分は角の約 3 手前から 3 先まで。角より上の継ぎ目の画素は実線と同じ。
+#[test]
+fn dash_pieces_keep_curve_sides_at_corners() {
+    let path = |w: &mut PathWriter<'_, '_>| {
+        w.move_to(Point::new(20.0, 170.0)).unwrap();
+        w.quad_to(Point::new(80.65, 107.6), Point::new(100.0, 30.0)).unwrap();
+        w.quad_to(Point::new(119.35, 107.6), Point::new(180.0, 170.0)).unwrap();
+    };
+    let (w, _, solid) = draw(&stroked(path, 20.0, JOIN_MITER, CAP_BUTT, &[]), 1.0);
+    let (_, _, dashed) = draw(&stroked(path, 20.0, JOIN_MITER, CAP_BUTT, &[0.0, 160.0, 6.0, 1000.0]), 1.0);
+    let alpha = |px: &[u8], x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+    assert!(alpha(&dashed, 100, 31) > 200, "部分が角を覆わない");
+    for y in 0..=26 {
+        for x in 70..130 {
+            assert_eq!(alpha(&dashed, x, y), alpha(&solid, x, y), "({x}, {y}) の継ぎ目が実線と違う");
+        }
+    }
+}
+
 /// non-scaling の線の滑らかなつなぎ目は描く座標系の接線で決める（単位 2 の 5 回目のレビュー）：縦に 60 倍する変形の下で、
 /// まっすぐな 3 次曲線のあとの線分のつなぎ目は、ユーザー単位では 1.15° でも描く座標系では 50° の角なので、指定の miter で
 /// 作る（同じ形を線分で書いたものと同じ画素。Chrome・resvg と同じ）。
