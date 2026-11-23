@@ -668,6 +668,8 @@ pub(crate) struct Background {
 pub(crate) const IMAGE_GRADIENT: u8 = 1;
 /// 画像の層に `data:` の画像がある（Chrome は img の中でも描く）。
 pub(crate) const IMAGE_DATA: u8 = 2;
+/// 画像の層に `image()`（色の画像など。Chrome は描く）がある（単位 3 の 5 回目のレビュー）。
+pub(crate) const IMAGE_FUNCTION: u8 = 4;
 
 /// グラデーションの関数の名前。
 const GRADIENTS: &[&[u8]] = &[
@@ -708,7 +710,8 @@ fn image_flags(s: &[u8], p: &Part, budget: &Budget<'_>) -> Result<Option<u8>, Er
                 let a = lex.next()?;
                 match a.kind {
                     Tk::Whitespace => continue,
-                    Tk::Str => return Ok(a.escaped || starts_data(text(a.inner))),
+                    // 前の空白は除いて見る（Chrome の URL の読みと同じ。単位 3 の 5 回目のレビュー）
+                    Tk::Str => return Ok(a.escaped || starts_data(text(a.inner).trim_ascii_start())),
                     _ => return Ok(false),
                 }
             }
@@ -729,10 +732,10 @@ fn image_flags(s: &[u8], p: &Part, budget: &Budget<'_>) -> Result<Option<u8>, Er
     if !is_fn(&p.t, IMAGE_WRAPPERS) {
         return Ok(None);
     }
-    // 包む関数：引数の中を字句ごとに見る（どの字句でも 1 つ進む）
+    // 包む関数：引数の中を字句ごとに見る（どの字句でも 1 つ進む）。`image()` はどこにあっても印にする（色の画像も描く）
     let mut lex = Lexer::over(s, p.span, budget);
-    let _ = lex.next()?;
-    let mut flags = 0u8;
+    let head = lex.next()?;
+    let mut flags = if is_fn(&head, &[b"image"]) { IMAGE_FUNCTION } else { 0 };
     loop {
         budget.spend(cost::OP_STEP)?;
         let t = lex.next()?;
@@ -741,6 +744,8 @@ fn image_flags(s: &[u8], p: &Part, budget: &Budget<'_>) -> Result<Option<u8>, Er
         }
         if is_fn(&t, GRADIENTS) {
             flags |= IMAGE_GRADIENT;
+        } else if is_fn(&t, &[b"image"]) {
+            flags |= IMAGE_FUNCTION;
         } else if data_url(&t, &mut lex)? {
             flags |= IMAGE_DATA;
         }

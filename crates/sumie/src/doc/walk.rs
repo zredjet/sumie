@@ -144,7 +144,7 @@ struct Walker<'a, 'd, 'b> {
     on_stack: MVec<'b, u32>,
     /// use の文脈の積み上げ
     ctx: MVec<'b, UseContext>,
-    overflow_id: Option<crate::style::props::PropertyId>,
+    overflow_ids: [Option<crate::style::props::PropertyId>; 3],
 }
 
 impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
@@ -179,7 +179,9 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
         budget.spend(cost::OP_STEP)?;
         // 中身で大きさを決める文書の根の変形の原点の既定は 0 0（usvg と同じ。書いた % は表示の領域で解く。ADR-101 (1)・ADR-102）
         let root_base = Base { content_sized: known.is_none(), ..base };
-        let c0 = compute(&initial, d.styles.of(0), &ids, &bufs, &root_base, budget)?;
+        let mut c0 = compute(&initial, d.styles.of(0), &ids, &bufs, &root_base, budget)?;
+        // 根の `display: contents` は block になる（CSS Display 3 §2.5。Chrome も根の箱を作る）。受け継ぐ子にも渡さない
+        c0.fx &= !crate::style::computed::FX_CONTENTS;
         base.root_font = c0.font_size;
         base.root_line = c0.line_height;
         base.outermost = false;
@@ -233,7 +235,8 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
             stack: MVec::new(budget),
             on_stack: MVec::new(budget),
             ctx: MVec::new(budget),
-            overflow_id: crate::style::props::lookup(b"overflow", false),
+            overflow_ids: [b"overflow".as_slice(), b"overflow-x", b"overflow-y"]
+                .map(|n| crate::style::props::lookup(n, false)),
         };
         if opts.build {
             if !root_ok {
@@ -257,7 +260,7 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
             child: root.first_child,
             ctx: NONE,
             has_vp,
-            children_rendered: u8::from(root_ok),
+            children_rendered: u8::from(root_ok && c0.fx & crate::style::computed::FX_CV_HIDDEN == 0),
             known: u8::from(root_known),
             in_text: 0,
             single: 0,
@@ -418,7 +421,7 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
         // 表示の領域で切るか（入れ子の svg・use の中の symbol。overflow が visible・auto なら切らない）
         let clips = svg_ns
             && (local == b"svg" || symbol_instance)
-            && !overflow_visible(d, next, self.overflow_id, &self.bufs, budget)?;
+            && !overflow_visible(d, next, self.overflow_ids, &self.bufs, budget)?;
         let context = if top.ctx == NONE { None } else { self.ctx.get(top.ctx as usize).copied() };
         f(&WalkItem {
             node: next,
@@ -449,7 +452,12 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
             ctx: top.ctx,
             has_vp,
             // use の中の symbol は子を描く（SVG 2 §5.5。ほかの文脈の symbol は描く木に入らない）
-            children_rendered: u8::from(rendered && (renders_children(local) || symbol_instance)),
+            // content-visibility: hidden の入れ物は中身を描かない（Chrome と同じ）
+            children_rendered: u8::from(
+                rendered
+                    && (renders_children(local) || symbol_instance)
+                    && comp.fx & crate::style::computed::FX_CV_HIDDEN == 0,
+            ),
             known: u8::from(known_ctm),
             in_text: u8::from(top.in_text != 0 || (svg_ns && local == b"text")),
             single: 0,
@@ -504,7 +512,7 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
         self.stack.push(Frame {
             child: e.target,
             ctx: at as u32,
-            children_rendered: 1,
+            children_rendered: u8::from(frame.computed.fx & crate::style::computed::FX_CV_HIDDEN == 0),
             single: 1,
             redraw: redraw | u8::from(removed),
             ..*frame
@@ -517,35 +525,46 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
 fn overflow_visible(
     d: &Document<'_>,
     node: u32,
-    id: Option<crate::style::props::PropertyId>,
+    ids: [Option<crate::style::props::PropertyId>; 3],
     bufs: &Bufs<'_>,
     budget: &Budget<'_>,
 ) -> Result<bool, Error> {
     let budget = budget_ref(budget);
-    for s in d.styles.of(node) {
-        budget.spend(cost::OP_STEP)?;
-        if Some(s.prop) != id {
-            continue;
-        }
-        // initial・unset は初期の値 visible（受け継がない）。inherit は切るとみなす（M2 は描かない側に倒す）
-        match s.wide {
-            crate::style::cascade::WIDE_NONE => {}
-            crate::style::cascade::WIDE_INHERIT => return Ok(false),
-            _ => return Ok(true),
-        }
-        // 1 つか 2 つの言葉（横・縦）がどれも visible か auto なら見える
-        let mut v = Values::new(bufs.of(s.src), s.value, budget);
-        let mut any = false;
-        while !v.at_end()? {
+    // 書いた宣言の値が見えるか（書いていなければ None）。initial・unset は初期の値 visible（受け継がない）。inherit は切ると
+    // みなす（M2 は描かない側に倒す）。言葉はどれも visible か auto なら見える
+    let read = |id: Option<crate::style::props::PropertyId>| -> Result<Option<bool>, Error> {
+        for s in d.styles.of(node) {
             budget.spend(cost::OP_STEP)?;
-            if !(v.eat_ident(b"visible")? || v.eat_ident(b"auto")?) {
-                return Ok(false);
+            if Some(s.prop) != id {
+                continue;
             }
-            any = true;
+            match s.wide {
+                crate::style::cascade::WIDE_NONE => {}
+                crate::style::cascade::WIDE_INHERIT => return Ok(Some(false)),
+                _ => return Ok(Some(true)),
+            }
+            let mut v = Values::new(bufs.of(s.src), s.value, budget);
+            let mut any = false;
+            while !v.at_end()? {
+                budget.spend(cost::OP_STEP)?;
+                if !(v.eat_ident(b"visible")? || v.eat_ident(b"auto")?) {
+                    return Ok(Some(false));
+                }
+                any = true;
+            }
+            return Ok(Some(any));
         }
-        return Ok(any);
+        Ok(None)
+    };
+    let [all, x, y] = ids;
+    let (all, x, y) = (read(all)?, read(x)?, read(y)?);
+    // どれかが見えない値なら切る側（まとめと長い名前の勝ち負けは節ごとの勝った宣言に残らないので、`overflow: hidden` の
+    // あとの `overflow-x: visible` のような書き方も切る側にして NotYet に倒す。単位 3 の 5 回目のレビュー）。書いていない
+    // 軸は既定の hidden
+    if all == Some(false) || x == Some(false) || y == Some(false) {
+        return Ok(false);
     }
-    Ok(false)
+    Ok(all == Some(true) || (x == Some(true) && y == Some(true)))
 }
 
 /// 属性の長さ（単位のない数も受ける）をユーザー単位に解く。書いていない・`auto`・壊れた値は None、基準がなく解けない
@@ -571,8 +590,6 @@ fn attr_len(
     Ok(Some(resolve(l, c.font_size, c.line_height, base, axis)))
 }
 
-/// 要素の `viewBox`（負の幅・高さの壊れたものは None。幅か高さが 0 のものは返し、呼び手が描かない）と
-/// `preserveAspectRatio`。
 /// 大きさを中身で決める文書で、根の viewBox の幅か高さが 0 か（大きさは viewBox がないものとして中身の外接矩形で決め、
 /// 何も描かない。ADR-78 (7)。描く木を作る段は外接矩形だけを集める）。
 pub(crate) fn bbox_only_root(d: &Document<'_>, budget: &Budget<'_>) -> Result<bool, Error> {
@@ -584,6 +601,8 @@ pub(crate) fn bbox_only_root(d: &Document<'_>, budget: &Budget<'_>) -> Result<bo
     Ok(view_box_of(doc, d.input, root, budget)?.is_some_and(|(vb, _)| vb.w <= 0.0 || vb.h <= 0.0))
 }
 
+/// 要素の `viewBox`（負の幅・高さの壊れたものは None。幅か高さが 0 のものは返し、呼び手が描かない）と
+/// `preserveAspectRatio`。
 fn view_box_of(doc: &XmlDoc, input: &[u8], n: &Node, budget: &Budget<'_>) -> Result<Option<(ViewBox, Aspect)>, Error> {
     let budget = budget_ref(budget);
     let Some(v) = doc.attr(input, n, NS_NONE, b"viewBox", budget)? else { return Ok(None) };

@@ -181,6 +181,7 @@ pub(crate) fn build_tree(d: &Document<'_>, budget: &Budget<'_>) -> Result<Tree, 
         points: MVec::new(budget),
         bbox: Rect::EMPTY,
         root: None,
+        bbox_only: crate::doc::walk::bbox_only_root(d, budget)?,
     };
     // 背景は、根が svg なら塗る（display: none・偽の条件の根も、viewBox の幅か高さが 0・変形が逆にできないなどで中身を
     // 描かない根も。Chrome と同じ。ADR-101 (8)・ADR-102）
@@ -200,10 +201,10 @@ pub(crate) fn build_tree(d: &Document<'_>, budget: &Budget<'_>) -> Result<Tree, 
         }
         visit(d, item, keys.as_slice(), &mut slots, &mut out, budget)
     })?;
-    let Out { mut nodes, mut verbs, mut coords, mut dashes, scratch, points, bbox, root } = out;
+    let Out { mut nodes, mut verbs, mut coords, mut dashes, scratch, points, bbox, root, bbox_only } = out;
     drop((scratch, points, slots, keys));
     // 大きさを中身で決める文書で根の viewBox の幅か高さが 0：外接矩形だけを使い、何も描かない（ADR-78 (7)）
-    if crate::doc::walk::bbox_only_root(d, budget)? {
+    if bbox_only {
         nodes.clear();
         verbs.clear();
         coords.clear();
@@ -243,17 +244,14 @@ fn background_of(d: &Document<'_>, root: &Computed, budget: &Budget<'_>) -> Resu
             if s.prop != img || s.wide != WIDE_NONE {
                 continue;
             }
-            let flags = if s.pad[0] & crate::style::cascade::BG_IMAGE_FROM_SHORTHAND != 0 {
-                s.pad[0]
-            } else {
-                crate::style::valid::image_list(bufs.of(s.src), s.value, budget)?.unwrap_or(0)
-            };
+            // 印はカスケードが宣言ごとに 1 度だけ求めたもの（読み直さない。木を作る段の見積もりの外の手間にしない）
+            let flags = s.pad[0] & !crate::style::cascade::BG_IMAGE_FROM_SHORTHAND;
             let not_yet =
                 |l: Later| Err(Error::Unsupported(Unsupported { feature: Feature::NotYet(l), position: None }));
             if flags & crate::style::valid::IMAGE_GRADIENT != 0 {
                 return not_yet(Later::Gradient);
             }
-            if flags & crate::style::valid::IMAGE_DATA != 0 {
+            if flags & (crate::style::valid::IMAGE_DATA | crate::style::valid::IMAGE_FUNCTION) != 0 {
                 return not_yet(Later::BackgroundImage);
             }
         }
@@ -315,6 +313,8 @@ struct Out<'b> {
     bbox: Rect,
     /// 根の要素の計算した値（破線の rem・rlh）
     root: Option<Computed>,
+    /// 大きさを中身で決める文書で根の viewBox の幅か高さが 0（外接矩形だけを集め、何も描かない。ADR-78 (7)）
+    bbox_only: bool,
 }
 
 /// 宣言ごとに 1 度だけ読むものの鍵を数えて並べる（重なりを除く）。
@@ -405,8 +405,9 @@ fn visit(
     let not_yet = |l: Later| {
         Err(Error::Unsupported(Unsupported { feature: Feature::NotYet(l), position: Some(u64::from(n.pos)) }))
     };
-    // M2 でまだ描かない効果（ADR-89 (1)）
-    if c.opacity < 1.0 {
+    // M2 でまだ描かない効果（ADR-89 (1)）。何も描かない文書（`bbox_only`）では、幾何に効かないもの（不透明度・混ぜ方・
+    // 塗りの種類）で断らない（Chrome は背景だけを描く。単位 3 の 5 回目のレビュー。幾何や外接矩形に効きうるものは断る）
+    if c.opacity < 1.0 && !out.bbox_only {
         return not_yet(Later::Opacity);
     }
     if c.fx & FX_CLIP != 0 {
@@ -418,7 +419,7 @@ fn visit(
     if c.fx & FX_FILTER != 0 {
         return not_yet(Later::Filter);
     }
-    if c.fx & (FX_BLEND | FX_ISOLATE) != 0 {
+    if c.fx & (FX_BLEND | FX_ISOLATE) != 0 && !out.bbox_only {
         return not_yet(Later::Blend);
     }
     if c.fx & FX_CSS_TRANSFORM != 0 {
@@ -565,7 +566,7 @@ fn visit(
         return Ok(());
     }
     out.bbox = out.bbox.union(&bounds);
-    if c.visibility != VISIBLE {
+    if c.visibility != VISIBLE || out.bbox_only {
         return Ok(());
     }
     // 塗りと線（use の中身の context-fill・context-stroke は use の塗り）

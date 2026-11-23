@@ -199,6 +199,15 @@ fn estimate_build_checks_instances_and_needs() {
     assert!(
         matches!(est("<image href=\"a.png\"/>"), Err(Error::Unsupported(u)) if u.feature == crate::error::Feature::Image)
     );
+    // 根の display: none と偽の条件は描くのを止めないので、中の画像も要る（ADR-102 (1)。単位 3 の 5 回目のレビュー）
+    for attrs in ["display=\"none\"", "style=\"display: none\"", "systemLanguage=\"xx\""] {
+        let src = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" {attrs}><image href=\"a.png\"/></svg>");
+        let doc = parse(src.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+        assert!(
+            matches!(doc.estimate_build(&Never), Err(Error::Unsupported(u)) if u.feature == crate::error::Feature::Image),
+            "{attrs}"
+        );
+    }
 }
 
 /// 読まなかった参照：CSS の url は escape を解いた形で載せ、feImage の外の画像は <image> と同じに要るものにする（文書の

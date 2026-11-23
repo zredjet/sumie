@@ -183,6 +183,8 @@ pub(crate) const FX_ISOLATE: u8 = 16;
 pub(crate) const FX_CSS_TRANSFORM: u8 = 32;
 /// `display: contents`
 pub(crate) const FX_CONTENTS: u8 = 64;
+/// `content-visibility: hidden`（入れ物の中身を描かない。NotYet でない）
+pub(crate) const FX_CV_HIDDEN: u8 = 128;
 
 /// 幾何のプロパティの欄（[`Geo::v`] の番号）。
 pub(crate) const G_X: usize = 0;
@@ -380,8 +382,9 @@ pub(crate) struct PropIds {
     isolation: Option<PropertyId>,
     /// 接頭辞つきの効果と `mask-image`（none でなければまだ描かない。ADR-101）
     prefixed: [Option<PropertyId>; 5],
-    /// CSS の個別の変形と offset-path（none でなければまだ描かない）
-    css_transform: [Option<PropertyId>; 4],
+    /// CSS の個別の変形と offset-path・offset（none でなければまだ描かない）
+    css_transform: [Option<PropertyId>; 5],
+    content_visibility: Option<PropertyId>,
 }
 
 /// 幾何の欄のプロパティの名前（[`G_X`] などの順）。
@@ -432,7 +435,9 @@ impl PropIds {
                 lookup(b"rotate", false),
                 lookup(b"scale", false),
                 lookup(b"offset-path", false),
+                lookup(b"offset", false),
             ],
+            content_visibility: lookup(b"content-visibility", false),
         }
     }
 }
@@ -471,7 +476,8 @@ struct Picked {
     blend: Option<Specified>,
     isolation: Option<Specified>,
     prefixed: [Option<Specified>; 5],
-    css_transform: [Option<Specified>; 4],
+    css_transform: [Option<Specified>; 5],
+    content_visibility: Option<Specified>,
 }
 
 fn pick(specs: &[Specified], ids: &PropIds, budget: &Budget<'_>) -> Result<Picked, Error> {
@@ -542,6 +548,8 @@ fn pick(specs: &[Specified], ids: &PropIds, budget: &Budget<'_>) -> Result<Picke
                 Some(x) => x,
                 None => continue,
             }
+        } else if id == ids.content_visibility {
+            &mut p.content_visibility
         } else if let Some(k) = ids.css_transform.iter().position(|g| id == *g) {
             match p.css_transform.get_mut(k) {
                 Some(x) => x,
@@ -1239,6 +1247,18 @@ fn effects(
             c.fx |= bit;
         }
     }
+    // content-visibility: hidden は入れ物の中身を描かない（受け継がない。Chrome と同じ。単位 3 の 5 回目のレビュー）
+    if let Some(s) = p.content_visibility.as_ref() {
+        budget.spend(cost::OP_STEP)?;
+        let hidden = match wide(s) {
+            Some(true) => parent.fx & FX_CV_HIDDEN != 0,
+            Some(false) => false,
+            None => Values::new(bufs.of(s.src), s.value, budget).eat_ident(b"hidden")?,
+        };
+        if hidden {
+            c.fx |= FX_CV_HIDDEN;
+        }
+    }
     // CSS の個別の変形と offset-path：none でなければまだ描かない（黙って変形なしで描かない。単位 3 の 4 回目のレビュー）
     for sp in p.css_transform.iter().flatten() {
         budget.spend(cost::OP_STEP)?;
@@ -1302,6 +1322,8 @@ fn transform(
     if let Some(o) = p.transform_origin.as_ref() {
         budget.spend(cost::OP_STEP)?;
         match o.wide {
+            // 根の inherit は初期の値（ADR-87 (2)。中身で大きさを決める文書の根は 0 0。単位 3 の 5 回目のレビュー）
+            WIDE_INHERIT if base.outermost => og = initial_origin,
             WIDE_INHERIT => {
                 og = parent.origin_spec;
                 og_known = parent.origin_known != 0;

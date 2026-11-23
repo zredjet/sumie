@@ -128,7 +128,9 @@ pub(crate) fn needs(
         let referenced_container = via_ref && not_rendered(local);
         // 自分の条件が偽ならどの文脈でも描かない。switch が選ばないのは、参照の辺で入れば効かない
         let hidden = refs.hidden.as_slice().get(i as usize).copied().unwrap_or(0);
-        let hidden = if referenced_container {
+        // 根は display: none と偽の条件でも描く（Chrome と同じ。ADR-102 (1)。単位 3 の 5 回目のレビュー）
+        let root = i == 0;
+        let hidden = if referenced_container || root {
             0
         } else if via_ref {
             hidden & HIDDEN_SELF
@@ -146,7 +148,7 @@ pub(crate) fn needs(
             continue;
         }
         // display: none の部分木は描かない（値は walk と同じ読み方：escape を解いて大文字小文字を問わない）
-        if !referenced_container {
+        if !referenced_container && !root {
             let spec = styles.of(i).iter().find(|s| Some(s.prop) == display).copied();
             if let Some(s) = spec
                 && s.wide == WIDE_NONE

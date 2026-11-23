@@ -552,9 +552,14 @@ fn background_shorthand() {
         "-webkit-cross-fade(linear-gradient(red, red), url(b), 50%) lime",
         "url(\"data:image/svg+xml,%3Csvg/%3E\") lime",
         "url(data:image/gif;base64,R0lGOD) lime",
+        // image() の色の画像と、前に空白のある data:（単位 3 の 5 回目のレビュー）
+        "image(red) lime",
+        "url(a), image-set(image(red) 1x) lime",
+        "url(\" data:image/gif;base64,R0lGOD\") lime",
     ] {
         assert!(not_yet(&format!("style='background: {g}'")), "{g}");
     }
+    assert!(not_yet("style=\"background-image: image(red)\""));
     // 印は後ろの background-color や長い名前の background-image で消えない（単位 3 の 4 回目のレビュー）
     assert!(not_yet("style=\"background: linear-gradient(red,red) lime; background-color: blue\""));
     assert!(not_yet("style=\"background-color: blue\"><style>svg { background: linear-gradient(red,red) }</style"));
@@ -630,6 +635,60 @@ fn more_not_yet_features() {
     }
 }
 
+/// 単位 3 の 5 回目のレビュー：overflow-x・overflow-y も入れ子の svg を切るかを決め（どちらかが見えない値なら切る側）、
+/// content-visibility: hidden は入れ物・use・根の中身を描かず、`all` は direction・unicode-bidi のほかを同じ言葉にし、
+/// `offset` のまとめは CSS の変形（NotYet）、根の display: contents は block（描く）。
+#[test]
+fn unit3_round5_properties() {
+    let nested =
+        |style: &str| format!("<svg width=\"5\" height=\"5\" style=\"{style}\"><rect width=\"9\" height=\"9\"/></svg>");
+    for style in [
+        "overflow: visible; overflow-x: hidden",
+        "overflow-y: scroll",
+        "overflow-x: visible",
+        "overflow: hidden; overflow-x: visible; overflow-y: visible",
+    ] {
+        assert_eq!(not_yet(&nested(style)), Later::Viewport, "{style}");
+    }
+    for style in
+        ["overflow: visible", "overflow-x: visible; overflow-y: auto", "overflow: visible; overflow-x: visible"]
+    {
+        assert_eq!(build(&svg(&nested(style))).unwrap().nodes.len(), 1, "{style}");
+    }
+    let count = |src: &str| build(src).unwrap().nodes.len();
+    let r = "<rect width=\"5\" height=\"5\"/>";
+    assert_eq!(count(&svg(&format!("<g style=\"content-visibility: hidden\">{r}</g>{r}"))), 1);
+    assert_eq!(count(&svg(&format!("<g style=\"content-visibility: auto\">{r}</g>{r}"))), 2);
+    assert_eq!(
+        count(&svg(&format!(
+            "<defs><g id=\"a\">{r}</g></defs><use href=\"#a\" style=\"content-visibility: hidden\"/>"
+        ))),
+        0
+    );
+    assert_eq!(
+        count(&format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"9\" height=\"9\" style=\"content-visibility: hidden\">{r}</svg>"
+        )),
+        0
+    );
+    // all: initial は塗りを初期の黒に、all: inherit は親の塗りに（書いた属性より強い）
+    let fill = |body: &str| build(&svg(body)).unwrap().nodes.as_slice().first().map(|n| n.fill);
+    assert_eq!(fill(&format!("<g fill=\"red\" style=\"all: initial\">{r}</g>")), Some([0.0, 0.0, 0.0, 1.0]));
+    assert_eq!(
+        fill("<g fill=\"lime\"><g fill=\"red\" style=\"all: inherit\"><rect width=\"5\" height=\"5\"/></g></g>"),
+        Some([0.0, 255.0, 0.0, 1.0])
+    );
+    // 前に書いた変形の個別のプロパティも all で初期に戻る
+    assert!(build(&svg(&format!("<style>g {{ translate: 5px }}</style><g style=\"all: unset\">{r}</g>"))).is_ok());
+    assert_eq!(not_yet(&format!("<g style=\"offset: path('M0 0 L9 9')\">{r}</g>")), Later::CssTransform);
+    assert_eq!(
+        count(&format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"9\" height=\"9\" style=\"display: contents\">{r}</svg>"
+        )),
+        1
+    );
+}
+
 /// 根の svg の display: none と偽の条件は描くことを止めない（Chrome と同じ。ADR-102。子の display: none は効く）。
 #[test]
 fn root_display_and_conditions_are_ignored() {
@@ -671,8 +730,14 @@ fn content_sized_documents() {
     assert_eq!(size("transform=\"scale(2)\"", r), (20.0, 20.0, 1));
     assert_eq!(size("transform=\"scale(2)\" style=\"transform-origin: 10% 10%\"", r), (10.0, 10.0, 1));
     assert_eq!(size("transform=\"scale(2)\" style=\"transform-origin: initial\"", r), (20.0, 20.0, 1));
-    // viewBox の幅か高さが 0：大きさは中身、描かない
+    // 根の inherit も初期の値（単位 3 の 5 回目のレビュー）
+    assert_eq!(size("transform=\"scale(2)\" style=\"transform-origin: inherit\"", r), (20.0, 20.0, 1));
+    // viewBox の幅か高さが 0：大きさは中身、描かない。幾何に効かない NotYet（不透明度・混ぜ方・グラデーション）で断らない
     assert_eq!(size("viewBox=\"0 0 0 10\"", "<rect width=\"10\" height=\"30\"/>"), (10.0, 30.0, 0));
+    for attrs in ["opacity=\"0.5\"", "style=\"mix-blend-mode: multiply\"", "fill=\"url(#g)\""] {
+        let body = format!("<linearGradient id=\"g\"/><rect width=\"10\" height=\"30\" {attrs}/>");
+        assert_eq!(size("viewBox=\"0 0 0 10\"", &body), (10.0, 30.0, 0), "{attrs}");
+    }
 }
 
 /// 文脈の塗りの元が use の currentColor：描く要素（中身）の color で解く（Chrome と同じ。ADR-102）。

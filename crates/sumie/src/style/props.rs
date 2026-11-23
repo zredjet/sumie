@@ -215,6 +215,7 @@ const ALIGNMENT: &[&[u8]] = &[
 ];
 const UNICODE_BIDI: &[&[u8]] = &[b"normal", b"embed", b"isolate", b"bidi-override", b"isolate-override", b"plaintext"];
 const WHITE_SPACE: &[&[u8]] = &[b"normal", b"pre", b"nowrap", b"pre-wrap", b"break-spaces", b"pre-line"];
+const CONTENT_VISIBILITY: &[&[u8]] = &[b"visible", b"auto", b"hidden"];
 const TRANSFORM_BOX: &[&[u8]] = &[b"content-box", b"border-box", b"fill-box", b"stroke-box", b"view-box"];
 const FONT_KERNING: &[&[u8]] = &[b"auto", b"normal", b"none"];
 const POINTER_EVENTS: &[&[u8]] = &[
@@ -240,6 +241,8 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"-webkit-mask", false, false, Kind::Raw),
     p(b"-webkit-mask-image", false, false, Kind::Raw),
     p(b"alignment-baseline", false, true, Kind::Keywords(ALIGNMENT)),
+    // 全体の言葉だけを受け、カスケードで長い名前（direction・unicode-bidi を除く）に分ける（Chrome と同じ。ユーザーの判断）
+    p(b"all", false, false, Kind::Keywords(&[])),
     // 根の svg の背景（CSS のプロパティとしてだけ。属性は読まない。resvg・Chrome と同じく描く。ADR-97 (4)）。まとめは
     // カスケードで `background-color` に分ける（最後の層の色。画像は描かない。Chrome と同じ。ADR-99 (4)）
     p(b"background", false, false, Kind::Background),
@@ -255,6 +258,8 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"color-interpolation", true, true, Kind::Keywords(INTERPOLATION)),
     p(b"color-interpolation-filters", true, true, Kind::Keywords(INTERPOLATION)),
     p(b"color-rendering", true, true, Kind::Keywords(COLOR_RENDERING)),
+    // 入れ物の中身を描かない（hidden。Chrome と同じ。ユーザーの判断。単位 3 の 5 回目のレビュー）
+    p(b"content-visibility", false, false, Kind::Keywords(CONTENT_VISIBILITY)),
     p(b"cursor", true, true, Kind::Raw),
     pu(b"cx", false, true, Kind::Length),
     pu(b"cy", false, true, Kind::Length),
@@ -301,9 +306,13 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"mix-blend-mode", false, false, Kind::Keywords(BLEND)),
     // CSS の個別の変形と offset-path（CSS のプロパティとしてだけ。まだ描かないので、none でなければ NotYet。単位 3 の
     // 4 回目のレビュー）
+    p(b"offset", false, false, Kind::Raw),
     p(b"offset-path", false, false, Kind::Raw),
     p(b"opacity", false, true, Kind::Opacity),
     p(b"overflow", false, true, Kind::Overflow),
+    // 長い名前（CSS のプロパティとしてだけ）。visible・auto のほかは切る側（NotYet）に倒す（単位 3 の 5 回目のレビュー）
+    p(b"overflow-x", false, false, Kind::Keywords(OVERFLOW)),
+    p(b"overflow-y", false, false, Kind::Keywords(OVERFLOW)),
     p(b"paint-order", true, true, Kind::PaintOrder),
     p(b"pointer-events", true, true, Kind::Keywords(POINTER_EVENTS)),
     pu(b"r", false, true, Kind::LengthNonNeg),

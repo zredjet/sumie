@@ -98,8 +98,8 @@ struct DeclInfo {
     font: u32,
 }
 
-/// `background` のまとめから分けた `background-image` の印（`pad[0]` の上の位。下の位は画像の層の印
-/// `valid::IMAGE_GRADIENT`・`IMAGE_DATA`。値の範囲は置かない）。
+/// `background-image` の画像の層の印を求めた印（`pad[0]` の上の位。下の位は画像の層の印 `valid::IMAGE_GRADIENT`・
+/// `IMAGE_DATA`・`IMAGE_FUNCTION`。まとめから分けたものは値の範囲を置かない）。
 pub(crate) const BG_IMAGE_FROM_SHORTHAND: u8 = 0x80;
 
 /// `font` のまとめを長い名前に分けた範囲（宣言ごとに 1 度だけ求める）。順は FONT_LONGHANDS の初めの 7 つ。
@@ -124,6 +124,13 @@ impl FontRec {
             r.present = 1;
         }
         r.pad[0] = b.image;
+        r
+    }
+
+    /// 長い名前の `background-image` の画像の層の印（`pad[0]`）。
+    fn image(flags: u8) -> FontRec {
+        let mut r = FontRec::default();
+        r.pad[0] = flags;
         r
     }
 
@@ -273,6 +280,7 @@ pub(crate) fn cascade(
     let mut fonts: MVec<'_, FontRec> = MVec::new(budget);
     let font_id = lookup(b"font", false);
     let background_id = lookup(b"background", false);
+    let background_image_id = lookup(b"background-image", false);
     for (ri, r) in sheet.rules.as_slice().iter().enumerate() {
         // 当たらない規則（条件が偽）の宣言は確かめない（警告も出さない）
         if active.get(ri).copied().unwrap_or(0) == 0 {
@@ -302,6 +310,16 @@ pub(crate) fn cascade(
             {
                 info.font = fonts.len() as u32;
                 fonts.push(FontRec::background(c))?;
+            }
+            // 長い名前の `background-image` の画像の層の印も宣言ごとに 1 度だけ求める（木を作る段で読み直さない：読み直すと
+            // 木を作る段の見積もりに入らない。単位 3 の 5 回目のレビュー）
+            if Some(info.prop) == background_image_id
+                && info.ok != 0
+                && info.wide == WIDE_NONE
+                && let Some(flags) = crate::style::valid::image_list(text, d.value, budget)?
+            {
+                info.font = fonts.len() as u32;
+                fonts.push(FontRec::image(flags))?;
             }
             if let Some(x) = infos.get_mut(k as usize) {
                 *x = info;
@@ -460,13 +478,32 @@ impl Out<'_, '_> {
         self.doc.node(self.cur)
     }
 
-    /// 候補を置く（強ければ入れ替える）。まとめのプロパティ（`marker`・`font`）は長い名前に分ける。`revert-layer` は
-    /// 候補にしない（弱い宣言に戻す）。
+    /// 候補を置く（強ければ入れ替える）。まとめのプロパティ（`all`・`marker`・`font`・`background`）は長い名前に分ける。
+    /// `revert-layer` は候補にしない（弱い宣言に戻す）。
     fn offer(&mut self, prop: PropertyId, key: Key, spec: Specified, font: Option<FontRec>) -> Result<(), Error> {
         self.budget.spend(cost::OP_STEP)?;
         if spec.wide == WIDE_REVERT_LAYER {
             return Ok(());
         }
+        // `all`（全体の言葉だけを受ける）は、direction・unicode-bidi と長い名前に分けるまとめを除くどの名前にも同じ言葉を
+        // 置く（Chrome と同じ。分けるまとめの長い名前はそれぞれの名前で置く。分けずに持つまとめ（`offset`・`mask`・
+        // `overflow` など）はそのまま置く。ユーザーの判断。単位 3 の 5 回目のレビュー）
+        if PROPS.get(usize::from(prop)).is_some_and(|p| p.name == b"all") {
+            for (i, p) in PROPS.iter().enumerate() {
+                self.budget.spend(cost::OP_STEP)?;
+                if matches!(p.name, b"all" | b"direction" | b"unicode-bidi" | b"font" | b"background" | b"marker") {
+                    continue;
+                }
+                let Ok(id) = PropertyId::try_from(i) else { continue };
+                self.offer_one(id, key, Specified { prop: id, ..spec }, None)?;
+            }
+            return Ok(());
+        }
+        self.offer_one(prop, key, spec, font)
+    }
+
+    /// `all` のほかの名前の候補を置く（`offer` の続き）。
+    fn offer_one(&mut self, prop: PropertyId, key: Key, spec: Specified, font: Option<FontRec>) -> Result<(), Error> {
         let name = PROPS.get(usize::from(prop)).map_or(&[][..], |p| p.name);
         if name == b"marker" {
             for id in self.short.markers.into_iter().flatten() {
@@ -479,6 +516,11 @@ impl Out<'_, '_> {
         }
         if name == b"background" {
             return self.offer_background(key, spec, font);
+        }
+        // 長い名前の `background-image`：画像の層の印を置く（まとめから分けたものと同じ形。値は読み直さない）
+        if name == b"background-image" && spec.wide == WIDE_NONE {
+            let flags = font.map_or(0, |r| r.pad[0]);
+            return self.put(prop, key, Specified { pad: [BG_IMAGE_FROM_SHORTHAND | flags, 0, 0], ..spec });
         }
         // use・symbol・入れ子の svg の width・height は CSS のプロパティでない（木を作る段が属性として読む）
         if (name == b"width" || name == b"height")
@@ -689,6 +731,8 @@ impl Out<'_, '_> {
                 font_parts(buf, d.value, cx, budget)?.map(|p| FontRec::of(&p))
             } else if self.short.background == Some(info.prop) && info.wide == WIDE_NONE {
                 crate::style::valid::background_color(buf, d.value, budget)?.map(FontRec::background)
+            } else if self.short.background_image == Some(info.prop) && info.wide == WIDE_NONE {
+                crate::style::valid::image_list(buf, d.value, budget)?.map(FontRec::image)
             } else {
                 None
             };
