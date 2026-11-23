@@ -161,6 +161,13 @@ fn content_size() {
     let t = build(&doc("")).unwrap();
     assert_eq!((t.size().width, t.size().height), (100.0, 100.0));
     assert!(matches!(build(&doc("<rect x=\"-10\" y=\"-10\" width=\"5\" height=\"5\"/>")), Err(Error::Invalid(_))));
+    // 描かない移動の点は大きさに入れない（続く移動・区間のないパス）。末尾の移動は入れる（resvg と同じ。単位 3 の 2 回目の
+    // レビュー）
+    let rect = "<rect width=\"10\" height=\"10\"/>";
+    for (d, side) in [("M200 200", 10.0), ("M300 300 M0 0 L10 10", 10.0), ("M0 0 L10 10 M300 300", 300.0)] {
+        let t = build(&doc(&format!("<path d=\"{d}\" stroke=\"black\"/>{rect}"))).unwrap();
+        assert_eq!((t.size().width, t.size().height), (side, side), "{d}");
+    }
 }
 
 #[test]
@@ -410,6 +417,33 @@ fn adversarial_estimates_hold() {
     let t = build(&svg(&c)).unwrap();
     // 規則の宣言は 1 度だけ置き場に書く
     assert!(t.held_bytes() < 200_000, "{}", t.held_bytes());
+    // 規則の並びの d・破線を多くの図形でない要素に当てる：鍵は当たる要素ごとに積んでから除く（単位 3 の 2 回目のレビュー）
+    for (rule, el, n) in [
+        ("*{stroke-dasharray:1;d:path('M0 0')}", "<a/>", 600),
+        ("*{stroke-dasharray:1;d:path('M0 0')}", "<a/>", 50_000),
+        ("*{stroke-dasharray: 1 2}", "<g/>", 20_000),
+    ] {
+        let doc = svg(&format!("<style>{rule}</style>{}", el.repeat(n)));
+        build(&doc).unwrap();
+        let d = crate::doc::parse(doc.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+        d.build(&Never).unwrap();
+    }
+    // 長い url の塗りが 1 つだけなら、ほかの図形の手間はその長さで数えない（単位 3 の 2 回目のレビュー）
+    let long: String = "a".repeat(20_000);
+    let doc = svg(&format!(
+        "<rect fill=\"url(#{long}) red\" width=\"5\" height=\"5\"/>{}",
+        "<rect fill=\"blue\" width=\"5\" height=\"5\"/>".repeat(20_000)
+    ));
+    build(&doc).unwrap();
+    let d = crate::doc::parse(doc.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
+    let e = d.estimate_build(&Never).unwrap();
+    assert!(e.work < 200_000_000, "{}", e.work);
+    // use の中身は use から受け継ぐ（祖先の並びの外の url も数える）
+    let doc = svg(&format!(
+        "<defs><rect id=\"r\" width=\"5\" height=\"5\"/></defs>{}",
+        format!("<use href=\"#r\" fill=\"url(#{long}) red\"/>").repeat(50)
+    ));
+    build(&doc).unwrap();
 }
 
 /// 読む段の見積もりが使う宣言の鍵と読んだ結果の大きさが、木の型と同じ。

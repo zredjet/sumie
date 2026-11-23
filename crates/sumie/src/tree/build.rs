@@ -20,7 +20,7 @@ use crate::doc::refs::{EDGE_CLIP, EDGE_FILTER, EDGE_MARKER_END, EDGE_MARKER_MID,
 use crate::doc::walk::{Used, WalkItem, WalkOptions, used_paint, walk_with};
 use crate::doc::{Document, Size};
 use crate::error::{Error, Feature, InvalidReason, Later, Stage, Unsupported};
-use crate::geom::{self, PathRef, PathWriter, Point, Rect, Transform};
+use crate::geom::{self, PathRef, PathSeg, PathWriter, Point, Rect, Transform};
 use crate::mem::{MVec, Plain, lower_bound_try, stable_sort};
 use crate::style::cascade::{ORIGIN_ATTR, SRC_INPUT, SRC_STORE, WIDE_NONE};
 use crate::style::computed::{
@@ -277,7 +277,7 @@ fn collect_keys<'b>(d: &Document<'_>, budget: &'b Budget<'b>) -> Result<MVec<'b,
     let input = d.input;
     let d_id = lookup(b"d", false);
     let dash_id = lookup(b"stroke-dasharray", false);
-    let mut keys: MVec<'_, DeclKey> = MVec::with_capacity(budget, cap(d.refs.weights.keys)?)?;
+    let mut keys: MVec<'_, DeclKey> = MVec::with_capacity(budget, cap(d.refs.weights.raw_keys)?)?;
     for (i, n) in doc.nodes.as_slice().iter().enumerate() {
         budget.spend(cost::OP_STEP)?;
         if n.kind != KIND_ELEMENT {
@@ -611,10 +611,23 @@ fn visit(
 
 /// 外接矩形（区間ごとに払う）。
 fn paid_bounds(path: PathRef<'_>, t: &Transform, budget: &Budget<'_>) -> Result<Rect, Error> {
+    // 移動の点は、続く移動に置き換わるものと、描く区間のないパスのものを入れない（描く区間の始めの点は区間が入れる）。
+    // 末尾の移動は入れる（resvg の中身で決まる大きさと同じ。FR-OUT-01。単位 3 の 2 回目のレビュー）
     let mut r = Rect::EMPTY;
+    let mut pending: Option<Point> = None;
+    let mut drawn = false;
     for seg in path.segments() {
         budget.spend(cost::BOUNDS_SEGMENT)?;
+        if let PathSeg::Move(p) = seg {
+            pending = Some(t.apply(p));
+            continue;
+        }
+        drawn = true;
+        pending = None;
         geom::add_bounds(&mut r, &geom::transform_seg(&seg, t));
+    }
+    if let (true, Some(p)) = (drawn, pending) {
+        r.add(p);
     }
     Ok(r)
 }

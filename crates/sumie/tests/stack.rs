@@ -68,16 +68,27 @@ fn parse_deep_nesting_on_a_small_stack() {
     assert_eq!((e, p), (Ok(()), Ok(())));
 }
 
-/// estimate_parse・parse・estimate_build の結果（読めなければ estimate_build は None）。
+/// estimate_parse・parse と、木を作る段から描く段まで（estimate_build・build・計画・4 × 4 の範囲を描く）の結果（読めなければ
+/// 後ろは None）。
 type Stages = (Result<(), sumie::Error>, Result<(), sumie::Error>, Option<Result<(), sumie::Error>>);
 
-/// 読む段の全体（estimate_parse・parse）と木を作る段の見積もりを 128 KiB のスタックで通し、結果を返す。
+/// 読む段の全体（estimate_parse・parse）と、木を作る段・計画・描く段を 128 KiB のスタックで通し、結果を返す（単位 3 の
+/// 2 回目のレビュー：木を作る段そのものも小さなスタックで通す）。
 fn parse_small(src: String, limits: Limits) -> Stages {
     let opts = sumie::ParseOptions { limits, ..sumie::ParseOptions::DEFAULT };
     on_small_stack(move || {
         let e = sumie::estimate_parse(src.as_bytes(), &opts, &sumie::Never).map(|_| ());
         let p = sumie::parse(src.as_bytes(), &opts, &sumie::Never);
-        let b = p.as_ref().ok().map(|d| d.estimate_build(&sumie::Never).map(|_| ()));
+        let b = p.as_ref().ok().map(|d| {
+            d.estimate_build(&sumie::Never)?;
+            let t = d.build(&sumie::Never)?;
+            let plan = t.plan(&sumie::RenderOptions::DEFAULT, &sumie::Never)?;
+            let size = plan.pixel_size();
+            let rect = sumie::PixelRect { x: 0, y: 0, width: size.width.min(4), height: size.height.min(4) };
+            let mut px = vec![0u8; rect.width as usize * rect.height as usize * 4];
+            let mut out = sumie::PixmapMut::new(&mut px, rect.width, rect.height, rect.width as usize * 4)?;
+            plan.render_region(rect, &mut out, &sumie::Never)
+        });
         (e, p.map(|_| ()), b)
     })
 }

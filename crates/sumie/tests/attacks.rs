@@ -74,6 +74,7 @@ impl Seen {
 fn run(src: impl Into<Vec<u8>>) -> Seen {
     let src = src.into();
     let head: String = String::from_utf8_lossy(&src).chars().take(160).collect();
+    let head_in = head.clone();
     let (check, heap, peak, seen) = on_small_stack(move || {
         let (out, heap) = measure(|| document_parse(&src));
         // 読めなかったものは読み直さない（上限で断る重い例を 2 度回さない）
@@ -86,7 +87,19 @@ fn run(src: impl Into<Vec<u8>>) -> Seen {
                 error: None,
                 warnings: d.report().warnings().map(|w| w.kind).collect(),
                 size: d.size().map(|s| (s.width, s.height)),
-                build: Some(d.estimate_build(&Never)),
+                build: Some({
+                    let e = d.estimate_build(&Never);
+                    // 見積もりが通れば、木を作る段そのものも 128 KiB のスタックで通り、上限で断らない（単位 3 の 2 回目の
+                    // レビュー）
+                    if e.is_ok() {
+                        let b = d.build(&Never);
+                        assert!(
+                            matches!(b, Ok(_) | Err(sumie::Error::Unsupported(_) | sumie::Error::Invalid(_))),
+                            "{head_in}：見積もりが通ったのに {b:?}"
+                        );
+                    }
+                    e
+                }),
             },
             Err(e) => Seen { error: Some(e), warnings: Vec::new(), size: None, build: None },
         };

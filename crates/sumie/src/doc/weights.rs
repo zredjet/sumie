@@ -33,6 +33,9 @@ pub(crate) struct BuildWeights {
     pub(crate) coords: u64,
     pub(crate) dashes: u64,
     pub(crate) keys: u64,
+    /// 重なりを除く前の鍵の数（木を作る段は、規則の並びの宣言も当たる要素ごとに積んでから並べて除く。置き場の容量と
+    /// 並べ替えの上限。単位 3 の 2 回目のレビュー）
+    pub(crate) raw_keys: u64,
 }
 
 /// 文書の全体の量（展開に依らない分）。
@@ -41,6 +44,9 @@ pub(crate) struct Globals {
     nodes: u64,
     specs: u64,
     keys: u64,
+    /// 規則の並びの `d`・破線の宣言の、当たる要素ごとの数と、重なりを除いた数
+    sheet_keys_raw: u64,
+    sheet_keys_kept: u64,
     poly_attrs: u64,
     /// 宣言ごとに 1 度だけ読む手間と、置き場に書く命令・座標・破線の上限
     decl_work: u64,
@@ -327,6 +333,9 @@ pub(crate) fn node_weights<'b>(
             // 規則の並びの宣言は当たる要素で共有するので、宣言ごとに 1 度だけ数える（並べて重なりを除いてから。単位 3 の
             // レビュー）
             if s.src == SRC_SHEET {
+                if kind != DECL_PAINT {
+                    g.sheet_keys_raw = g.sheet_keys_raw.saturating_add(1);
+                }
                 sheet_decls.push(SheetDecl { start: s.value.start, end: s.value.end, kind, pad: [0; 7], verbs: 0 })?;
                 continue;
             }
@@ -356,15 +365,47 @@ pub(crate) fn node_weights<'b>(
             continue;
         }
         x.verbs = decl(&mut g, &mut max_d, sheet, Span { start: x.start, end: x.end }, true, x.kind, budget)?;
+        if x.kind != DECL_PAINT {
+            g.sheet_keys_kept = g.sheet_keys_kept.saturating_add(1);
+        }
         if let Some(y) = sheet_decls.get_mut(keep) {
             *y = x;
         }
         keep = keep.saturating_add(1);
     }
     sheet_decls.truncate(keep);
+    // 図形が受け継ぎうる url の塗りの長さ：祖先の並び（行きがけの順なので親が先）の url の塗りの最大と、use の中身が
+    // use から受け継ぐ分（どの use でも、その祖先の並びの最大以下）。文書のどこかの長い url で、すべての図形を数えない
+    // （単位 3 の 2 回目のレビュー）
+    let mut chain: MVec<'_, u64> = MVec::with_capacity(budget, if g.max_paint == 0 { 0 } else { n })?;
+    let mut use_paint = 0u64;
+    if g.max_paint > 0 {
+        for (i, node) in nodes.iter().enumerate() {
+            budget.spend(cost::OP_STEP)?;
+            let mut own = if node.parent == NONE { 0 } else { chain.get(node.parent as usize).copied().unwrap_or(0) };
+            if node.kind == KIND_ELEMENT {
+                for s in styles.of(i as u32) {
+                    budget.spend(cost::OP_STEP)?;
+                    let p = Some(s.prop);
+                    if (p == fill_id || p == stroke_id) && s.wide == WIDE_NONE {
+                        let buf = bufs.of(s.src);
+                        if contains(s.value.of(buf), b'\\', budget)? || has_url(buf, s.value, budget)? {
+                            own = own.max(s.value.len() as u64);
+                        }
+                    }
+                }
+                if node.ns == NS_SVG && node.local.of(input) == b"use" {
+                    use_paint = use_paint.max(own);
+                }
+            }
+            chain.push(own)?;
+        }
+    }
+    let paint_of = |i: usize| {
+        let bytes = chain.get(i).copied().unwrap_or(0).max(use_paint);
+        if bytes == 0 { cost::BUILD_PAINT_COLOR } else { cost::build_paint(bytes, g.paint_escaped, ids) }
+    };
     // 2 度目：要素ごとの重み
-    let paint =
-        if g.max_paint == 0 { cost::BUILD_PAINT_COLOR } else { cost::build_paint(g.max_paint, g.paint_escaped, ids) };
     let lookups = cost::search(g.keys).saturating_mul(2);
     let node_push = cost::OP_STEP.saturating_add(cost::copy(PATH_NODE_BYTES));
     let mut w: MVec<'_, u64> = MVec::with_capacity(budget, n)?;
@@ -438,7 +479,7 @@ pub(crate) fn node_weights<'b>(
             };
             let write = if basic_shape(local) { cost::SHAPE_WRITE } else { 0 };
             x = x
-                .saturating_add(paint.saturating_mul(2))
+                .saturating_add(paint_of(i).saturating_mul(2))
                 .saturating_add(segs.saturating_mul(cost::BOUNDS_SEGMENT))
                 .saturating_add(lookups)
                 .saturating_add(write)
@@ -495,14 +536,16 @@ pub(crate) fn close_weights(g: &Globals, e: &Expanded, report_bytes: u64) -> Bui
     let key_size = KEY_BYTES;
     let slot_size = SLOT_BYTES;
     let keys = g.keys;
+    // 集めて並べるのは重なりを除く前の鍵（規則の並びの宣言は当たる要素ごと）
+    let raw = keys.saturating_sub(g.sheet_keys_kept).saturating_add(g.sheet_keys_raw);
     let work = e
         .work
         .saturating_add(g.decl_work)
         // 鍵を集める・並べる・重なりを除く
         .saturating_add(g.nodes.saturating_add(g.specs).saturating_add(g.poly_attrs).saturating_mul(cost::OP_STEP))
-        .saturating_add(keys.saturating_mul(cost::OP_STEP.saturating_add(cost::copy(key_size))))
-        .saturating_add(cost::stable_sort(keys, key_size))
-        .saturating_add(keys.saturating_mul(cost::OP_STEP))
+        .saturating_add(raw.saturating_mul(cost::OP_STEP.saturating_add(cost::copy(key_size))))
+        .saturating_add(cost::stable_sort(raw, key_size))
+        .saturating_add(raw.saturating_mul(cost::OP_STEP))
         .saturating_add(cost::fill(keys.saturating_mul(slot_size)))
         // 積み上げにある数の表・たどる段と use の文脈の積み上げ・一時の置き場
         .saturating_add(cost::fill(g.nodes.saturating_mul(4)))
@@ -514,9 +557,9 @@ pub(crate) fn close_weights(g: &Globals, e: &Expanded, report_bytes: u64) -> Bui
         .saturating_add(cost::copy(out_bytes))
         .saturating_add(cost::ALLOC_STEP.saturating_mul(32))
         .saturating_add(cost::copy(report_bytes));
-    let peak = keys
+    let peak = raw
         .saturating_mul(key_size)
-        .saturating_add(cost::stable_sort_bytes(keys, key_size))
+        .saturating_add(cost::stable_sort_bytes(raw, key_size))
         .saturating_add(keys.saturating_mul(slot_size))
         .saturating_add(g.nodes.saturating_mul(4))
         .saturating_add(grow_bytes(frames, frame))
@@ -535,6 +578,7 @@ pub(crate) fn close_weights(g: &Globals, e: &Expanded, report_bytes: u64) -> Bui
         coords,
         dashes,
         keys,
+        raw_keys: raw,
     }
 }
 

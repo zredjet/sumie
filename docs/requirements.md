@@ -99,7 +99,7 @@
 
 | ID | 優先 | 要件 |
 |---|---|---|
-| FR-PT-01 | M | 塗り：`none`・色・`url(#id)`（あとに代わりの色を付けられる）・`currentColor`・`context-fill`・`context-stroke`（marker の中。SVG 2。marker の中から使われる pattern・mask・clipPath・filter の中身と、marker の外には文脈の要素がなく、塗らない。Chrome と同じ。ADR-87 (4)） |
+| FR-PT-01 | M | 塗り：`none`・色・`url(#id)`（あとに代わりの色を付けられる）・`currentColor`・`context-fill`・`context-stroke`（marker の中と use の中身。SVG 2。use の中身は最も近い use の塗りと線。marker の中から使われる pattern・mask・clipPath・filter の中身と、marker と use の外には文脈の要素がなく、塗らない。Chrome と同じ。ADR-87 (4)・ADR-93 (2)） |
 | FR-PT-02 | M | 色：SVG の 147 の名前・`#rgb`・`#rgba`・`#rrggbb`・`#rrggbbaa`・`rgb()`・`rgba()`・`hsl()`・`hsla()`・`transparent`。CSS Color 4 の `/` の α と `hwb()` も読む。システムの色は読まない。`lab()`・`oklch()` などは M1 では読まずに警告し、照らしてから決める（ADR-66 (4)） |
 | FR-PT-03 | M | `fill-rule`・`fill-opacity`・`stroke-opacity`・`stroke-width`・`stroke-linecap`・`stroke-linejoin`（`miter`・`round`・`bevel`。SVG 2 の `miter-clip`・`arcs` は Chrome と同じく壊れた値。ADR-91 (1)）・`stroke-miterlimit`（負だけが壊れた値。1 未満は継ぎ目がいつも bevel。ADR-76）・`stroke-dasharray`（奇数個は 2 度並べる・% ・負や合計 0 は実線）・`stroke-dashoffset` |
 | FR-PT-04 | M | `paint-order`・`vector-effect: non-scaling-stroke`・`shape-rendering`（`crispEdges` は反エイリアスなし。`optimizeSpeed` は resvg と同じ扱い。M2 で照らす） |
