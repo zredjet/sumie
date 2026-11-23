@@ -428,6 +428,17 @@ fn visit(
     if c.fx & FX_CONTENTS != 0 {
         return not_yet(Later::DisplayContents);
     }
+    // CSS の箱のプロパティ：根の箱（border・padding など）・どの要素の outline・rect の論理の大きさ（ADR-103）
+    {
+        use crate::style::props::{BOX_LOGICAL, BOX_OUTLINE, BOX_ROOT};
+        let rect = n.ns == NS_SVG && n.local.of(d.input) == b"rect";
+        if c.css_box & BOX_OUTLINE != 0
+            || (item.node == 0 && c.css_box & BOX_ROOT != 0)
+            || (rect && c.css_box & BOX_LOGICAL != 0)
+        {
+            return not_yet(Later::CssBox);
+        }
+    }
     // 受け継がない参照（clip-path・mask・filter）の辺は値の並びの節へ張る：並びの節に参照先への辺があれば効く
     let xml_nodes = doc.nodes.len();
     let effective = |t: u32| (t as usize) < xml_nodes || !d.refs.of(t).is_empty();

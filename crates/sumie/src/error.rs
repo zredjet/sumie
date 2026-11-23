@@ -134,6 +134,9 @@ pub enum Later {
     DisplayContents,
     /// 根の背景の画像の層（`data:` の画像。デコーダを渡す口と同じ M3）
     BackgroundImage,
+    /// CSS の箱のプロパティ（根の `border`・`padding`・`margin`・`box-shadow`・`position` など、要素の `outline`、rect の
+    /// 論理の大きさ `inline-size`・`block-size`）が初期の値と同じ絵にならない（Chrome は描く。M3 で決める。ADR-103）
+    CssBox,
 }
 
 /// 壊れた入力・呼び手の誤り。

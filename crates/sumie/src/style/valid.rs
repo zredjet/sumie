@@ -5,7 +5,7 @@ use crate::budget::Budget;
 use crate::cost;
 use crate::css::lex::{Kind as Tk, Lexer, ident_is};
 use crate::error::Error;
-use crate::style::props::Kind;
+use crate::style::props::{BoxRule, Kind};
 use crate::values::{self, Unit, Values};
 use crate::xml::lex::Span;
 
@@ -84,6 +84,11 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
         Kind::Length => len_of(&mut v, cx)?.is_some(),
         Kind::LengthNonNeg => len_of(&mut v, cx)?.is_some_and(|l| l.value >= 0.0),
         Kind::LengthAuto => v.eat_ident(b"auto")? || len_of(&mut v, cx)?.is_some_and(|l| l.value >= 0.0),
+        Kind::SizeAuto => {
+            v.eat_ident(b"auto")?
+                || (!cx.attr && eat_any(&mut v, crate::style::props::SIZE_KEYWORDS)?)
+                || len_of(&mut v, cx)?.is_some_and(|l| l.value >= 0.0)
+        }
         // 負だけが壊れた値（0 以上 1 未満は継ぎ目がいつも bevel になる。SVG 2・Chrome と同じ）
         Kind::MiterLimit => v.number()?.is_some_and(|n| n >= 0.0),
         Kind::Keywords(list) => {
@@ -264,7 +269,7 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
                 }
             }
         }
-        Kind::Raw => {
+        Kind::Raw | Kind::CssBox(_) => {
             while !v.at_end()? {
                 budget.spend(crate::cost::OP_STEP)?;
                 let t = v.next()?;
@@ -277,6 +282,16 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
         Kind::Transform | Kind::Font | Kind::Background | Kind::BackgroundImage => false,
     };
     Ok(ok && v.at_end()?)
+}
+
+/// 言葉の並びのどれか 1 つを読む。
+fn eat_any(v: &mut Values<'_, '_>, words: &[&[u8]]) -> Result<bool, Error> {
+    for w in words {
+        if v.eat_ident(w)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `url(...)` を 1 つ読む。
@@ -651,6 +666,35 @@ pub(crate) fn font_parts(s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) ->
     }
     p.family = Some(family);
     Ok(Some(p))
+}
+
+/// CSS の箱のプロパティの値が、初期の値と同じ絵になるか（[`BoxRule`]。宣言ごとに 1 度だけ求める。ADR-103）。字句ごとに
+/// 払う。読めない字句は同じ絵にならないとみなす（NotYet の側）。
+pub(crate) fn box_neutral(rule: BoxRule, s: &[u8], range: Span, budget: &Budget<'_>) -> Result<bool, Error> {
+    let budget = budget_ref(budget);
+    const STYLES: &[&[u8]] = &[b"solid", b"dashed", b"dotted", b"double", b"groove", b"ridge", b"inset", b"outset"];
+    let mut v = Values::new(s, range, budget);
+    let mut count = 0u32;
+    while !v.at_end()? {
+        budget.spend(crate::cost::OP_STEP)?;
+        let t = v.next()?;
+        count = count.saturating_add(1);
+        let is = |w: &[u8]| t.kind == Tk::Ident && ident_is(s, t.inner, t.escaped, w);
+        let zero = matches!(t.kind, Tk::Number | Tk::Dimension | Tk::Percentage) && t.finite && t.value == 0.0;
+        let neutral = match rule {
+            BoxRule::Border => !STYLES.iter().any(|w| is(w)),
+            BoxRule::Outline => !STYLES.iter().any(|w| is(w)) && !is(b"auto"),
+            BoxRule::Zero => zero,
+            BoxRule::ZeroOrAuto => zero || is(b"auto"),
+            BoxRule::NoneOnly => is(b"none") && count == 1,
+            BoxRule::Keyword(k) => is(k) && count == 1,
+            BoxRule::Logical => false,
+        };
+        if !neutral {
+            return Ok(false);
+        }
+    }
+    Ok(count > 0 || !matches!(rule, BoxRule::Logical))
 }
 
 #[cfg(test)]

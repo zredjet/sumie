@@ -168,7 +168,10 @@ pub(crate) struct Computed {
     pub(crate) raw_known: u8,
     /// `transform_raw` に割合の平行移動がある（`raw_coef` を使う）
     pub(crate) raw_pct: u8,
-    pub(crate) pad: [u8; 6],
+    /// CSS の箱のプロパティの、初期の値と同じ絵にならない宣言の効く要素の印（受け継がない。`props::BOX_ROOT` など。
+    /// 木を作る段が根・どの要素・rect で NotYet にする。ADR-103）
+    pub(crate) css_box: u8,
+    pub(crate) pad: [u8; 5],
 }
 
 /// 効果の印：`clip-path` が url でも none でもない（基本の形など）・`filter` が url でも none でもない（フィルタの関数）・
@@ -342,7 +345,8 @@ impl Computed {
             origin_known: 1,
             raw_known: 1,
             raw_pct: 0,
-            pad: [0; 6],
+            css_box: 0,
+            pad: [0; 5],
         }
     }
 }
@@ -478,6 +482,9 @@ struct Picked {
     prefixed: [Option<Specified>; 5],
     css_transform: [Option<Specified>; 5],
     content_visibility: Option<Specified>,
+    /// CSS の箱のプロパティの、同じ絵にならない宣言の効く要素の印（`props::BOX_ROOT` など）と、`inherit` の印
+    css_box: u8,
+    css_box_inherit: u8,
 }
 
 fn pick(specs: &[Specified], ids: &PropIds, budget: &Budget<'_>) -> Result<Picked, Error> {
@@ -561,6 +568,14 @@ fn pick(specs: &[Specified], ids: &PropIds, budget: &Budget<'_>) -> Result<Picke
                 None => continue,
             }
         } else {
+            // CSS の箱のプロパティ：宣言の印（カスケードが宣言ごとに 1 度だけ求めたもの）を効く要素ごとに集める
+            if let Some(crate::style::props::Kind::CssBox(rule)) = PROPS.get(usize::from(sp.prop)).map(|q| q.kind) {
+                match sp.wide {
+                    WIDE_NONE if sp.pad[0] & crate::style::cascade::BOX_ON != 0 => p.css_box |= rule.scope(),
+                    WIDE_INHERIT => p.css_box_inherit |= rule.scope(),
+                    _ => {}
+                }
+            }
             continue;
         };
         *slot = Some(sp);
@@ -684,6 +699,7 @@ pub(crate) fn compute(
         line: LineStyle { non_scaling: 0, ..parent.line },
         geo: Geo::INITIAL,
         fx: 0,
+        css_box: 0,
         ..*parent
     };
     let p = pick(specs, ids, budget)?;
@@ -836,7 +852,9 @@ pub(crate) fn compute(
     }
     line_style(&mut c, parent, &p, bufs, &wide, budget)?;
     geometry(&mut c, parent, &p, bufs, base, &wide, budget)?;
-    effects(&mut c, parent, &p, bufs, &wide, budget)?;
+    effects(&mut c, parent, &p, bufs, &wide, base.outermost, budget)?;
+    // CSS の箱のプロパティ（受け継がない。`inherit` は親の印）
+    c.css_box = p.css_box | (parent.css_box & p.css_box_inherit);
     if let Some(s) = p.visibility.as_ref() {
         budget.spend(cost::OP_STEP)?;
         c.visibility = match wide(s) {
@@ -1122,7 +1140,16 @@ fn geometry(
                 let bit = 1u16.checked_shl(k as u32).unwrap_or(0);
                 let can_auto = matches!(k, G_WIDTH | G_HEIGHT | G_RX | G_RY);
                 let mut v = Values::new(buf, s.value, budget);
-                if can_auto && v.eat_ident(b"auto")? {
+                let sizing = matches!(k, G_WIDTH | G_HEIGHT) && s.origin != ORIGIN_ATTR;
+                let mut auto = can_auto && v.eat_ident(b"auto")?;
+                for w in crate::style::props::SIZE_KEYWORDS {
+                    if auto || !sizing {
+                        break;
+                    }
+                    budget.spend(cost::OP_STEP)?;
+                    auto = v.eat_ident(w)?;
+                }
+                if auto {
                     if v.at_end()? {
                         c.geo.auto |= bit;
                     }
@@ -1176,15 +1203,24 @@ fn geometry(
 }
 
 /// M2 でまだ描かない効果の印（[`FX_CLIP`] など）を求める。
+#[allow(clippy::too_many_arguments, reason = "根かを足した")]
 fn effects(
     c: &mut Computed,
     parent: &Computed,
     p: &Picked,
     bufs: &Bufs<'_>,
     wide: &dyn Fn(&Specified) -> Option<bool>,
+    root: bool,
     budget: &Budget<'_>,
 ) -> Result<(), Error> {
     let budget = budget_ref(budget);
+    // 値が none だけか
+    let none_only = |s: &Specified| -> Result<bool, Error> {
+        let buf = bufs.of(s.src);
+        let mut v = Values::new(buf, s.value, budget);
+        let t = v.next()?;
+        Ok(t.kind == Tk::Ident && ident_is(buf, t.inner, t.escaped, b"none") && v.at_end()?)
+    };
     // 値が none（か normal・auto）でも url だけでもないか
     let other = |s: &Specified, keep: &[u8]| -> Result<bool, Error> {
         let buf = bufs.of(s.src);
@@ -1217,19 +1253,15 @@ fn effects(
         let on = match wide(s) {
             Some(true) => parent.fx & bit != 0,
             Some(false) => false,
+            // 根の mask は CSS の箱の mask（url が mask の要素を指さなければ、Chrome は何も描かない）。none でなければ
+            // まだ描かない（CSS の洗い出し。ADR-103）
+            None if root && bit == FX_MASK => !none_only(s)?,
             None => other(s, keep)?,
         };
         if on {
             c.fx |= bit;
         }
     }
-    // 接頭辞つきの効果と mask-image：none でなければ（url でも。参照の辺を持たないので）まだ描かない
-    let none_only = |s: &Specified| -> Result<bool, Error> {
-        let buf = bufs.of(s.src);
-        let mut v = Values::new(buf, s.value, budget);
-        let t = v.next()?;
-        Ok(t.kind == Tk::Ident && ident_is(buf, t.inner, t.escaped, b"none") && v.at_end()?)
-    };
     for (k, sp) in p.prefixed.iter().enumerate() {
         let Some(s) = sp.as_ref() else { continue };
         budget.spend(cost::OP_STEP)?;

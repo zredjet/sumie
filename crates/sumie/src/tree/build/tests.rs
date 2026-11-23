@@ -711,6 +711,86 @@ fn unit3_round5_properties() {
     );
 }
 
+/// CSS の洗い出し（ADR-103）：根の箱のプロパティ（border・padding・margin・角の丸み・box-shadow・position・
+/// scrollbar-gutter・根の mask）、どの要素の outline、rect の論理の大きさは、初期の値と同じ絵にならなければ NotYet。
+/// `-webkit-opacity`・`-webkit-transform` は Chrome の別名として読む。
+#[test]
+fn css_box_properties() {
+    let root = |style: &str| {
+        build(&format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\" style=\"{style}\"><rect width=\"5\" height=\"5\"/></svg>"
+        ))
+    };
+    let refused = |r: Result<Tree, Error>| match r {
+        Err(Error::Unsupported(u)) => match u.feature {
+            Feature::NotYet(l) => Some(l),
+            _ => None,
+        },
+        _ => None,
+    };
+    for style in [
+        "padding: 10px",
+        "margin: 5px",
+        "margin-inline-start: 1px",
+        "border: 1px solid red",
+        "border-left-style: dashed",
+        "-webkit-border-before: 2px dotted",
+        "border-radius: 4px",
+        "-webkit-border-bottom-right-radius: 3px",
+        "box-shadow: 0 0 2px red",
+        "position: relative",
+        "scrollbar-gutter: stable",
+        "outline: auto",
+        "border-image: linear-gradient(red, red) 1",
+    ] {
+        assert_eq!(refused(root(style)), Some(Later::CssBox), "{style}");
+    }
+    assert_eq!(refused(root("mask: url(#missing)")), Some(Later::Mask));
+    for style in [
+        "padding: 0",
+        "margin: 0 auto",
+        "border: none",
+        "border: 0",
+        "border-width: 5px; border-color: red",
+        "border-radius: 0 0px 0%",
+        "box-shadow: none",
+        "position: static",
+        "outline: none",
+        "mask: none",
+        "padding: initial",
+        "margin: inherit",
+    ] {
+        assert!(root(style).is_ok(), "{style}");
+    }
+    // 規則で書いても同じ
+    assert_eq!(
+        refused(build(&svg("<style>svg { margin: 4px }</style><rect width=\"5\" height=\"5\"/>"))),
+        Some(Later::CssBox)
+    );
+    // 根でない要素の箱のプロパティは効かない（Chrome と同じ）。outline はどの要素も、論理の大きさは rect だけ
+    let r = "<rect width=\"5\" height=\"5\"";
+    assert!(build(&svg(&format!("<g style=\"padding: 10px; border: 2px solid; margin: 3px\">{r}/></g>"))).is_ok());
+    assert_eq!(not_yet(&format!("{r} style=\"outline: 1px solid red\"/>")), Later::CssBox);
+    assert_eq!(not_yet(&format!("<g style=\"outline-style: auto\">{r}/></g>")), Later::CssBox);
+    assert_eq!(not_yet(&format!("{r} style=\"inline-size: auto\"/>")), Later::CssBox);
+    assert_eq!(not_yet(&format!("{r} style=\"-webkit-logical-height: 3px\"/>")), Later::CssBox);
+    assert!(build(&svg(&format!("<g style=\"inline-size: 5px; outline: none\">{r}/></g>"))).is_ok());
+    // outline: inherit は親の印
+    assert_eq!(
+        not_yet(&format!("<g style=\"outline: 1px solid\"><g style=\"outline: inherit\">{r}/></g></g>")),
+        Later::CssBox
+    );
+    // Chrome の別名
+    assert_eq!(not_yet(&format!("{r} style=\"-webkit-opacity: 0.5\"/>")), Later::Opacity);
+    let t = build(&svg(&format!("{r} style=\"-webkit-transform: translate(10px, 0)\"/>"))).unwrap();
+    assert_eq!(t.nodes.as_slice()[0].transform.e, 10.0);
+    // CSS の width・height の大きさの言葉は auto と同じ（rect を描かない。Chrome と同じ）。属性では壊れた値
+    for w in ["stretch", "min-content", "fit-content", "-webkit-fill-available"] {
+        assert_eq!(build(&svg(&format!("{r} style=\"width: {w}\"/>"))).unwrap().nodes.len(), 0, "{w}");
+    }
+    assert_eq!(build(&svg("<rect width=\"stretch\" height=\"5\" style=\"width: 5px\"/>")).unwrap().nodes.len(), 1);
+}
+
 /// 根の svg の display: none と偽の条件は描くことを止めない（Chrome と同じ。ADR-102。子の display: none は効く）。
 #[test]
 fn root_display_and_conditions_are_ignored() {

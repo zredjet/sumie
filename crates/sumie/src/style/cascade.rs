@@ -19,7 +19,7 @@ use crate::error::Error;
 use crate::mem::{Frozen, MVec, Plain, stable_sort};
 use crate::report::WarningKind;
 use crate::style::cond::{Env, media, supports, supports_import};
-use crate::style::props::{PROPS, PropertyId, lookup, prop};
+use crate::style::props::{PROPS, PropertyId, lookup, lookup_css, prop};
 use crate::style::valid::{Ctx, Wide, font_parts, valid, wide};
 use crate::xml::lex::Span;
 use crate::xml::{FLAG_IN_STORE, NS_NONE, NS_SVG, Node, XmlDoc};
@@ -101,6 +101,19 @@ struct DeclInfo {
 /// `background-image` の画像の層の印を求めた印（`pad[0]` の上の位。下の位は画像の層の印 `valid::IMAGE_GRADIENT`・
 /// `IMAGE_DATA`・`IMAGE_FUNCTION`。まとめから分けたものは値の範囲を置かない）。
 pub(crate) const BG_IMAGE_FROM_SHORTHAND: u8 = 0x80;
+
+/// CSS の箱のプロパティ（`Kind::CssBox`）の値が初期の値と同じ絵にならない印（`pad[0]`。宣言ごとに 1 度だけ求める。ADR-103）。
+pub(crate) const BOX_ON: u8 = 1;
+
+/// CSS の箱のプロパティの宣言の印（同じ絵にならなければ [`BOX_ON`]）。
+fn box_flag(id: PropertyId, text: &[u8], value: Span, budget: &Budget<'_>) -> Result<Option<u8>, Error> {
+    match prop(id).map(|p| p.kind) {
+        Some(crate::style::props::Kind::CssBox(rule)) => {
+            Ok(Some(if crate::style::valid::box_neutral(rule, text, value, budget)? { 0 } else { BOX_ON }))
+        }
+        _ => Ok(None),
+    }
+}
 
 /// `font` のまとめを長い名前に分けた範囲（宣言ごとに 1 度だけ求める）。順は FONT_LONGHANDS の初めの 7 つ。
 #[repr(C)]
@@ -321,6 +334,14 @@ pub(crate) fn cascade(
                 info.font = fonts.len() as u32;
                 fonts.push(FontRec::image(flags))?;
             }
+            // CSS の箱のプロパティの印も宣言ごとに 1 度だけ
+            if info.ok != 0
+                && info.wide == WIDE_NONE
+                && let Some(flag) = box_flag(info.prop, text, d.value, budget)?
+            {
+                info.font = fonts.len() as u32;
+                fonts.push(FontRec::image(flag))?;
+            }
             if let Some(x) = infos.get_mut(k as usize) {
                 *x = info;
             }
@@ -371,10 +392,10 @@ fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {
 pub(crate) fn decl_prop(text: &[u8], d: &Decl, budget: &Budget<'_>) -> Result<Option<PropertyId>, Error> {
     budget.spend(cost::LOOKUP)?;
     if d.name_escaped == 0 {
-        return Ok(lookup(d.name.of(text), true));
+        return Ok(lookup_css(d.name.of(text)));
     }
-    // 名前は 32 バイトの内の ASCII（表のどの名前もそう）
-    let mut buf = [0u8; 32];
+    // 名前は NAME_MAX バイトの内の ASCII（表のどの名前もそう）
+    let mut buf = [0u8; crate::style::props::NAME_MAX];
     let mut n = 0usize;
     for c in decode(text, d.name) {
         let Some(b) = u8::try_from(c).ok().filter(u8::is_ascii) else { return Ok(None) };
@@ -382,7 +403,7 @@ pub(crate) fn decl_prop(text: &[u8], d: &Decl, budget: &Budget<'_>) -> Result<Op
         *x = b;
         n = n.saturating_add(1);
     }
-    Ok(lookup(buf.get(..n).unwrap_or(&[]), true))
+    Ok(lookup_css(buf.get(..n).unwrap_or(&[])))
 }
 
 /// 宣言の名前と値を確かめる（知らない名前は prop が u16::MAX）。
@@ -516,6 +537,13 @@ impl Out<'_, '_> {
         }
         if name == b"background" {
             return self.offer_background(key, spec, font);
+        }
+        // CSS の箱のプロパティ：同じ絵にならない印を置く（求めていなければ同じ絵にならないとみなす。値は読み直さない）
+        if spec.wide == WIDE_NONE
+            && matches!(PROPS.get(usize::from(prop)).map(|p| p.kind), Some(crate::style::props::Kind::CssBox(_)))
+        {
+            let flag = font.map_or(BOX_ON, |r| r.pad[0]);
+            return self.put(prop, key, Specified { pad: [flag, 0, 0], ..spec });
         }
         // 長い名前の `background-image`：画像の層の印を置く（まとめから分けたものと同じ形。値は読み直さない）
         if name == b"background-image" && spec.wide == WIDE_NONE {
@@ -733,6 +761,8 @@ impl Out<'_, '_> {
                 crate::style::valid::background_color(buf, d.value, budget)?.map(FontRec::background)
             } else if self.short.background_image == Some(info.prop) && info.wide == WIDE_NONE {
                 crate::style::valid::image_list(buf, d.value, budget)?.map(FontRec::image)
+            } else if info.wide == WIDE_NONE {
+                box_flag(info.prop, buf, d.value, budget)?.map(FontRec::image)
             } else {
                 None
             };
