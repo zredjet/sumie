@@ -52,7 +52,26 @@ const LATER: &[&str] = &[
 
 /// 既知の差（道と、方式の差の理由を書いた ADR）：resvg と Chrome は近いのに sumie が両方から外れるが、方式の差として認めた
 /// もの（ADR-101）。ここにない不具合の候補が 1 つでもあれば M2 の合否は不合格。
-const KNOWN: &[(&str, &str)] = &[];
+const KNOWN: &[(&str, &str)] = &[
+    ("real/flag-icons/flags/4x3/af.svg", THIN),
+    ("real/flag-icons/flags/4x3/bt.svg", THIN),
+    ("real/flag-icons/flags/4x3/eac.svg", THIN),
+    ("real/flag-icons/flags/4x3/ec.svg", THIN),
+    ("real/flag-icons/flags/4x3/va.svg", THIN),
+    ("real/tabler-icons/icons/outline/creative-commons-off.svg", THICK),
+    ("real/tabler-icons/icons/outline/fish-off.svg", THICK),
+    ("real/tabler-icons/icons/outline/om.svg", THICK),
+    ("real/tabler-icons/icons/outline/rainbow-off.svg", THICK),
+    ("real/tabler-icons/icons/outline/square-rounded-chevrons-up.svg", THICK),
+    ("real/tabler-icons/icons/outline/storm.svg", THICK),
+    ("real/tabler-icons/icons/outline/wash-dry-3.svg", THICK),
+    ("real/tabler-icons/icons/outline/world-map-off.svg", THICK),
+];
+
+/// 曲線の太い線の縁（ADR-97 (3)）。
+const THICK: &str = "ADR-97 (3)・ADR-101 (5)：曲線の太い線の縁の反エイリアス（外れた画素はすべて縁の半端な画素。4 倍で描いて縮めた絵に sumie がいちばん近い）";
+/// 細い線と線の縁（ADR-97 (2)(3)）。
+const THIN: &str = "ADR-97 (2)(3)・ADR-101 (5)：細い線と曲線の線の縁の反エイリアス（外れた画素はすべて色の境。線を消すと Chrome との差は 2% 前後以下）";
 
 /// 照合の集まりの 1 件。
 #[derive(Debug, Clone)]
