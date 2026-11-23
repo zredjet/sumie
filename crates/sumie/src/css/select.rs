@@ -372,6 +372,10 @@ const PE_SELECTION: u8 = 4;
 const PE_SLOTTED: u8 = 5;
 /// `::column`（`::scroll-marker` と、利用者の動きの擬似クラス。CSS Overflow 5）
 const PE_COLUMN: u8 = 6;
+/// `::-webkit-scrollbar*`（利用者の動きの擬似クラスと、スクロールバーの擬似クラス。Chrome と同じ）
+const PE_SCROLLBAR: u8 = 7;
+/// 表にないほかの `::-webkit-*`（利用者の動きの擬似クラス。Chrome と同じ）
+const PE_WEBKIT: u8 = 8;
 
 /// `::slotted()` のあとに書ける木に沿う擬似要素（Chrome 157 と照らした。`::first-line`・`::selection` は書けない）。
 const AFTER_SLOTTED: &[&[u8]] =
@@ -401,6 +405,8 @@ struct Frame {
     max_spec: Spec,
     /// 並びの中に当てない選択子がある
     any_unsupported: bool,
+    /// 並びの中に表にない `::-webkit-*` の擬似要素がある（[`Parsed::webkit`]）
+    any_webkit: bool,
     /// 読んでいる選択子
     prev_compound: u32,
     pending_comb: u8,
@@ -440,6 +446,7 @@ impl Frame {
             count: 0,
             max_spec: Spec::default(),
             any_unsupported: false,
+            any_webkit: false,
             prev_compound: NONE,
             pending_comb: COMB_NONE,
             spec: Spec::default(),
@@ -550,6 +557,9 @@ pub(crate) struct Parsed {
     /// 寛容な並び（`:is()`・`:where()`）の中の壊れた選択子を捨てた（`@supports selector()` は偽。Chrome と同じ。単位 3 の
     /// 10 回目のレビュー）
     pub(crate) dropped: bool,
+    /// 表にない `::-webkit-*` の擬似要素を受けた（規則では Chrome も受けるが、`@supports selector()` では Chrome の知るものだけ
+    /// 真なので分からない。単位 3 の 11 回目のレビュー）
+    pub(crate) webkit: bool,
 }
 
 /// 選択子の並び `range` を読む（壊れていれば None。表に足した分は捨てずに残る）。並びの選択子は `next` でつなぐ。
@@ -633,7 +643,12 @@ fn parse_list(s: &[u8], range: Span, ns: NsTable<'_>, t: &mut Tables<'_>, budget
                 if tok.kind != Kind::Eof || f.count == 0 {
                     return Err(invalid());
                 }
-                return Ok(Parsed { first: f.first_sel, unsupported: f.any_unsupported, dropped });
+                return Ok(Parsed {
+                    first: f.first_sel,
+                    unsupported: f.any_unsupported,
+                    dropped,
+                    webkit: f.any_webkit,
+                });
             }
             frames.pop();
             close_list(&f, t, frames.last_mut())?;
@@ -955,9 +970,10 @@ fn attribute(cur: &mut Cursor<'_, '_, '_>, s: &[u8], t: &mut Tables<'_>, ns: NsT
     cur.skip_ws()?;
     let mut end = cur.next()?;
     if end.kind == Kind::Ident {
+        // `s` の印は Chrome が捨てる（単位 3 の 11 回目のレビュー）
         if ident_is(s, end.inner, end.escaped, b"i") {
             x.flags = FLAG_CASE_I;
-        } else if !ident_is(s, end.inner, end.escaped, b"s") {
+        } else {
             return Err(invalid());
         }
         cur.skip_ws()?;
@@ -1000,17 +1016,24 @@ fn pseudo(
     let legacy = n.kind == Kind::Ident && any(LEGACY_PSEUDO_ELEMENTS);
     if element || legacy {
         // 擬似要素：いちばん外の並びにだけ書ける
-        let known = match n.kind {
-            Kind::Ident => any(PSEUDO_ELEMENTS) || webkit(),
+        // 関数の形は引数を文法で確かめる（Chrome と仕様が捨てる形を受けない。単位 3 の 11 回目のレビュー）
+        let (known, listed) = match n.kind {
+            Kind::Ident => (any(PSEUDO_ELEMENTS) || webkit(), any(PSEUDO_ELEMENTS)),
             Kind::Function => {
-                let ok = any(PSEUDO_ELEMENT_FUNCTIONS) || webkit();
-                cur.skip_function()?;
-                ok
+                let form = pseudo_element_form(&nm);
+                let arg = cur.skip_function()?;
+                match form {
+                    Some(form) => (args_ok(s, arg, form, budget)?, true),
+                    None => (webkit(), false),
+                }
             }
-            _ => false,
+            _ => (false, false),
         };
         if !known || !f.top {
             return Err(invalid());
+        }
+        if !listed {
+            f.any_webkit = true;
         }
         let follows = match f.pe {
             PE_NONE => true,
@@ -1023,8 +1046,13 @@ fn pseudo(
         if !follows {
             return Err(invalid());
         }
+        let scrollbar = n.inner.of(s).get(..17).is_some_and(|p| p.eq_ignore_ascii_case(b"-webkit-scrollbar"));
         let next_pe = if n.kind == Kind::Ident && (is(b"before") || is(b"after")) {
             PE_BEFORE_AFTER
+        } else if n.kind == Kind::Ident && scrollbar && !n.escaped {
+            PE_SCROLLBAR
+        } else if !listed {
+            PE_WEBKIT
         } else if n.kind == Kind::Function && is(b"part") {
             PE_PART
         } else if n.kind == Kind::Ident && is(b"selection") {
@@ -1063,19 +1091,20 @@ fn pseudo(
                 S_LINK
             } else if is(b"defined") {
                 S_UNIVERSAL
-            } else if any(DYNAMIC) {
-                S_NEVER
-            } else if is(b"window-inactive") && f.pe_ctx() == PE_SELECTION {
-                // `::selection` のあとだけに書ける
+            } else if any(DYNAMIC) || any(SCROLLBAR_CLASSES) {
                 S_NEVER
             } else {
                 return Err(invalid());
             };
-            // 擬似要素のあと：利用者の動きの擬似クラス（`::part()` のあとは構造でない擬似クラス、`::selection` のあとは
-            // `:window-inactive` も）だけ
+            // 擬似要素のあと：`::part()` のあとは利用者の動きと構造でない擬似クラス、`::-webkit-scrollbar*` のあとは利用者の
+            // 動きとスクロールバーの擬似クラス、`::slotted()`・`::column` のあとは利用者の動きの擬似クラス、`::selection` の
+            // あとは `:window-inactive` だけ（`::before`・`::after`・`::selection`・`::placeholder` などのあとの `:hover` は
+            // Chrome が捨てる。単位 3 の 11 回目のレビュー）
             let pe = f.pe_ctx();
-            let after_pe = any(USER_ACTION)
-                || (pe == PE_PART && matches!(kind, S_NEVER | S_LINK | S_UNIVERSAL))
+            let user = any(USER_ACTION);
+            let after_pe = (pe == PE_PART && matches!(kind, S_NEVER | S_LINK | S_UNIVERSAL))
+                || (pe == PE_SCROLLBAR && (user || any(SCROLLBAR_CLASSES) || is(b"enabled") || is(b"disabled")))
+                || (matches!(pe, PE_SLOTTED | PE_COLUMN | PE_WEBKIT) && user)
                 || (pe == PE_SELECTION && is(b"window-inactive"));
             if pe != PE_NONE && !after_pe {
                 return Err(invalid());
@@ -1166,7 +1195,11 @@ fn pseudo(
                 return Err(invalid());
             }
             if is(b"lang") {
+                // 言語の範囲は 1 つの名前だけ（文字列と並びは Chrome が捨てる。単位 3 の 11 回目のレビュー）
                 let arg = cur.skip_function()?;
+                if !args_ok(s, arg, ArgForm::Ident, budget)? {
+                    return Err(invalid());
+                }
                 let ranges = lang_ranges(s, arg, t)?;
                 let mut x = Simple::new(S_LANG);
                 x.a = ranges;
@@ -1193,9 +1226,12 @@ fn pseudo(
                 cur.skip_function()?;
                 return Err(invalid());
             }
-            if any(NEVER_FUNCTIONS) {
-                // 正しいが当てない（引数は確かめない）
-                cur.skip_function()?;
+            if let Some(form) = never_function_form(&nm) {
+                // 正しいが当てない（引数は文法で確かめる。単位 3 の 11 回目のレビュー）
+                let arg = cur.skip_function()?;
+                if !args_ok(s, arg, form, budget)? {
+                    return Err(invalid());
+                }
                 f.spec.b = f.spec.b.saturating_add(1);
                 return add_simple(f, t, Simple::new(S_NEVER), false);
             }
@@ -1232,20 +1268,6 @@ const PSEUDO_ELEMENTS: &[&[u8]] = &[
     b"column",
     b"checkmark",
     b"picker-icon",
-];
-
-/// 関数の形の擬似要素。
-const PSEUDO_ELEMENT_FUNCTIONS: &[&[u8]] = &[
-    b"cue",
-    b"part",
-    b"slotted",
-    b"highlight",
-    b"view-transition-group",
-    b"view-transition-image-pair",
-    b"view-transition-old",
-    b"view-transition-new",
-    b"scroll-button",
-    b"picker",
 ];
 
 /// 利用者の動きの擬似クラス（擬似要素のあとにも書ける。Selectors 4 §3.6.3）。
@@ -1287,7 +1309,6 @@ const DYNAMIC: &[&[u8]] = &[
     b"buffering",
     b"stalled",
     b"muted",
-    b"volume-locked",
     b"current",
     b"past",
     b"future",
@@ -1302,9 +1323,150 @@ const DYNAMIC: &[&[u8]] = &[
     b"host",
 ];
 
-/// 正しいが当てない関数の擬似クラス（引数は確かめない）。
-const NEVER_FUNCTIONS: &[&[u8]] =
-    &[b"host", b"host-context", b"state", b"current", b"nth-col", b"nth-last-col", b"active-view-transition-type"];
+/// Chrome が受けるスクロールバーの擬似クラスと `-webkit-` の擬似クラス（静止した絵では当たらない。単位 3 の 11 回目の
+/// レビュー。ADR-73 (6)）。
+const SCROLLBAR_CLASSES: &[&[u8]] = &[
+    b"horizontal",
+    b"vertical",
+    b"increment",
+    b"decrement",
+    b"start",
+    b"end",
+    b"double-button",
+    b"single-button",
+    b"no-button",
+    b"corner-present",
+    b"window-inactive",
+    b"-webkit-drag",
+    b"-webkit-full-page-media",
+    b"-webkit-full-screen-ancestor",
+];
+
+/// 関数の擬似クラス・擬似要素の引数の形（仕様の文法と Chrome。単位 3 の 11 回目のレビュー）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgForm {
+    /// 名前 1 つ以上（空白で区切る）
+    Idents,
+    /// 名前 1 つ
+    Ident,
+    /// 名前の `,` の並び
+    IdentList,
+    /// `select` だけ
+    Select,
+    /// `*` か向きの言葉
+    ScrollButton,
+    /// `*` か名前と、`.名前` の続き
+    ViewTransition,
+    /// 複合の選択子 1 つ
+    Compound,
+    /// 複合の選択子の `,` の並び
+    CompoundList,
+}
+
+/// 正しいが当てない関数の擬似クラスと引数の形（`:current()`・`:nth-col()`・`:nth-last-col()` は Chrome が捨てる）。
+fn never_function_form(nm: &crate::css::lex::Name) -> Option<ArgForm> {
+    if nm.is(b"host") || nm.is(b"host-context") {
+        Some(ArgForm::Compound)
+    } else if nm.is(b"state") {
+        Some(ArgForm::Ident)
+    } else if nm.is(b"active-view-transition-type") {
+        Some(ArgForm::IdentList)
+    } else {
+        None
+    }
+}
+
+/// 関数の形の擬似要素の引数の形。
+fn pseudo_element_form(nm: &crate::css::lex::Name) -> Option<ArgForm> {
+    if nm.is(b"cue") {
+        Some(ArgForm::CompoundList)
+    } else if nm.is(b"part") {
+        Some(ArgForm::Idents)
+    } else if nm.is(b"slotted") {
+        Some(ArgForm::Compound)
+    } else if nm.is(b"highlight") {
+        Some(ArgForm::Ident)
+    } else if nm.is(b"view-transition-group")
+        || nm.is(b"view-transition-image-pair")
+        || nm.is(b"view-transition-old")
+        || nm.is(b"view-transition-new")
+    {
+        Some(ArgForm::ViewTransition)
+    } else if nm.is(b"scroll-button") {
+        Some(ArgForm::ScrollButton)
+    } else if nm.is(b"picker") {
+        Some(ArgForm::Select)
+    } else {
+        None
+    }
+}
+
+/// `::scroll-button()` の向きの言葉。
+const SCROLL_DIRECTIONS: &[&[u8]] =
+    &[b"up", b"down", b"left", b"right", b"block-start", b"block-end", b"inline-start", b"inline-end"];
+
+/// 関数の引数 `arg` が `form` の形か（入れ子のかっこの中は 1 つの字句として見る）。字句ごとに払う。
+fn args_ok(s: &[u8], arg: Span, form: ArgForm, budget: &Budget<'_>) -> Result<bool, Error> {
+    let mut lex = Lexer::over(s, arg, budget);
+    let mut nest = Nest::new(budget);
+    let list = matches!(form, ArgForm::IdentList | ArgForm::CompoundList);
+    // 今の項の字句の数・項の中の空白・前の字句が `.` か
+    let (mut items, mut ws, mut dot) = (0u32, false, false);
+    loop {
+        budget.spend(cost::OP_STEP)?;
+        let t = lex.next()?;
+        if t.kind == Kind::Eof {
+            break;
+        }
+        if !nest.top() {
+            nest.feed(&t)?;
+            continue;
+        }
+        match t.kind {
+            Kind::Whitespace => {
+                ws |= items > 0;
+                continue;
+            }
+            Kind::Comma => {
+                if !list || items == 0 || dot {
+                    return Ok(false);
+                }
+                (items, ws, dot) = (0, false, false);
+                continue;
+            }
+            _ => {}
+        }
+        let is = |w: &[u8]| t.kind == Kind::Ident && ident_is(s, t.inner, t.escaped, w);
+        let ok = match form {
+            ArgForm::Idents => t.kind == Kind::Ident,
+            ArgForm::Ident | ArgForm::IdentList => items == 0 && t.kind == Kind::Ident,
+            ArgForm::Select => items == 0 && is(b"select"),
+            ArgForm::ScrollButton => items == 0 && (t.is_delim(b'*') || SCROLL_DIRECTIONS.iter().any(|w| is(w))),
+            ArgForm::ViewTransition => {
+                !ws && if dot {
+                    t.kind == Kind::Ident
+                } else if items == 0 {
+                    t.kind == Kind::Ident || t.is_delim(b'*') || t.is_delim(b'.')
+                } else {
+                    t.is_delim(b'.')
+                }
+            }
+            ArgForm::Compound | ArgForm::CompoundList => {
+                !ws && (matches!(t.kind, Kind::Ident | Kind::Hash | Kind::Colon | Kind::Function | Kind::LBracket)
+                    || t.is_delim(b'.')
+                    || t.is_delim(b'*')
+                    || t.is_delim(b'|'))
+            }
+        };
+        if !ok {
+            return Ok(false);
+        }
+        dot = t.is_delim(b'.');
+        items = items.saturating_add(1);
+        nest.feed(&t)?;
+    }
+    Ok(items > 0 && !dot)
+}
 
 /// An+B の名前の形（`n`・`-n`・`n-`・`-n-`・`n-<数字>`・`-n-<数字>`）。
 struct NForm {

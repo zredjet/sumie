@@ -400,7 +400,11 @@ fn apply(p: &mut Frame, v: Tri) {
 /// ほかの関数は知らない形。
 fn function_leaf(s: &[u8], f: Token, inner: Span, mode: Mode<'_>, budget: &Budget<'_>) -> Result<Tri, Error> {
     let is = |w: &[u8]| ident_is(s, f.inner, f.escaped, w);
-    if mode.general == Tri::False && (is(b"font-tech") || is(b"font-format")) {
+    // 媒体の問いでは、どの関数も知らない形（`selector()` も。単位 3 の 11 回目のレビュー）
+    if mode.general != Tri::False {
+        return Ok(mode.general);
+    }
+    if is(b"font-tech") || is(b"font-format") {
         return Ok(Tri::Unknown);
     }
     if !is(b"selector") {
@@ -412,7 +416,8 @@ fn function_leaf(s: &[u8], f: Token, inner: Span, mode: Mode<'_>, budget: &Budge
     Ok(match parse_selector_list(s, inner, mode.ns, &mut t, budget)? {
         // 寛容な並びで捨てた選択子があれば支えない（Chrome と同じ。単位 3 の 10 回目のレビュー）
         Some(p) if p.dropped => Tri::False,
-        Some(p) if p.unsupported => Tri::Unknown,
+        // 当てないセレクタと、表にない `::-webkit-*` は分からない（Chrome は知るものだけ真。単位 3 の 11 回目のレビュー）
+        Some(p) if p.unsupported || p.webkit => Tri::Unknown,
         Some(p) => Tri::of(t.selectors.get(p.first as usize).is_some_and(|x| x.next == crate::css::select::NONE)),
         None => Tri::False,
     })

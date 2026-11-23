@@ -127,13 +127,14 @@ fn structural_and_logical() {
 
 #[test]
 fn language() {
+    // 並びの `:lang(de, fr)` は Chrome が捨てる（単位 3 の 11 回目のレビュー）
     let out = run(DOC, ":lang(en) {} :lang(fr) {} :lang(en-us) {} :lang(de, fr) {}");
     // xml:lang は受け継ぐ。c1 は lang="fr"
     assert!(hits(&out, 0).contains(&"r1".to_string()));
     assert!(!hits(&out, 0).contains(&"c1".to_string()));
     assert_eq!(hits(&out, 1), ["c1"]);
     assert!(hits(&out, 2).contains(&"g2".to_string()));
-    assert_eq!(hits(&out, 3), ["c1"]);
+    assert!(hits(&out, 3).is_empty());
 }
 
 #[test]
@@ -225,7 +226,8 @@ fn work_covers_compounds_and_attributes() {
 #[test]
 fn lang_extended_ranges() {
     let svg = r##"<svg xmlns="http://www.w3.org/2000/svg"><g id="a" lang="de-CH"/><g id="b" lang="de-Latn-CH"/><g id="c" lang="de-x-CH"/><g id="d" lang="fr"/></svg>"##;
-    let out = run(svg, ":lang(\"*-CH\") {} :lang(de-CH) {} :lang(\\*) {}");
+    // 文字列の範囲は Chrome が捨てるので、escape した名前で書く（単位 3 の 11 回目のレビュー）
+    let out = run(svg, ":lang(\\*-CH) {} :lang(de-CH) {} :lang(\\*) {}");
     assert_eq!(hits(&out, 0), ["a", "b"]);
     assert_eq!(hits(&out, 1), ["a", "b"]);
     assert_eq!(hits(&out, 2).len(), 4);

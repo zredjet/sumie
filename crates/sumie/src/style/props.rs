@@ -214,10 +214,9 @@ pub(crate) const OVERFLOW: &[&[u8]] = &[b"visible", b"hidden", b"scroll", b"auto
 const RENDERING: &[&[u8]] = &[b"auto", b"optimizespeed", b"crispedges", b"geometricprecision"];
 const COLOR_RENDERING: &[&[u8]] = &[b"auto", b"optimizespeed", b"optimizequality"];
 const TEXT_RENDERING: &[&[u8]] = &[b"auto", b"optimizespeed", b"optimizelegibility", b"geometricprecision"];
-// `smooth`・`high-quality` は CSS Images 4 にあるが Chrome は壊れた値、`-webkit-optimize-contrast` は Chrome が受ける（Chrome に
-// 寄せる。画像の描き方は M3 で決める。単位 3 の 10 回目のレビュー）
-const IMAGE_RENDERING: &[&[u8]] =
-    &[b"auto", b"optimizespeed", b"optimizequality", b"crisp-edges", b"pixelated", b"-webkit-optimize-contrast"];
+// `smooth`・`high-quality` は CSS Images 4 に、`optimizeSpeed`・`optimizeQuality` は SVG 1.1 にあるが Chrome は壊れた値、
+// `-webkit-optimize-contrast` は Chrome が受ける（Chrome に寄せる。画像の描き方は M3 で決める。単位 3 の 10・11 回目のレビュー）
+const IMAGE_RENDERING: &[&[u8]] = &[b"auto", b"crisp-edges", b"pixelated", b"-webkit-optimize-contrast"];
 const INTERPOLATION: &[&[u8]] = &[b"auto", b"srgb", b"linearrgb"];
 const ISOLATION: &[&[u8]] = &[b"auto", b"isolate"];
 const BLEND: &[&[u8]] = &[
@@ -270,16 +269,15 @@ pub(crate) const FONT_STRETCH: &[&[u8]] = &[
     b"extra-expanded",
     b"ultra-expanded",
 ];
+// `text-top`・`text-bottom` は Chrome が壊れた値にする（単位 3 の 11 回目のレビュー）
 const DOMINANT: &[&[u8]] = &[
     b"auto",
-    b"text-bottom",
     b"alphabetic",
     b"ideographic",
     b"middle",
     b"central",
     b"mathematical",
     b"hanging",
-    b"text-top",
     b"use-script",
     b"no-change",
     b"reset-size",
@@ -299,8 +297,7 @@ const ALIGNMENT: &[&[u8]] = &[
     b"alphabetic",
     b"hanging",
     b"mathematical",
-    // `text-top` は Chrome が壊れた値にする（単位 3 の 10 回目のレビュー）
-    b"text-bottom",
+    // `text-top`・`text-bottom` は Chrome が壊れた値にする（単位 3 の 10・11 回目のレビュー）
 ];
 // `-webkit-` の 3 つは Chrome が受ける別名（文字を描く M5 で isolate などと同じに扱う。単位 3 の 10 回目のレビュー）
 const UNICODE_BIDI: &[&[u8]] = &[

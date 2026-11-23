@@ -272,11 +272,12 @@ fn third_review_cascade_cases() {
     // 名前空間のない lang は SVG の要素のもの（ほかの名前空間の要素の lang は受け継がない）
     let out = run(&svg, ":lang(fr) { opacity: .5 }");
     assert_eq!(get(&out, "in", "opacity"), None);
-    // 文字列の範囲の中の `,` で範囲を分けない
+    // `:lang()` の文字列と並びは Chrome が捨てる（単位 3 の 11 回目のレビュー）
     let svg2 = format!("<svg {SVG}><rect id=\"e\" lang=\"en\"/></svg>");
-    let out = run(&svg2, ":lang(\"xx,en\") { opacity: .5 } :lang(xx, en) { stroke: red }");
+    let out = run(&svg2, ":lang(\"xx,en\") { opacity: .5 } :lang(xx, en) { stroke: red } :lang(en) { fill: blue }");
     assert_eq!(get(&out, "e", "opacity"), None);
-    assert_eq!(get(&out, "e", "stroke"), Some("red"));
+    assert_eq!(get(&out, "e", "stroke"), None);
+    assert_eq!(get(&out, "e", "fill"), Some("blue"));
 }
 
 /// CSS の 4 回目のレビューの指摘（Chrome 157 と照らした形）。

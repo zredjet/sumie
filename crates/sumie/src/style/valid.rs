@@ -757,7 +757,7 @@ fn font_style(v: &mut Values<'_, '_>) -> Result<bool, Error> {
 /// `display`（CSS Display 3）：昔の 1 つの言葉か、外の言葉・中の言葉（・`list-item`）を 1 つずつ順を問わずに。
 fn display(v: &mut Values<'_, '_>, budget: &Budget<'_>) -> Result<bool, Error> {
     // `run-in` と ruby の内側の `ruby-base`・`ruby-base-container`・`ruby-text-container` は Chrome が壊れた値にする（Chrome に
-    // 寄せる。ADR-74 (5) を改める。単位 3 の 10 回目のレビュー）
+    // 寄せる。ADR-74 (12)・ADR-76 (5) を改める。単位 3 の 10・11 回目のレビュー）
     const OUTSIDE: &[&[u8]] = &[b"block", b"inline"];
     const INSIDE: &[&[u8]] = &[b"flow", b"flow-root", b"table", b"flex", b"grid", b"ruby", b"math"];
     const SINGLE: &[&[u8]] = &[b"ruby", b"ruby-text", b"math", b"flow"];

@@ -1291,6 +1291,45 @@ fn unit3_round10() {
     }
 }
 
+/// 単位 3 の 11 回目のレビュー：媒体の問いの `selector()`・`@supports` の言葉の表と `::-webkit-*`・関数の擬似クラスの引数。
+#[test]
+fn unit3_round11() {
+    let rect = "<rect class=\"a\" width=\"40\" height=\"40\" fill=\"green\"/>";
+    let fill = |src: &str| {
+        let t = build(&svg(src)).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        t.nodes.as_slice().first().map(|n| n.fill)
+    };
+    let green = fill(rect);
+    for q in ["@media selector(rect)", "@media (selector(rect))", "@media screen and (selector(rect))"] {
+        assert_eq!(fill(&format!("<style>{q} {{ rect {{ fill: red }} }}</style>{rect}")), green, "{q}");
+    }
+    assert_eq!(fill(&format!("<style media=\"selector(rect)\">rect {{ fill: red }}</style>{rect}")), green);
+    for cond in [
+        "(alignment-baseline: text-bottom)",
+        "(dominant-baseline: text-top)",
+        "(dominant-baseline: text-bottom)",
+        "(image-rendering: optimizeSpeed)",
+        "(image-rendering: optimizeQuality)",
+        "selector(:host())",
+        "selector(::part())",
+    ] {
+        assert_eq!(fill(&format!("<style>@supports {cond} {{ rect {{ fill: red }} }}</style>{rect}")), green, "{cond}");
+    }
+    assert_eq!(
+        not_yet(&format!("<style>@supports selector(::-webkit-foo) {{ rect {{ fill: red }} }}</style>{rect}")),
+        Later::Supports
+    );
+    // 規則の中の引数の壊れた関数の擬似クラス・擬似要素は、規則ごと捨てる（Chrome と同じ）
+    for sel in
+        ["#zz :host()", "#zz ::part()", "#zz ::slotted(a b)", "#zz :state(a b)", "#zz :lang('en')", "#zz ::after:hover"]
+    {
+        assert_eq!(fill(&format!("<style>.a, {sel} {{ fill: red }}</style>{rect}")), green, "{sel}");
+    }
+    for sel in ["#zz ::-webkit-scrollbar:horizontal", "#zz :window-inactive", "#zz ::part(x):hover"] {
+        assert_ne!(fill(&format!("<style>.a, {sel} {{ fill: red }}</style>{rect}")), green, "{sel}");
+    }
+}
+
 /// 根の svg の display: none と偽の条件は描くことを止めない（Chrome と同じ。ADR-102。子の display: none は効く）。
 #[test]
 fn root_display_and_conditions_are_ignored() {

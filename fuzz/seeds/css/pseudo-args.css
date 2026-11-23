@@ -1,0 +1,6 @@
+.a, :host(.b:hover), :host-context([x] a), :state(open), :active-view-transition-type(a, b) { fill: red }
+::part(a b), ::slotted(rect.a), ::cue(.a, b), ::highlight(x), ::picker(select), ::scroll-button(*) { fill: blue }
+::view-transition-old(a.b.c), ::view-transition-new(.b), ::-webkit-scrollbar-button:vertical:increment { fill: green }
+:lang(\*-CH), :lang('en'), :lang(en, fr), [u*=d s], ::after:hover, :window-inactive, ::-webkit-foo:hover { fill: navy }
+@media selector(rect), ((min-width: 1px), print) { rect { fill: red } }
+@supports selector(::-webkit-foo) or selector(:is(:foo)) or (dominant-baseline: text-top) { rect { fill: red } }

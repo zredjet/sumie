@@ -120,7 +120,7 @@ fn simple_selectors_and_combinators() {
     assert_eq!(parse(" g  >rect.a#b , *").unwrap(), format!("g > rect.a#b@{}, *@0", sp(1, 1, 2)));
     assert_eq!(parse("a b+c~d").unwrap(), format!("a b + c ~ d@{}", sp(0, 0, 4)));
     assert_eq!(
-        parse("[x] [y=\"v\"][z~=w i][q|=a][p^=b][s$='c'][u*=d s]").unwrap(),
+        parse("[x] [y=\"v\"][z~=w i][q|=a][p^=b][s$='c'][u*=d]").unwrap(),
         format!("[0|x] [0|y=\"v\"][0|z~=\"w\" i][0|q|=\"a\"][0|p^=\"b\"][0|s$=\"c\"][0|u*=\"d\"]@{}", sp(0, 7, 0))
     );
     assert_eq!(
@@ -165,7 +165,11 @@ fn pseudo_classes_and_an_b() {
     for bad in [":nth-child(2 n)", ":nth-child(+ 2n)", ":nth-child(n++1)", ":nth-child()", ":nth-of-type(n of a)"] {
         assert_eq!(parse(bad), None, "{bad}");
     }
-    assert_eq!(parse(":lang(EN, \"fr-CA\")").unwrap(), format!(":lang(en\0fr-ca)@{}", sp(0, 1, 0)));
+    // `:lang()` は名前 1 つだけ（文字列と並びは Chrome が捨てる。単位 3 の 11 回目のレビュー）
+    assert_eq!(parse(":lang(EN)").unwrap(), format!(":lang(en)@{}", sp(0, 1, 0)));
+    for bad in [":lang(EN, \"fr-CA\")", ":lang('en')", ":lang(en, fr)", "[u*=d s]"] {
+        assert_eq!(parse(bad), None, "{bad}");
+    }
     assert_eq!(parse("a:link:hover").unwrap(), format!("a:link:never@{}", sp(0, 2, 1)));
     assert_eq!(parse("rect::before").unwrap(), format!("rect:never@{}", sp(0, 0, 2)));
     assert_eq!(parse_full("rect:has(> g), g", &[]), Some((format!("g@{}", sp(0, 0, 1)), true)));
@@ -247,10 +251,68 @@ fn pseudo_names_and_pseudo_elements() {
         "::part(x)::before",
         "::part(x):hover",
         "::-webkit-foo:hover",
-        "::before:hover",
+        "::-webkit-scrollbar:horizontal",
+        "::-webkit-scrollbar-thumb:window-inactive",
+        "::-webkit-scrollbar-button:vertical:increment",
+        "::-webkit-scrollbar:disabled",
+        ":window-inactive",
+        ":-webkit-drag",
+        ":host(.a:hover)",
+        ":host-context([x])",
+        ":state(open)",
+        ":active-view-transition-type(a, b)",
+        "::part(a b)",
+        "::slotted(rect.a)",
+        "::cue(.a, b)",
+        "::highlight(x)",
+        "::picker(select)",
+        "::scroll-button(*)",
+        "::scroll-button(up)",
+        "::view-transition-group(*)",
+        "::view-transition-old(a.b.c)",
+        "::view-transition-new(.b)",
         ":lang(\\*-CH)",
     ] {
         assert!(valid(ok), "{ok}");
+    }
+    // 関数の引数の文法と、Chrome が捨てる形（単位 3 の 11 回目のレビュー）
+    for bad in [
+        ":host()",
+        ":host(a b)",
+        ":host-context(a b)",
+        ":state()",
+        ":state(a b)",
+        ":active-view-transition-type()",
+        ":active-view-transition-type(a b)",
+        ":nth-col(1)",
+        ":nth-col(foo)",
+        ":current(a)",
+        ":volume-locked",
+        "::part()",
+        "::part(1)",
+        "::slotted()",
+        "::slotted(a b)",
+        "::slotted(a, b)",
+        "::cue()",
+        "::cue(a b)",
+        "::highlight()",
+        "::highlight(a b)",
+        "::highlight(1)",
+        "::picker()",
+        "::picker(foo)",
+        "::scroll-button(foo)",
+        "::view-transition-group()",
+        "::view-transition-group(1)",
+        "::view-transition-group(a b)",
+        "::before:hover",
+        "::after:hover",
+        "::selection:hover",
+        "::placeholder:hover",
+        "::marker:hover",
+        "::backdrop:hover",
+        "::picker-icon:focus",
+    ] {
+        assert!(!valid(bad), "{bad}");
     }
     for bad in [
         ":target-within",
@@ -391,12 +453,16 @@ fn webkit_any_and_pseudo_classes_after_pseudo_elements() {
         assert_eq!(parse(bad), None, "{bad}");
     }
     // 擬似要素のあとの論理の擬似クラスは、中が利用者の動きの擬似クラスだけなら書ける（当たらない）
+    // `::before`・`::after` のあとの利用者の動きの擬似クラスは Chrome が捨てる（`:is()` は寛容なので空の並び、`:not()` は
+    // 壊れる。単位 3 の 11 回目のレビュー）
+    assert_eq!(parse("rect::after:not(:focus, :active)"), None);
     for ok in [
         "rect::before:is(:hover)",
-        "rect::after:not(:focus, :active)",
         "::part(x):link",
         "::part(x):is(:hover)",
         "::selection:window-inactive",
+        // 単独の `:window-inactive` も Chrome は受ける（単位 3 の 11 回目のレビュー）
+        "rect:window-inactive",
     ] {
         assert!(parse(ok).is_some(), "{ok}");
     }
@@ -406,7 +472,6 @@ fn webkit_any_and_pseudo_classes_after_pseudo_elements() {
         "rect::before:not(.a)",
         "rect::before:not(:first-child)",
         "::part(x):first-child",
-        "rect:window-inactive",
         "rect::before:not(:hover g)",
         "rect::before:nth-child(1)",
     ] {
