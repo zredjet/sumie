@@ -354,7 +354,7 @@ fn render_ops_on_random_documents() {
         let src = random_doc(&mut r);
         let mut data = vec![(r.i(4)) as u8, r.i(256) as u8, r.i(256) as u8, r.i(256) as u8];
         data.extend_from_slice(src.as_bytes());
-        assert_eq!(crate::fuzzing::render_ops(&data), crate::fuzzing::Check::Ok, "{src}");
+        assert_eq!(crate::fuzzing::render_ops(&data).check, crate::fuzzing::Check::Ok, "{src}");
         let d = crate::doc::parse(src.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap();
         drawn += usize::from(d.build(&Never).is_ok());
     }

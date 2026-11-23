@@ -1234,85 +1234,170 @@ pub fn stroke_ops(data: &[u8]) -> Check {
     }
 }
 
-/// 木を作る段を通す（ファズの `build` の対象）。入力を SVG として読み、読めたら `estimate_build` と見張りつきの `build` を
-/// 2 度呼ぶ。確かめること：見積もり ≥ 実際（手間・確保の山・持ち続ける量）・1 回の払いが中止の間隔を超えない・返しすぎない・
-/// 見積もりが通れば同じ断り（Unsupported）か木を返す・同じ入力で同じ結果（節の並び）・見積もりの上限で作っても同じ。
-pub fn build_ops(data: &[u8]) -> Check {
-    use crate::doc::{Watch, parse};
-    let opts = crate::style::ParseOptions::DEFAULT;
-    let Ok(d) = parse(data, &opts, &Never) else { return Check::Ok };
-    let est = d.estimate_build(&Never);
-    let run = || {
-        let mut w = Watch::default();
-        let t = d.build_watch(&Never, &mut w);
-        (t, w)
-    };
-    let (a, wa) = run();
-    let (b, wb) = run();
-    if wa != wb {
-        return Check::Violation("同じ入力で木を作る段の勘定が違う");
-    }
-    if wa.over_released || wa.max_spend >= CANCEL_INTERVAL {
-        return Check::Violation("木を作る段の勘定が崩れた");
-    }
-    match (&est, &a, &b) {
-        (Ok(e), Ok(t), Ok(u)) => {
-            if t.nodes.as_slice() != u.nodes.as_slice() || t.coords.as_slice() != u.coords.as_slice() {
-                return Check::Violation("同じ入力で木が違う");
-            }
-            if wa.work > e.work || wa.peak > e.peak_bytes || t.held_bytes() > e.result_bytes {
-                return Check::Violation("木を作る段の見積もりが実際を下回る");
-            }
-            match d.build(&Never) {
-                Ok(v) if v.nodes.as_slice() == t.nodes.as_slice() => Check::Ok,
-                _ => Check::Violation("見積もりの上限で作ると違う"),
-            }
-        }
-        (Ok(_), Err(x), Err(y)) => {
-            if x != y {
-                return Check::Violation("同じ入力で断りが違う");
-            }
-            match x {
-                Error::Unsupported(_) | Error::Invalid(_) => Check::Ok,
-                _ => Check::Violation("見積もりが通ったのに上限か中止で断った"),
-            }
-        }
-        (Err(_), _, _) => Check::Ok,
-        _ => Check::Violation("同じ入力で結果が違う"),
+/// [`build_ops`]・[`render_ops`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageOutcome {
+    pub check: Check,
+    /// 数えた確保の山（試験で、ヒープの実際の山と比べる。生きている段の結果と、いま走る段の数えた山の和の最大）
+    pub counted_peak: u64,
+    /// 確かめの終わりまで届いたか（読めない・断った入力は偽。試験が届いた件数の下限を確かめる）
+    pub reached: bool,
+}
+
+impl StageOutcome {
+    fn new(check: Check, counted_peak: u64, reached: bool) -> StageOutcome {
+        StageOutcome { check, counted_peak, reached }
     }
 }
 
+/// 生きている段の結果の量と、数えた山。
+struct Live {
+    live: u64,
+    peak: u64,
+}
+
+impl Live {
+    /// 段の数えた山 `stage_peak` を走らせ、結果 `held` を生かしたままにする。
+    fn run(&mut self, stage_peak: u64, held: u64) {
+        self.peak = self.peak.max(self.live.saturating_add(stage_peak));
+        self.live = self.live.saturating_add(held);
+    }
+}
+
+/// ファズと変異で使う、木を作る段の上限（時間切れを避ける。見積もりが上限を超えれば作らずに同じ断りを確かめる）。
+const FUZZ_BUILD_WORK: u64 = 1 << 26;
+
+/// 木を作る段を通す（ファズの `tree` の対象）。入力を SVG として読み、読めたら `estimate_build` を呼ぶ。確かめること：
+/// 見積もりが断れば `build` も同じ誤りで断る（D2・architecture.md §3.1）。見積もりが通れば、見張りつきの `build` を 2 度
+/// 呼び、見積もり ≥ 実際（手間・確保の山・持ち続ける量）・1 回の払いが中止の間隔を超えない・返しすぎない・同じ断り
+/// （Unsupported・Invalid）か木を返す・同じ入力で同じ結果（節の並び）・見積もりの上限で作っても同じ。
+pub fn build_ops(data: &[u8]) -> StageOutcome {
+    use crate::doc::{Watch, parse_watch};
+    let limits = crate::limits::Limits { build_work: FUZZ_BUILD_WORK, ..crate::limits::Limits::DEFAULT };
+    let opts = crate::style::ParseOptions { limits, ..crate::style::ParseOptions::DEFAULT };
+    let mut pw = Watch::default();
+    let parsed = parse_watch(data, &opts, &Never, &mut pw);
+    let mut m = Live { live: 0, peak: 0 };
+    let Ok(d) = parsed else { return StageOutcome::new(Check::Ok, pw.peak, false) };
+    m.run(pw.peak, d.held_bytes());
+    let est = match d.estimate_build(&Never) {
+        Ok(e) => e,
+        Err(e) => {
+            let c = match d.build(&Never) {
+                Err(x) if x == e => Check::Ok,
+                _ => Check::Violation("見積もりが断ったのに build が同じに断らない"),
+            };
+            return StageOutcome::new(c, m.peak, false);
+        }
+    };
+    let run = |m: &mut Live| {
+        let mut w = Watch::default();
+        let t = d.build_watch(&Never, &mut w);
+        m.run(w.peak, t.as_ref().map_or(0, |t| t.held_bytes()));
+        (t, w)
+    };
+    let (a, wa) = run(&mut m);
+    let (b, wb) = run(&mut m);
+    let out = |c: Check, m: &Live, reached: bool| StageOutcome::new(c, m.peak, reached);
+    if wa != wb {
+        return out(Check::Violation("同じ入力で木を作る段の勘定が違う"), &m, false);
+    }
+    if wa.over_released || wa.max_spend >= CANCEL_INTERVAL {
+        return out(Check::Violation("木を作る段の勘定が崩れた"), &m, false);
+    }
+    match (&a, &b) {
+        (Ok(t), Ok(u)) => {
+            if t.nodes.as_slice() != u.nodes.as_slice() || t.coords.as_slice() != u.coords.as_slice() {
+                return out(Check::Violation("同じ入力で木が違う"), &m, false);
+            }
+            if wa.work > est.work || wa.peak > est.peak_bytes || t.held_bytes() > est.result_bytes {
+                return out(Check::Violation("木を作る段の見積もりが実際を下回る"), &m, false);
+            }
+            m.run(est.peak_bytes, 0);
+            match d.build(&Never) {
+                Ok(v) if v.nodes.as_slice() == t.nodes.as_slice() => out(Check::Ok, &m, true),
+                _ => out(Check::Violation("見積もりの上限で作ると違う"), &m, false),
+            }
+        }
+        (Err(x), Err(y)) => {
+            if x != y {
+                return out(Check::Violation("同じ入力で断りが違う"), &m, false);
+            }
+            match x {
+                Error::Unsupported(_) | Error::Invalid(_) => out(Check::Ok, &m, false),
+                _ => out(Check::Violation("見積もりが通ったのに上限か中止で断った"), &m, false),
+            }
+        }
+        _ => out(Check::Violation("同じ入力で結果が違う"), &m, false),
+    }
+}
+
+/// ファズと変異で使う、計画と描く段の上限（時間切れを避ける）。
+const FUZZ_RENDER_LIMITS: crate::limits::RenderLimits =
+    crate::limits::RenderLimits { plan_work: 1 << 26, render_work: 1 << 26, ..crate::limits::RenderLimits::DEFAULT };
+
 /// 描く段までを通す（ファズの `render` の対象）。頭の 4 バイトで倍率と範囲を選び、残りを SVG として読む。読めて木が
-/// できたら、確かめること：見積もりが通れば計画と描画が上限で断らない（形の約束。ADR-37）・範囲の見積もりが全体の
-/// 見積もりを超えない・範囲の描画が全体の同じ矩形とビット単位で同じ（ADR-13）・同じ入力で同じ画素。大きなキャンバス
-/// （256 × 256 を超えるもの）は速さのために描かない。
-pub fn render_ops(data: &[u8]) -> Check {
-    use crate::doc::parse;
+/// できたら、確かめること：見積もりが断れば計画も同じ誤りで断る（D2・architecture.md §3.1）・見積もりが通れば計画と描画が
+/// 上限で断らない（形の約束。ADR-37）・計画の持ち続ける量 ≤ 見積もり・計画を 2 度作っても辺が同じ・範囲の見積もり（手間と
+/// 一時の量）が全体の見積もりを超えない・範囲の描画が全体の同じ矩形とビット単位で同じ（ADR-13）・同じ入力で同じ画素。
+/// 大きなキャンバス（256 × 256 を超えるもの）は速さのために描かない。
+pub fn render_ops(data: &[u8]) -> StageOutcome {
+    use crate::doc::{Watch, parse_watch};
     use crate::plan::RenderOptions;
     use crate::render::PixelRect;
-    let Some((head, svg)) = data.split_first_chunk::<4>() else { return Check::Ok };
+    let mut m = Live { live: 0, peak: 0 };
+    let none = |m: &Live| StageOutcome::new(Check::Ok, m.peak, false);
+    let bad = |what: &'static str, m: &Live| StageOutcome::new(Check::Violation(what), m.peak, false);
+    let Some((head, svg)) = data.split_first_chunk::<4>() else { return none(&m) };
     let scale = [1.0, 0.5, 2.0, 0.25].get(usize::from(head[0] & 3)).copied().unwrap_or(1.0);
-    let opts = crate::style::ParseOptions::DEFAULT;
-    let Ok(d) = parse(svg, &opts, &Never) else { return Check::Ok };
-    let Ok(tree) = d.build(&Never) else { return Check::Ok };
-    let ropts = RenderOptions { scale, ..RenderOptions::DEFAULT };
-    let Ok(px) = tree.pixel_size(scale) else { return Check::Ok };
+    let limits = crate::limits::Limits { build_work: FUZZ_BUILD_WORK, ..crate::limits::Limits::DEFAULT };
+    let opts = crate::style::ParseOptions { limits, ..crate::style::ParseOptions::DEFAULT };
+    let mut pw = Watch::default();
+    let parsed = parse_watch(svg, &opts, &Never, &mut pw);
+    m.run(pw.peak, 0);
+    let Ok(d) = parsed else { return none(&m) };
+    m.live = d.held_bytes();
+    let Ok(be) = d.estimate_build(&Never) else { return none(&m) };
+    let Ok(tree) = d.build(&Never) else { return none(&m) };
+    m.run(be.peak_bytes, tree.held_bytes());
+    let ropts = RenderOptions { scale, limits: FUZZ_RENDER_LIMITS };
+    let Ok(px) = tree.pixel_size(scale) else { return none(&m) };
     if u64::from(px.width).saturating_mul(u64::from(px.height)) > 256 * 256 {
-        return Check::Ok;
+        return none(&m);
     }
-    let Ok(est) = tree.estimate(&ropts, &Never) else { return Check::Ok };
-    let Ok(plan) = tree.plan(&ropts, &Never) else {
-        return Check::Violation("見積もりが通ったのに計画を断った");
+    let est = match tree.estimate(&ropts, &Never) {
+        Ok(e) => e,
+        Err(e) => {
+            return match tree.plan(&ropts, &Never) {
+                Err(x) if x == e => none(&m),
+                _ => bad("見積もりが断ったのに計画が同じに断らない", &m),
+            };
+        }
     };
+    let Ok(plan) = tree.plan(&ropts, &Never) else {
+        return bad("見積もりが通ったのに計画を断った", &m);
+    };
+    m.run(est.plan.peak_bytes, plan.held_bytes());
+    if plan.held_bytes() > est.plan.result_bytes {
+        return bad("計画の持ち続ける量が見積もりを超える", &m);
+    }
+    match tree.plan(&ropts, &Never) {
+        Ok(p) if p.edges.as_slice() == plan.edges.as_slice() && p.items.len() == plan.items.len() => {
+            m.run(est.plan.peak_bytes, 0);
+        }
+        _ => return bad("同じ入力で計画が違う", &m),
+    }
     let (w, h) = (plan.width, plan.height);
     let b = Budget::new(Stage::Render, u64::MAX, u64::MAX, &Never);
     let full_rect = PixelRect { x: 0, y: 0, width: w, height: h };
+    let full_bytes = u64::from(w).saturating_mul(u64::from(h)).saturating_mul(4);
+    m.run(full_bytes.saturating_add(est.render.peak_bytes), full_bytes);
     let Some(full) = draw_rect(&plan, full_rect, &b) else {
-        return Check::Violation("見積もりが通ったのに全体を描けない");
+        return bad("見積もりが通ったのに全体を描けない", &m);
     };
     match plan.estimate_region(full_rect, &Never) {
         Ok(e) if e.work <= est.render.work && e.peak_bytes <= est.render.peak_bytes => {}
-        _ => return Check::Violation("全体の範囲の見積もりが描く見積もりを超える"),
+        _ => return bad("全体の範囲の見積もりが描く見積もりを超える", &m),
     }
     // 範囲：頭の 3 バイトから
     let x = u32::from(head[1]).checked_rem(w).unwrap_or(0);
@@ -1321,11 +1406,13 @@ pub fn render_ops(data: &[u8]) -> Check {
     let rw = u32::from(head[3] & 15).checked_rem(room_w).unwrap_or(0).saturating_add(1);
     let rh = u32::from(head[3] >> 4).checked_rem(room_h).unwrap_or(0).saturating_add(1);
     let rect = PixelRect { x, y, width: rw.min(room_w), height: rh.min(room_h) };
-    match plan.estimate_region(rect, &Never) {
-        Ok(e) if e.work <= est.render.work => {}
-        _ => return Check::Violation("範囲の見積もりが全体を超える"),
-    }
-    let Some(part) = draw_rect(&plan, rect, &b) else { return Check::Violation("範囲を描けない") };
+    let region = match plan.estimate_region(rect, &Never) {
+        Ok(e) if e.work <= est.render.work && e.peak_bytes <= est.render.peak_bytes => e,
+        _ => return bad("範囲の見積もりが全体を超える", &m),
+    };
+    let part_bytes = u64::from(rect.width).saturating_mul(u64::from(rect.height)).saturating_mul(4);
+    m.run(part_bytes.saturating_add(region.peak_bytes), part_bytes);
+    let Some(part) = draw_rect(&plan, rect, &b) else { return bad("範囲を描けない", &m) };
     let (fs, ps) = (full.as_slice(), part.as_slice());
     let n = (rect.width as usize).saturating_mul(4);
     for yy in 0..rect.height as usize {
@@ -1336,12 +1423,13 @@ pub fn render_ops(data: &[u8]) -> Check {
             .saturating_mul(4);
         let o = yy.saturating_mul(n);
         if fs.get(a..a.saturating_add(n)) != ps.get(o..o.saturating_add(n)) {
-            return Check::Violation("範囲の描画が全体と違う");
+            return bad("範囲の描画が全体と違う", &m);
         }
     }
+    m.run(full_bytes.saturating_add(est.render.peak_bytes), 0);
     match draw_rect(&plan, full_rect, &b) {
-        Some(again) if again.as_slice() == fs => Check::Ok,
-        _ => Check::Violation("同じ入力で画素が違う"),
+        Some(again) if again.as_slice() == fs => StageOutcome::new(Check::Ok, m.peak, true),
+        _ => bad("同じ入力で画素が違う", &m),
     }
 }
 

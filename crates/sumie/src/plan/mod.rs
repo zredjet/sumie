@@ -832,7 +832,9 @@ pub(crate) struct Totals {
 }
 
 impl Tree {
-    /// 計画と全体を 1 度描く分の見積もり（ADR-37。決定的な関数）。
+    /// 計画と全体を 1 度描く分の見積もり（ADR-37。決定的な関数）。キャンバスの大きさ・描く節の数のほか、計画の手間と
+    /// 持ち続ける量・描く手間と一時の量を `RenderLimits` の `plan_work`・`plan_bytes`・`render_work`・`temp_bytes` と比べ、
+    /// 超えれば `Limit` を返す（architecture.md §3.1。これが通れば、同じ設定の `plan`・`render` は `Limit` にならない）。
     pub fn estimate(&self, opts: &RenderOptions, cancel: &dyn Cancel) -> Result<RenderEstimate, Error> {
         let (est, _, _) = self.estimate_with(opts, Quality::DEFAULT, cancel)?;
         Ok(est)
@@ -911,6 +913,12 @@ impl Tree {
         let bg = background_work(crate::paint::premultiply(self.background), pixels);
         let render =
             Estimate { work: tot.render_work.saturating_add(work).saturating_add(bg), peak_bytes, result_bytes: 0 };
+        // 上限と比べる（architecture.md §3.1 の「計画と描く手間」。これが通れば、同じ設定の plan・render は Limit に
+        // ならない。plan_bytes は Plan が持ち続ける量）
+        check(plan.work, lim.plan_work, Resource::Work, Stage::Plan)?;
+        check(plan.result_bytes, lim.plan_bytes, Resource::Memory, Stage::Plan)?;
+        check(render.work, lim.render_work, Resource::Work, Stage::Render)?;
+        check(render.peak_bytes, lim.temp_bytes, Resource::Memory, Stage::Render)?;
         Ok((RenderEstimate { plan, render }, px, tot))
     }
 
@@ -920,13 +928,8 @@ impl Tree {
     }
 
     pub(crate) fn plan_with(&self, opts: &RenderOptions, q: Quality, cancel: &dyn Cancel) -> Result<Plan, Error> {
+        // 見積もりが上限と比べる（超えれば Limit）
         let (est, px, tot) = self.estimate_with(opts, q, cancel)?;
-        let lim = &opts.limits;
-        check(est.plan.work, lim.plan_work, Resource::Work, Stage::Plan)?;
-        // plan_bytes は Plan が持ち続ける量（architecture.md §3）
-        check(est.plan.result_bytes, lim.plan_bytes, Resource::Memory, Stage::Plan)?;
-        check(est.render.work, lim.render_work, Resource::Work, Stage::Render)?;
-        check(est.render.peak_bytes, lim.temp_bytes, Resource::Memory, Stage::Render)?;
         let budget = Budget::new(Stage::Plan, est.plan.work, est.plan.peak_bytes, cancel);
         let b = &budget;
         let canvas = PixelBox { x0: 0, y0: 0, x1: i64::from(px.width), y1: i64::from(px.height) };

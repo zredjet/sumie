@@ -85,7 +85,9 @@ impl<'s> Document<'s> {
     /// フォントの集まりを受けないので、ラスターの画像は `Unsupported`（`Image`）、SVG の画像は `Unsupported`（`NestedSvg`）、
     /// 文字は `Unsupported`（`TextWithoutFonts`））、展開の数を `Limits::instances` と比べる（超えれば `Limit`（`Instances`））。
     /// 手間と確保は、展開した要素ごとの重みの和（`doc::refs` が展開の数と同じ数え方で足したもの）と、宣言ごとに 1 度だけ読む
-    /// 分の和。
+    /// 分の和。手間と確保の山を `Limits::build_work`・`build_bytes` と比べ、超えれば `Limit`（`Work`・`Memory`。段は
+    /// `Build`）を返す（architecture.md §3.1 の「木を作る手間・木を作る確保」。これが通れば、同じ文書の `build` は `Limit`
+    /// にならない（確保器の失敗と中止を除く））。
     pub fn estimate_build(&self, cancel: &dyn Cancel) -> Result<Estimate, Error> {
         let budget = Budget::new(Stage::EstimateBuild, self.limits.estimate_work, self.limits.estimate_bytes, cancel);
         budget.spend(cost::OP_STEP)?;
@@ -93,16 +95,11 @@ impl<'s> Document<'s> {
         let w = &self.refs.weights;
         let r = self.report.bytes();
         let work = w.work.saturating_add(self.report.copy_work()).saturating_add(BUILD_FIXED);
-        Ok(Estimate {
+        let est = Estimate {
             work,
             peak_bytes: w.peak_bytes.saturating_add(r).saturating_add(BUILD_FIXED_BYTES),
             result_bytes: w.result_bytes.saturating_add(r),
-        })
-    }
-
-    /// 木を作る（architecture.md §3）。見積もりを上限と比べ（超えれば `Limit`）、見積もりの値を上限にして作る。
-    pub fn build(&self, cancel: &dyn Cancel) -> Result<Tree, Error> {
-        let est = self.estimate_build(cancel)?;
+        };
         let limits = &self.limits;
         if est.work > limits.build_work {
             return Err(Error::limit(crate::error::Resource::Work, est.work, limits.build_work, Stage::Build));
@@ -110,6 +107,12 @@ impl<'s> Document<'s> {
         if est.peak_bytes > limits.build_bytes {
             return Err(Error::limit(crate::error::Resource::Memory, est.peak_bytes, limits.build_bytes, Stage::Build));
         }
+        Ok(est)
+    }
+
+    /// 木を作る（architecture.md §3）。見積もり（上限を超えれば `Limit`）の値を上限にして作る。
+    pub fn build(&self, cancel: &dyn Cancel) -> Result<Tree, Error> {
+        let est = self.estimate_build(cancel)?;
         let budget = Budget::new(Stage::Build, est.work, est.peak_bytes, cancel);
         build_tree(self, &budget)
     }

@@ -6,7 +6,7 @@ use libfuzzer_sys::fuzz_target;
 use sumie::fuzzing::{Check, build_ops};
 
 fuzz_target!(|data: &[u8]| {
-    if let Check::Violation(what) = build_ops(data) {
+    if let Check::Violation(what) = build_ops(data).check {
         panic!("tree：{what}");
     }
 });

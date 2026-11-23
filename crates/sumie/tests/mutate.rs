@@ -1,6 +1,7 @@
 //! 種つきの変異の試験（CLAUDE.md・architecture.md §9）。種と回数を固定し、`sumie-testkit` の ChaCha8 で作った入力を
 //! ファズの入り口（`sumie::fuzzing`）に通して、不変の条件・panic しないこと・ヒープの山 ≤ 数えた山を確かめる。
-//! 段ごとのパーサーの対象：M1 の xml・dtd・css・values・document（読む段の全体）。
+//! 段ごとの対象：M0 の mem・math、M1 の xml・dtd・css・values・document（読む段の全体）、M2 の path・stroke・tree（木を作る
+//! 段）・render（描く段まで）。
 
 #![allow(
     clippy::unwrap_used,
@@ -14,11 +15,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use sumie::Cancel;
 use sumie::fuzzing::{
-    CSS_HEAD, CSS_TAIL, Check, build_ops, css_parse, document_parse, document_parse_cancel, dtd_parse, math_ops,
-    mem_ops, mem_ops_with, path_ops, render_ops, stroke_ops, values_parse, xml_parse,
+    CSS_HEAD, CSS_TAIL, Check, StageOutcome, build_ops, css_parse, document_parse, document_parse_cancel, dtd_parse,
+    math_ops, mem_ops, mem_ops_with, path_ops, render_ops, stroke_ops, values_parse, xml_parse,
 };
 use sumie_testkit::alloc::{assert_heap_within, measure};
-use sumie_testkit::mutate::cases;
+use sumie_testkit::mutate::{cases, value_cases};
 
 /// mem_ops の種：上限の 2 バイトと、(操作, 引数) の並び。
 /// fuzz/seeds/mem_ops と同じもの（fuzz/README.md）。
@@ -423,26 +424,128 @@ fn stroke_survives_seeded_mutations() {
     }
 }
 
-/// 木を作る段（`fuzzing::build_ops`）の種つきの変異：見積もり ≥ 実際・勘定・同じ結果。返していない確保がないこと。
-#[test]
-fn build_survives_seeded_mutations() {
-    let seeds = fuzz_seeds("tree");
+/// 木を作る段と描く段の変異：数・長さ・パスの命令・M2 の属性の字句だけを差し込む（構造を壊す字句を入れると、ほとんどが
+/// 読めなくなって木まで届かない。単位 4 の 1 回目のレビュー）。
+const SHAPE_DICT: &[&[u8]] = &[
+    b"0",
+    b"1",
+    b"-1",
+    b".5",
+    b"1e30",
+    b"1e-30",
+    b"1e308",
+    b"-0",
+    b"999999",
+    b"%",
+    b"px",
+    b"em",
+    b" ",
+    b",",
+    b"M",
+    b"L",
+    b"C",
+    b"Q",
+    b"A",
+    b"Z",
+    b"m",
+    b"l",
+    b"c",
+    b"a",
+    b"z",
+    b"h",
+    b"v",
+    b"0 1 1",
+    b"none",
+    b"round",
+    b"square",
+    b"bevel",
+    b"miter",
+    b"evenodd",
+    b"nonzero",
+    b"crispEdges",
+    b"non-scaling-stroke",
+    b"currentColor",
+    b"#f00",
+    b"0.3",
+    b"2 3",
+    b" stroke-width=\"0.4\"",
+    b" stroke-dasharray=\"3 1\"",
+    b" stroke-dashoffset=\"7\"",
+    b" pathLength=\"10\"",
+    b" transform=\"rotate(30)\"",
+    b" transform=\"scale(1e-3 4)\"",
+    b" stroke-linecap=\"round\"",
+];
+
+/// 種そのものと、構造を保つ変異（`n` 件）と、構造も壊す変異（`n / 4` 件）を通す。届いた件数（確かめの終わりまで行った
+/// 件）と全体の件数を返す。
+fn stage_cases(target: &str, seed: u64, n: usize, run: fn(&[u8]) -> StageOutcome) -> (usize, usize) {
+    let seeds = fuzz_seeds(target);
     let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
-    for (n, case) in cases(0x5eed_000b, 2000, &refs, DOC_DICT, 4096).iter().enumerate() {
-        let (out, heap) = measure(|| build_ops(case));
-        assert_eq!(out, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
-        assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
+    let mut all: Vec<Vec<u8>> = seeds.clone();
+    all.extend(value_cases(seed, n, &refs, SHAPE_DICT, 4096));
+    all.extend(cases(seed ^ 1, n / 4, &refs, SHAPE_DICT, 4096));
+    let mut reached = 0usize;
+    for (i, case) in all.iter().enumerate() {
+        let (out, heap) = measure(|| run(case));
+        assert_eq!(out.check, Check::Ok, "{target} {i} 件目 {:?}", String::from_utf8_lossy(case));
+        assert_heap_within(&heap, out.counted_peak, 0, &format!("{target} {i} 件目"));
+        assert_eq!(heap.current, 0, "{target} {i} 件目：返していない確保");
+        if i < seeds.len() {
+            assert!(out.reached, "{target} の種 {i} が確かめの終わりまで届かない");
+        }
+        reached += usize::from(out.reached);
     }
+    eprintln!("{target}：届いた件 {reached}/{}", all.len());
+    (reached, all.len())
 }
 
-/// 描く段まで（`fuzzing::render_ops`）の種つきの変異：形の約束・範囲の一致・同じ画素。返していない確保がないこと。
+/// 木を作る段（`fuzzing::build_ops`）の種と種つきの変異：見積もり ≥ 実際・勘定・同じ結果・断りが見積もりと同じ・
+/// ヒープの山 ≤ 数えた山・返していない確保がないこと。
+#[test]
+fn build_survives_seeded_mutations() {
+    let (reached, n) = stage_cases("tree", 0x5eed_000b, 2000, build_ops);
+    assert!(reached * 2 > n, "木まで届いた件 {reached}/{n}");
+}
+
+/// 描く段まで（`fuzzing::render_ops`）の種と種つきの変異：形の約束・範囲の一致・同じ画素・ヒープの山 ≤ 数えた山・
+/// 返していない確保がないこと。
 #[test]
 fn render_survives_seeded_mutations() {
-    let seeds = fuzz_seeds("render");
-    let refs: Vec<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
-    for (n, case) in cases(0x5eed_000c, 600, &refs, DOC_DICT, 4096).iter().enumerate() {
-        let (out, heap) = measure(|| render_ops(case));
-        assert_eq!(out, Check::Ok, "{n} 件目 {:?}", String::from_utf8_lossy(case));
-        assert_eq!(heap.current, 0, "{n} 件目：返していない確保");
+    let (reached, n) = stage_cases("render", 0x5eed_000c, 600, render_ops);
+    assert!(reached * 2 > n, "描く段の終わりまで届いた件 {reached}/{n}");
+}
+
+/// ファズと単位 4 の 1 回目のレビューが見つけた入力：見積もりが上限を超えて断る文書（太さ 2×10³⁷ の線・use の倍々 18 段）
+/// と、計画が重い弧（大きな半径と T）。どれも断りが見積もりと同じで、確かめが崩れない。
+#[test]
+fn fuzz_found_inputs() {
+    let head = "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"100\" height=\"100\">\n<rect width=\"100\" height=\"100\" fill=\"red\"/>\n";
+    let wide = format!(
+        "{head}<polyline points=\"20,80 50,20 80,80\" fall=\"none\" stroke=\"green\" stroke-width=\"2{}\" streko-linejoin=\"round\" stroke-miterlimit=\"2\"/>\n</svg>\n",
+        "2".repeat(37)
+    );
+    let arc = format!("{head}<path fill=\"green\" d=\"M37 50 A1 1 0 0 1 9888888888880 50 T\"/>\n</svg>\n");
+    let mut d = String::from("M0 0");
+    for i in 0..300 {
+        d.push_str(&format!(" L{} {}", i % 50, (i * 7) % 50));
+    }
+    let mut doubling = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"50\" height=\"50\"><defs><path id=\"g0\" d=\"{d}\"/>"
+    );
+    for l in 1..=18 {
+        doubling
+            .push_str(&format!("<g id=\"g{l}\"><use xlink:href=\"#g{p}\"/><use xlink:href=\"#g{p}\"/></g>", p = l - 1));
+    }
+    doubling.push_str("</defs><use xlink:href=\"#g18\"/></svg>");
+    for (head4, svg) in [([0u8, 5, 0x37, 9], &wide), ([0, 5, 9, 0x37], &arc), ([0, 0, 0, 0], &doubling)] {
+        let mut data = head4.to_vec();
+        data.extend_from_slice(svg.as_bytes());
+        let (out, heap) = measure(|| render_ops(&data));
+        assert_eq!(out.check, Check::Ok, "{svg}");
+        assert_heap_within(&heap, out.counted_peak, 0, "ファズの入力");
+        let (out, heap) = measure(|| build_ops(svg.as_bytes()));
+        assert_eq!(out.check, Check::Ok, "{svg}");
+        assert_heap_within(&heap, out.counted_peak, 0, "ファズの入力");
     }
 }

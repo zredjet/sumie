@@ -14,10 +14,15 @@
 use super::*;
 use crate::tree::{CAP_ROUND, JOIN_BEVEL};
 
-fn try_plan(t: &Tree, scale: f64) -> (RenderEstimate, Result<Plan, Error>) {
+/// 見積もりの計画の分（断れば None）と計画。見積もりが断れば、計画も同じ誤りで断る（architecture.md §3.1）。
+fn try_plan(t: &Tree, scale: f64) -> (Option<Estimate>, Result<Plan, Error>) {
     let opts = RenderOptions { scale, ..RenderOptions::DEFAULT };
-    let est = t.estimate(&opts, &Never).unwrap();
-    (est, t.plan(&opts, &Never))
+    let est = t.estimate(&opts, &Never);
+    let plan = t.plan(&opts, &Never);
+    if let Err(e) = &est {
+        assert_eq!(plan.as_ref().err(), Some(e));
+    }
+    (est.ok().map(|e| e.plan), plan)
 }
 
 /// (A) 見る箱の角の外を斜めに通る線分：見積もりは Liang–Barsky で「箱にかからない」とし、計画の Cull は弦の外接矩形で
@@ -46,8 +51,8 @@ fn corner_chords_dash_pieces() {
         let t = b.tree(100.0, 100.0);
         let (est, r) = try_plan(&t, 1.0);
         match r {
-            Ok(p) => eprintln!("A n={n_sub}: OK edges={} est={:?}", p.edges.len(), est.plan),
-            Err(e) => eprintln!("A n={n_sub}: ERR {e:?} est={:?}", est.plan),
+            Ok(p) => eprintln!("A n={n_sub}: OK edges={} est={:?}", p.edges.len(), est),
+            Err(e) => eprintln!("A n={n_sub}: ERR {e:?} est={:?}", est),
         }
     }
 }
@@ -80,8 +85,8 @@ fn non_scaling_path_length_nonuniform() {
         let t = b.tree(1000.0, 100.0);
         let (est, r) = try_plan(&t, 1.0);
         match r {
-            Ok(p) => eprintln!("B pl={pl}: OK edges={} est={:?}", p.edges.len(), est.plan),
-            Err(e) => eprintln!("B pl={pl}: ERR {e:?} est={:?}", est.plan),
+            Ok(p) => eprintln!("B pl={pl}: OK edges={} est={:?}", p.edges.len(), est),
+            Err(e) => eprintln!("B pl={pl}: ERR {e:?} est={:?}", est),
         }
     }
 }
@@ -166,7 +171,7 @@ fn control_b_uniform() {
     );
     let t = b.tree(1000.0, 100.0);
     let (est, r) = try_plan(&t, 1.0);
-    eprintln!("B-uniform: {:?} est={:?}", r.map(|p| p.edges.len()), est.plan);
+    eprintln!("B-uniform: {:?} est={:?}", r.map(|p| p.edges.len()), est);
 }
 
 fn svg_plan(src: &str) -> String {
@@ -179,8 +184,8 @@ fn svg_plan(src: &str) -> String {
         Err(e) => return format!("estimate ERR {e:?}"),
     };
     match t.plan(&opts, &Never) {
-        Ok(p) => format!("OK edges={} est={:?}", p.edges.len(), est.plan),
-        Err(e) => format!("plan ERR {e:?} est={:?}", est.plan),
+        Ok(p) => format!("OK edges={} est={:?}", p.edges.len(), est),
+        Err(e) => format!("plan ERR {e:?} est={:?}", est),
     }
 }
 

@@ -135,6 +135,8 @@ struct Outcome {
     chrome_attempts: u32,
     /// 大きさが整数でない（Chrome が画素の格子に合わせて引き伸ばすので、縁の値が resvg と食い違う）
     fractional: bool,
+    /// 描いた入力のバイト列の BLAKE3（`compare-sumie` が絵の写しを引くときに照らす。読めなければ空）
+    input: String,
 }
 
 fn load_items(root: &Path, args: &[String]) -> Result<Vec<Item>, String> {
@@ -265,11 +267,13 @@ fn one(
         scale: 1,
         chrome_attempts: 0,
         fractional: false,
+        input: String::new(),
     };
     let svg = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) => return fail(e.to_string()),
     };
+    let input = blake3::hash(&svg).to_hex().to_string();
     let (k, css, fractional) = match resvg.tree(&svg) {
         Ok(t) => {
             let (w, h) = Resvg::size(&t);
@@ -300,6 +304,7 @@ fn one(
         scale: k,
         chrome_attempts: attempts,
         fractional,
+        input,
     }
 }
 
@@ -400,7 +405,7 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], header: &str) -> Result<()
             .str("path", o.item.path.as_str())
             .str("category", o.item.category.as_str());
         let g = group(&o.item);
-        l = l.str("features", o.item.features.as_str()).str("group", g.label());
+        l = l.str("features", o.item.features.as_str()).str("group", g.label()).str("input", o.input.as_str());
         if let Some(m) = &o.metrics {
             l = l
                 .int("w", m.w)

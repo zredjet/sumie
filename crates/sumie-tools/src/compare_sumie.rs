@@ -1,16 +1,19 @@
 //! `compare-sumie`：sumie の描いたものを resvg・Chrome と比べる（M2 から。ADR-15・ADR-56 (1)・ADR-61・ADR-89 (2)）。
 //!
 //! `compare-sumie [--root corpus] [--filter <道の一部>] [--all] [--limit N] [--jobs N] [--min-side N] [--cache <dir>,…]
-//! [--quality <誤差>] [--out <dir>]`
+//! [--out <dir>]`
 //!
 //! - 集まり：照合の集まりの `scope` が in のもの（`--all` ですべて）のうち、後のマイルストーンの機能の印（文字・フィルタ・
-//!   グラデーション・pattern・mask・clip・marker・画像・blend・未定義の振る舞い）のないもの。sumie が `NotYet` を返したものは
-//!   理由ごとに数えて外す（ADR-89 (2)）
+//!   グラデーション・pattern・mask・clip・marker・画像・`foreignObject`・blend・未定義の振る舞い・animation・script）の
+//!   ないもの。sumie が `NotYet` を返したものは理由ごとに数えて外す（ADR-89 (2)）。ほかの断り（`Unsupported` の画像・入れ子の
+//!   SVG・文字など）は外さずに「描けない」に数える
 //! - 倍率は `compare` と同じ（長い辺が `--min-side` に満たなければ整数倍）。resvg と Chrome の絵は `--cache` のフォルダ
-//!   （`compare` の出力。`report.jsonl` と `img/<id>-a.png`・`-b.png`）に同じ道・同じ倍率のものがあれば使う
+//!   （`compare` の出力。`report.jsonl` と `img/<id>-a.png`・`-b.png`）に同じ道・同じ入力のダイジェスト・同じ倍率のものが
+//!   あれば使う（ダイジェストのない古い行は使わない）。フォルダがなければ誤り
 //! - 測るもの：sumie と resvg・sumie と Chrome・resvg と Chrome の差（`compare::measure`）。合否は sumie と resvg に
 //!   ADR-15 の図形と単色の基準（8/255・2%・平らな所 2/255）を当てる。resvg と Chrome が基準の内なのに sumie が両方から
-//!   外れるものを不具合の候補にする
+//!   外れるものを不具合の候補にする。Chrome が撮れなければ sumie と resvg の合否は測り、Chrome との差だけを空にする。
+//!   resvg が断ったものも sumie を走らせ、両方が断ったか片方だけかを書く
 //! - 出力：`<out>/report.jsonl`・`<out>/summary.txt`・`<out>/index.html`（sumie と resvg の差の大きい順。絵は `<out>/img/`）
 
 use std::collections::BTreeMap;
@@ -27,7 +30,21 @@ use crate::image::{self, Rgba};
 use crate::oracle::{Chrome, Fonts, Resvg};
 
 /// 後のマイルストーンの機能の印（ADR-89 (2)）。
-const LATER: &[&str] = &["text", "filter", "gradient", "pattern", "mask", "clip", "marker", "image", "blend", "ub"];
+const LATER: &[&str] = &[
+    "text",
+    "filter",
+    "gradient",
+    "pattern",
+    "mask",
+    "clip",
+    "marker",
+    "image",
+    "foreignObject",
+    "blend",
+    "ub",
+    "animation",
+    "script",
+];
 
 /// 照合の集まりの 1 件。
 #[derive(Debug, Clone)]
@@ -45,6 +62,8 @@ struct Outcome {
     excluded: String,
     /// 描けなかった理由
     error: String,
+    /// Chrome が撮れなかった理由（sumie と resvg の差は測る）
+    chrome_error: String,
     sr: Option<Metrics>,
     sc: Option<Metrics>,
     rc: Option<Metrics>,
@@ -84,30 +103,50 @@ fn load_items(root: &Path, args: &[String]) -> Result<Vec<Item>, String> {
     Ok(out)
 }
 
-/// `compare` の出力の絵の在りか（道 → (フォルダ, id, 倍率)）。
-fn load_cache(dirs: &[PathBuf]) -> BTreeMap<String, (PathBuf, u64, u64)> {
-    let mut out = BTreeMap::new();
-    for d in dirs {
-        let Ok(text) = std::fs::read_to_string(d.join("report.jsonl")) else { continue };
-        for l in text.lines() {
-            let Ok(line) = Line::parse(l) else { continue };
-            let (Some(p), Some(id), Some(k)) = (line.get_str("path"), line.get_int("id"), line.get_int("scale")) else {
-                continue;
-            };
-            out.entry(p.to_string()).or_insert((d.clone(), id as u64, k as u64));
-        }
-    }
-    out
+/// `compare` の出力の絵の 1 つ（フォルダ・id・倍率・入力のダイジェスト）。
+#[derive(Debug, Clone)]
+struct Cached {
+    dir: PathBuf,
+    id: u64,
+    scale: u64,
+    input: String,
 }
 
-/// sumie で描く（倍率 `k`）。`NotYet` は Ok(Err(理由))。
+/// `compare` の出力の絵の在りか（道 → 写しの並び。フォルダの順）。フォルダか `report.jsonl` がなければ誤り。
+fn load_cache(dirs: &[PathBuf]) -> Result<BTreeMap<String, Vec<Cached>>, String> {
+    let mut out: BTreeMap<String, Vec<Cached>> = BTreeMap::new();
+    for d in dirs {
+        let report = d.join("report.jsonl");
+        let text = std::fs::read_to_string(&report).map_err(|e| format!("--cache：{}：{e}", report.display()))?;
+        for l in text.lines() {
+            let Ok(line) = Line::parse(l) else { continue };
+            let (Some(p), Some(id), Some(k), Some(input)) =
+                (line.get_str("path"), line.get_int("id"), line.get_int("scale"), line.get_str("input"))
+            else {
+                continue;
+            };
+            if input.is_empty() {
+                continue;
+            }
+            out.entry(p.to_string()).or_default().push(Cached {
+                dir: d.clone(),
+                id: id as u64,
+                scale: k as u64,
+                input: input.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// sumie で描く（倍率 `k`）。`NotYet` は Ok(Err(理由))（外す）。ほかの断りは Err（描けない）。
 fn render_sumie(svg: &[u8], k: u32) -> Result<Result<Rgba, String>, String> {
     let doc = sumie::parse(svg, &sumie::ParseOptions::DEFAULT, &sumie::Never).map_err(|e| format!("sumie：{e:?}"))?;
     let tree = match doc.build(&sumie::Never) {
         Ok(t) => t,
         Err(sumie::Error::Unsupported(u)) => match u.feature {
             sumie::Feature::NotYet(l) => return Ok(Err(format!("NotYet：{l:?}"))),
-            f => return Ok(Err(format!("未対応：{f:?}"))),
+            f => return Err(format!("sumie：未対応：{f:?}")),
         },
         Err(e) => return Err(format!("sumie：{e:?}")),
     };
@@ -135,7 +174,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let min_side = crate::corpus::num_arg::<u32>(args, "--min-side", DEFAULT_MIN_SIDE)?;
     let cache_dirs: Vec<PathBuf> =
         arg(args, "--cache").map(|c| c.split(',').map(PathBuf::from).collect()).unwrap_or_default();
-    let cache = load_cache(&cache_dirs);
+    let cache = load_cache(&cache_dirs)?;
     let items = load_items(&root, args)?;
     for f in ["report.jsonl", "summary.txt", "index.html"] {
         let _ = std::fs::remove_file(out_dir.join(f));
@@ -184,7 +223,7 @@ fn one(
     work: &Path,
     resvg: &Resvg,
     chrome: &Chrome,
-    cache: &BTreeMap<String, (PathBuf, u64, u64)>,
+    cache: &BTreeMap<String, Vec<Cached>>,
     min_side: u32,
 ) -> Outcome {
     let mut o = Outcome { id, path: item.path.clone(), scale: 1, ..Outcome::default() };
@@ -209,7 +248,15 @@ fn one(
             (k, (cw * k as f32, ch * k as f32))
         }
         Err(e) => {
-            o.error = format!("resvg：{e}");
+            // 両方が断ったか、resvg だけかを書く
+            o.error = match render_sumie(&svg, 1) {
+                Ok(Ok(_)) => format!("resvg だけが断る：{e}"),
+                Ok(Err(reason)) => {
+                    o.excluded = reason;
+                    return o;
+                }
+                Err(s) => format!("両方が断る：resvg：{e}・{s}"),
+            };
             return o;
         }
     };
@@ -225,10 +272,11 @@ fn one(
             return o;
         }
     };
-    let cached = cache.get(&item.path).filter(|(_, _, ck)| *ck == u64::from(k));
+    let digest = blake3::hash(&svg).to_hex().to_string();
+    let cached = cache.get(&item.path).and_then(|v| v.iter().find(|c| c.scale == u64::from(k) && c.input == digest));
     let from_cache = |suffix: &str| -> Option<Rgba> {
-        let (d, cid, _) = cached?;
-        image::read_png(&d.join("img").join(format!("{cid}-{suffix}.png"))).ok()
+        let c = cached?;
+        image::read_png(&c.dir.join("img").join(format!("{}-{suffix}.png", c.id))).ok()
     };
     let a = match from_cache("a") {
         Some(a) => a,
@@ -241,19 +289,21 @@ fn one(
         },
     };
     let b = match from_cache("b").filter(|b| b.w == a.w && b.h == a.h) {
-        Some(b) => b,
+        Some(b) => Some(b),
         None => match chrome.render(&path, a.w, a.h, css, work) {
-            Ok((b, _)) => b,
+            Ok((b, _)) => Some(b),
             Err(e) => {
-                o.error = format!("chrome：{e}");
-                return o;
+                o.chrome_error = format!("chrome：{e}");
+                None
             }
         },
     };
     let img = out_dir.join("img");
     let _ = image::write_png(&img.join(format!("{id}-s.png")), &c);
     let _ = image::write_png(&img.join(format!("{id}-a.png")), &a);
-    let _ = image::write_png(&img.join(format!("{id}-b.png")), &b);
+    if let Some(b) = &b {
+        let _ = image::write_png(&img.join(format!("{id}-b.png")), b);
+    }
     match measure(&c, &a) {
         Some((m, d)) => {
             let _ = image::write_png(&img.join(format!("{id}-d.png")), &d);
@@ -261,8 +311,10 @@ fn one(
         }
         None => o.error = format!("大きさが違う（sumie {}×{}・resvg {}×{}）", c.w, c.h, a.w, a.h),
     }
-    o.sc = measure(&c, &b).map(|x| x.0);
-    o.rc = measure(&a, &b).map(|x| x.0);
+    if let Some(b) = &b {
+        o.sc = measure(&c, b).map(|x| x.0);
+        o.rc = measure(&a, b).map(|x| x.0);
+    }
     o
 }
 
@@ -287,7 +339,10 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
         l = metrics_line(l, "sr", &o.sr);
         l = metrics_line(l, "sc", &o.sc);
         l = metrics_line(l, "rc", &o.rc);
-        l = l.str("excluded", o.excluded.as_str()).str("error", o.error.as_str());
+        l = l
+            .str("excluded", o.excluded.as_str())
+            .str("error", o.error.as_str())
+            .str("chrome_error", o.chrome_error.as_str());
         jsonl.push_str(&l.to_json());
         jsonl.push('\n');
     }
@@ -313,6 +368,7 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
         let _ = writeln!(s, "  {r}：{n}");
     }
     let measured: Vec<&Outcome> = set.iter().copied().filter(|o| o.sr.is_some()).collect();
+    let no_chrome = measured.iter().filter(|o| !o.chrome_error.is_empty()).count();
     let errors: Vec<&Outcome> = set.iter().copied().filter(|o| o.sr.is_none()).collect();
     let _ = writeln!(
         s,
@@ -321,6 +377,9 @@ fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<()
     let pass = measured.iter().filter(|o| o.sr.as_ref().is_some_and(passes)).count();
     let _ =
         writeln!(s, "測れた {} 件・描けない {} 件・基準で通る {pass}/{}", measured.len(), errors.len(), measured.len());
+    if no_chrome > 0 {
+        let _ = writeln!(s, "Chrome が撮れなかった {no_chrome} 件（sumie と resvg の合否には入れ、Chrome との差は空）");
+    }
     let goal = measured.iter().filter(|o| o.sr.as_ref().is_some_and(|m| ratio8(m) <= 0.005 && m.flat_max <= 2)).count();
     let _ = writeln!(s, "目標（0.5%）で通る {goal}/{}", measured.len());
     let mut r: Vec<f64> = measured.iter().filter_map(|o| o.sr.as_ref().map(ratio8)).collect();

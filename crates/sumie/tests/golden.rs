@@ -1,6 +1,6 @@
 //! ゴールデン（determinism.md §10。`goldens/README.md`）。全ターゲットで同じファイルを照らす。
 //!
-//! M0 は形の確かめだけ（描く口は M2 から。行ができたら、ここで今の版の行を描き直してダイジェストを照らす）：
+//! 形の確かめ（M0 から）と、今の版の描いた行の照らし（M2 から。行ごとに描き直して画素と報告のダイジェストを照らす）：
 //! - ファイルの名前は `render-v<N>.jsonl`（N は正規の 10 進。N ≤ 今の版）か `estimate.jsonl`。今の版のファイルがある
 //! - 各行は鍵の決まった平らな JSON で、バイトが正規の形（読み直して書くと同じ）、名前が重ならない。ファイルは改行で
 //!   終わり、CR を持たない
@@ -82,7 +82,14 @@ fn input_index(root: &Path) -> BTreeMap<String, String> {
                 } else if p.extension().is_some_and(|x| x == "svg") {
                     let h = blake3::hash(&std::fs::read(&p).unwrap()).to_hex().to_string();
                     let rel = p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
-                    out.entry(h).or_insert(rel);
+                    // 中身の同じファイルは道の小さい方（read_dir の順は機械ごとに違うので、作り直しで名前が変わらない）
+                    out.entry(h)
+                        .and_modify(|r: &mut String| {
+                            if rel < *r {
+                                r.clone_from(&rel);
+                            }
+                        })
+                        .or_insert(rel);
                 }
             }
         }
@@ -464,8 +471,13 @@ fn regenerate_estimates() {
 
 /// 版に入る報告のダイジェスト（README の並べ方：使ったフォントの数（u32 LE）と各 32 バイトの鍵と u32 の書体の番号・
 /// 見つからなかった文字の数と各 u32 の符号位置・デコーダの識別子の長さ（u32）とバイト列。M2 はフォントもデコーダもなく、
-/// 12 バイトの 0）。
-fn report_digest() -> String {
+/// 12 バイトの 0）。文書が文字も画像も要らないことを確かめてから使う（M3・M5 で中身が入るとき、見落とさずにここで落ちる）。
+fn report_digest(doc: &sumie::Document<'_>) -> String {
+    let n = doc.needs();
+    assert!(
+        !n.text && !n.raster_images && !n.svg_images,
+        "報告に中身が入る文書（{n:?}）：report のダイジェストを並べ方どおりに作る"
+    );
     blake3::hash(&[0u8; 12]).to_hex().to_string()
 }
 
@@ -499,6 +511,7 @@ fn render(data: &[u8], scale: f64, region: Option<(u32, u32, u32, u32)>) -> Resu
 /// 描いた行。
 fn render_line(name: &str, path: &str, data: &[u8], scale: f64, region: Option<(u32, u32, u32, u32)>) -> Option<Line> {
     let (w, h, px) = render(data, scale, region).ok()?;
+    let doc = sumie::parse(data, &sumie::ParseOptions::DEFAULT, &sumie::Never).ok()?;
     let region_text = region.map_or(String::new(), |(x, y, w, h)| format!("{x},{y},{w},{h}"));
     Some(
         Line::new()
@@ -513,7 +526,7 @@ fn render_line(name: &str, path: &str, data: &[u8], scale: f64, region: Option<(
             .int("width", i128::from(w))
             .int("height", i128::from(h))
             .str("pixels", pixels_digest(w, h, &px))
-            .str("report", report_digest()),
+            .str("report", report_digest(&doc)),
     )
 }
 

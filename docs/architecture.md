@@ -596,14 +596,17 @@ Unicode の表は、`sumie-tools` の `gen-unicode` が Unicode の文字のデ�
 
 M0 にあるのは `oracle`・`compare`・`bench`（と子の `bench-one`）・`corpus`（`import-resvg`・`resvg-source`・`fetch-w3c`・
 `fetch-real`・`index`）・`gen-heavy`・`kura-compat`・`oracle-lock`・`gen-disallowed`・`check-lint-probe`。M1 で `probe`・`wellformed`・`latency`・`sizes`・`values`
-を足した。「（M2 から）」などの印のものはまだない。
+を、M2 で `compare-sumie`・`bench-sumie` を足した。「（M5 から）」などの印のものはまだない。描いた画素を PNG にする口と
+ゴールデンの行は、道具でなく `compare-sumie` の出力（`img/<id>-s.png`）と試験（`cargo test -p sumie --test golden -- --ignored
+regenerate_renders`）が受け持つ。
 
 | 道具 | すること |
 |---|---|
-| `render` | （M2 から）この描画器で PNG に描く（確かめる人のため。PNG の書き出しは道具の側） |
 | `oracle resvg` | resvg 0.48.1（Kura と同じ feature）を、Kura と同じ usvg の設定（総称の書体 Times・Helvetica・Apple Chancery・Papyrus・Courier、フォントを名前の順に登録、languages、`default_size`）で描く（出力は乗算済み）。resvg の下の依存（svgtypes・roxmltree・unicode-script など）の版も Kura の Cargo.lock に揃え、`crates/sumie-tools/oracle-lock.txt`（`oracle-lock` が Kura の lock から書く。Kura の rev つき）と試験で照らす（ADR-57 (1)） |
 | `oracle chrome` | `/Applications/Google Chrome.app` のヘッドレスで描く（決めた描き方は下の「Chrome の描き方」。Chrome の版を記録）。PNG はストレートなので、決めた式で乗算済みに直す |
-| `compare` | 2 つの描画の差を乗算済みの RGBA8 で測る（ADR-15 の基準）・差の画像・一覧の HTML |
+| `compare` | 2 つの描画の差を乗算済みの RGBA8 で測る（ADR-15 の基準）・差の画像・一覧の HTML。行に描いた入力の BLAKE3（`input`）を書く |
+| `compare-sumie` | sumie を resvg・Chrome と比べる（M2 から。ADR-89 (2)）：後のマイルストーンの機能の印を外し、`NotYet` は理由ごとに数えて外す（ほかの断りは「描けない」）。合否は sumie と resvg に ADR-15 の基準、resvg と Chrome が基準の内で sumie が両方から外れるものを不具合の候補にする。`--cache` の `compare` の出力の絵を、道・入力のダイジェスト・倍率が同じときだけ使う |
+| `bench-sumie` | sumie の段ごとの時間（読む・木を作る・計画・描く・タイルの合計。`--repeat` 回の最小）と見積もりの手間、時間 ÷ 手間（ns／単位）を並べる（M2 から。NFR-05・NFR-07）。見積もりが断れば、断った段と要る量を書く |
 | `corpus` | 照合の集まりの取り込み（出どころ・版・ライセンス・ダイジェストの一覧。resvg の試験・W3C・実例の SVG。ADR-21・ADR-59）と、使っている機能での分類（マイルストーンごとの範囲を選ぶ） |
 | `probe` | M1 の範囲を決める照らし：CSS のセレクタ・アットルール・カスケード・SVG 2 の属性・値の書き方・大きさの端の小さな SVG を `tests/svg/m1-probe/` に書き、resvg と Chrome で描いて、決めた点の色で「効く・効かない」を表にする（`README.md`。ADR-64） |
 | `wellformed` | XML の整形式の照らし：照合の集まり・Kura のファズのコーパス（`--kura-fuzz <dir>`。読むだけで、名前は BLAKE3 にする）・変異（`--mutate N`）・端の例を、roxmltree（usvg が外に出しているもの）と sumie の XML の段（`sumie::fuzzing::xml_parse`）の両方で読み、受ける・断るの食い違いと、どちらも読む文書の木（名前空間・名前・属性・文字。`sumie::fuzzing::xml_tree`。ATTLIST のある文書は比べない）の違いを `local/wellformed/`（`summary.md`・`result.jsonl`・食い違った入力の `diff/`）に書く（FR-IN-04・ADR-65） |
@@ -617,7 +620,6 @@ M0 にあるのは `oracle`・`compare`・`bench`（と子の `bench-one`）・`
 | `gen-fonts` | （M5 から）試験用の AAT のフォントの生成（写しを許すフォントに fontTools で `morx`・`kerx`・Apple の `kern`・`trak` を足す。作り方と出どころを `tests/fonts/` の一覧に書く） |
 | `bench` | resvg 単体と同じ入力で時間・確保のピークを比べる（1 件ずつ子のプロセス `bench-one`）。タイルで描いたときの合計の時間も測る（M2 から） |
 | `gen-unicode` | （M5 から）Unicode の表の生成（§7.2） |
-| `golden` | （M2 から）ゴールデンの行を足す（凍結した版のファイルは追記だけ） |
 
 **Chrome の描き方**（M0 で決めた。ADR-52・ADR-57 (2)・ADR-60）：SVG を HTML の `<img>`（CSS の画素で resvg の小数のままの大きさ、切り出しは resvg の整数の大きさ W・H）で
 左上に置き、`--headless --disable-gpu --hide-scrollbars --default-background-color=00000000 --force-device-scale-factor=1

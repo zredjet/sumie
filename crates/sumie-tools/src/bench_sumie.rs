@@ -25,8 +25,12 @@ fn min_time<T>(repeat: u32, mut f: impl FnMut() -> Result<T, String>) -> Result<
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
+    crate::corpus::check_args(args, &["--repeat", "--scale", "--tile"], &[], usize::MAX)?;
     let repeat = num_arg::<u32>(args, "--repeat", 3)?.max(1);
     let scale: f64 = arg(args, "--scale").map(|s| s.parse().map_err(|e| format!("{e}"))).transpose()?.unwrap_or(1.0);
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(format!("--scale は正の有限の数（{scale}）"));
+    }
     let tile = num_arg::<u32>(args, "--tile", 0)?;
     let files: Vec<&String> = {
         let mut v = Vec::new();
@@ -57,7 +61,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     continue;
                 }
             };
-        l = l.int("parse_work", pe.map(|e| e.work).unwrap_or(0)).str("parse_ms", format!("{parse_ms:.3}"));
+        let parse_work = pe.map(|e| e.work).unwrap_or(0);
+        l = l
+            .int("parse_work", parse_work)
+            .str("parse_ms", format!("{parse_ms:.3}"))
+            .str("parse_ns_per_unit", format!("{:.3}", parse_ms * 1e6 / parse_work.max(1) as f64));
         let be = match doc.estimate_build(&sumie::Never) {
             Ok(e) => e,
             Err(e) => {
@@ -80,6 +88,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
         let re = match tree.estimate(&ropts, &sumie::Never) {
             Ok(e) => e,
             Err(e) => {
+                // 上限を超えた見積もりは、要る量を段の手間の欄にも書く
+                if let sumie::Error::Limit(le) = &e {
+                    let key = if le.stage == sumie::Stage::Render { "render_work" } else { "plan_work" };
+                    l = l.int(key, le.needed);
+                }
                 println!("{}", l.str("refused", format!("Tree::estimate：{e:?}")).to_json());
                 continue;
             }
