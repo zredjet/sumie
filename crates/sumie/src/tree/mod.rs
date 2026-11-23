@@ -25,6 +25,8 @@ pub(crate) const CRISP: u8 = 16;
 pub(crate) const NON_SCALING: u8 = 32;
 /// 破線の % の基準（表示の領域）がある
 pub(crate) const HAS_VP: u8 = 64;
+/// `pathLength="0"`（倍が無限：破線は実線。ADR-95 (2)）
+pub(crate) const PATH_LENGTH_ZERO: u8 = 128;
 
 /// 端と継ぎ目の番号（`geom::stroke` の型に写す）。
 pub(crate) const CAP_BUTT: u8 = 0;

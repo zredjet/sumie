@@ -83,4 +83,8 @@
 | `stroke-width-zero` | 太さ 0 の線は描かない | 効く | 効く |
 | `dash-closed-join` | 閉じた形の最初と最後の破線をつなぐ（始めの角を miter の継ぎ目で描く。ADR-92 (1)） | 効く | 効く |
 | `arc-zero-length` | 始めと終わりが同じ弧は長さ 0 の線（丸い端の点を描く。ADR-92 (2)） | 効く | 効く |
+| `nonscaling-pathlength` | non-scaling-stroke と pathLength の破線は画面の道の長さの割合（倍率 2 の下で 40 画素ずつ：効けば (30,20) は線。ADR-94 (4)） | 効かない | 効かない |
+| `pathlength-zero` | pathLength="0" は無いもの（破線 10 10 のまま：効けば (25,50) は隙間で背景。ADR-93 (7)） | 効く | 効かない |
+| `dash-odd-count` | 奇数個の破線は 2 度並べる（5 10 5 → 5 10 5 5 10 5：効けば (32,50) は隙間で背景） | 効く | 効く |
+| `nonscaling-pathlength-user` | non-scaling-stroke と pathLength の破線をユーザー単位の道の長さで割り、画面の長さで描く（倍率 2 の下で 20 画素ずつ：効けば (50,20) は線） | 効かない | 効く |
 | `dash-zero-closed` | 閉じた長さ 0 の部分パス（M z）に破線を付けると描かない（Chrome と同じ） | 効く | 効く |

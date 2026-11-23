@@ -248,6 +248,34 @@ fn stroke_probes() -> Vec<Probe> {
             false,
         ),
         stroke(
+            "nonscaling-pathlength",
+            "non-scaling-stroke と pathLength の破線は画面の道の長さの割合（倍率 2 の下で 40 画素ずつ：効けば (30,20) は線。ADR-94 (4)）",
+            "<g transform=\"scale(2)\"><path d=\"M0 10 H40\" pathLength=\"10\" stroke-dasharray=\"5 5\" vector-effect=\"non-scaling-stroke\" fill=\"none\" stroke=\"green\" stroke-width=\"6\"/></g>",
+            (30, 20),
+            false,
+        ),
+        stroke(
+            "pathlength-zero",
+            "pathLength=\"0\" は無いもの（破線 10 10 のまま：効けば (25,50) は隙間で背景。ADR-93 (7)）",
+            &format!("<path d=\"M10 50 H90\" pathLength=\"0\" stroke-dasharray=\"10 10\" {g} stroke-width=\"10\"/>"),
+            (25, 50),
+            true,
+        ),
+        stroke(
+            "dash-odd-count",
+            "奇数個の破線は 2 度並べる（5 10 5 → 5 10 5 5 10 5：効けば (32,50) は隙間で背景）",
+            &format!("<path d=\"M10 50 H90\" stroke-dasharray=\"5 10 5\" {g} stroke-width=\"10\"/>"),
+            (32, 50),
+            true,
+        ),
+        stroke(
+            "nonscaling-pathlength-user",
+            "non-scaling-stroke と pathLength の破線をユーザー単位の道の長さで割り、画面の長さで描く（倍率 2 の下で 20 画素ずつ：効けば (50,20) は線）",
+            "<g transform=\"scale(2)\"><path d=\"M0 10 H40\" pathLength=\"10\" stroke-dasharray=\"5 5\" vector-effect=\"non-scaling-stroke\" fill=\"none\" stroke=\"green\" stroke-width=\"6\"/></g>",
+            (50, 20),
+            false,
+        ),
+        stroke(
             "dash-zero-closed",
             "閉じた長さ 0 の部分パス（M z）に破線を付けると描かない（Chrome と同じ）",
             &format!(

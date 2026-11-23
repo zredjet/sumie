@@ -112,7 +112,7 @@ pub(crate) fn flatten_seg(
                 match *seg {
                     PathSeg::Quad(p0, p1, p2) => quad_at(p0, p1, p2, u),
                     PathSeg::Cubic(p0, p1, p2, p3) => cubic_at(p0, p1, p2, p3, u),
-                    PathSeg::ArcTo(_, a) => a.at(a.theta1 + a.dtheta * u),
+                    PathSeg::ArcTo(from, a) => a.at_from(from, a.theta1 + a.dtheta * u),
                     _ => end_point(seg),
                 }
             };

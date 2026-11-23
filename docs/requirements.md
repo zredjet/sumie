@@ -92,7 +92,7 @@
 |---|---|---|
 | FR-SH-01 | M | `path`：パスのデータの文法すべて（暗黙の命令の繰り返し・区切りのない数・弧の旗の詰め書き）。途中で壊れていれば、そこまでを描く（SVG の誤りの扱い）。弧は SVG 1.1 の付録 F の式で中心の形に直し、半径が足りなければ広げる |
 | FR-SH-02 | M | `rect`（`rx`・`ry` の `auto` と半分への切り詰め）・`circle`・`ellipse`（SVG 2 の `auto`）・`line`・`polyline`・`polygon`（数が奇数なら最後を捨てる）。大きさが 0 か負なら描かない |
-| FR-SH-03 | M | `pathLength`（破線と textPath の `startOffset` の割合に効く。Chrome と同じ。resvg は読まない。ADR-91 (2)） |
+| FR-SH-03 | M | `pathLength`（破線と textPath の `startOffset` の割合に効く。Chrome と同じ。resvg は読まない。ADR-91 (2)。non-scaling-stroke との組み合わせと `pathLength="0"`（実線）は ADR-95） |
 | FR-SH-04 | M | 長さの単位：数・px・in・cm・mm・Q・pt・pc・em・ex（em の半分）・ch（em の半分）・ic（1em）・cap（0.7em）・lh（`line-height` の計算した値）・rlh（根の要素の `line-height`）・rem・%（向きに応じた表示の領域の幅・高さ・対角の √2 で割ったもの）・vw・vh・vmin・vmax・vi・vb（横書きなので vi は vw、vb は vh。`@media` と同じ文書の大きさから。中身で大きさが決まる文書では壊れた値）。ch・ic・cap は読む段にフォントがないので CSS Values 4 の代わりの値（ADR-74）。単位の大文字小文字は区別しない（ADR-66 (4)）。CSS の宣言では、単位のない長さは SVG のプロパティ（x・y・r・rx・ry・cx・cy・stroke-width・stroke-dashoffset・baseline-shift・stroke-dasharray）だけが受ける（属性はどれも受ける。Chrome と同じ。ADR-74）。`calc()`・`var()` は M1 では読まずに壊れた値として警告する |
 
 ### 2.4 塗りと線（FR-PT）

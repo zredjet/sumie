@@ -71,10 +71,26 @@ pub(crate) trait LoopSink {
 
 /// 点の向き（単位の長さ。長さ 0 なら None）。
 fn direction(a: Point, b: Point) -> Option<Point> {
-    // 差を半分にしてから求める（どちらの点も有限なら差の半分は有限。差があふれても向きが出る。単位の 1 回目のレビュー）
+    // 差を半分にしてから求め（どちらの点も有限なら差の半分は有限）、成分の大きさの最大で割ってから長さを求める（hypot も
+    // あふれない。単位の 1 回目・2 回目のレビュー）
     let (dx, dy) = (b.x / 2.0 - a.x / 2.0, b.y / 2.0 - a.y / 2.0);
-    let l = math::hypot(dx, dy);
-    (l > 0.0 && l.is_finite()).then(|| Point::new(dx / l, dy / l))
+    let m = math::max(dx.abs(), dy.abs());
+    if !(m > 0.0 && m.is_finite()) {
+        return None;
+    }
+    let (ux, uy) = (dx / m, dy / m);
+    let l = math::hypot(ux, uy);
+    (l > 0.0 && l.is_finite()).then(|| Point::new(ux / l, uy / l))
+}
+
+/// 区間の長さ（差を半分にしてから求めて 2 倍。あふれれば ∞）。
+fn seg_len(a: Point, b: Point) -> f64 {
+    let (hx, hy) = (b.x / 2.0 - a.x / 2.0, b.y / 2.0 - a.y / 2.0);
+    let m = math::max(hx.abs(), hy.abs());
+    if !(m > 0.0 && m.is_finite()) {
+        return if m == 0.0 { 0.0 } else { f64::INFINITY };
+    }
+    2.0 * m * math::hypot(hx / m, hy / m)
 }
 
 /// 左の法線（向き `d` を 90° 回したもの。y が下向きの座標で画面の右回り）。
@@ -172,7 +188,7 @@ pub(crate) fn stroke_polyline(
                 let (back, ahead) = (ring_prev(i, n), ring_next(i, n));
                 let (a, b) = if forward { (back, ahead) } else { (ahead, back) };
                 let (Some(&p), Some(&a), Some(&b)) = (v.get(i), v.get(a), v.get(b)) else { continue };
-                vertex(&mut e, pen, a, p, b)?;
+                vertex(&mut e, pen, a, p, b, forward)?;
             }
         }
         return Ok(());
@@ -190,7 +206,7 @@ pub(crate) fn stroke_polyline(
         let (Some(&a), Some(&p), Some(&b)) = (v.get(ring_prev(i, n)), v.get(i), v.get(ring_next(i, n))) else {
             continue;
         };
-        vertex(&mut e, pen, a, p, b)?;
+        vertex(&mut e, pen, a, p, b, true)?;
     }
     let dn = direction(before_last, last).unwrap_or(d0);
     cap(&mut e, pen, last, dn)?;
@@ -198,7 +214,7 @@ pub(crate) fn stroke_polyline(
         let (Some(&a), Some(&p), Some(&b)) = (v.get(ring_next(i, n)), v.get(i), v.get(ring_prev(i, n))) else {
             continue;
         };
-        vertex(&mut e, pen, a, p, b)?;
+        vertex(&mut e, pen, a, p, b, false)?;
     }
     cap(&mut e, pen, first, Point::new(-d0.x, -d0.y))?;
     Ok(())
@@ -214,8 +230,10 @@ fn ring_next(i: usize, n: usize) -> usize {
     if j >= n { 0 } else { j }
 }
 
-/// 頂点 `p`（前の点 `a`・次の点 `b`）の左の縁の点：入る区間の終わりの縁・継ぎ目・出る区間の始めの縁。
-fn vertex(e: &mut Emit<'_, '_>, pen: &Pen, a: Point, p: Point, b: Point) -> Result<(), Error> {
+/// 頂点 `p`（前の点 `a`・次の点 `b`）の左の縁の点：入る区間の終わりの縁・継ぎ目・出る区間の始めの縁。ちょうどの折り返し
+/// （外積 0・内積が負）は左右のどちらも外側に見えるので、前へ回る縁（`forward`）だけを外側にし、後ろへ回る縁は内側として
+/// 頂点を通す（継ぎ目を 2 度作らない。塗る所は同じ。単位 1 の 2 回目のレビュー）。
+fn vertex(e: &mut Emit<'_, '_>, pen: &Pen, a: Point, p: Point, b: Point, forward: bool) -> Result<(), Error> {
     e.budget.spend(cost::OP_STEP)?;
     let (Some(d1), Some(d2)) = (direction(a, p), direction(p, b)) else { return Ok(()) };
     let (n1, n2) = (normal(d1), normal(d2));
@@ -225,7 +243,7 @@ fn vertex(e: &mut Emit<'_, '_>, pen: &Pen, a: Point, p: Point, b: Point) -> Resu
     let cross = d1.x * d2.y - d1.y * d2.x;
     let dot = d1.x * d2.x + d1.y * d2.y;
     e.point(end_in)?;
-    if cross > 0.0 {
+    if cross > 0.0 || (cross == 0.0 && dot < 0.0 && !forward) {
         // 左は内側：頂点を通す
         e.point(p)?;
         return e.point(start_out);
@@ -298,35 +316,64 @@ fn zero_length(e: &mut Emit<'_, '_>, pen: &Pen, p: Point) -> Result<(), Error> {
     }
 }
 
-/// 破線の型（並び・合計・始めの位相）。`dashes` は偶数個で、どれも 0 以上、合計は 0 より大きい（呼び手が確かめる）。
+/// 破線の型（並び・合計・始めの位相と、その位相の並びの番号と残り）。`dashes` は偶数個で、どれも 0 以上、合計は 0 より
+/// 大きい（作るときに確かめる）。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Dashes<'a> {
     pub(crate) dashes: &'a [f64],
     pub(crate) total: f64,
     /// 部分パスの頭の位相（`stroke-dashoffset` を合計で割った余り。0 以上で合計未満）
     pub(crate) phase: f64,
+    /// 頭の位相が入る並びの番号と、その部分の中ですでに進んだ長さ（部分パスごとに求め直さない）
+    start: usize,
+    start_left: f64,
 }
 
 impl<'a> Dashes<'a> {
-    /// 並びと位相のずれから作る（偶数個・0 以上・合計 0 より大を確かめ、外れれば None で実線）。
-    pub(crate) fn new(dashes: &'a [f64], offset: f64) -> Option<Dashes<'a>> {
-        if dashes.is_empty()
-            || !dashes.len().is_multiple_of(2)
-            || dashes.iter().any(|d| d.is_nan() || *d < 0.0 || !d.is_finite())
-        {
-            return None;
+    /// 並びと位相のずれから作る（偶数個・0 以上・合計 0 より大を確かめ、外れれば None で実線）。並びをなめる分を払う。
+    pub(crate) fn new(dashes: &'a [f64], offset: f64, budget: &Budget<'_>) -> Result<Option<Dashes<'a>>, Error> {
+        if dashes.is_empty() || !dashes.len().is_multiple_of(2) {
+            return Ok(None);
         }
         let mut total = 0.0;
         for &d in dashes {
+            budget.spend(cost::OP_STEP)?;
+            if d.is_nan() || d < 0.0 || !d.is_finite() {
+                return Ok(None);
+            }
             total += d;
         }
         if total.is_nan() || total <= 0.0 || !total.is_finite() {
-            return None;
+            return Ok(None);
         }
         let phase = math::rem_euclid(offset, total);
-        Some(Dashes { dashes, total, phase: if phase.is_finite() && phase < total { phase } else { 0.0 } })
+        let phase = if phase.is_finite() && phase < total { phase } else { 0.0 };
+        // 位相を並びの番号と、その中の残りに（位相がちょうど長さ 0 の部分の頭なら、そこから始める：頭の長さ 0 の線も端を描く）
+        let n = dashes.len();
+        let mut idx = 0usize;
+        let mut left = phase;
+        let mut steps = 0usize;
+        while let Some(&d) = dashes.get(idx) {
+            if left < d || (d == 0.0 && left == 0.0) {
+                break;
+            }
+            left -= d;
+            idx = ring_next(idx, n);
+            budget.spend(cost::OP_STEP)?;
+            steps = steps.saturating_add(1);
+            // 丸めで並びを 1 周しても止まらなければ、頭から始める
+            if steps > n {
+                idx = 0;
+                left = 0.0;
+                break;
+            }
+        }
+        Ok(Some(Dashes { dashes, total, phase, start: idx, start_left: left }))
     }
 }
+
+/// 破線の部分を受け取る口（部分の折れ線と、閉じた線として描くか）。
+pub(crate) type PieceFn<'f> = &'f mut dyn FnMut(&[Point], bool) -> Result<(), Error>;
 
 /// 部分パスの折れ線 `pts` を破線に分け、線の部分ごとに `piece`（その部分の折れ線）を呼ぶ。`buf` は部分の点の置き場、
 /// `head` は閉じた部分パスの最初の部分を最後の部分につなぐための置き場（resvg・Chrome と同じ。ADR-92 (1)）。閉じた長さ 0 の
@@ -340,27 +387,25 @@ pub(crate) fn dash_polyline(
     buf: &mut crate::mem::MVec<'_, Point>,
     head: &mut crate::mem::MVec<'_, Point>,
     budget: &Budget<'_>,
-    piece: &mut dyn FnMut(&[Point]) -> Result<(), Error>,
+    piece: PieceFn<'_>,
 ) -> Result<(), Error> {
     let Some(&first) = pts.first() else { return Ok(()) };
-    if closed && pts.iter().all(|&p| p == first) {
-        budget.spend(cost::OP_STEP)?;
-        return Ok(());
+    if closed {
+        let mut all_same = true;
+        for &p in pts {
+            budget.spend(cost::OP_STEP)?;
+            if p != first {
+                all_same = false;
+                break;
+            }
+        }
+        if all_same {
+            return Ok(());
+        }
     }
     let n = dashes.dashes.len();
-    // 位相を並びの番号と、その中の残りに
-    let mut idx = 0usize;
-    let mut left = dashes.phase;
-    while let Some(&d) = dashes.dashes.get(idx) {
-        // 位相がちょうど長さ 0 の部分の頭なら、そこから始める（頭の長さ 0 の線も端を描く）
-        if left < d || (d == 0.0 && left == 0.0) {
-            break;
-        }
-        left -= d;
-        idx = ring_next(idx, n);
-        budget.spend(cost::OP_STEP)?;
-    }
-    let mut remain = dashes.dashes.get(idx).copied().unwrap_or(0.0) - left;
+    let mut idx = dashes.start;
+    let mut remain = dashes.dashes.get(idx).copied().unwrap_or(0.0) - dashes.start_left;
     let mut on = idx.is_multiple_of(2);
     // 閉じた部分パスで頭が線の中なら、最初の部分は最後の部分につなぐ（最初の部分が終わるまで head に貯める）
     let hold_head = closed && on;
@@ -374,11 +419,11 @@ pub(crate) fn dash_polyline(
     'segs: for k in 0..count {
         budget.spend(cost::OP_STEP)?;
         let (Some(&a), Some(&b)) = (pts.get(k), pts.get(ring_next(k, pts.len()))) else { continue };
-        let (dx, dy) = (b.x - a.x, b.y - a.y);
-        let seg = math::hypot(dx, dy);
+        let seg = seg_len(a, b);
         if !seg.is_finite() {
             break;
         }
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
         let mut t0 = 0.0;
         // 区間の中の破線の境
         while seg - t0 > remain {
@@ -397,7 +442,7 @@ pub(crate) fn dash_polyline(
                     head.append_slice(buf.as_slice())?;
                     holding = false;
                 } else {
-                    piece(buf.as_slice())?;
+                    piece(buf.as_slice(), false)?;
                 }
                 buf.clear();
             } else {
@@ -415,9 +460,10 @@ pub(crate) fn dash_polyline(
         }
     }
     if holding {
-        // 最初の部分が終わらなかった（全体が線）：1 つの部分として描く
+        // 最初の部分が終わらなかった（閉じた部分パスの全体が線）：閉じた線として描く（始めの角も継ぎ目。ADR-92 (1)・
+        // Chrome と同じ。単位 1 の 2 回目のレビュー）
         if buf.len() > 1 {
-            piece(buf.as_slice())?;
+            piece(buf.as_slice(), true)?;
         }
         return Ok(());
     }
@@ -430,10 +476,10 @@ pub(crate) fn dash_polyline(
             }
             head.clear();
         }
-        piece(buf.as_slice())?;
+        piece(buf.as_slice(), false)?;
     }
     if !head.is_empty() {
-        piece(head.as_slice())?;
+        piece(head.as_slice(), false)?;
     }
     Ok(())
 }

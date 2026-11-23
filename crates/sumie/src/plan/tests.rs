@@ -17,6 +17,8 @@ use crate::report::ReportBuilder;
 use crate::tree::{CAP_BUTT, JOIN_MITER, PathNode};
 use crate::values::Length;
 
+mod adversarial;
+
 /// 試しの木を組む口。
 struct Builder {
     nodes: Vec<PathNode>,
@@ -315,4 +317,16 @@ fn bad_arguments() {
     // キャンバスの上限
     let small = RenderOptions { scale: 1.0, limits: RenderLimits { canvas_side: 5, ..RenderLimits::DEFAULT } };
     assert!(matches!(t.estimate(&small, &Never), Err(Error::Limit(_))));
+}
+
+/// 計画と描く段の型の大きさ（暗黙の詰め物がない。determinism.md §2.6）と、計画と木が Send + Sync（Kura が複数のスレッドで
+/// 描く。architecture.md §3）。
+#[test]
+fn layouts_and_threads() {
+    assert_eq!(size_of::<Edge>(), 20);
+    assert_eq!(size_of::<DrawItem>(), 64);
+    assert_eq!(size_of::<crate::tree::PathNode>(), 240);
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<Plan>();
+    send_sync::<Tree>();
 }

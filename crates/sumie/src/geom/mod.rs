@@ -213,11 +213,23 @@ pub(crate) struct ArcSeg {
 }
 
 impl ArcSeg {
-    /// 角 θ の点。
+    /// 角 θ の点（中心からじかに求める。中心が遠いと桁が落ちるので、弧の上の点は [`ArcSeg::at_from`] で求める）。
     pub(crate) fn at(&self, theta: f64) -> Point {
         let (s, co) = (math::sin(theta), math::cos(theta));
         let [m0, m1, m2, m3] = self.m;
         Point::new(self.c.x + m0 * co + m1 * s, self.c.y + m2 * co + m3 * s)
+    }
+
+    /// 角 θ の点を、始めの点 `from`（角 `theta1` の点）からの差で求める（和積の形：`cos θ − cos θ1 = −2 sin((θ+θ1)/2)
+    /// sin((θ−θ1)/2)`・`sin θ − sin θ1 = 2 cos((θ+θ1)/2) sin((θ−θ1)/2)`。半径が座標より桁違いに大きくても桁が落ちない。
+    /// 単位 1 の 2 回目のレビュー）。
+    pub(crate) fn at_from(&self, from: Point, theta: f64) -> Point {
+        let h = (theta - self.theta1) / 2.0;
+        let mid = (theta + self.theta1) / 2.0;
+        let sh = math::sin(h);
+        let (dc, ds) = (-2.0 * math::sin(mid) * sh, 2.0 * math::cos(mid) * sh);
+        let [m0, m1, m2, m3] = self.m;
+        Point::new(from.x + (m0 * dc + m1 * ds), from.y + (m2 * dc + m3 * ds))
     }
 
     /// 変形した弧（楕円の弧は変形の下でも楕円の弧）。
@@ -513,10 +525,11 @@ pub(crate) fn rect(
     rx: f64,
     ry: f64,
 ) -> Result<(), Error> {
-    if width <= 0.0 || height <= 0.0 {
+    let (x1, y1) = (x + width, y + height);
+    // 大きさが 0 以下か、足すとあふれるなら書かない（NaN・±∞ を値に入れない）
+    if !(width > 0.0 && height > 0.0 && x1.is_finite() && y1.is_finite() && x.is_finite() && y.is_finite()) {
         return Ok(());
     }
-    let (x1, y1) = (x + width, y + height);
     if rx <= 0.0 || ry <= 0.0 {
         w.move_to(Point::new(x, y))?;
         w.line_to(Point::new(x1, y))?;
@@ -539,7 +552,8 @@ pub(crate) fn rect(
 /// `circle`・`ellipse` の同じ形のパス（SVG 2 §10.4・§10.5：`(cx + rx, cy)` から時計回りに 4 つの弧）。半径が 0 以下なら
 /// 何も書かない。
 pub(crate) fn ellipse(w: &mut PathWriter<'_, '_>, cx: f64, cy: f64, rx: f64, ry: f64) -> Result<(), Error> {
-    if rx <= 0.0 || ry <= 0.0 {
+    let ext = [cx + rx, cx - rx, cy + ry, cy - ry];
+    if !(rx > 0.0 && ry > 0.0 && ext.iter().all(|v| v.is_finite())) {
         return Ok(());
     }
     let c = Point::new(cx, cy);
@@ -589,7 +603,7 @@ pub(crate) fn add_bounds(r: &mut Rect, seg: &PathSeg) {
             for base in [math::atan2(m1, m0), math::atan2(m3, m2)] {
                 for k in [0.0, core::f64::consts::PI] {
                     if let Some(th) = angle_in_sweep(base + k, a.theta1, a.dtheta) {
-                        let q = a.at(th);
+                        let q = a.at_from(p, th);
                         if q.finite() {
                             r.add(q);
                         }

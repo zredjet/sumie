@@ -156,15 +156,24 @@ fn round_pieces_follow_the_arc_formula() {
     assert_eq!(huge.round_pieces(1.0), u64::MAX);
 }
 
+fn nb() -> Budget<'static> {
+    Budget::new(Stage::Plan, u64::MAX, u64::MAX, &Never)
+}
+
 fn pieces(pts: &[(f64, f64)], closed: bool, dashes: &[f64], offset: f64) -> Vec<Vec<Point>> {
+    pieces_closed(pts, closed, dashes, offset).into_iter().map(|(p, _)| p).collect()
+}
+
+/// 破線の部分と、閉じた線として描くか。
+fn pieces_closed(pts: &[(f64, f64)], closed: bool, dashes: &[f64], offset: f64) -> Vec<(Vec<Point>, bool)> {
     let budget = Budget::new(Stage::Plan, u64::MAX, u64::MAX, &Never);
     let mut buf = MVec::new(&budget);
     let mut head = MVec::new(&budget);
     let v: Vec<Point> = pts.iter().map(|&(x, y)| Point::new(x, y)).collect();
-    let d = Dashes::new(dashes, offset).unwrap();
+    let d = Dashes::new(dashes, offset, &budget).unwrap().unwrap();
     let mut out = Vec::new();
-    dash_polyline(&v, closed, &d, &mut buf, &mut head, &budget, &mut |s| {
-        out.push(s.to_vec());
+    dash_polyline(&v, closed, &d, &mut buf, &mut head, &budget, &mut |s, c| {
+        out.push((s.to_vec(), c));
         Ok(())
     })
     .unwrap();
@@ -217,12 +226,12 @@ fn dashes_split_by_length() {
 
 #[test]
 fn bad_dash_lists_are_solid() {
-    assert!(Dashes::new(&[], 0.0).is_none());
-    assert!(Dashes::new(&[1.0, 2.0, 3.0], 0.0).is_none());
-    assert!(Dashes::new(&[1.0, -2.0], 0.0).is_none());
-    assert!(Dashes::new(&[0.0, 0.0], 0.0).is_none());
-    assert!(Dashes::new(&[f64::NAN, 1.0], 0.0).is_none());
-    let d = Dashes::new(&[2.0, 3.0], 12.0).unwrap();
+    assert!(Dashes::new(&[], 0.0, &nb()).unwrap().is_none());
+    assert!(Dashes::new(&[1.0, 2.0, 3.0], 0.0, &nb()).unwrap().is_none());
+    assert!(Dashes::new(&[1.0, -2.0], 0.0, &nb()).unwrap().is_none());
+    assert!(Dashes::new(&[0.0, 0.0], 0.0, &nb()).unwrap().is_none());
+    assert!(Dashes::new(&[f64::NAN, 1.0], 0.0, &nb()).unwrap().is_none());
+    let d = Dashes::new(&[2.0, 3.0], 12.0, &nb()).unwrap().unwrap();
     assert_eq!(d.phase, 2.0);
 }
 
@@ -234,8 +243,8 @@ fn every_point_is_paid() {
     let budget = Budget::new(Stage::Plan, u64::MAX, u64::MAX, &Never);
     let mut buf = MVec::new(&budget);
     let mut head = MVec::new(&budget);
-    let d = Dashes::new(&[1.0, 1e30], 0.0).unwrap();
-    dash_polyline(&v, false, &d, &mut buf, &mut head, &budget, &mut |_| Ok(())).unwrap();
+    let d = Dashes::new(&[1.0, 1e30], 0.0, &budget).unwrap().unwrap();
+    dash_polyline(&v, false, &d, &mut buf, &mut head, &budget, &mut |_, _| Ok(())).unwrap();
     assert!(budget.work() >= n as u64 * crate::cost::OP_STEP, "{}", budget.work());
     assert!(budget.max_spend() < crate::budget::CANCEL_INTERVAL);
     let same: Vec<Point> = vec![Point::new(1.0, 1.0); n];
@@ -256,12 +265,59 @@ fn huge_differences() {
     let mut buf = MVec::new(&budget);
     let mut head = MVec::new(&budget);
     let v: Vec<Point> = far.iter().map(|&(x, y)| Point::new(x, y)).collect();
-    let d = Dashes::new(&[1.0, 1.0], 0.0).unwrap();
-    dash_polyline(&v, false, &d, &mut buf, &mut head, &budget, &mut |_| Ok(())).unwrap();
+    let d = Dashes::new(&[1.0, 1.0], 0.0, &budget).unwrap().unwrap();
+    dash_polyline(&v, false, &d, &mut buf, &mut head, &budget, &mut |_, _| Ok(())).unwrap();
     // 区間に比べて細かすぎる破線は境が多すぎるので、手間の上限で止まる（見積もりが先に断る）
     let v = [Point::new(1e17, 0.0), Point::new(2e17, 0.0)];
-    let d = Dashes::new(&[1.0, 1.0], 0.0).unwrap();
+    let d = Dashes::new(&[1.0, 1.0], 0.0, &budget).unwrap().unwrap();
     let budget = Budget::new(Stage::Plan, 1 << 24, u64::MAX, &Never);
-    let r = dash_polyline(&v, false, &d, &mut buf, &mut head, &budget, &mut |_| Ok(()));
+    let r = dash_polyline(&v, false, &d, &mut buf, &mut head, &budget, &mut |_, _| Ok(()));
     assert!(matches!(r, Err(Error::Limit(_))));
+}
+
+/// 閉じた部分パスの全体が最初の破線に入るなら、閉じた線として描く（始めの角も継ぎ目。単位 1 の 2 回目のレビュー）。
+#[test]
+fn whole_closed_dash_is_closed() {
+    let sq = [(25.0, 25.0), (75.0, 25.0), (75.0, 75.0), (25.0, 75.0)];
+    let p = pieces_closed(&sq, true, &[1000.0, 10.0], 0.0);
+    assert_eq!(p.len(), 1);
+    assert!(p[0].1);
+    // 角の手前に隙間があれば開いた部分（Chrome と同じ）
+    let p = pieces_closed(&sq, true, &[190.0, 10.0], 0.0);
+    assert!(p.iter().all(|(_, c)| !c));
+}
+
+/// ちょうどの折り返し（外積 0）の round の継ぎ目は、半円を 1 度だけ出す（単位 1 の 2 回目のレビュー）。
+#[test]
+fn exact_reversal_makes_one_round_join() {
+    let pen = Pen { half: 20.0, cap: Cap::Butt, join: Join::Round, miter_limit: 4.0, scale: 1.0, tol: 0.25 };
+    let count = |pts: &[(f64, f64)]| {
+        let budget = nb();
+        let mut scratch = MVec::new(&budget);
+        let v: Vec<Point> = pts.iter().map(|&(x, y)| Point::new(x, y)).collect();
+        let mut sink = Loops::default();
+        stroke_polyline(&v, false, &pen, &mut scratch, &budget, &mut sink).unwrap();
+        sink.0.iter().map(Vec::len).sum::<usize>()
+    };
+    let half_circle = pen.round_pieces(core::f64::consts::PI) as usize;
+    let straight = count(&[(20.0, 100.0), (180.0, 100.0)]);
+    let folded = count(&[(20.0, 100.0), (180.0, 100.0), (20.0, 100.0)]);
+    // 折り返しても塗る所は線分と同じ（先の半円を含む）
+    let budget = nb();
+    let mut scratch = MVec::new(&budget);
+    let v = [Point::new(20.0, 100.0), Point::new(180.0, 100.0), Point::new(20.0, 100.0)];
+    let mut l = Loops::default();
+    stroke_polyline(&v, false, &pen, &mut scratch, &budget, &mut l).unwrap();
+    assert!(l.inside(195.0, 100.0) && l.inside(100.0, 115.0) && l.inside(100.0, 85.0) && !l.inside(10.0, 100.0));
+    // 折り返しの頂点：前へ回る縁は円弧、後ろへ回る縁は頂点を通す 3 点
+    assert!(folded <= straight + half_circle + 8, "{folded} {straight} {half_circle}");
+}
+
+/// 巨大な座標の向きもあふれずに求める（単位 1 の 2 回目のレビュー）。
+#[test]
+fn direction_of_huge_coordinates() {
+    let d = direction(Point::new(-1.5e308, -1.5e308), Point::new(1.5e308, 1.5e308)).unwrap();
+    assert!((d.x - core::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12 && (d.y - d.x).abs() < 1e-12);
+    assert!(seg_len(Point::new(-1.5e308, 0.0), Point::new(1.5e308, 0.0)).is_infinite());
+    assert_eq!(seg_len(Point::new(1.0, 1.0), Point::new(4.0, 5.0)), 5.0);
 }

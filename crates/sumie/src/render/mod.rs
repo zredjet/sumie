@@ -64,13 +64,10 @@ impl Plan {
             if b.is_empty() {
                 continue;
             }
-            let per_row = cost::RASTER_ROW
-                .saturating_add(cost::RASTER_SWEEP)
-                .saturating_add(b.width().saturating_mul(cost::RASTER_SWEEP.saturating_add(cost::PAINT_PIXEL)));
             work = work
-                .saturating_add(b.height().saturating_mul(per_row))
-                .saturating_add(u64::from(it.edges[1]).saturating_mul(cost::RASTER_EDGE_ROW))
-                .saturating_add(it.edge_rows.saturating_mul(cost::RASTER_EDGE_ROW))
+                .saturating_add(b.height().saturating_mul(crate::plan::row_work(b.width())))
+                .saturating_add(u64::from(it.edges[1]).saturating_mul(crate::plan::EDGE_START_WORK))
+                .saturating_add(it.edge_rows.saturating_mul(crate::plan::EDGE_ROW_WORK))
                 .saturating_add(it.cells.saturating_mul(cost::RASTER_CELL));
         }
         let (frame, peak_bytes) =
@@ -126,6 +123,7 @@ impl Plan {
             let color = it.color;
             let stride = out.stride;
             let data = &mut *out.data;
+
             fill_region(
                 self.edges_of(it),
                 it.fill_rule(),
@@ -138,7 +136,7 @@ impl Plan {
                     if a == 0 {
                         return Ok(());
                     }
-                    budget.spend(len.saturating_mul(cost::PAINT_PIXEL))?;
+                    budget.spend_units(len, cost::PAINT_PIXEL)?;
                     let row = usize::try_from(y.saturating_sub(r.y0)).unwrap_or(0).saturating_mul(stride);
                     let col = usize::try_from(x.saturating_sub(r.x0)).unwrap_or(0).saturating_mul(4);
                     let start = row.saturating_add(col);

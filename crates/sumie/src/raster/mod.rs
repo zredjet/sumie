@@ -147,12 +147,12 @@ pub(crate) fn push_segment(a: Point, b: Point, out: &mut MVec<'_, Edge>) -> Resu
 }
 
 /// 床の割り算（`d > 0`）。
-fn floor_div(n: i64, d: i64) -> i64 {
+pub(crate) fn floor_div(n: i64, d: i64) -> i64 {
     n.checked_div_euclid(d).unwrap_or(0)
 }
 
 /// 辺の y（固定小数）での x（床）。
-fn x_at(e: &Edge, y: i64) -> i64 {
+pub(crate) fn x_at(e: &Edge, y: i64) -> i64 {
     let (x0, y0, x1, y1) = (i64::from(e.x0), i64::from(e.y0), i64::from(e.x1), i64::from(e.y1));
     let num = x1.saturating_sub(x0).saturating_mul(y.saturating_sub(y0));
     x0.saturating_add(floor_div(num, y1.saturating_sub(y0)))
@@ -239,6 +239,27 @@ impl<'b> RowCells<'b> {
             self.hi = idx;
             self.touched = true;
         }
+    }
+
+    /// 辺の、行 `row`（画素）の中の部分が回るセルの数の上限（範囲の列（左の外は 1 列にまとめる）で切った列の差 ＋ 1。回る前に
+    /// 払う）。
+    pub(crate) fn cells_bound(&self, e: &Edge, row: i64) -> u64 {
+        let ry0 = row.saturating_mul(ONE);
+        let ry1 = ry0.saturating_add(ONE);
+        let ya = i64::from(e.y0).max(ry0);
+        let yb = i64::from(e.y1).min(ry1);
+        if ya >= yb {
+            return 0;
+        }
+        let ca = floor_div(x_at(e, ya), ONE);
+        let cb = floor_div(x_at(e, yb), ONE);
+        let right = self.x0.saturating_add(i64::try_from(self.width).unwrap_or(i64::MAX));
+        let lo = ca.min(cb).max(self.x0.saturating_sub(1));
+        let hi = ca.max(cb).min(right);
+        if hi < lo {
+            return 1;
+        }
+        u64::try_from(hi.saturating_sub(lo)).unwrap_or(0).saturating_add(1)
     }
 
     /// 辺の、行 `row`（画素）の中の部分のセルを積む（反エイリアス）。回ったセルの数を返す（手間の勘定）。
@@ -393,19 +414,6 @@ impl PixelBox {
     }
 }
 
-/// 辺の外接矩形の画素（被覆が 0 でありうる画素を含む）。辺がなければ空。
-pub(crate) fn edges_box(edges: &[Edge]) -> PixelBox {
-    let mut b = PixelBox { x0: i64::MAX, y0: i64::MAX, x1: i64::MIN, y1: i64::MIN };
-    for e in edges {
-        let (xl, xr) = (i64::from(e.x0.min(e.x1)), i64::from(e.x0.max(e.x1)));
-        b.x0 = b.x0.min(floor_div(xl, ONE));
-        b.x1 = b.x1.max(floor_div(xr, ONE).saturating_add(1));
-        b.y0 = b.y0.min(floor_div(i64::from(e.y0), ONE));
-        b.y1 = b.y1.max(floor_div(i64::from(e.y1).saturating_add(ONE - 1), ONE));
-    }
-    b
-}
-
 /// 行ごとの処理の置き場（セルと、行にかかる辺の番号）。
 pub(crate) struct Scan<'b> {
     pub(crate) cells: RowCells<'b>,
@@ -453,12 +461,14 @@ pub(crate) fn fill_region(
                 break;
             }
             budget.spend(cost::RASTER_EDGE_ROW)?;
-            scan.active.push(u32::try_from(next).unwrap_or(u32::MAX))?;
+            let idx = u32::try_from(next).map_err(|_| budget.too_large())?;
+            scan.active.push(idx)?;
             next = next.saturating_add(1);
         }
-        // 終わった辺を除く（順は保つ）
+        // 終わった辺を除く（順は保つ。かかる辺ごとに払う）
         let mut keep = 0usize;
         let n = scan.active.len();
+        budget.spend_units(n as u64, cost::OP_STEP)?;
         for k in 0..n {
             let Some(&i) = scan.active.get(k) else { continue };
             let alive = edges.get(i as usize).is_some_and(|e| i64::from(e.y1) > row_start);
@@ -478,14 +488,21 @@ pub(crate) fn fill_region(
         for k in 0..scan.active.len() {
             let Some(&i) = scan.active.get(k) else { continue };
             let Some(e) = edges.get(i as usize) else { continue };
-            let c = if aa { scan.cells.add_edge(e, row) } else { scan.cells.add_edge_center(e, row) };
-            budget.spend(cost::RASTER_EDGE_ROW.saturating_add(c.saturating_mul(cost::RASTER_CELL)))?;
+            // 回る前に払う（1 行の中で全部の列を回る辺でも、1 回の払いは中止の間隔の内。単位 2 のレビュー）
+            budget.spend(cost::RASTER_EDGE_ROW)?;
+            let bound = if aa { scan.cells.cells_bound(e, row) } else { 1 };
+            budget.spend_units(bound, cost::RASTER_CELL)?;
+            if aa {
+                scan.cells.add_edge(e, row);
+            } else {
+                scan.cells.add_edge_center(e, row);
+            }
         }
         // 掃く
         if let Some((lo, hi)) = scan.cells.touched() {
             let width = scan.cells.width();
             let x0 = scan.cells.x0();
-            budget.spend(cost::RASTER_SWEEP.saturating_mul((hi.saturating_sub(lo) as u64).saturating_add(1)))?;
+            budget.spend_units((hi.saturating_sub(lo) as u64).saturating_add(1), cost::RASTER_SWEEP)?;
             let mut acc: i64 = 0;
             let mut run_start: i64 = 0;
             let mut run_len: u64 = 0;

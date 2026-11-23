@@ -195,6 +195,8 @@ pub(crate) fn path_data(s: &[u8], w: &mut PathWriter<'_, '_>, budget: &Budget<'_
     let mut after_close = false;
     loop {
         sc.skip_wsp()?;
+        // 命令の始まり（足した点が有限でなければ、ここを誤りにする）
+        let at = sc.i;
         let Some(c) = sc.at(sc.i)? else { return Ok(Parsed::Complete) };
         let cmd = if is_command(c) {
             sc.i = sc.i.saturating_add(1);
@@ -235,33 +237,69 @@ pub(crate) fn path_data(s: &[u8], w: &mut PathWriter<'_, '_>, budget: &Budget<'_
         }
         after_close = false;
         let [a0, a1, a2, a3, a4, a5, a6] = a;
+        // 相対の足し算と映しの点が有限か（一つ一つの数は有限でも、足すとあふれうる。NaN・±∞ を値に入れない。単位 1 の
+        // 2 回目のレビュー）
+        let fin = |ps: &[Point]| ps.iter().all(|p| p.finite());
         match upper {
-            b'M' => w.move_to(pt(a0, a1))?,
-            b'L' => w.line_to(pt(a0, a1))?,
-            b'H' => w.line_to(Point::new(if rel { cur.x + a0 } else { a0 }, cur.y))?,
-            b'V' => w.line_to(Point::new(cur.x, if rel { cur.y + a0 } else { a0 }))?,
+            b'M' | b'L' => {
+                let p = pt(a0, a1);
+                if !fin(&[p]) {
+                    return Ok(Parsed::Error(at));
+                }
+                if upper == b'M' { w.move_to(p)? } else { w.line_to(p)? }
+            }
+            b'H' | b'V' => {
+                let p = if upper == b'H' {
+                    Point::new(if rel { cur.x + a0 } else { a0 }, cur.y)
+                } else {
+                    Point::new(cur.x, if rel { cur.y + a0 } else { a0 })
+                };
+                if !fin(&[p]) {
+                    return Ok(Parsed::Error(at));
+                }
+                w.line_to(p)?
+            }
             b'C' => {
-                let (c2, p) = (pt(a2, a3), pt(a4, a5));
-                w.cubic_to(pt(a0, a1), c2, p)?;
+                let (c1, c2, p) = (pt(a0, a1), pt(a2, a3), pt(a4, a5));
+                if !fin(&[c1, c2, p]) {
+                    return Ok(Parsed::Error(at));
+                }
+                w.cubic_to(c1, c2, p)?;
                 last_ctrl = c2;
             }
             b'S' => {
                 let c1 = if matches!(prev.upper(), b'C' | b'S') { reflect(last_ctrl, cur) } else { cur };
                 let (c2, p) = (pt(a0, a1), pt(a2, a3));
+                if !fin(&[c1, c2, p]) {
+                    return Ok(Parsed::Error(at));
+                }
                 w.cubic_to(c1, c2, p)?;
                 last_ctrl = c2;
             }
             b'Q' => {
-                let c1 = pt(a0, a1);
-                w.quad_to(c1, pt(a2, a3))?;
+                let (c1, p) = (pt(a0, a1), pt(a2, a3));
+                if !fin(&[c1, p]) {
+                    return Ok(Parsed::Error(at));
+                }
+                w.quad_to(c1, p)?;
                 last_ctrl = c1;
             }
             b'T' => {
                 let c1 = if matches!(prev.upper(), b'Q' | b'T') { reflect(last_ctrl, cur) } else { cur };
-                w.quad_to(c1, pt(a0, a1))?;
+                let p = pt(a0, a1);
+                if !fin(&[c1, p]) {
+                    return Ok(Parsed::Error(at));
+                }
+                w.quad_to(c1, p)?;
                 last_ctrl = c1;
             }
-            b'A' => w.arc_to(a0, a1, a2, a3 != 0.0, a4 != 0.0, pt(a5, a6))?,
+            b'A' => {
+                let p = pt(a5, a6);
+                if !fin(&[p]) {
+                    return Ok(Parsed::Error(at));
+                }
+                w.arc_to(a0, a1, a2, a3 != 0.0, a4 != 0.0, p)?
+            }
             _ => {
                 w.close()?;
                 after_close = true;

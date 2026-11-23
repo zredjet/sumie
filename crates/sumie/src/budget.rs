@@ -89,6 +89,18 @@ impl<'c> Budget<'c> {
     }
 
     /// 確保の量を数える（確保の前に呼ぶ）。上限を超えたら `Limit`。
+    /// `n` 個（1 つ `per` 単位）の仕事を、1 回の払いが `CANCEL_INTERVAL` 未満になる塊に分けて前払いする。
+    pub(crate) fn spend_units(&self, n: u64, per: u64) -> Result<(), Error> {
+        let step = chunk_len(per) as u64;
+        let mut left = n;
+        while left > 0 {
+            let k = if left < step { left } else { step };
+            self.spend(k.saturating_mul(per))?;
+            left = left.saturating_sub(k);
+        }
+        Ok(())
+    }
+
     pub(crate) fn charge(&self, bytes: u64) -> Result<(), Error> {
         let Some(b) = self.bytes.get().checked_add(bytes) else {
             return Err(Error::limit(Resource::Memory, u64::MAX, self.bytes_limit, self.stage));

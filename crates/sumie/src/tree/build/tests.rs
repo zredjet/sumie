@@ -298,3 +298,29 @@ fn estimate_is_tight_on_large_documents() {
 fn node_size_matches_the_estimate() {
     assert_eq!(size_of::<crate::tree::PathNode>() as u64, crate::doc::weights::PATH_NODE_BYTES);
 }
+
+/// 読む → 木 → 計画 → 描く（倍率 1）。画素の α を返す口。
+fn alpha_at(src: &str) -> impl Fn(u32, u32) -> u8 + use<> {
+    use crate::plan::RenderOptions;
+    use crate::render::PixmapMut;
+    let t = build(src).unwrap();
+    let plan = t.plan(&RenderOptions::DEFAULT, &Never).unwrap();
+    let (w, h) = (plan.pixel_size().width, plan.pixel_size().height);
+    let mut px = vec![0u8; (w * h * 4) as usize];
+    plan.render(&mut PixmapMut::new(&mut px, w, h, (w * 4) as usize).unwrap(), &Never).unwrap();
+    move |x, y| px[((y * w + x) * 4 + 3) as usize]
+}
+
+/// pathLength="0" の破線は実線・non-scaling と pathLength は要素の座標系の長さで割って画面の長さで描く（Chrome と同じ。
+/// `tests/svg/m2-probe/` の pathlength-zero・nonscaling-pathlength。ADR-95）。
+#[test]
+fn path_length_follows_chrome() {
+    let a = alpha_at(&svg(
+        "<path d=\"M10 50 H90\" pathLength=\"0\" stroke-dasharray=\"10 10\" stroke=\"green\" stroke-width=\"10\"/>",
+    ));
+    assert_eq!(a(25, 50), 255);
+    let a =
+        alpha_at(&svg("<g transform=\"scale(2)\"><path d=\"M0 10 H40\" pathLength=\"10\" stroke-dasharray=\"5 5\" \
+         vector-effect=\"non-scaling-stroke\" fill=\"none\" stroke=\"green\" stroke-width=\"6\"/></g>"));
+    assert_eq!((a(10, 20), a(30, 20), a(50, 20)), (255, 0, 255));
+}

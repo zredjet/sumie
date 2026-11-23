@@ -30,7 +30,7 @@ use crate::style::computed::{
 use crate::style::props::lookup;
 use crate::tree::{
     CAP_BUTT, CAP_ROUND, CAP_SQUARE, CRISP, EVEN_ODD, HAS_FILL, HAS_STROKE, HAS_VP, JOIN_BEVEL, JOIN_MITER, JOIN_ROUND,
-    NON_SCALING, PathNode, STROKE_FIRST, Tree,
+    NON_SCALING, PATH_LENGTH_ZERO, PathNode, STROKE_FIRST, Tree,
 };
 use crate::values::{Color, Length, Values, path};
 use crate::xml::lex::Span;
@@ -531,16 +531,21 @@ fn visit(
         dashes = dash_slot(d, keys, slots, out, &DeclKey::new(l.dash_src, l.dash, KEY_DASH), budget)?;
         dash_offset = resolve(l.dash_offset, c.font_size, c.line_height, &base, Axis::Diag).unwrap_or(0.0);
     }
+    // pathLength（負か読めなければ無いもの。0 は倍が無限で破線が実線になる：SVG 2・Chrome。ADR-95 (2)）
     let path_length = match doc.attr(input, n, NS_NONE, b"pathLength", budget)? {
         Some(v) => {
             let mut vals = Values::new(v, Span::new(0, v.len()), budget);
             match vals.number()? {
-                Some(x) if x > 0.0 && x.is_finite() && vals.at_end()? => x,
-                _ => 0.0,
+                Some(x) if x >= 0.0 && x.is_finite() && vals.at_end()? => x,
+                _ => -1.0,
             }
         }
-        None => 0.0,
+        None => -1.0,
     };
+    if path_length == 0.0 {
+        flags |= PATH_LENGTH_ZERO;
+    }
+    let path_length = if path_length > 0.0 { path_length } else { 0.0 };
     let (w, h) = vp.unwrap_or((0.0, 0.0));
     out.nodes.push(PathNode {
         transform: item.ctm,

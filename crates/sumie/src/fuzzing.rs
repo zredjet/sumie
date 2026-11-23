@@ -1171,7 +1171,7 @@ pub fn stroke_ops(data: &[u8]) -> Check {
             crate::values::path::path_data(text, &mut w, &b)?;
         }
         let pen = Pen { half, cap, join, miter_limit: limit, scale: 1.0, tol: 0.25 };
-        let dashes = Dashes::new(dash, offset);
+        let dashes = Dashes::new(dash, offset, &b)?;
         let mut poly: MVec<'_, Point> = MVec::new(&b);
         let mut scratch: MVec<'_, Point> = MVec::new(&b);
         let mut buf: MVec<'_, Point> = MVec::new(&b);
@@ -1183,8 +1183,8 @@ pub fn stroke_ops(data: &[u8]) -> Check {
         let mut flush = |poly: &mut MVec<'_, Point>, closed: bool, sink: &mut Count| -> Result<(), Error> {
             match &dashes {
                 None => stroke_polyline(poly.as_slice(), closed, &pen, &mut scratch, &b, sink)?,
-                Some(d) => dash_polyline(poly.as_slice(), closed, d, &mut buf, &mut hd, &b, &mut |piece| {
-                    stroke_polyline(piece, false, &pen, &mut scratch, &b, sink)
+                Some(d) => dash_polyline(poly.as_slice(), closed, d, &mut buf, &mut hd, &b, &mut |piece, pc| {
+                    stroke_polyline(piece, pc, &pen, &mut scratch, &b, sink)
                 })?,
             }
             poly.clear();

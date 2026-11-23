@@ -198,7 +198,7 @@ fn points_lists() {
     // 区切りのない数
     assert_eq!(pts("-1-2 .5.5").0, [p(-1.0, -2.0), p(0.5, 0.5)]);
     assert_eq!(pts("-1-2.5.5").0, [p(-1.0, -2.5)]);
-    // 途中の誤り・続く `,,`・終わりの `,` は誤り（呼び手は何も描かない）
+    // 途中の誤り・続く `,,` は誤り（呼び手は何も描かない）
     assert!(!pts("10,10 90,10 x 10,90").1);
     assert!(!pts("10,,10").1);
     // 終わりの `,` は受ける（resvg・Chrome と同じ）。頭の `,` は誤り
@@ -259,4 +259,25 @@ fn work_and_verbs_per_byte() {
         );
     }
     eprintln!("work/byte {worst_work:.2} verbs/byte {worst_verbs:.3}");
+}
+
+/// 相対の足し算や映しがあふれる点は書かない（その命令の位置で誤り。単位 1 の 2 回目のレビュー）。
+#[test]
+fn overflowing_points_stop() {
+    for d in [
+        "m1e308 0 1e308 0",
+        "M1e308 0 C 0 0 0 0 -1e308 0 S 1e308 0 1 1",
+        "M0 0 h1e308 h1e308",
+        "M1e308 1 a1 1 0 0 1 1e308 0",
+    ] {
+        let b = Budget::new(Stage::Build, u64::MAX, u64::MAX, &Never);
+        let mut verbs = MVec::new(&b);
+        let mut coords = MVec::new(&b);
+        let r = {
+            let mut w = PathWriter::new(&mut verbs, &mut coords);
+            path_data(d.as_bytes(), &mut w, &b).unwrap()
+        };
+        assert!(matches!(r, Parsed::Error(_)), "{d}");
+        assert!(coords.as_slice().iter().all(|v| v.is_finite()), "{d}");
+    }
 }
