@@ -74,9 +74,7 @@ const fn rule(path: &'static str, reason: &'static str, sc: f64, sr: f64, flat: 
 
 /// 既知の差（ADR-101 (5)・ADR-103）。ここにない不具合の候補が 1 つでもあれば、M2 の合否は不合格。
 const KNOWN: &[Known] = &[
-    edge("real/flag-icons/flags/4x3/bt.svg", THIN, 0.03289, 0.02898),
     edge("real/flag-icons/flags/4x3/eac.svg", THIN, 0.02525, 0.02461),
-    edge("real/flag-icons/flags/4x3/ec.svg", THIN, 0.02629, 0.02144),
     edge("real/tabler-icons/icons/outline/brand-doctrine.svg", THICK, 0.02105, 0.02002),
     edge("real/tabler-icons/icons/outline/creative-commons-off.svg", THICK, 0.02737, 0.02411),
     edge("real/tabler-icons/icons/outline/fish-off.svg", THICK, 0.02028, 0.02058),
