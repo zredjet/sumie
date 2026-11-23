@@ -18,8 +18,14 @@ pub(crate) const MERGE_STEP: u64 = 4;
 /// の注。最も多いのは `zh1` の繰り返しの 3 バイトで 35 バイト）。
 #[allow(dead_code, reason = "木の見積もり（M2 の tree）から使う")]
 pub(crate) const PATH_GEOMETRY_BYTES: u64 = 12;
-/// 平坦化で点を 1 つ求める手間（曲線の式を解いて点を渡す。architecture.md §5.2 の「計画」）。
-pub(crate) const FLATTEN_POINT: u64 = 8;
+/// 平坦化で点を 1 つ求める手間（曲線の式を解いて点を渡す。architecture.md §5.2 の「計画」。M2 の仮の校正：M2 の集まりで
+/// 計画の時間 ÷ 見積もりが 3 ns／単位に届いたので 8 から上げた。ADR-98）。
+pub(crate) const FLATTEN_POINT: u64 = 16;
+/// 曲線（2 次・3 次・弧）の区間 1 つを平坦化する決まった手間（描く座標系に写して分ける数を求める：`hypot`・平方根、弧は
+/// 半径の固有値。M2 の仮の校正。16 × 16 の小さなアイコンで、区間ごとの分が点の手間に比べて大きかった。ADR-98）。
+pub(crate) const FLATTEN_CURVE: u64 = 64;
+/// 計画で辺を 1 本作る手間（描く座標系に写した線分を確かめ、箱で切り、固定小数にする。M2 の仮の校正。ADR-98）。
+pub(crate) const PLAN_EDGE: u64 = 16;
 /// 線の外形・破線の点を 1 つ作る手間。
 pub(crate) const OUTLINE_POINT: u64 = 8;
 /// ラスタライズ：1 行の決まった手間・行にかかる辺 1 本の手間・セル 1 つの手間・掃く画素 1 つの手間。

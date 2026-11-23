@@ -80,7 +80,8 @@ pub(crate) fn pieces(seg: &PathSeg, t: &Transform, tol: f64, reach: f64) -> u64 
 }
 
 /// 区間を平坦化した点（ユーザー単位）を、始めの点を除いて順に `out` に渡す（最後は終わりの点）。分ける数は描く座標系で
-/// 決める（[`pieces`]）。分ける数の分の手間を塊ごとに前払いする。`Move`・`Close` は何も渡さない（呼び手が扱う）。
+/// 決める（[`pieces`]）。曲線は分ける数を求める決まった手間（[`cost::FLATTEN_CURVE`]）を払い、分ける数の分の手間を塊ごとに
+/// 前払いする。`Move`・`Close` は何も渡さない（呼び手が扱う）。
 pub(crate) fn flatten_seg(
     seg: &PathSeg,
     t: &Transform,
@@ -95,7 +96,10 @@ pub(crate) fn flatten_seg(
             budget.spend(cost::FLATTEN_POINT)?;
             return out(*b);
         }
-        _ => pieces(seg, t, tol, reach),
+        _ => {
+            budget.spend(cost::FLATTEN_CURVE)?;
+            pieces(seg, t, tol, reach)
+        }
     };
     let step = chunk_len(cost::FLATTEN_POINT) as u64;
     let nf = n as f64;

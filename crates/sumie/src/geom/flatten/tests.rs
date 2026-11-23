@@ -125,15 +125,20 @@ fn points_end_exactly_and_stay_within_tolerance() {
 }
 
 #[test]
-fn flattening_pays_per_point() {
+fn flattening_pays_per_curve_and_point() {
     let b = Budget::new(Stage::Plan, u64::MAX, u64::MAX, &Never);
     // 2 階の差は √2 · 10⁷ なので n = ⌈√(3 · √2 · 10⁷ / 0.4)⌉ ≈ 10,300（塊を 2 つ以上に分ける）
     let c = PathSeg::Cubic(Point::new(0.0, 0.0), Point::new(0.0, 1e7), Point::new(1e7, 1e7), Point::new(1e7, 0.0));
     let n = pieces(&c, &Transform::IDENTITY, 0.1, 0.0);
     assert!(n > 10_000, "{n}");
     flatten_seg(&c, &Transform::IDENTITY, 0.1, 0.0, &b, &mut |_| Ok(())).unwrap();
-    assert_eq!(b.work(), n * cost::FLATTEN_POINT);
+    assert_eq!(b.work(), cost::FLATTEN_CURVE + n * cost::FLATTEN_POINT);
     assert!(b.max_spend() < crate::budget::CANCEL_INTERVAL);
+    // 線分は点 1 つの分だけ
+    let b = Budget::new(Stage::Plan, u64::MAX, u64::MAX, &Never);
+    let l = PathSeg::Line(Point::new(0.0, 0.0), Point::new(1e7, 0.0));
+    flatten_seg(&l, &Transform::IDENTITY, 0.1, 0.0, &b, &mut |_| Ok(())).unwrap();
+    assert_eq!(b.work(), cost::FLATTEN_POINT);
 }
 
 /// 線の外形が箱の中に届くなら、箱の外の曲線も分ける（届く距離だけ箱を広げて見る。単位の 1 回目のレビュー）。

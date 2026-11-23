@@ -137,8 +137,9 @@ fn argument() -> Error {
 /// 節の数え（閉じた式の見積もりと、計画の置き場の大きさに使う）。
 #[derive(Debug, Clone, Copy, Default)]
 struct Counts {
-    /// 平坦化の点（部分パスの始めの点を含む）・部分パスの数・1 つの部分パスの点の最大
+    /// 平坦化の点（部分パスの始めの点を含む）・曲線（2 次・3 次・弧）の区間の数・部分パスの数・1 つの部分パスの点の最大
     points: u64,
+    curves: u64,
     subpaths: u64,
     max_sub: u64,
     /// 描く座標系の制御多角形の長さ（線分・閉じ・曲線の制御多角形・弧は |Δθ| × 最大の半径）
@@ -302,7 +303,11 @@ fn count(
                 last_dir = None;
                 continue;
             }
-            _ => pieces(&seg, t, q.tol, reach),
+            PathSeg::Line(..) => 1,
+            _ => {
+                c.curves = c.curves.saturating_add(1);
+                pieces(&seg, t, q.tol, reach)
+            }
         };
         c.points = c.points.saturating_add(n);
         sub = sub.saturating_add(n);
@@ -609,7 +614,8 @@ pub(crate) const PLAN_FRAME: u64 = 9 * cost::ALLOC_STEP + 256;
 pub(crate) const RENDER_SLACK: u64 = 1024;
 
 /// 辺 1 本を足す手間（push_segment の中の点の確かめと固定小数への変換と、置き場への写しと、項目の行とセルの上限を数える分）。
-const EDGE_WORK: u64 = push_cost(size_of::<Edge>() as u64).saturating_add(2 * cost::OP_STEP);
+const EDGE_WORK: u64 =
+    push_cost(size_of::<Edge>() as u64).saturating_add(cost::OP_STEP).saturating_add(cost::PLAN_EDGE);
 /// 点 1 つを置き場に足す手間。
 const POINT_WORK: u64 = push_cost(size_of::<Point>() as u64);
 
@@ -699,6 +705,7 @@ fn bound_node(
         out.plan_work = out
             .plan_work
             .saturating_add(c.points.saturating_mul(cost::FLATTEN_POINT.saturating_add(POINT_WORK)))
+            .saturating_add(c.curves.saturating_mul(cost::FLATTEN_CURVE))
             .saturating_add(e.saturating_mul(EDGE_WORK))
             .saturating_add(cost::stable_sort(e, size_of::<Edge>() as u64));
         out.edges = out.edges.saturating_add(e);
@@ -789,6 +796,7 @@ fn bound_node(
         out.plan_work = out
             .plan_work
             .saturating_add(v.saturating_mul(passes).saturating_mul(cost::FLATTEN_POINT.saturating_add(POINT_WORK)))
+            .saturating_add(c.curves.saturating_mul(passes).saturating_mul(cost::FLATTEN_CURVE))
             .saturating_add(if mode.device { v.saturating_mul(POINT_WORK) } else { 0 })
             .saturating_add(dash_pts.saturating_mul(cost::OUTLINE_POINT.saturating_add(POINT_WORK)))
             .saturating_add(dedup.saturating_mul(POINT_WORK.saturating_add(cost::OP_STEP)))
@@ -1138,11 +1146,11 @@ fn fill_edges(
         for &p in pts.iter().skip(1) {
             let d = t.apply(p);
             dev.add(d);
-            budget.spend(cost::OP_STEP)?;
+            budget.spend(cost::PLAN_EDGE)?;
             push_segment(prev, d, edges)?;
             prev = d;
         }
-        budget.spend(cost::OP_STEP)?;
+        budget.spend(cost::PLAN_EDGE)?;
         push_segment(prev, t.apply(first), edges)
     })
 }
@@ -1192,7 +1200,7 @@ impl LoopSink for EdgeSink<'_, '_> {
         self.dev.add(d);
         match self.prev {
             Some(a) => {
-                self.budget.spend(cost::OP_STEP)?;
+                self.budget.spend(cost::PLAN_EDGE)?;
                 push_segment(a, d, self.edges)?;
             }
             None => self.first = Some(d),
