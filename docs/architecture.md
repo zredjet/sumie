@@ -227,6 +227,9 @@ Kura の「形」（値を描かずに大きさなどを読む。今の Kura は
 に当たるのは、`parse` → `estimate_build` → `build` → `Tree::estimate`。形を通ったものは、同じ上限・同じ資源・同じ倍率なら、
 `plan`・`render` で `Limit`・`Unsupported` にならない（確保の失敗と中止を除く）。範囲が全体に含まれるなら、
 `Plan::estimate_region` は `RenderEstimate.render` を超えない（Kura がタイルで描いても形の約束が保てる。試験で確かめる）。
+この約束は普通の入力（照合の集まり・実例・Kura の遅い入力）で守る。上限を狙って作った入力（極端な倍率・極小の破線・巨大な
+半径など）では、形を通っても `plan`・`render` が `Limit` で安全に断りうる（その段の上限は見積もりの値なので、確保も手間も
+上限を超えない。決定的なので D2 は保つ。ADR-100 (5)）。
 大きさだけなら `parse` → `pixel_size` で足りる。ただし viewBox も幅・高さもない（か %）文書は、usvg と同じく中身の外接矩形の
 右下を大きさにする（FR-OUT-01・ADR-58 (1)）ので、木を作るまで大きさが決まらない。`Document::size`・`pixel_size` はそれを
 「中身で決まる（木が要る）」として `None` を返し（ADR-63 (3)）、大きさは `Tree::size`・`pixel_size` から読む。Kura の形は
