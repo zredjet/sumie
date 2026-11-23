@@ -149,39 +149,8 @@ pub(crate) enum Fallback {
     Color(ColorValue),
 }
 
-/// 2 × 3 の変形の行列（`[a c e; b d f]`）。
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Transform {
-    pub(crate) a: f64,
-    pub(crate) b: f64,
-    pub(crate) c: f64,
-    pub(crate) d: f64,
-    pub(crate) e: f64,
-    pub(crate) f: f64,
-}
-
-impl Plain for Transform {}
-
-impl Transform {
-    pub(crate) const IDENTITY: Transform = Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
-
-    /// `self × o`（`o` を先に当てる）。
-    pub(crate) fn then(&self, o: &Transform) -> Transform {
-        Transform {
-            a: self.a * o.a + self.c * o.b,
-            b: self.b * o.a + self.d * o.b,
-            c: self.a * o.c + self.c * o.d,
-            d: self.b * o.c + self.d * o.d,
-            e: self.a * o.e + self.c * o.f + self.e,
-            f: self.b * o.e + self.d * o.f + self.f,
-        }
-    }
-
-    pub(crate) fn finite(&self) -> bool {
-        [self.a, self.b, self.c, self.d, self.e, self.f].iter().all(|v| v.is_finite())
-    }
-}
+/// 変形の行列（`geom` に置く。ADR-89 (5)）。
+pub(crate) use crate::geom::Transform;
 
 /// `viewBox`。
 #[repr(C)]

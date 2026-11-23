@@ -14,6 +14,8 @@ pub(crate) const FILL_BYTES_PER_UNIT: u64 = 16;
 pub(crate) const COPY_BYTES_PER_UNIT: u64 = 16;
 /// 安定な併合の並べ替えの、1 つの要素を 1 段で比べて写す手間。
 pub(crate) const MERGE_STEP: u64 = 4;
+/// 平坦化で点を 1 つ求める手間（曲線の式を解いて点を渡す。architecture.md §5.2 の「計画」）。
+pub(crate) const FLATTEN_POINT: u64 = 8;
 /// 2 分の探索の 1 歩の手間。
 pub(crate) const SEARCH_STEP: u64 = 8;
 /// id の表の 2 分の探索で、表が大きいとき 1 歩に足す手間（1 歩で表・属性・入力の 3 か所を散らばって読み、表が大きいと

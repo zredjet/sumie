@@ -16,6 +16,7 @@ mod cost;
 mod css;
 mod doc;
 mod error;
+mod geom;
 mod limits;
 mod math;
 mod mem;
