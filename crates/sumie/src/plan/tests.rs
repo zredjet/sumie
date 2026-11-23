@@ -48,7 +48,8 @@ fn node() -> PathNode {
         flags: 0,
         cap: CAP_BUTT,
         join: JOIN_MITER,
-        pad: [0; 5],
+        shape: 0,
+        pad: [0; 4],
     }
 }
 

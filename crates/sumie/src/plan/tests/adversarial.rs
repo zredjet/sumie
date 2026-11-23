@@ -801,7 +801,7 @@ fn dash_pieces_keep_curve_sides_at_corners() {
     }
 }
 
-/// 太さ 1 画素以下の細い線の継ぎ目は bevel（Skia の細い線は区間ごとに描いて継ぎ目を作らない。Chrome・resvg と同じ。
+/// 太さ 1 画素以下の細い線は継ぎ目を作らない（Skia の細い線は区間ごとに描く。Chrome・resvg と同じ。
 /// tests/painting/context/in-use の星の鋭い角で、miter の先が頂点の 1 画素上まで出て α 153 だった。ADR-103）。太い線は
 /// 書いたとおりの miter。
 #[test]

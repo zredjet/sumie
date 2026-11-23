@@ -174,12 +174,13 @@ pub(crate) enum Cap {
     Square,
 }
 
-/// 継ぎ目の形。
+/// 継ぎ目の形。`None` は継ぎ目を作らない（外側も頂点を通し、区間ごとの線を合わせた形。Skia の細い線と同じ。ADR-103）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Join {
     Miter,
     Round,
     Bevel,
+    None,
 }
 
 /// 線のペン。
@@ -556,7 +557,9 @@ fn vertex(
     }
     // 滑らかな点の外側は、継ぎ目の形に依らず円弧（縁は曲線を写したもの。尖りに半径 h の丸が付く。resvg・Chrome と同じ。
     // ADR-101）
-    let join = if smooth { Join::Round } else { pen.join };
+    // 継ぎ目を作らない細い線は、滑らかな点でも円弧を作らない（Skia の細い線は平坦化した区間ごとに描く。曲がりの半径が
+    // 太さの半分より小さい曲線（rx の小さな角の丸み）で外側に丸い被覆が出ない。ADR-103）
+    let join = if smooth && pen.join != Join::None { Join::Round } else { pen.join };
     // 曲線に接する角の外側の継ぎ目は、曲線の側を弦でなく外挿した向きで作る（miter の先・miterlimit の判定・bevel の向きを
     // Chrome・resvg にそろえる。ADR-101 (7)(f)）。縁は弦の法線の点 → 向きの法線の点 → 継ぎ目 → 向きの法線の点 → 弦の法線の点と
     // つなぐ（間は頂点から太さの半分の円の内なので線の中）。向きの曲がる側が弦と逆なら弦のまま
@@ -573,6 +576,8 @@ fn vertex(
     }
     match join {
         Join::Bevel => {}
+        // 外側も頂点を通す（2 本の区間の butt の端が頂点で切れたまま）
+        Join::None => return e.point(p).and_then(|()| e.point(start_out)),
         Join::Round => {
             // 外側の円弧（曲がる角だけ。左の縁が外なので負の向き。折り返し（外積 0・内積が負）は半回り）
             let turn = if jc == 0.0 { -core::f64::consts::PI } else { math::atan2(jc, jd) };

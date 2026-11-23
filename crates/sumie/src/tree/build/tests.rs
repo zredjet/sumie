@@ -594,6 +594,28 @@ fn background_and_hairlines() {
     assert_eq!(a(50, 49), 0);
 }
 
+/// 細い線は継ぎ目を作らない（Skia の細い線。角の外の画素は Chrome で 0）が、Chrome が枠の描き方で描く rect（角の丸みなし・
+/// miter・miterlimit ≥ √2・破線なし・軸にそった変形）は角を四角くする（resvg の試験の枠の角の画素は Chrome で α 64。rotate(90)
+/// の rect も同じ。ADR-103）。
+#[test]
+fn thin_rect_frames_keep_square_corners() {
+    let corner = |body: &str| alpha_at(&svg(body))(0, 0);
+    let s = "fill=\"none\" stroke=\"black\"";
+    assert_eq!(corner(&format!("<rect x=\"1\" y=\"1\" width=\"10\" height=\"10\" {s}/>")), 64);
+    assert_eq!(
+        corner(&format!("<rect x=\"1\" y=\"1\" width=\"10\" height=\"10\" {s} transform=\"rotate(90 6 6)\"/>")),
+        64
+    );
+    for other in [
+        format!("<path d=\"M1 1 H11 V11 H1 Z\" {s}/>"),
+        format!("<rect x=\"1\" y=\"1\" width=\"10\" height=\"10\" {s} stroke-linejoin=\"round\"/>"),
+        format!("<rect x=\"1\" y=\"1\" width=\"10\" height=\"10\" {s} stroke-miterlimit=\"1.2\"/>"),
+        format!("<rect x=\"1\" y=\"1\" width=\"10\" height=\"10\" rx=\"0.001\" {s}/>"),
+    ] {
+        assert_eq!(corner(&other), 0, "{other}");
+    }
+}
+
 /// `background` のまとめを規則で多くの要素に当てても、読む段の手間は要素の数 × 値の長さにならない（宣言ごとに 1 度だけ色の
 /// 範囲を求める。単位 3 の 3 回目のレビュー）。
 #[test]

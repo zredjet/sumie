@@ -36,6 +36,10 @@ pub(crate) const JOIN_MITER: u8 = 0;
 pub(crate) const JOIN_ROUND: u8 = 1;
 pub(crate) const JOIN_BEVEL: u8 = 2;
 
+/// 節の図形の種類（[`PathNode::shape`]）：角の丸みのない rect（Chrome は miter の継ぎ目の rect の線を Skia の枠の描き方で
+/// 描き、細い線でも角を四角くする。ADR-103）。ほかは 0。
+pub(crate) const SHAPE_RECT: u8 = 1;
+
 /// 描くパスの節。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -63,7 +67,9 @@ pub(crate) struct PathNode {
     pub(crate) flags: u8,
     pub(crate) cap: u8,
     pub(crate) join: u8,
-    pub(crate) pad: [u8; 5],
+    /// 図形の種類（[`SHAPE_RECT`] か 0）
+    pub(crate) shape: u8,
+    pub(crate) pad: [u8; 4],
 }
 
 impl Plain for PathNode {}

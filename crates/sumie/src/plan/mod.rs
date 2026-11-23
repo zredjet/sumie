@@ -669,21 +669,31 @@ pub(crate) struct StrokeMode {
     pub(crate) dash_unit: f64,
     /// 外形を作る座標系から描く座標系への最大の倍率
     pub(crate) sigma: f64,
-    /// 細い線（描く座標系の 1 画素の線を太さの α で描く）。継ぎ目は bevel にする（Skia の細い線は区間ごとに描いて継ぎ目を
-    /// 作らないので、鋭い角に miter の先が出ない。Chrome・resvg と同じ。ADR-103）
+    /// 細い線（描く座標系の 1 画素の線を太さの α で描く）で、継ぎ目を作らない（Skia の細い線は区間ごとに描いて継ぎ目を
+    /// 作らないので、角の外側が欠け、鋭い角に miter の先が出ない。Chrome・resvg と同じ。Chrome が枠の描き方で描く rect は
+    /// 除く。ADR-103）
     pub(crate) hair: bool,
 }
 
 /// 節の線の形を決める（`t` は描く座標系への変形）。描く座標系の太さが 1 画素以下の反エイリアスの線は、描く座標系の 1 画素の
-/// 線を太さ（2 つの軸の太さの平均）の α で、継ぎ目を bevel にして描く（Chrome・resvg の細い線と同じ。ADR-97 (2)・ADR-103）。細い線の破線の長さは、変形の
+/// 線を太さ（2 つの軸の太さの平均）の α で、継ぎ目を作らずに描く（Chrome・resvg の細い線と同じ。ADR-97 (2)・ADR-103）。細い線の破線の長さは、変形の
 /// 面積の倍の平方根（相似の変形なら倍率そのもの）で描く座標系の長さにする。
 pub(crate) fn stroke_mode(n: &PathNode, t: &Transform, scale: f64) -> StrokeMode {
     let w = n.stroke_width;
     let aa = n.flags & CRISP == 0;
+    // Chrome が Skia の枠の描き方で描く rect（角の丸みなし・miter で miterlimit ≥ √2・破線なし・non-scaling でない・軸に
+    // そった変形）は、細い線でも角を四角くする（書いた miter の継ぎ目で描く。ADR-103）
+    let frame = n.shape == crate::tree::SHAPE_RECT
+        && n.join == crate::tree::JOIN_MITER
+        && n.miter_limit >= core::f64::consts::SQRT_2
+        && n.dashes[1] == 0
+        && n.flags & NON_SCALING == 0
+        && axis_aligned(t);
+    let hair = !frame;
     if n.flags & NON_SCALING != 0 {
         let wd = w * scale;
         if aa && wd <= 1.0 {
-            return StrokeMode { device: true, half: 0.5, alpha: wd, dash_unit: scale, sigma: 1.0, hair: true };
+            return StrokeMode { device: true, half: 0.5, alpha: wd, dash_unit: scale, sigma: 1.0, hair };
         }
         return StrokeMode { device: true, half: wd / 2.0, alpha: 1.0, dash_unit: scale, sigma: 1.0, hair: false };
     }
@@ -691,16 +701,16 @@ pub(crate) fn stroke_mode(n: &PathNode, t: &Transform, scale: f64) -> StrokeMode
     let len1 = math::hypot(t.c * w, t.d * w);
     if aa && len0 <= 1.0 && len1 <= 1.0 {
         let geo = t.det().abs().sqrt();
-        return StrokeMode {
-            device: true,
-            half: 0.5,
-            alpha: (len0 + len1) / 2.0,
-            dash_unit: geo,
-            sigma: 1.0,
-            hair: true,
-        };
+        return StrokeMode { device: true, half: 0.5, alpha: (len0 + len1) / 2.0, dash_unit: geo, sigma: 1.0, hair };
     }
     StrokeMode { device: false, half: w / 2.0, alpha: 1.0, dash_unit: 1.0, sigma: t.max_scale(), hair: false }
+}
+
+/// 変形が矩形を軸にそった矩形に写すか（Skia の rectStaysRect。Chromium は 90° の倍数の回転を正確な 0・±1 にするので、
+/// 大きさに対して 1e-12 の内の成分は 0 とみなす）。
+fn axis_aligned(t: &Transform) -> bool {
+    let tiny = 1e-12 * (t.a.abs() + t.b.abs() + t.c.abs() + t.d.abs());
+    (t.b.abs() <= tiny && t.c.abs() <= tiny) || (t.a.abs() <= tiny && t.d.abs() <= tiny)
 }
 
 /// 節の線のペン（太さの半分は線を作る座標系。`mode` は [`stroke_mode`]）。
@@ -711,7 +721,7 @@ fn pen_of(n: &PathNode, t: &Transform, mode: &StrokeMode, q: Quality) -> Pen {
         _ => Cap::Butt,
     };
     let join = match n.join {
-        _ if mode.hair => Join::Bevel,
+        _ if mode.hair => Join::None,
         JOIN_ROUND => Join::Round,
         JOIN_BEVEL => Join::Bevel,
         _ => Join::Miter,

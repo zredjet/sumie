@@ -476,6 +476,7 @@ fn visit(
     let start_c = out.coords.len();
     // 幾何：宣言ごとに読むもの（パスのデータと points）は置き場の範囲、図形は節ごとに書く
     let mut shared: Option<Ranges> = None;
+    let mut shape = 0u8;
     match local {
         b"path" => {
             if g.d_src == DASH_NONE {
@@ -505,6 +506,9 @@ fn visit(
             };
             let rx = crate::math::min(rx, w / 2.0);
             let ry = crate::math::min(ry, h / 2.0);
+            if rx <= 0.0 || ry <= 0.0 {
+                shape = crate::tree::SHAPE_RECT;
+            }
             budget.spend(cost::OP_STEP)?;
             let mut pw = PathWriter::new(&mut out.verbs, &mut out.coords);
             geom::rect(&mut pw, x, y, w, h, rx, ry)?;
@@ -661,7 +665,8 @@ fn visit(
             2 => JOIN_BEVEL,
             _ => JOIN_MITER,
         },
-        pad: [0; 5],
+        shape,
+        pad: [0; 4],
     })
 }
 
