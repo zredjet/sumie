@@ -98,6 +98,10 @@ struct DeclInfo {
     font: u32,
 }
 
+/// `background` のまとめから分けた `background-image` の印（`pad[0]` の上の位。下の位は画像の層の印
+/// `valid::IMAGE_GRADIENT`・`IMAGE_DATA`。値の範囲は置かない）。
+pub(crate) const BG_IMAGE_FROM_SHORTHAND: u8 = 0x80;
+
 /// `font` のまとめを長い名前に分けた範囲（宣言ごとに 1 度だけ求める）。順は FONT_LONGHANDS の初めの 7 つ。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -111,17 +115,15 @@ struct FontRec {
 impl Plain for FontRec {}
 
 impl FontRec {
-    /// `background` のまとめの最後の層の色の範囲（`spans[0]`。色があれば `present` の 1、グラデーションの層があれば 2。
-    /// ADR-99 (4)・ADR-101）。
+    /// `background` のまとめの最後の層の色の範囲（`spans[0]`。色があれば `present` の 1）と画像の層の印（`pad[0]`。
+    /// `valid::IMAGE_GRADIENT`・`IMAGE_DATA`。ADR-99 (4)・ADR-101・ADR-102）。
     fn background(b: crate::style::valid::Background) -> FontRec {
         let mut r = FontRec::default();
         if let Some(c) = b.color {
             r.spans[0] = c;
             r.present = 1;
         }
-        if b.gradient {
-            r.present |= 2;
-        }
+        r.pad[0] = b.image;
         r
     }
 
@@ -413,6 +415,7 @@ struct Shorthands {
     markers: [Option<PropertyId>; 3],
     background: Option<PropertyId>,
     background_color: Option<PropertyId>,
+    background_image: Option<PropertyId>,
 }
 
 impl Shorthands {
@@ -423,6 +426,7 @@ impl Shorthands {
             markers: [b"marker-start".as_slice(), b"marker-mid", b"marker-end"].map(|n| lookup(n, false)),
             background: lookup(b"background", false),
             background_color: lookup(b"background-color", false),
+            background_image: lookup(b"background-image", false),
         }
     }
 }
@@ -515,21 +519,36 @@ impl Out<'_, '_> {
         Ok(())
     }
 
-    /// `background` を `background-color` に分ける（最後の層の色の範囲。色がなければ `initial`。全体の言葉はそのまま。
-    /// ほかの長い名前は描かないので置かない。色の範囲は宣言ごとに 1 度だけ求めたもの（`rec`）。ADR-99 (4)）。
+    /// `background` を `background-color` と `background-image` に分ける（色は最後の層の色の範囲。色がなければ `initial`。
+    /// 画像は値の範囲を置かず、画像の層の印を `pad[0]` に `BG_IMAGE_FROM_SHORTHAND` と合わせて置く。全体の言葉はそのまま。
+    /// ほかの長い名前は描かないので置かない。範囲と印は宣言ごとに 1 度だけ求めたもの（`rec`）。ADR-99 (4)・ADR-102）。
     fn offer_background(&mut self, key: Key, spec: Specified, rec: Option<FontRec>) -> Result<(), Error> {
-        let Some(id) = self.short.background_color else { return Ok(()) };
-        if spec.wide != WIDE_NONE {
-            return self.put(id, key, Specified { prop: id, ..spec });
-        }
-        // グラデーションの層は描かないので、印（pad[0]）を付けて木を作る段で NotYet にする（ADR-101）
-        let s = match rec {
-            Some(r) if r.present & 1 != 0 => Specified { prop: id, value: r.spans[0], ..spec },
-            Some(_) => Specified { prop: id, value: Span::default(), wide: WIDE_INITIAL, ..spec },
-            None => return Ok(()),
+        let (Some(color_id), Some(image_id)) = (self.short.background_color, self.short.background_image) else {
+            return Ok(());
         };
-        let gradient = rec.is_some_and(|r| r.present & 2 != 0);
-        self.put(id, key, Specified { pad: [u8::from(gradient), 0, 0], ..s })
+        if spec.wide != WIDE_NONE {
+            self.put(color_id, key, Specified { prop: color_id, ..spec })?;
+            return self.put(image_id, key, Specified { prop: image_id, ..spec });
+        }
+        let Some(r) = rec else { return Ok(()) };
+        let color = if r.present & 1 != 0 {
+            Specified { prop: color_id, value: r.spans[0], ..spec }
+        } else {
+            Specified { prop: color_id, value: Span::default(), wide: WIDE_INITIAL, ..spec }
+        };
+        self.put(color_id, key, color)?;
+        // 画像の層の印（グラデーション・data: の画像は木を作る段で NotYet。単位 3 の 4 回目のレビュー：印を色の宣言に
+        // 乗せると、後ろの background-color や長い名前の background-image で消えた）
+        self.put(
+            image_id,
+            key,
+            Specified {
+                prop: image_id,
+                value: Span::default(),
+                pad: [BG_IMAGE_FROM_SHORTHAND | r.pad[0], 0, 0],
+                ..spec
+            },
+        )
     }
 
     fn put(&mut self, prop: PropertyId, key: Key, spec: Specified) -> Result<(), Error> {

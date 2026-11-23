@@ -53,6 +53,8 @@ pub(crate) enum Kind {
     Font,
     /// `background` のまとめ（カスケードで `background-color` に分ける）
     Background,
+    /// `background-image`（層ごとに 1 つの画像。根の背景の画像の層を NotYet にするために読む）
+    BackgroundImage,
     /// `baseline`・`sub`・`super` か長さか割合
     BaselineShift,
     /// CSS の `transform`
@@ -242,6 +244,9 @@ pub(crate) const PROPS: &[Prop] = &[
     // カスケードで `background-color` に分ける（最後の層の色。画像は描かない。Chrome と同じ。ADR-99 (4)）
     p(b"background", false, false, Kind::Background),
     p(b"background-color", false, false, Kind::Color),
+    // 画像の層（グラデーションと data: の画像は Chrome が描くので、まだ描かない：NotYet。外の url は Chrome も img では
+    // 読まない。単位 3 の 4 回目のレビュー）
+    p(b"background-image", false, false, Kind::BackgroundImage),
     pu(b"baseline-shift", false, true, Kind::BaselineShift),
     p(b"clip", false, true, Kind::Raw),
     p(b"clip-path", false, true, Kind::ClipPath),
@@ -288,17 +293,24 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"marker-end", true, true, Kind::UrlOrNone),
     p(b"marker-mid", true, true, Kind::UrlOrNone),
     p(b"marker-start", true, true, Kind::UrlOrNone),
-    p(b"mask", false, true, Kind::UrlOrNone),
+    // CSS のまとめ（url のあとの言葉・画像・層）も受ける。none と url ただ 1 つのほかはまだ描かない（NotYet。単位 3 の
+    // 4 回目のレビュー）
+    p(b"mask", false, true, Kind::Raw),
     p(b"mask-image", false, false, Kind::Raw),
     p(b"mask-type", false, true, Kind::Keywords(MASK_TYPE)),
     p(b"mix-blend-mode", false, false, Kind::Keywords(BLEND)),
+    // CSS の個別の変形と offset-path（CSS のプロパティとしてだけ。まだ描かないので、none でなければ NotYet。単位 3 の
+    // 4 回目のレビュー）
+    p(b"offset-path", false, false, Kind::Raw),
     p(b"opacity", false, true, Kind::Opacity),
     p(b"overflow", false, true, Kind::Overflow),
     p(b"paint-order", true, true, Kind::PaintOrder),
     p(b"pointer-events", true, true, Kind::Keywords(POINTER_EVENTS)),
     pu(b"r", false, true, Kind::LengthNonNeg),
+    p(b"rotate", false, false, Kind::Raw),
     pu(b"rx", false, true, Kind::LengthAuto),
     pu(b"ry", false, true, Kind::LengthAuto),
+    p(b"scale", false, false, Kind::Raw),
     p(b"shape-rendering", true, true, Kind::Keywords(RENDERING)),
     p(b"stop-color", false, true, Kind::Color),
     p(b"stop-opacity", false, true, Kind::Opacity),
@@ -316,6 +328,7 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"transform", false, false, Kind::Transform),
     p(b"transform-box", false, false, Kind::Keywords(TRANSFORM_BOX)),
     p(b"transform-origin", false, true, Kind::TransformOrigin),
+    p(b"translate", false, false, Kind::Raw),
     p(b"unicode-bidi", false, true, Kind::Keywords(UNICODE_BIDI)),
     p(b"vector-effect", false, true, Kind::Keywords(VECTOR_EFFECT)),
     p(b"visibility", true, true, Kind::Keywords(VISIBILITY)),

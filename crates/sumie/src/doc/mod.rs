@@ -225,6 +225,7 @@ fn root_font_size(
         viewport: media,
         doc: media,
         outermost: true,
+        content_sized: false,
     };
     let bufs = Bufs { input, store: doc.store.as_slice(), sheet: sheet.text.as_slice() };
     let c = compute(&initial, styles.of(0), &PropIds::new(), &bufs, &base, budget)?;

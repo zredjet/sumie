@@ -128,6 +128,12 @@ pub enum Later {
     Filter,
     /// 外接矩形の要る `transform-box`（fill-box など）の変形と、表示の領域の決まらない % の位置（M3）
     TransformBox,
+    /// CSS の個別の変形（`translate`・`rotate`・`scale`）と `offset-path`（M3）
+    CssTransform,
+    /// `display: contents`（M3）
+    DisplayContents,
+    /// 根の背景の画像の層（`data:` の画像。デコーダを渡す口と同じ M3）
+    BackgroundImage,
 }
 
 /// 壊れた入力・呼び手の誤り。

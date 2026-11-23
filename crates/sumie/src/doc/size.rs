@@ -33,15 +33,27 @@ pub struct PixelSize {
 pub(crate) enum SizeRule {
     /// 属性で決まる
     Known(Size),
-    /// 中身の外接矩形で決まる（木が要る）
-    Content,
+    /// 中身の外接矩形で決まる（木が要る）。値は % を解く表示の領域の幅・高さ（書いた絶対の幅・高さ、% は 100 に対する
+    /// 割合、書いていないか壊れた側は 100。usvg・Chrome と同じ。ADR-102）
+    Content((f64, f64)),
 }
+
+/// 大きさを中身で決める文書の表示の領域の既定（usvg の `Options::default_size` と同じ 100 × 100）。
+pub(crate) const CONTENT_SIZED_VIEWPORT: (f64, f64) = (100.0, 100.0);
 
 impl SizeRule {
     pub(crate) fn known(self) -> Option<Size> {
         match self {
             SizeRule::Known(s) => Some(s),
-            SizeRule::Content => None,
+            SizeRule::Content(_) => None,
+        }
+    }
+
+    /// % を解く根の表示の領域（大きさが決まる文書はその大きさ）。
+    pub(crate) fn viewport(self) -> (f64, f64) {
+        match self {
+            SizeRule::Known(s) => (s.width, s.height),
+            SizeRule::Content(v) => v,
         }
     }
 }
@@ -57,10 +69,10 @@ enum Dim {
 pub(crate) fn size_rule(doc: &XmlDoc, input: &[u8], font_size: f64, budget: &Budget<'_>) -> Result<SizeRule, Error> {
     let budget = budget_ref(budget);
     let Some(root) = doc.nodes.as_slice().first().filter(|n| n.kind == KIND_ELEMENT) else {
-        return Ok(SizeRule::Content);
+        return Ok(SizeRule::Content(CONTENT_SIZED_VIEWPORT));
     };
     if root.ns != NS_SVG || root.local.of(input) != b"svg" {
-        return Ok(SizeRule::Content);
+        return Ok(SizeRule::Content(CONTENT_SIZED_VIEWPORT));
     }
     let len = |name: &[u8]| -> Result<Dim, Error> {
         let Some(a) = doc.find_attr(input, root, NS_NONE, name, budget)? else { return Ok(Dim::No) };
@@ -104,7 +116,16 @@ pub(crate) fn size_rule(doc: &XmlDoc, input: &[u8], font_size: f64, budget: &Bud
                 (None, None) => (v.w, v.h),
             }
         }
-        _ => return Ok(SizeRule::Content),
+        (w, h, None) => {
+            // 大きさを中身で決める：% を解く表示の領域は書いた幅・高さ（% は 100 に対する割合）、ないか壊れた側は 100
+            let base = |d: Dim, full: f64| match d {
+                Dim::Abs(x) if x > 0.0 && x.is_finite() => x,
+                Dim::Pct(p) if p > 0.0 && p.is_finite() => full * p / 100.0,
+                _ => full,
+            };
+            let (fw, fh) = CONTENT_SIZED_VIEWPORT;
+            return Ok(SizeRule::Content((base(w, fw), base(h, fh))));
+        }
     };
     if !(size.0.is_finite() && size.1.is_finite() && size.0 > 0.0 && size.1 > 0.0) {
         return Err(Error::Invalid(Invalid { reason: InvalidReason::Size, position: Some(u64::from(root.pos)) }));

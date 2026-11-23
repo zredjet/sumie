@@ -475,9 +475,10 @@ fn decl_sizes_match_the_estimate() {
     assert_eq!(size_of::<super::DeclSlot>() as u64, crate::doc::weights::SLOT_BYTES);
 }
 
-/// 根の svg の `background` のまとめは、最後の層の色を `background-color` として描く（Chrome と同じ。画像は描かない。
+/// 根の svg の `background` のまとめは、最後の層の色を `background-color` として描く（Chrome と同じ。外の url の画像は描かない。
 /// まとめの後ろの `background-color` が勝ち、色のないまとめは透明に戻す。ADR-99 (4)）。形は Chrome と同じに確かめ（ADR-101）、
-/// グラデーションの層は NotYet。根を描かない（viewBox の幅が 0 など）ときも背景は塗る（Chrome と同じ）。
+/// グラデーションと data: の画像の層は NotYet（後ろの宣言や長い名前の background-image でも消えない。ADR-102）。根を描かない
+/// （viewBox の幅が 0・display: none など）ときも背景は塗る（Chrome と同じ。ADR-102）。
 #[test]
 fn background_shorthand() {
     use crate::plan::RenderOptions;
@@ -521,22 +522,52 @@ fn background_shorthand() {
     ] {
         assert_eq!(style(&format!("background-color: lime; background: {bad}")), LIME, "{bad}");
     }
-    // 正しい形
-    for good in ["left 10px top 5px red", "center / 10px auto red", "top left red", "repeat-x fixed padding-box red"] {
+    // Chrome では壊れた形（単位 3 の 4 回目のレビュー）
+    for bad in ["element(#a) red", "cross-fade(url(a) 50%, url(b)) red", "calc(10deg) red", "center / calc(5deg) red"] {
+        assert_eq!(style(&format!("background-color: lime; background: {bad}")), LIME, "{bad}");
+    }
+    // 正しい形（箱の text・border-area と、長さの min・max・clamp も。単位 3 の 4 回目のレビュー）
+    for good in [
+        "left 10px top 5px red",
+        "center / 10px auto red",
+        "top left red",
+        "repeat-x fixed padding-box red",
+        "text red",
+        "border-box text red",
+        "padding-box border-area red",
+        "min(1px, 2px) red",
+        "clamp(1px, 2px, 3px) red",
+        "center / min(5px, 2px) red",
+        "url(x.png) red",
+    ] {
         assert_eq!(style(&format!("background-color: lime; background: {good}")), RED, "{good}");
     }
-    // グラデーションの層はまだ描かない
+    let not_yet = |attrs: &str| matches!(pixel(attrs), Err(Error::Unsupported(_)));
+    // グラデーションと data: の画像の層はまだ描かない（包む関数の中も）
     for g in [
         "linear-gradient(red, red) lime",
         "-webkit-linear-gradient(top, red, red) lime",
         "url(a), radial-gradient(red, red)",
+        "image-set(linear-gradient(red, red) 1x) lime",
+        "-webkit-cross-fade(linear-gradient(red, red), url(b), 50%) lime",
+        "url(\"data:image/svg+xml,%3Csvg/%3E\") lime",
+        "url(data:image/gif;base64,R0lGOD) lime",
     ] {
-        assert!(matches!(pixel(&format!("style=\"background: {g}\"")), Err(Error::Unsupported(_))), "{g}");
+        assert!(not_yet(&format!("style='background: {g}'")), "{g}");
     }
-    // 根を描かなくても背景は塗る
+    // 印は後ろの background-color や長い名前の background-image で消えない（単位 3 の 4 回目のレビュー）
+    assert!(not_yet("style=\"background: linear-gradient(red,red) lime; background-color: blue\""));
+    assert!(not_yet("style=\"background-color: blue\"><style>svg { background: linear-gradient(red,red) }</style"));
+    assert!(not_yet("style=\"background-image: linear-gradient(red,red)\""));
+    assert!(not_yet("style=\"background-image: url(a.png), url('data:image/png;base64,AA')\""));
+    // 画像の層を後ろで none にすれば描く
+    assert_eq!(style("background: linear-gradient(red,red) lime; background-image: none"), LIME);
+    assert_eq!(style("background-image: url(x.png); background-color: lime"), LIME);
+    // 根を描かなくても背景は塗る（display: none と偽の条件の根は中身も描く。Chrome と同じ。ADR-102）
     assert_eq!(pixel("viewBox=\"0 0 0 0\" style=\"background: red\"").unwrap(), RED);
     assert_eq!(pixel("transform=\"scale(0)\" style=\"background: red\"").unwrap(), RED);
-    assert_eq!(pixel("style=\"display: none; background: red\"").unwrap(), NONE);
+    assert_eq!(pixel("style=\"display: none; background: red\"").unwrap(), RED);
+    assert_eq!(pixel("systemLanguage=\"xx\" style=\"background: red\"").unwrap(), RED);
     // 規則で書いても同じ（!important と後ろ勝ち）
     assert_eq!(
         pixel("class=\"k\"><style>.k { background: red !important } svg { background: lime }</style").unwrap(),
@@ -570,4 +601,86 @@ fn background_shorthand_is_checked_once_per_declaration() {
     let (a, b) = (work(500, 500), work(1000, 1000));
     // 値と要素をどちらも 2 倍にしても、手間はおよそ 2 倍（2 乗なら 4 倍）
     assert!(b < a * 3, "{a} → {b}");
+}
+
+/// まだ描かないので NotYet にするもの（単位 3 の 4 回目のレビュー：どれも黙って違う絵になっていた）：CSS の個別の変形と
+/// offset-path・display: contents・mask のまとめの形・clip-path の shape()。none と url ただ 1 つの mask は今のまま。
+#[test]
+fn more_not_yet_features() {
+    let r = "<rect width=\"5\" height=\"5\"";
+    for css in ["translate: 10px 10px", "rotate: 90deg", "scale: 3", "offset-path: path('M0 0 L12 12')"] {
+        assert_eq!(not_yet(&format!("{r} style=\"{css}\"/>")), Later::CssTransform, "{css}");
+    }
+    assert_eq!(not_yet("<g style=\"display: contents\"><rect width=\"5\" height=\"5\"/></g>"), Later::DisplayContents);
+    assert_eq!(not_yet(&format!("{r} style=\"display: contents\"/>")), Later::DisplayContents);
+    let m = "<mask id=\"m\"><rect width=\"5\" height=\"5\"/></mask>";
+    for css in ["mask: url(#m) luminance", "mask: url(#m) no-repeat", "mask: linear-gradient(transparent, transparent)"]
+    {
+        assert_eq!(not_yet(&format!("{m}{r} style=\"{css}\"/>")), Later::Mask, "{css}");
+    }
+    assert_eq!(not_yet(&format!("{m}{r} style=\"mask: url(#m)\"/>")), Later::Mask);
+    for p in ["clip-path", "-webkit-clip-path"] {
+        let css = format!("{p}: shape(from 0 0, line to 20px 0, line to 0 20px, close)");
+        assert_eq!(not_yet(&format!("{r} style=\"{css}\"/>")), Later::Clip, "{css}");
+    }
+    // none は描く
+    for css in ["translate: none", "rotate: none", "scale: none", "offset-path: none", "mask: none", "display: inline"]
+    {
+        assert!(build(&svg(&format!("{r} style=\"{css}\"/>"))).is_ok(), "{css}");
+    }
+}
+
+/// 根の svg の display: none と偽の条件は描くことを止めない（Chrome と同じ。ADR-102。子の display: none は効く）。
+#[test]
+fn root_display_and_conditions_are_ignored() {
+    let x = "xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\"";
+    for attrs in [
+        "style=\"display:none\"",
+        "display=\"none\"",
+        "requiredExtensions=\"http://example.com/x\"",
+        "systemLanguage=\"xx\"",
+    ] {
+        let t = build(&format!("<svg {x} {attrs}><rect width=\"10\" height=\"10\" fill=\"blue\"/></svg>")).unwrap();
+        assert_eq!(t.nodes.len(), 1, "{attrs}");
+    }
+    let t = build(&format!("<svg {x}><style>svg {{ display: none }}</style><rect width=\"10\" height=\"10\"/></svg>"))
+        .unwrap();
+    assert_eq!(t.nodes.len(), 1);
+    let t = build(&format!("<svg {x}><rect width=\"10\" height=\"10\" display=\"none\"/></svg>")).unwrap();
+    assert_eq!(t.nodes.len(), 0);
+}
+
+/// 大きさを中身で決める文書：% は書いた幅・高さ（% は 100 に対する割合）、ない側は 100 で解き（usvg・Chrome と同じ。ADR-102）、
+/// 根の変形の原点は既定だけ 0 0（書いた % は表示の領域で解く。usvg と同じ）。viewBox の幅か高さが 0 なら大きさは中身で決め、
+/// 何も描かない（ADR-78 (7)）。
+#[test]
+fn content_sized_documents() {
+    let size = |root: &str, body: &str| {
+        let t = build(&format!("<svg xmlns=\"http://www.w3.org/2000/svg\" {root}>{body}</svg>")).unwrap();
+        (t.size.width, t.size.height, t.nodes.len())
+    };
+    assert_eq!(size("width=\"40\"", "<rect width=\"50%\" height=\"30\"/>"), (20.0, 30.0, 1));
+    assert_eq!(size("height=\"40\"", "<rect width=\"10\" height=\"50%\"/>"), (10.0, 20.0, 1));
+    assert_eq!(size("width=\"30%\"", "<rect width=\"50%\" height=\"10\"/>"), (15.0, 10.0, 1));
+    // 向きのない % は対角 √((40² + 100²) / 2) で解く（resvg の 8 × 8 と同じ半径）
+    let r10 = 0.1 * ((40.0f64 * 40.0 + 100.0 * 100.0) / 2.0).sqrt();
+    assert!((size("width=\"40\"", "<circle r=\"10%\" cx=\"10\" cy=\"10\"/>").0 - (10.0 + r10)).abs() < 1e-9);
+    assert_eq!(size("", "<rect width=\"50%\" height=\"10\"/>"), (50.0, 10.0, 1));
+    // 根の変形の原点：既定は 0 0、書いた % は 100 × 100 で解く
+    let r = "<rect width=\"10\" height=\"10\"/>";
+    assert_eq!(size("transform=\"scale(2)\"", r), (20.0, 20.0, 1));
+    assert_eq!(size("transform=\"scale(2)\" style=\"transform-origin: 10% 10%\"", r), (10.0, 10.0, 1));
+    assert_eq!(size("transform=\"scale(2)\" style=\"transform-origin: initial\"", r), (20.0, 20.0, 1));
+    // viewBox の幅か高さが 0：大きさは中身、描かない
+    assert_eq!(size("viewBox=\"0 0 0 10\"", "<rect width=\"10\" height=\"30\"/>"), (10.0, 30.0, 0));
+}
+
+/// 文脈の塗りの元が use の currentColor：描く要素（中身）の color で解く（Chrome と同じ。ADR-102）。
+#[test]
+fn context_paint_current_color_uses_the_drawn_element() {
+    let t = build(&svg("<defs><rect id=\"r\" width=\"5\" height=\"5\" fill=\"context-fill\" color=\"blue\"/></defs>\
+         <use href=\"#r\" fill=\"currentColor\" color=\"lime\"/>"))
+    .unwrap();
+    let n = t.nodes.as_slice().first().copied().unwrap();
+    assert_eq!(n.fill, [0.0, 0.0, 255.0, 1.0]);
 }

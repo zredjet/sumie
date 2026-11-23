@@ -24,8 +24,9 @@ use crate::geom::{self, PathRef, PathSeg, PathWriter, Point, Rect, Transform};
 use crate::mem::{MVec, Plain, lower_bound_try, stable_sort};
 use crate::style::cascade::{ORIGIN_ATTR, SRC_INPUT, SRC_STORE, WIDE_NONE};
 use crate::style::computed::{
-    Axis, Base, Bufs, CPaint, Computed, DASH_NONE, FX_BLEND, FX_CLIP, FX_FILTER, FX_ISOLATE, FX_MASK, G_CX, G_CY,
-    G_HEIGHT, G_R, G_RX, G_RY, G_WIDTH, G_X, G_Y, PAINT_CONTEXT_FILL, PAINT_CONTEXT_STROKE, VISIBLE, resolve,
+    Axis, Base, Bufs, CPaint, Computed, DASH_NONE, FX_BLEND, FX_CLIP, FX_CONTENTS, FX_CSS_TRANSFORM, FX_FILTER,
+    FX_ISOLATE, FX_MASK, G_CX, G_CY, G_HEIGHT, G_R, G_RX, G_RY, G_WIDTH, G_X, G_Y, PAINT_CONTEXT_FILL,
+    PAINT_CONTEXT_STROKE, VISIBLE, resolve,
 };
 use crate::style::props::lookup;
 use crate::tree::{
@@ -181,29 +182,33 @@ pub(crate) fn build_tree(d: &Document<'_>, budget: &Budget<'_>) -> Result<Tree, 
         bbox: Rect::EMPTY,
         root: None,
     };
-    // 背景は、根が svg で display: none でなく条件で隠れていなければ塗る（viewBox の幅か高さが 0・変形が逆にできないなどで
-    // 中身を描かない根でも塗る。Chrome と同じ。ADR-101）
+    // 背景は、根が svg なら塗る（display: none・偽の条件の根も、viewBox の幅か高さが 0・変形が逆にできないなどで中身を
+    // 描かない根も。Chrome と同じ。ADR-101 (8)・ADR-102）
     let mut paint_background = false;
     walk_with(d, WalkOptions { build: true }, budget, &mut |item| {
         if item.node == 0 {
             out.root = Some(item.computed);
-            let hidden = d.refs.hidden.as_slice().first().copied().unwrap_or(0) != 0;
             paint_background = d
                 .xml
                 .nodes
                 .as_slice()
                 .first()
-                .is_some_and(|n| n.ns == crate::xml::NS_SVG && n.local.of(d.input) == b"svg")
-                && item.computed.display_none == 0
-                && !hidden;
+                .is_some_and(|n| n.ns == crate::xml::NS_SVG && n.local.of(d.input) == b"svg");
         }
         if !item.rendered {
             return Ok(());
         }
         visit(d, item, keys.as_slice(), &mut slots, &mut out, budget)
     })?;
-    let Out { nodes, verbs, coords, dashes, scratch, points, bbox, root } = out;
+    let Out { mut nodes, mut verbs, mut coords, mut dashes, scratch, points, bbox, root } = out;
     drop((scratch, points, slots, keys));
+    // 大きさを中身で決める文書で根の viewBox の幅か高さが 0：外接矩形だけを使い、何も描かない（ADR-78 (7)）
+    if crate::doc::walk::bbox_only_root(d, budget)? {
+        nodes.clear();
+        verbs.clear();
+        coords.clear();
+        dashes.clear();
+    }
     let size = match d.size.known() {
         Some(s) => s,
         None => content_size(&bbox)?,
@@ -229,16 +234,35 @@ pub(crate) fn build_tree(d: &Document<'_>, budget: &Budget<'_>) -> Result<Tree, 
 /// ADR-97 (4)）。
 fn background_of(d: &Document<'_>, root: &Computed, budget: &Budget<'_>) -> Result<[f64; 4], Error> {
     let budget = budget_ref(budget);
-    let Some(id) = lookup(b"background-color", false) else { return Ok([0.0; 4]) };
     let bufs = Bufs { input: d.input, store: d.xml.store.as_slice(), sheet: d.sheet.text.as_slice() };
+    // 画像の層（勝った background-image。まとめから分けたものは印で、長い名前は値を読む）：グラデーションと data: の画像は
+    // まだ描かない（Chrome は描く。黙って違う絵にしない。ADR-101 (8)・ADR-102）
+    if let Some(img) = lookup(b"background-image", false) {
+        for s in d.styles.of(0) {
+            budget.spend(cost::OP_STEP)?;
+            if s.prop != img || s.wide != WIDE_NONE {
+                continue;
+            }
+            let flags = if s.pad[0] & crate::style::cascade::BG_IMAGE_FROM_SHORTHAND != 0 {
+                s.pad[0]
+            } else {
+                crate::style::valid::image_list(bufs.of(s.src), s.value, budget)?.unwrap_or(0)
+            };
+            let not_yet =
+                |l: Later| Err(Error::Unsupported(Unsupported { feature: Feature::NotYet(l), position: None }));
+            if flags & crate::style::valid::IMAGE_GRADIENT != 0 {
+                return not_yet(Later::Gradient);
+            }
+            if flags & crate::style::valid::IMAGE_DATA != 0 {
+                return not_yet(Later::BackgroundImage);
+            }
+        }
+    }
+    let Some(id) = lookup(b"background-color", false) else { return Ok([0.0; 4]) };
     for s in d.styles.of(0) {
         budget.spend(cost::OP_STEP)?;
         if s.prop != id {
             continue;
-        }
-        // background のまとめのグラデーションの層はまだ描かない（Chrome は描く。黙って違う絵にしない。ADR-101）
-        if s.pad[0] != 0 {
-            return Err(Error::Unsupported(Unsupported { feature: Feature::NotYet(Later::Gradient), position: None }));
         }
         if s.wide != WIDE_NONE {
             continue;
@@ -397,6 +421,12 @@ fn visit(
     if c.fx & (FX_BLEND | FX_ISOLATE) != 0 {
         return not_yet(Later::Blend);
     }
+    if c.fx & FX_CSS_TRANSFORM != 0 {
+        return not_yet(Later::CssTransform);
+    }
+    if c.fx & FX_CONTENTS != 0 {
+        return not_yet(Later::DisplayContents);
+    }
     // 受け継がない参照（clip-path・mask・filter）の辺は値の並びの節へ張る：並びの節に参照先への辺があれば効く
     let xml_nodes = doc.nodes.len();
     let effective = |t: u32| (t as usize) < xml_nodes || !d.refs.of(t).is_empty();
@@ -428,6 +458,7 @@ fn visit(
         viewport: item.viewport,
         doc: d.media_size,
         outermost: false,
+        content_sized: false,
     };
     let vp = item.viewport;
     let basis = |axis: Axis| -> Option<f64> {
@@ -667,14 +698,14 @@ enum Painted {
 fn paint(d: &Document<'_>, item: &WalkItem, p: CPaint, is_fill: bool, budget: &Budget<'_>) -> Result<Painted, Error> {
     let c = &item.computed;
     // 文脈の塗りは、使う側の種類（use の fill か stroke か）で解く（輪で切った塗りの辺を正しく見る。単位 3 の 3 回目の
-    // レビュー）
-    let (p, color, node, side) = match (p.kind, item.context) {
-        (PAINT_CONTEXT_FILL, Some(x)) => (x.fill, x.fill_color, x.fill_node, true),
-        (PAINT_CONTEXT_STROKE, Some(x)) => (x.stroke, x.stroke_color, x.stroke_node, false),
+    // レビュー）。use の塗りの currentColor は、描く要素（中身）の color で解く（Chrome と同じ。ADR-102）
+    let (p, node, side) = match (p.kind, item.context) {
+        (PAINT_CONTEXT_FILL, Some(x)) => (x.fill, x.fill_node, true),
+        (PAINT_CONTEXT_STROKE, Some(x)) => (x.stroke, x.stroke_node, false),
         (PAINT_CONTEXT_FILL | PAINT_CONTEXT_STROKE, None) => return Ok(Painted::None),
-        _ => (p, c.color, item.node, is_fill),
+        _ => (p, item.node, is_fill),
     };
-    Ok(match used_paint(d, node, &p, side, color, budget)? {
+    Ok(match used_paint(d, node, &p, side, c.color, budget)? {
         Used::None | Used::ContextFill | Used::ContextStroke => Painted::None,
         Used::Color(col) => Painted::Color(col),
         Used::Server(t) => {

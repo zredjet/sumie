@@ -67,6 +67,7 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
         Kind::Path if cx.attr => return Ok(true),
         Kind::Font => return Ok(font_parts(s, range, cx, budget)?.is_some()),
         Kind::Background => return Ok(background_color(s, range, budget)?.is_some()),
+        Kind::BackgroundImage => return Ok(image_list(s, range, budget)?.is_some()),
         _ => {}
     }
     let mut v = Values::new(s, range, budget);
@@ -209,7 +210,9 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
             if v.eat_ident(b"none")? {
                 true
             } else {
-                const FNS: &[&[u8]] = &[b"inset", b"circle", b"ellipse", b"polygon", b"path", b"rect", b"xywh"];
+                // `shape()`（CSS Shapes 2）も受ける（まだ描かないので NotYet。単位 3 の 4 回目のレビュー）
+                const FNS: &[&[u8]] =
+                    &[b"inset", b"circle", b"ellipse", b"polygon", b"path", b"rect", b"xywh", b"shape"];
                 const BOXES: &[&[u8]] = &[
                     b"fill-box",
                     b"stroke-box",
@@ -271,7 +274,7 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
             }
             true
         }
-        Kind::Transform | Kind::Font | Kind::Background => false,
+        Kind::Transform | Kind::Font | Kind::Background | Kind::BackgroundImage => false,
     };
     Ok(ok && v.at_end()?)
 }
@@ -657,7 +660,151 @@ mod tests;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Background {
     pub(crate) color: Option<Span>,
-    pub(crate) gradient: bool,
+    /// 画像の層の印（[`IMAGE_GRADIENT`]・[`IMAGE_DATA`]）
+    pub(crate) image: u8,
+}
+
+/// 画像の層にグラデーションがある（関数の引数の中も）。
+pub(crate) const IMAGE_GRADIENT: u8 = 1;
+/// 画像の層に `data:` の画像がある（Chrome は img の中でも描く）。
+pub(crate) const IMAGE_DATA: u8 = 2;
+
+/// グラデーションの関数の名前。
+const GRADIENTS: &[&[u8]] = &[
+    b"linear-gradient",
+    b"radial-gradient",
+    b"conic-gradient",
+    b"repeating-linear-gradient",
+    b"repeating-radial-gradient",
+    b"repeating-conic-gradient",
+    b"-webkit-linear-gradient",
+    b"-webkit-radial-gradient",
+    b"-webkit-repeating-linear-gradient",
+    b"-webkit-repeating-radial-gradient",
+    b"-webkit-gradient",
+];
+
+/// 画像を包む関数の名前（引数の中のグラデーションと url を見る）。接頭辞のない `cross-fade()` と `element()` は Chrome では
+/// 壊れた値（単位 3 の 4 回目のレビュー）。
+const IMAGE_WRAPPERS: &[&[u8]] = &[b"image", b"image-set", b"-webkit-image-set", b"-webkit-cross-fade"];
+
+/// 部分が画像（`none`・url・グラデーション・画像を包む関数）なら、その印（[`IMAGE_GRADIENT`]・[`IMAGE_DATA`]）。画像でなければ
+/// None。包む関数は引数の中のグラデーションの関数と `data:` の url を探す。
+fn image_flags(s: &[u8], p: &Part, budget: &Budget<'_>) -> Result<Option<u8>, Error> {
+    let budget = budget_ref(budget);
+    let is_fn = |t: &crate::css::lex::Token, names: &[&[u8]]| {
+        t.kind == Tk::Function && names.iter().any(|w| ident_is(s, t.inner, t.escaped, w))
+    };
+    // url（字句の url か、文字列の url() 関数）が data: か
+    let data_url = |t: &crate::css::lex::Token, lex: &mut Lexer<'_, '_>| -> Result<bool, Error> {
+        let text = |sp: Span| s.get(sp.start as usize..sp.end as usize).unwrap_or(&[]);
+        let starts_data = |b: &[u8]| b.len() >= 5 && b.get(..5).is_some_and(|h| h.eq_ignore_ascii_case(b"data:"));
+        // escape を含む url は中身を読み直さず、data: とみなす（まだ描かない側に倒す）
+        if t.kind == Tk::Url {
+            return Ok(t.escaped || starts_data(text(t.inner).trim_ascii_start()));
+        }
+        if is_fn(t, &[b"url"]) {
+            loop {
+                let a = lex.next()?;
+                match a.kind {
+                    Tk::Whitespace => continue,
+                    Tk::Str => return Ok(a.escaped || starts_data(text(a.inner))),
+                    _ => return Ok(false),
+                }
+            }
+        }
+        Ok(false)
+    };
+    if p.t.kind == Tk::Ident && ident_is(s, p.t.inner, p.t.escaped, b"none") {
+        return Ok(Some(0));
+    }
+    if is_fn(&p.t, GRADIENTS) {
+        return Ok(Some(IMAGE_GRADIENT));
+    }
+    if p.t.kind == Tk::Url || is_fn(&p.t, &[b"url"]) {
+        let mut lex = Lexer::over(s, p.span, budget);
+        let t = lex.next()?;
+        return Ok(Some(if data_url(&t, &mut lex)? { IMAGE_DATA } else { 0 }));
+    }
+    if !is_fn(&p.t, IMAGE_WRAPPERS) {
+        return Ok(None);
+    }
+    // 包む関数：引数の中を字句ごとに見る（どの字句でも 1 つ進む）
+    let mut lex = Lexer::over(s, p.span, budget);
+    let _ = lex.next()?;
+    let mut flags = 0u8;
+    loop {
+        budget.spend(cost::OP_STEP)?;
+        let t = lex.next()?;
+        if t.kind == Tk::Eof {
+            break;
+        }
+        if is_fn(&t, GRADIENTS) {
+            flags |= IMAGE_GRADIENT;
+        } else if data_url(&t, &mut lex)? {
+            flags |= IMAGE_DATA;
+        }
+    }
+    Ok(Some(flags))
+}
+
+/// `background-image` の値（`,` で分けた層ごとに画像 1 つ）を確かめ、画像の印（[`IMAGE_GRADIENT`]・[`IMAGE_DATA`]）を返す
+/// （壊れていれば None）。
+pub(crate) fn image_list(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<Option<u8>, Error> {
+    let budget = budget_ref(budget);
+    let mut lex = Lexer::over(s, range, budget);
+    let mut flags = 0u8;
+    let mut in_layer = false;
+    loop {
+        budget.spend(cost::OP_STEP)?;
+        let t = lex.next()?;
+        match t.kind {
+            Tk::Eof => return Ok(in_layer.then_some(flags)),
+            Tk::Whitespace => continue,
+            Tk::Comma => {
+                if !in_layer {
+                    return Ok(None);
+                }
+                in_layer = false;
+                continue;
+            }
+            Tk::BadString | Tk::BadUrl => return Ok(None),
+            _ => {}
+        }
+        if in_layer {
+            return Ok(None);
+        }
+        // 部分（関数なら対応する `)` まで）
+        let mut end = t.span.end;
+        if t.kind == Tk::Function {
+            let mut depth = 1u32;
+            loop {
+                let u = lex.next()?;
+                match u.kind {
+                    Tk::Eof => {
+                        end = range.end;
+                        break;
+                    }
+                    Tk::Function | Tk::LParen | Tk::LBracket | Tk::LBrace => depth = depth.saturating_add(1),
+                    Tk::RParen | Tk::RBracket | Tk::RBrace => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            end = u.span.end;
+                            break;
+                        }
+                    }
+                    Tk::BadString | Tk::BadUrl => return Ok(None),
+                    _ => {}
+                }
+            }
+        }
+        let p = Part::of(s, Span { start: t.span.start, end }, budget)?;
+        match image_flags(s, &p, budget)? {
+            Some(f) => flags |= f,
+            None => return Ok(None),
+        }
+        in_layer = true;
+    }
 }
 
 /// まとめの部分（字句 1 つか、関数なら対応する `)` まで）と、その頭の字句（範囲から読み直す）。
@@ -682,7 +829,7 @@ impl Part {
 pub(crate) fn background_color(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<Option<Background>, Error> {
     let budget = budget_ref(budget);
     let mut lex = Lexer::over(s, range, budget);
-    let mut out = Background { color: None, gradient: false };
+    let mut out = Background { color: None, image: 0 };
     let mut layer: crate::mem::MVec<'_, Span> = crate::mem::MVec::new(budget);
     let mut ended = false;
     let mut last_layer = false;
@@ -730,11 +877,11 @@ pub(crate) fn background_color(s: &[u8], range: Span, budget: &Budget<'_>) -> Re
             layer.push(Span { start: t.span.start, end })?;
         }
         match layer_of(s, layer.as_slice(), last_layer, budget)? {
-            Some((color, gradient)) => {
+            Some((color, image)) => {
                 if last_layer {
                     out.color = color;
                 }
-                out.gradient |= gradient;
+                out.image |= image;
             }
             None => return Ok(None),
         }
@@ -742,8 +889,8 @@ pub(crate) fn background_color(s: &[u8], range: Span, budget: &Budget<'_>) -> Re
     Ok(Some(out))
 }
 
-/// 1 つの層を確かめる（色の範囲とグラデーションか。壊れていれば None）。部分は範囲で受け、頭の字句をその都度読み直す。
-fn layer_of(s: &[u8], spans: &[Span], last: bool, budget: &Budget<'_>) -> Result<Option<(Option<Span>, bool)>, Error> {
+/// 1 つの層を確かめる（色の範囲と画像の印。壊れていれば None）。部分は範囲で受け、頭の字句をその都度読み直す。
+fn layer_of(s: &[u8], spans: &[Span], last: bool, budget: &Budget<'_>) -> Result<Option<(Option<Span>, u8)>, Error> {
     let budget = budget_ref(budget);
     if spans.is_empty() {
         return Ok(None);
@@ -756,10 +903,29 @@ fn layer_of(s: &[u8], spans: &[Span], last: bool, budget: &Budget<'_>) -> Result
     };
     let is = |p: &Part, w: &[u8]| p.t.kind == Tk::Ident && ident_is(s, p.t.inner, p.t.escaped, w);
     let fname = |p: &Part, w: &[u8]| p.t.kind == Tk::Function && ident_is(s, p.t.inner, p.t.escaped, w);
-    // 長さか割合（負でもよい：位置）か calc()
+    // 長さか割合（負でもよい：位置）か、長さか割合の calc()・min()・max()・clamp()（中に長さでない次元があれば壊れた値。
+    // 単位 3 の 4 回目のレビュー）
     let lp = |p: &Part| -> Result<bool, Error> {
-        if fname(p, b"calc") {
-            return Ok(true);
+        if [b"calc".as_slice(), b"min", b"max", b"clamp"].iter().any(|w| fname(p, w)) {
+            let mut lex = Lexer::over(s, p.span, budget);
+            let _ = lex.next()?;
+            let mut length = false;
+            loop {
+                budget.spend(cost::OP_STEP)?;
+                let t = lex.next()?;
+                match t.kind {
+                    Tk::Eof => return Ok(length),
+                    Tk::Percentage => length = true,
+                    Tk::Dimension => {
+                        let mut v = Values::new(s, t.span, budget);
+                        if v.length(false)?.is_none() {
+                            return Ok(false);
+                        }
+                        length = true;
+                    }
+                    _ => {}
+                }
+            }
         }
         match p.t.kind {
             Tk::Percentage => Ok(true),
@@ -777,7 +943,7 @@ fn layer_of(s: &[u8], spans: &[Span], last: bool, budget: &Budget<'_>) -> Result
     let pos_token = |p: &Part| -> Result<bool, Error> { Ok(h(p) || vt(p) || c(p) || lp(p)?) };
     let mut color: Option<Span> = None;
     let (mut image, mut position, mut repeat, mut attach, mut boxes) = (false, false, false, false, 0u8);
-    let mut gradient = false;
+    let mut flags = 0u8;
     let mut i = 0usize;
     while let Some(p) = part(i)? {
         budget.spend(cost::OP_STEP)?;
@@ -793,41 +959,13 @@ fn layer_of(s: &[u8], spans: &[Span], last: bool, budget: &Budget<'_>) -> Result
             i = i.saturating_add(1);
             continue;
         }
-        // 画像
-        let grad = [
-            b"linear-gradient".as_slice(),
-            b"radial-gradient",
-            b"conic-gradient",
-            b"repeating-linear-gradient",
-            b"repeating-radial-gradient",
-            b"repeating-conic-gradient",
-            b"-webkit-linear-gradient",
-            b"-webkit-radial-gradient",
-            b"-webkit-repeating-linear-gradient",
-            b"-webkit-repeating-radial-gradient",
-            b"-webkit-gradient",
-        ]
-        .iter()
-        .any(|w| fname(&p, w));
-        let other_image = p.t.kind == Tk::Url
-            || is(&p, b"none")
-            || [
-                b"url".as_slice(),
-                b"image",
-                b"image-set",
-                b"-webkit-image-set",
-                b"cross-fade",
-                b"-webkit-cross-fade",
-                b"element",
-            ]
-            .iter()
-            .any(|w| fname(&p, w));
-        if grad || other_image {
+        // 画像（包む関数の引数の中のグラデーションと data: の url も印にする）
+        if let Some(f) = image_flags(s, &p, budget)? {
             if image {
                 return Ok(None);
             }
             image = true;
-            gradient |= grad;
+            flags |= f;
             i = i.saturating_add(1);
             continue;
         }
@@ -905,7 +1043,13 @@ fn layer_of(s: &[u8], spans: &[Span], last: bool, budget: &Budget<'_>) -> Result
             i = i.saturating_add(1);
             continue;
         }
-        if is(&p, b"border-box") || is(&p, b"padding-box") || is(&p, b"content-box") {
+        // 箱（background-origin と background-clip。clip は text と border-area も。Chrome と同じ）
+        if is(&p, b"border-box")
+            || is(&p, b"padding-box")
+            || is(&p, b"content-box")
+            || is(&p, b"text")
+            || is(&p, b"border-area")
+        {
             if boxes >= 2 {
                 return Ok(None);
             }
@@ -915,7 +1059,7 @@ fn layer_of(s: &[u8], spans: &[Span], last: bool, budget: &Budget<'_>) -> Result
         }
         return Ok(None);
     }
-    Ok(Some((color, gradient)))
+    Ok(Some((color, flags)))
 }
 
 /// 続いた位置の字句が `<bg-position>` の形か（1 つ：どれでも。2 つ：言葉どうしは横 2 つ・縦 2 つでなければ順を問わず、長さを

@@ -134,6 +134,7 @@ impl Tree {
             viewport: (n.flags & HAS_VP != 0).then_some((n.viewport[0], n.viewport[1])),
             doc: self.doc_size,
             outermost: false,
+            content_sized: false,
         };
         resolve(l, n.font_size, n.line_height, &base, Axis::Diag)
     }

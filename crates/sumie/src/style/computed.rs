@@ -179,6 +179,10 @@ pub(crate) const FX_FILTER: u8 = 2;
 pub(crate) const FX_MASK: u8 = 4;
 pub(crate) const FX_BLEND: u8 = 8;
 pub(crate) const FX_ISOLATE: u8 = 16;
+/// CSS の個別の変形（`translate`・`rotate`・`scale`）か `offset-path` が none でない
+pub(crate) const FX_CSS_TRANSFORM: u8 = 32;
+/// `display: contents`
+pub(crate) const FX_CONTENTS: u8 = 64;
 
 /// 幾何のプロパティの欄（[`Geo::v`] の番号）。
 pub(crate) const G_X: usize = 0;
@@ -376,6 +380,8 @@ pub(crate) struct PropIds {
     isolation: Option<PropertyId>,
     /// 接頭辞つきの効果と `mask-image`（none でなければまだ描かない。ADR-101）
     prefixed: [Option<PropertyId>; 5],
+    /// CSS の個別の変形と offset-path（none でなければまだ描かない）
+    css_transform: [Option<PropertyId>; 4],
 }
 
 /// 幾何の欄のプロパティの名前（[`G_X`] などの順）。
@@ -421,6 +427,12 @@ impl PropIds {
                 lookup(b"-webkit-mask-image", false),
                 lookup(b"mask-image", false),
             ],
+            css_transform: [
+                lookup(b"translate", false),
+                lookup(b"rotate", false),
+                lookup(b"scale", false),
+                lookup(b"offset-path", false),
+            ],
         }
     }
 }
@@ -459,6 +471,7 @@ struct Picked {
     blend: Option<Specified>,
     isolation: Option<Specified>,
     prefixed: [Option<Specified>; 5],
+    css_transform: [Option<Specified>; 4],
 }
 
 fn pick(specs: &[Specified], ids: &PropIds, budget: &Budget<'_>) -> Result<Picked, Error> {
@@ -529,6 +542,11 @@ fn pick(specs: &[Specified], ids: &PropIds, budget: &Budget<'_>) -> Result<Picke
                 Some(x) => x,
                 None => continue,
             }
+        } else if let Some(k) = ids.css_transform.iter().position(|g| id == *g) {
+            match p.css_transform.get_mut(k) {
+                Some(x) => x,
+                None => continue,
+            }
         } else if let Some(k) = ids.geo.iter().position(|g| id == *g) {
             match p.geo.get_mut(k) {
                 Some(x) => x,
@@ -575,6 +593,10 @@ pub(crate) struct Base {
     /// 根の要素を求めるか。根の svg には UA の規則の `transform-origin: 0 0` が当たらず、既定は 50% 50%。参照の箱は
     /// `transform-box` に依らず表示の領域の箱（CSS の箱を持つ要素の border-box。Chrome と同じ。ADR-85 (1)）
     pub(crate) outermost: bool,
+    /// 大きさを中身で決める文書の根の要素を求めるか。変形の原点の既定（書いていないか初期の値）は 0 0（usvg と同じ。大きさが
+    /// 変形に依るので表示の領域の真ん中は決まらない。書いた % と言葉は表示の領域（書いた幅・高さ、なければ 100）で解く。
+    /// ADR-101 (1)・ADR-102）
+    pub(crate) content_sized: bool,
 }
 
 /// % の向き。
@@ -835,6 +857,16 @@ pub(crate) fn compute(
             Some(false) => 0,
             None => u8::from(Values::new(bufs.of(s.src), s.value, budget).eat_ident(b"none")?),
         };
+        // display: contents は要素の箱（変形・位置・効果）を捨てて子を描く（CSS Display 3 §2.8）。まだ描かない（NotYet。
+        // 黙って箱を残して描かない。単位 3 の 4 回目のレビュー）
+        let contents = match wide(s) {
+            Some(true) => parent.fx & FX_CONTENTS != 0,
+            Some(false) => false,
+            None => Values::new(bufs.of(s.src), s.value, budget).eat_ident(b"contents")?,
+        };
+        if contents {
+            c.fx |= FX_CONTENTS;
+        }
     }
     transform(&mut c, parent, &p, bufs, base, budget)?;
     Ok(c)
@@ -1207,6 +1239,18 @@ fn effects(
             c.fx |= bit;
         }
     }
+    // CSS の個別の変形と offset-path：none でなければまだ描かない（黙って変形なしで描かない。単位 3 の 4 回目のレビュー）
+    for sp in p.css_transform.iter().flatten() {
+        budget.spend(cost::OP_STEP)?;
+        let on = match wide(sp) {
+            Some(true) => parent.fx & FX_CSS_TRANSFORM != 0,
+            Some(false) => false,
+            None => !none_only(sp)?,
+        };
+        if on {
+            c.fx |= FX_CSS_TRANSFORM;
+        }
+    }
     Ok(())
 }
 
@@ -1252,7 +1296,8 @@ fn transform(
     let line = c.line_height;
     // 変形の原点の計算した値（長さと割合。受け継がない。inherit は親の計算した値で、割合はこの要素の参照の箱で解く。
     // CSS Transforms 1・Chrome と同じ。文書の 6 回目のレビュー）。既定は UA の規則の 0 0、根の svg は 50% 50%（ADR-85 (1)）
-    let mut og = if base.outermost { ORIGIN_CENTER } else { [0.0; 4] };
+    let initial_origin = if base.content_sized { [0.0; 4] } else { ORIGIN_CENTER };
+    let mut og = if base.outermost { initial_origin } else { [0.0; 4] };
     let mut og_known = true;
     if let Some(o) = p.transform_origin.as_ref() {
         budget.spend(cost::OP_STEP)?;
@@ -1269,8 +1314,8 @@ fn transform(
                 }
             },
             // initial・unset は CSS の初期の値 50% 50%（SVG の要素の 0 0 は UA の規則の値で、initial はそれを上書きする。
-            // Chrome と同じ。文書の 4 回目のレビュー）
-            _ => og = ORIGIN_CENTER,
+            // Chrome と同じ。文書の 4 回目のレビュー）。大きさを中身で決める文書の根は 0 0（usvg と同じ）
+            _ => og = initial_origin,
         }
     }
     c.origin_spec = og;

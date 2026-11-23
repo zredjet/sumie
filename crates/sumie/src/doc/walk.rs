@@ -65,11 +65,9 @@ pub(crate) struct WalkOptions {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct UseContext {
+    /// 塗り（currentColor は使う側の要素の color で解く。Chrome と同じ。ADR-102）
     pub(crate) fill: CPaint,
     pub(crate) stroke: CPaint,
-    /// それぞれの currentColor を解く色
-    pub(crate) fill_color: Color,
-    pub(crate) stroke_color: Color,
     /// それぞれの url の取り除いた辺を見る節（塗りを書いた use）
     pub(crate) fill_node: u32,
     pub(crate) stroke_node: u32,
@@ -149,9 +147,6 @@ struct Walker<'a, 'd, 'b> {
     overflow_id: Option<crate::style::props::PropertyId>,
 }
 
-/// 大きさを中身で決める文書の表示の領域（usvg の `Options::default_size` と同じ 100 × 100。Kura は変えない）。
-pub(crate) const CONTENT_SIZED_VIEWPORT: (f64, f64) = (100.0, 100.0);
-
 impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
     /// 根を計算して `f` に渡し、根の段を積む（根が要素でなければ None）。
     fn start(
@@ -167,9 +162,9 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
         let ids = PropIds::new();
         let bufs = Bufs { input, store: doc.store.as_slice(), sheet: d.sheet.text.as_slice() };
         let known = d.size.known().map(|s| (s.width, s.height));
-        // 大きさを中身で決める文書（幅・高さ・viewBox のない根）の表示の領域は 100 × 100（usvg の既定の大きさ。% の長さを
-        // 解く基準。大きさそのものは中身の外接矩形で決める。ADR-99 (1)）
-        let size = known.or(Some(CONTENT_SIZED_VIEWPORT));
+        // 大きさを中身で決める文書（幅・高さ・viewBox のない根）の表示の領域は、書いた幅・高さ（% は 100 に対する割合）、
+        // なければ 100（usvg の既定の大きさ。% の長さを解く基準。大きさそのものは中身の外接矩形で決める。ADR-99 (1)・ADR-102）
+        let size = Some(d.size.viewport());
         let initial = Computed::initial(d.font_size);
         let mut base = Base {
             default_font: d.font_size,
@@ -179,11 +174,11 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
             // vw などは `@media` と同じ文書の大きさ（既定の文字の大きさで解いたもの。ADR-74 (7)）
             doc: d.media_size,
             outermost: true,
+            content_sized: false,
         };
         budget.spend(cost::OP_STEP)?;
-        // 中身で大きさを決める文書の根の変形の原点の % は 0 × 0 で解く（既定の 50% 50% は (0, 0)。usvg と同じ。大きさが
-        // 変形に依るので、表示の領域の真ん中は決まらない。ADR-101）
-        let root_base = if known.is_none() { Base { viewport: Some((0.0, 0.0)), ..base } } else { base };
+        // 中身で大きさを決める文書の根の変形の原点の既定は 0 0（usvg と同じ。書いた % は表示の領域で解く。ADR-101 (1)・ADR-102）
+        let root_base = Base { content_sized: known.is_none(), ..base };
         let c0 = compute(&initial, d.styles.of(0), &ids, &bufs, &root_base, budget)?;
         base.root_font = c0.font_size;
         base.root_line = c0.line_height;
@@ -200,15 +195,13 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
                     (Transform::IDENTITY, size)
                 }
             },
-            (None, Some((vb, _))) if vb.w <= 0.0 || vb.h <= 0.0 => {
-                root_drawn = false;
-                (Transform::IDENTITY, size)
-            }
+            // 大きさを中身で決める文書の幅か高さが 0 の viewBox：大きさは viewBox がないものとして中身の外接矩形で決め、何も
+            // 描かない（ADR-78 (7)）。たどりは描く木を作る段が外接矩形だけを集めるために続ける（`bbox_only_root`）
             _ => (Transform::IDENTITY, size),
         };
-        let hidden = d.refs.hidden.as_slice().first().copied().unwrap_or(0) != 0;
-        let root_ok =
-            root.ns == NS_SVG && root.local.of(input) == b"svg" && c0.display_none == 0 && !hidden && root_drawn;
+        // 根の `display: none` と偽の条件（requiredExtensions・systemLanguage など）は描くことを止めない（Chrome は根の箱を
+        // 必ず作り、背景も中身も描く。ADR-102。子の display と条件は今のまま効く）
+        let root_ok = root.ns == NS_SVG && root.local.of(input) == b"svg" && root_drawn;
         // 根の svg の変形は viewBox の変形の外側に掛ける（usvg・Chrome と同じ。文書の 1 回目のレビュー）。原点の既定は表示の
         // 領域の真ん中（Chrome と同じ。usvg は原点。ADR-85 (1)）
         let root_own = c0.transform;
@@ -496,18 +489,18 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
         }
         // use の中身の context-fill・context-stroke が使う塗り（use の塗りがまた文脈の塗りなら、外の use の文脈から）
         let c = &frame.computed;
-        let pick = |p: CPaint| -> (CPaint, Color, u32) {
+        let pick = |p: CPaint| -> (CPaint, u32) {
             match (p.kind, outer) {
-                (PAINT_CONTEXT_FILL, Some(o)) => (o.fill, o.fill_color, o.fill_node),
-                (PAINT_CONTEXT_STROKE, Some(o)) => (o.stroke, o.stroke_color, o.stroke_node),
-                (PAINT_CONTEXT_FILL | PAINT_CONTEXT_STROKE, None) => (CPaint::NONE, c.color, frame.node),
-                _ => (p, c.color, frame.node),
+                (PAINT_CONTEXT_FILL, Some(o)) => (o.fill, o.fill_node),
+                (PAINT_CONTEXT_STROKE, Some(o)) => (o.stroke, o.stroke_node),
+                (PAINT_CONTEXT_FILL | PAINT_CONTEXT_STROKE, None) => (CPaint::NONE, frame.node),
+                _ => (p, frame.node),
             }
         };
-        let (fill, fill_color, fill_node) = pick(c.fill);
-        let (stroke, stroke_color, stroke_node) = pick(c.stroke);
+        let (fill, fill_node) = pick(c.fill);
+        let (stroke, stroke_node) = pick(c.stroke);
         let at = self.ctx.len();
-        self.ctx.push(UseContext { fill, stroke, fill_color, stroke_color, fill_node, stroke_node })?;
+        self.ctx.push(UseContext { fill, stroke, fill_node, stroke_node })?;
         self.stack.push(Frame {
             child: e.target,
             ctx: at as u32,
@@ -580,6 +573,17 @@ fn attr_len(
 
 /// 要素の `viewBox`（負の幅・高さの壊れたものは None。幅か高さが 0 のものは返し、呼び手が描かない）と
 /// `preserveAspectRatio`。
+/// 大きさを中身で決める文書で、根の viewBox の幅か高さが 0 か（大きさは viewBox がないものとして中身の外接矩形で決め、
+/// 何も描かない。ADR-78 (7)。描く木を作る段は外接矩形だけを集める）。
+pub(crate) fn bbox_only_root(d: &Document<'_>, budget: &Budget<'_>) -> Result<bool, Error> {
+    if d.size.known().is_some() {
+        return Ok(false);
+    }
+    let doc = &d.xml;
+    let Some(root) = doc.nodes.as_slice().first().filter(|n| n.kind == KIND_ELEMENT) else { return Ok(false) };
+    Ok(view_box_of(doc, d.input, root, budget)?.is_some_and(|(vb, _)| vb.w <= 0.0 || vb.h <= 0.0))
+}
+
 fn view_box_of(doc: &XmlDoc, input: &[u8], n: &Node, budget: &Budget<'_>) -> Result<Option<(ViewBox, Aspect)>, Error> {
     let budget = budget_ref(budget);
     let Some(v) = doc.attr(input, n, NS_NONE, b"viewBox", budget)? else { return Ok(None) };
