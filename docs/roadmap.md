@@ -152,6 +152,8 @@ DTD のまわりの多バイト文字・英数字と記号の 15 字のすべて
 - [ ] use の中身への CSS のセレクタを影の木の中で照らす（Chrome と同じ。ADR-102 (3)）・CSS の個別の変形と `offset-path`・`display: contents`・`mask` のまとめ・`shape()`・根の背景のグラデーションと data: の画像（M2 は NotYet。ADR-102 (6)(7)）
 - [ ] CSS の箱のプロパティ（根の border・padding・margin・角の丸み・box-shadow・position、要素の outline、rect の論理の大きさ）を
   描くか既知の差にするかを決める（M2 は初期の値と同じ絵でなければ NotYet。ADR-103 (5)）
+- [ ] 細い線（太さ 1 画素以下）を区間ごとに Skia と同じ塗り方（主軸の列ごとの標本と src-over の重ね）で描く（M2 は区間を
+  合わせた形の面積の被覆で、45° の線の鋭さ・継ぎ目・密な折れ線・重なりが既知の差。2026-11-24、ユーザーの判断。ADR-107 (7)(a)）
 
 **完了条件**：ここまでの機能の集まりで基準を満たす／Kura の pattern・mask の爆弾（巨大なタイル・objectBoundingBox の
 入れ子 24 段・曲線をタイルいっぱいに 3,000 回描き直す形・0.0001 の破線 1,000 本）を描く前に断るか、上限の内で描く／Kura の
@@ -186,6 +188,8 @@ feTurbulence）を見積もりの内で描くか描く前に断り、時間 ≤ 
 - [ ] OpenType の組版：GDEF・GSUB・GPOS・OpenType の `kern`
 - [ ] AAT の組版（ラテン文字・和文の分）：`morx` の非文脈・合字・文脈の副表・`kerx`（`ankr`）・Apple の形の `kern`・`trak`。
   状態機械の歩数の上限（ADR-29）
+- [ ] `white-space` のまとめの新しい値（`collapse`・`preserve nowrap` など）と、`unicode-bidi` の `-webkit-` の別名の描き方
+  （M2 は壊れた値・受けるだけ。ADR-107 (5)）
 - [ ] 字形ごとの上限と組版の上限（版に入る定数）。字形ごとの上限を超えた字形・壊れた字形は輪郭を空にして警告、組版の上限を
   超えたらそれ以上当てはめずに続ける（ADR-34）
 - [ ] 試験用の AAT のフォントを作る（`gen-fonts`：写しを許すフォントに fontTools で `morx`・`kerx`・Apple の `kern`・`trak` を足す。
@@ -238,6 +242,7 @@ pattern・clipPath・mask の中身にして 3,000 回参照）を上限の内�
 - [ ] resvg との差の記録（`docs/differences.md`）
 - [ ] CSS の `calc()`・`var()`（カスタムプロパティ）・`attr()`（ADR-103 (5)(e)）と `@scope` を読む・当てる（M1 では壊れた値・飛ばすアットルールとして警告
   する。2026-11-23、ユーザーの判断。ADR-83 (3)）
+- [ ] `@supports` の知らないプロパティの名前を、版を固定した Chrome のプロパティの名前の表で照らす（M2 は偽。ADR-107 (4)(b)）
 - [ ] ファズ：全部の対象の時間の合計で 24 時間以上（文書の全体を描く対象は、そのうち 8 時間以上）
 - [ ] Kura に渡す口の確定と、Kura の側の変更の案（`docs/kura-integration.md`：Kura の今の SVG の呼び出しの一覧と、そのすべての
   置き換え先の口。Kura のリポジトリには書かない）
