@@ -168,45 +168,48 @@ fn r4_wide_row_pays_per_chunk() {
 }
 
 /// 範囲の見積もりと全体の見積もり・計画の外接矩形と節の箱の丸めの差：ユーザー単位の外接矩形 × 倍率と、倍率を掛けた変形
-/// で写した点の差で、項目の矩形が節の箱より 1 画素広くなるか。
+/// で写した点は 1 ulp ずれうる（(a·x + e)·s と (a·s)·x + e·s）。項目の矩形は辺の固定小数の端から求めるので、節の箱の内に
+/// 収まり、全体の範囲の見積もりは描く段の見積もりを超えない（単位 2 の 3 回目のレビュー。必ず確かめる形）。
 #[test]
 fn r5_item_box_vs_node_box() {
-    // (x + e)·s が整数 k 以上なのに x·s + e·s < k となる x を探す
-    let s: f64 = 3.0;
-    let e: f64 = 0.1;
-    let mut found = None;
-    let mut x: f64 = 10.0 / 3.0 - e - 1e-9;
-    for _ in 0..2_000_000 {
-        let user = x + e;
-        let dev = s * x + e * s;
-        if (user * s).floor() > dev.floor() {
-            found = Some(x);
-            break;
+    let mut hits = 0usize;
+    for (s, e) in [(3.0, 0.1), (3.0, 0.15), (0.7, 0.3), (1.3, 0.05), (3.0, 0.2), (2.5, 0.1)] {
+        let mut body = String::new();
+        for k in 0..30 {
+            let x = 1.9 + f64::from(k) / 3.0;
+            body.push_str(&format!("<polygon points=\"{x},10 {},10.3 {},70.3 {x},70\"/>", x + 3.0, x + 3.0));
         }
-        x = f64::from_bits(x.to_bits() + 1);
+        let src = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"100\"><g transform=\"translate({e},0)\">{body}</g></svg>"
+        );
+        let d = crate::doc::parse(src.as_bytes(), &crate::style::ParseOptions::DEFAULT, &Never).unwrap();
+        let t = d.build(&Never).unwrap();
+        let opts = RenderOptions { scale: s, ..RenderOptions::DEFAULT };
+        let est = t.estimate(&opts, &Never).unwrap();
+        let plan = t.plan(&opts, &Never).unwrap();
+        let canvas = PixelBox { x0: 0, y0: 0, x1: i64::from(plan.width), y1: i64::from(plan.height) };
+        // 塗りだけの節は項目 1 つ：項目の矩形 ⊆ 節の箱
+        for (it, n) in plan.items.as_slice().iter().zip(t.nodes.as_slice()) {
+            let nb = node_box(n, s, 0.0, canvas);
+            let ib = it.pixel_box();
+            assert!(
+                ib.x0 >= nb.x0 && ib.y0 >= nb.y0 && ib.x1 <= nb.x1 && ib.y1 <= nb.y1,
+                "{ib:?} ⊄ {nb:?}（{s}・{e}）"
+            );
+            hits += usize::from(ib.x0 == nb.x0 || ib.x1 == nb.x1);
+        }
+        let full = PixelRect { x: 0, y: 0, width: plan.width, height: plan.height };
+        let r = plan.estimate_region(full, &Never).unwrap();
+        assert!(r.work <= est.render.work, "{} > {}（{s}・{e}）", r.work, est.render.work);
+        // 描く段の上限を見積もりちょうどにしても描ける
+        let lim = RenderLimits { render_work: est.render.work, ..RenderLimits::DEFAULT };
+        let plan = t.plan(&RenderOptions { scale: s, limits: lim }, &Never).unwrap();
+        let mut px = vec![0u8; plan.width as usize * plan.height as usize * 4];
+        let mut out = PixmapMut::new(&mut px, plan.width, plan.height, plan.width as usize * 4).unwrap();
+        plan.render(&mut out, &Never).unwrap();
     }
-    let Some(x0) = found else {
-        println!("r5: 見つからない");
-        return;
-    };
-    let mut b = Builder::new();
-    b.add(
-        |w| rect(w, x0, x0, 0.5, 0.5, 0.0, 0.0).unwrap(),
-        |n| {
-            n.flags = HAS_FILL;
-            n.fill = [0.0, 0.0, 0.0, 1.0];
-            n.transform = Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e, f: e };
-        },
-    );
-    let t = b.tree(20.0, 20.0);
-    let opts = RenderOptions { scale: s, ..RenderOptions::DEFAULT };
-    let est = t.estimate(&opts, &Never).unwrap();
-    let plan = t.plan(&opts, &Never).unwrap();
-    let it = plan.items.as_slice()[0];
-    let full = plan.estimate_region(PixelRect { x: 0, y: 0, width: plan.width, height: plan.height }, &Never).unwrap();
-    let nb = node_box(&t.nodes.as_slice()[0], s, 0.0, PixelBox { x0: 0, y0: 0, x1: 60, y1: 60 });
-    println!("r5: x0 {x0} item {:?} node {:?} region {} full {}", it.bbox, nb, full.work, est.render.work);
-    assert!(full.work <= est.render.work);
+    // 境の画素まで使う項目がある（丸めの際を確かめている）
+    assert!(hits > 0);
 }
 
 /// r2 の対照：pathLength なしで実際の周期を同じ（2）にすると通る（原因は倍の求め方）。

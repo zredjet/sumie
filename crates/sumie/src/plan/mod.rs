@@ -192,28 +192,29 @@ impl View {
         !(x1 < self.x0 || x0 > self.x1 || y1 < self.y0 || y0 > self.y1)
     }
 
-    /// 線分のうち箱の中の割合（Liang–Barsky。0〜1。有限でなければ 1）。
+    /// 線分を箱で切った端（箱にかからなければ None）。外の端は箱の境の上の点にし、境に近い方の端から内挿して求める
+    /// （計画の辺の切り方 `raster::push_segment` と同じ。巨大な線分の箱の中の部分を、t の丸めで失わない。ファズと単位 2 の
+    /// 3 回目のレビュー）。
+    fn clip(&self, a: Point, b: Point) -> Option<(Point, Point)> {
+        let (p, q) = crate::raster::clip_y(a, b, self.y0, self.y1)?;
+        crate::raster::clip_x(p, q, self.x0, self.x1)
+    }
+
+    /// 線分のうち箱の中の割合（0〜1。有限でなければ 1）。箱で切った部分の長さ ÷ 全体の長さ（長い方の軸の差で比べる）。
     fn inside_fraction(&self, a: Point, b: Point) -> f64 {
-        let (dx, dy) = (b.x - a.x, b.y - a.y);
-        let (mut lo, mut hi) = (0.0f64, 1.0f64);
-        for (p, q) in [(-dx, a.x - self.x0), (dx, self.x1 - a.x), (-dy, a.y - self.y0), (dy, self.y1 - a.y)] {
-            if p == 0.0 {
-                if q < 0.0 {
-                    return 0.0;
-                }
-                continue;
-            }
-            let r = q / p;
-            if r.is_nan() {
-                return 1.0;
-            }
-            if p < 0.0 {
-                lo = math::max(lo, r);
-            } else {
-                hi = math::min(hi, r);
-            }
+        if !a.finite() || !b.finite() {
+            return 1.0;
         }
-        if hi > lo { hi - lo } else { 0.0 }
+        if a == b {
+            return if self.meets(a.x, a.y, a.x, a.y) { 1.0 } else { 0.0 };
+        }
+        let Some((p, q)) = self.clip(a, b) else { return 0.0 };
+        let (dx, dy) = ((b.x - a.x).abs(), (b.y - a.y).abs());
+        if !(dx.is_finite() && dy.is_finite()) {
+            return 1.0;
+        }
+        let f = if dx >= dy { (q.x - p.x).abs() / dx } else { (q.y - p.y).abs() / dy };
+        if f.is_finite() { math::min(f, 1.0) } else { 1.0 }
     }
 }
 
@@ -613,9 +614,10 @@ pub(crate) const PLAN_FRAME: u64 = 9 * cost::ALLOC_STEP + 256;
 /// 描く段の決まった手間の足し分（行の置き場を作る・項目を選ぶ）。
 pub(crate) const RENDER_SLACK: u64 = 1024;
 
-/// 辺 1 本を足す手間（push_segment の中の点の確かめと固定小数への変換と、置き場への写しと、項目の行とセルの上限を数える分）。
+/// 辺 1 本を足す手間（push_segment の中の点の確かめと固定小数への変換と、置き場への写しと、項目の矩形を辺の端から求め、
+/// 行とセルの上限を数える分）。
 const EDGE_WORK: u64 =
-    push_cost(size_of::<Edge>() as u64).saturating_add(cost::OP_STEP).saturating_add(cost::PLAN_EDGE);
+    push_cost(size_of::<Edge>() as u64).saturating_add(cost::OP_STEP.saturating_mul(2)).saturating_add(cost::PLAN_EDGE);
 /// 点 1 つを置き場に足す手間。
 const POINT_WORK: u64 = push_cost(size_of::<Point>() as u64);
 
@@ -952,7 +954,6 @@ impl Tree {
                 if n.flags & STROKE_FIRST != 0 { [HAS_STROKE, HAS_FILL] } else { [HAS_FILL, HAS_STROKE] };
             for what in order {
                 let start = edges.len();
-                let mut dev = DevBox::new();
                 let color = if what == HAS_FILL {
                     n.fill
                 } else {
@@ -963,7 +964,7 @@ impl Tree {
                     continue;
                 }
                 if what == HAS_FILL {
-                    fill_edges(self.path(n), &t, q, &mut poly, &mut edges, &mut dev, b)?;
+                    fill_edges(self.path(n), &t, q, &mut poly, &mut edges, b)?;
                 } else {
                     if n.stroke_width.is_nan() || n.stroke_width <= 0.0 {
                         continue;
@@ -977,13 +978,15 @@ impl Tree {
                         dash_scaled: &mut dash_scaled,
                         canvas,
                     };
-                    stroke_edges(self, n, &t, &mode, q, parts, &mut edges, &mut dev, b)?;
+                    stroke_edges(self, n, &t, &mode, q, parts, &mut edges, b)?;
                 }
                 let end = edges.len();
                 if end == start {
                     continue;
                 }
-                let bbox = dev.pixels().intersect(&canvas);
+                // 項目の画素の矩形は辺の固定小数の端から（点の浮動小数から求めると、見積もりの節の箱と丸めが 1 ulp ずれて
+                // 1 画素はみ出しうる。単位 2 の 3 回目のレビュー）
+                let bbox = edges_box(edges.as_slice().get(start..end).unwrap_or(&[]), b)?.intersect(&canvas);
                 let slice = edges.as_mut_slice().get_mut(start..end).unwrap_or(&mut []);
                 stable_sort(b, slice, |x, y| x.y0 < y.y0)?;
                 // 範囲の見積もりの行とセルの上限（辺ごと。項目の矩形の中の行だけ。払う）
@@ -1052,41 +1055,23 @@ fn check(needed: u64, allowed: u64, resource: Resource, stage: Stage) -> Result<
     if needed > allowed { Err(Error::limit(resource, needed, allowed, stage)) } else { Ok(()) }
 }
 
-/// 描く座標系の点の外接矩形（箱で切る前。有限な点だけ）。
-struct DevBox {
-    x0: f64,
-    y0: f64,
-    x1: f64,
-    y1: f64,
-}
-
-impl DevBox {
-    fn new() -> DevBox {
-        DevBox { x0: f64::INFINITY, y0: f64::INFINITY, x1: f64::NEG_INFINITY, y1: f64::NEG_INFINITY }
+/// 辺の固定小数の端から求める画素の矩形（セルを積む列は x の端の床、行は y の端の床から天井まで。辺 1 本ごとに払う）。
+/// 点は節の外接矩形 × 倍率 ± 届く幅から 1/256 画素と丸めの差しかずれないので、見積もりの節の箱（1 画素の余白）の内。
+fn edges_box(edges: &[Edge], budget: &Budget<'_>) -> Result<PixelBox, Error> {
+    let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+    for e in edges {
+        budget.spend(cost::OP_STEP)?;
+        x0 = x0.min(i64::from(e.x0.min(e.x1)));
+        x1 = x1.max(i64::from(e.x0.max(e.x1)));
+        y0 = y0.min(i64::from(e.y0));
+        y1 = y1.max(i64::from(e.y1));
     }
-
-    fn add(&mut self, p: Point) {
-        if p.finite() {
-            self.x0 = math::min(self.x0, p.x);
-            self.y0 = math::min(self.y0, p.y);
-            self.x1 = math::max(self.x1, p.x);
-            self.y1 = math::max(self.y1, p.y);
-        }
+    if x0 > x1 {
+        return Ok(PixelBox { x0: 0, y0: 0, x1: 0, y1: 0 });
     }
-
-    /// 画素の矩形（1 画素の余白。外接矩形がなければ空）。
-    fn pixels(&self) -> PixelBox {
-        if !(self.x0 <= self.x1 && self.y0 <= self.y1) {
-            return PixelBox { x0: 0, y0: 0, x1: 0, y1: 0 };
-        }
-        let f = |v: f64| if v.is_nan() { 0 } else { v as i64 };
-        PixelBox {
-            x0: f(self.x0.floor()).saturating_sub(1),
-            y0: f(self.y0.floor()).saturating_sub(1),
-            x1: f(self.x1.ceil()).saturating_add(1),
-            y1: f(self.y1.ceil()).saturating_add(1),
-        }
-    }
+    let floor = |v: i64| crate::raster::floor_div(v, ONE);
+    let ceil = |v: i64| floor(v.saturating_add(ONE - 1));
+    Ok(PixelBox { x0: floor(x0), y0: floor(y0), x1: floor(x1).saturating_add(1), y1: ceil(y1) })
 }
 
 /// 部分パスの点と閉じたかを受け取る口。
@@ -1139,16 +1124,13 @@ fn fill_edges(
     q: Quality,
     poly: &mut MVec<'_, Point>,
     edges: &mut MVec<'_, Edge>,
-    dev: &mut DevBox,
     budget: &Budget<'_>,
 ) -> Result<(), Error> {
     subpaths(path, t, q, 0.0, poly, budget, &mut |pts, _| {
         let Some(&first) = pts.first() else { return Ok(()) };
         let mut prev = t.apply(first);
-        dev.add(prev);
         for &p in pts.iter().skip(1) {
             let d = t.apply(p);
-            dev.add(d);
             budget.spend(cost::PLAN_EDGE)?;
             push_segment(prev, d, edges)?;
             prev = d;
@@ -1173,7 +1155,6 @@ struct StrokeParts<'a, 'b> {
 /// 外形の輪を描く座標系の辺にする口。
 struct EdgeSink<'e, 'b> {
     edges: &'e mut MVec<'b, Edge>,
-    dev: &'e mut DevBox,
     /// 外形の座標から描く座標系へ
     t: Transform,
     first: Option<Point>,
@@ -1200,7 +1181,6 @@ impl LoopSink for EdgeSink<'_, '_> {
 
     fn point(&mut self, p: Point) -> Result<(), Error> {
         let d = self.t.apply(p);
-        self.dev.add(d);
         match self.prev {
             Some(a) => {
                 self.budget.spend(cost::PLAN_EDGE)?;
@@ -1223,7 +1203,6 @@ fn stroke_edges(
     q: Quality,
     parts: StrokeParts<'_, '_>,
     edges: &mut MVec<'_, Edge>,
-    dev: &mut DevBox,
     budget: &Budget<'_>,
 ) -> Result<(), Error> {
     let device = mode.device;
@@ -1284,7 +1263,7 @@ fn stroke_edges(
         }
     }
     let dashes = Dashes::new(dash_scaled.as_slice(), n.dash_offset * dash_scale, budget)?;
-    let mut sink = EdgeSink { edges, dev, t: to_dev, first: None, prev: None, budget: budget_ref(budget) };
+    let mut sink = EdgeSink { edges, t: to_dev, first: None, prev: None, budget: budget_ref(budget) };
     // 破線の部分は見る箱にかかるものだけを作る（ADR-30 (4)。見積もりと同じ箱）
     let cull = Cull { to_dev, view: View::new(canvas, reach) };
     subpaths(path, t, q, reach, poly, budget, &mut |pts, closed| {

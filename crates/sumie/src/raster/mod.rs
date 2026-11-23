@@ -72,67 +72,87 @@ fn push_fixed(out: &mut MVec<'_, Edge>, a: Point, b: Point) -> Result<(), Error>
     out.push(e)
 }
 
-/// 線分 a → b の t の点。
-fn lerp(a: Point, b: Point, t: f64) -> Point {
-    Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+/// 線分 a → b の上で y が `y` の点（`a.y != b.y`）。境に近い方の端から内挿する（遠い端から内挿すると、t が 1 の近くで
+/// 丸まり、巨大な線分の箱の中の部分を失う。ファズと単位 2 の 3 回目のレビュー）。y はちょうど `y`。
+pub(crate) fn at_y(a: Point, b: Point, y: f64) -> Point {
+    let (n, f) = if (a.y - y).abs() <= (b.y - y).abs() { (a, b) } else { (b, a) };
+    let s = (y - n.y) / (f.y - n.y);
+    let x = n.x + (f.x - n.x) * s;
+    Point::new(if x.is_finite() { x } else { n.x }, y)
+}
+
+/// 線分 a → b の上で x が `x` の点（`a.x != b.x`。[`at_y`] と同じに、近い方の端から内挿する）。
+pub(crate) fn at_x(a: Point, b: Point, x: f64) -> Point {
+    let (n, f) = if (a.x - x).abs() <= (b.x - x).abs() { (a, b) } else { (b, a) };
+    let s = (x - n.x) / (f.x - n.x);
+    let y = n.y + (f.y - n.y) * s;
+    Point::new(x, if y.is_finite() { y } else { n.y })
+}
+
+/// 線分を y の範囲 [lo, hi] で切った端（範囲にかからなければ None）。外の端を、範囲の境の上の点に置き換える。
+pub(crate) fn clip_y(a: Point, b: Point, lo: f64, hi: f64) -> Option<(Point, Point)> {
+    if (a.y < lo && b.y < lo) || (a.y > hi && b.y > hi) {
+        return None;
+    }
+    let fix = |p: Point| {
+        if p.y < lo {
+            at_y(a, b, lo)
+        } else if p.y > hi {
+            at_y(a, b, hi)
+        } else {
+            p
+        }
+    };
+    Some((fix(a), fix(b)))
+}
+
+/// 線分を x の範囲 [lo, hi] で切った端（[`clip_y`] と同じ）。
+pub(crate) fn clip_x(a: Point, b: Point, lo: f64, hi: f64) -> Option<(Point, Point)> {
+    if (a.x < lo && b.x < lo) || (a.x > hi && b.x > hi) {
+        return None;
+    }
+    let fix = |p: Point| {
+        if p.x < lo {
+            at_x(a, b, lo)
+        } else if p.x > hi {
+            at_x(a, b, hi)
+        } else {
+            p
+        }
+    };
+    Some((fix(a), fix(b)))
 }
 
 /// 描く座標系の線分を、決まった箱で切って固定小数の辺にし `out` に足す。有限でない点は足さない（呼び手が描かないと決める）。
+/// y は箱で切り、x は箱の境で分けて、右の外の部分は捨て、左の外の部分は箱の左の縁の縦の辺にする（左から足す被覆を保つ）。
 pub(crate) fn push_segment(a: Point, b: Point, out: &mut MVec<'_, Edge>) -> Result<(), Error> {
     if !a.finite() || !b.finite() || a.y == b.y {
         return Ok(());
     }
-    // y を箱に切る
-    let (ylo, yhi) = (-BOX, BOX);
-    if (a.y < ylo && b.y < ylo) || (a.y > yhi && b.y > yhi) {
+    let Some((p, q)) = clip_y(a, b, -BOX, BOX) else { return Ok(()) };
+    if p.y == q.y {
         return Ok(());
     }
-    let dy = b.y - a.y;
-    let mut t0: f64 = 0.0;
-    let mut t1: f64 = 1.0;
-    for bound in [ylo, yhi] {
-        let t = (bound - a.y) / dy;
-        if t > 0.0 && t < 1.0 {
-            // 外の側を切る
-            let outside_start = if bound == ylo { a.y < ylo } else { a.y > yhi };
-            if outside_start {
-                if t > t0 {
-                    t0 = t;
-                }
-            } else if t < t1 {
-                t1 = t;
-            }
-        }
-    }
-    if t0 >= t1 {
-        return Ok(());
-    }
-    let (p, q) = (lerp(a, b, t0), lerp(a, b, t1));
-    // x の箱の境で分ける（多くて 3 つ）
-    let mut cuts = [0.0f64, 1.0, 1.0, 1.0];
+    // x の箱の境で分ける（p から q の向きの順。多くて 3 つ）
+    let mut pts = [p, q, q, q];
     let mut n = 1usize;
-    let dx = q.x - p.x;
-    if dx != 0.0 {
-        let (ta, tb) = ((-BOX - p.x) / dx, (BOX - p.x) / dx);
-        let ts = if ta > tb { [tb, ta] } else { [ta, tb] };
-        for t in ts {
-            if t > 0.0 && t < 1.0 {
-                if let Some(c) = cuts.get_mut(n) {
-                    *c = t;
-                }
-                n = n.saturating_add(1);
+    let bounds = if p.x <= q.x { [-BOX, BOX] } else { [BOX, -BOX] };
+    for x in bounds {
+        if (p.x < x) != (q.x < x) && p.x != q.x {
+            if let Some(c) = pts.get_mut(n) {
+                *c = at_x(p, q, x);
             }
+            n = n.saturating_add(1);
         }
     }
-    if let Some(c) = cuts.get_mut(n) {
-        *c = 1.0;
+    if let Some(c) = pts.get_mut(n) {
+        *c = q;
     }
     for k in 0..n {
-        let (Some(&s0), Some(&s1)) = (cuts.get(k), cuts.get(k.saturating_add(1))) else { continue };
-        if s1 <= s0 {
+        let (Some(&u), Some(&v)) = (pts.get(k), pts.get(k.saturating_add(1))) else { continue };
+        if u.y == v.y {
             continue;
         }
-        let (u, v) = (lerp(p, q, s0), lerp(p, q, s1));
         let mid = (u.x + v.x) / 2.0;
         if mid > BOX {
             continue;
