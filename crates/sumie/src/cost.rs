@@ -55,6 +55,23 @@ pub(crate) const RASTER_SWEEP: u64 = 1;
 pub(crate) const RASTER_EDGE_START: u64 = RASTER_EDGE_ROW + OP_STEP + OP_STEP + copy(4);
 pub(crate) const RASTER_EDGE_ROW_WORK: u64 = RASTER_EDGE_ROW + OP_STEP;
 
+/// 重なりを確かめる副走査線の数（行の中の y は (2s + 1) / (2 · SUB_ROWS) の所。ADR-103）。
+pub(crate) const SUB_ROWS: usize = 4;
+/// 求め直す画素の、副走査線 1 本の交わりの数の上限（超えれば面積の被覆のまま。手間を交わりの数に比例させる）。
+pub(crate) const SUB_MAX_CROSS: usize = 8;
+
+/// 副走査線の重なりの確かめ（ADR-103）：交わり 1 つの手間（x を求め、列の欄に足し、つながりの並びに足し、空にする）と、
+/// 副走査線 1 本の 1 歩（列ごとの巻き数の幅の確かめと足し・求め直す画素の差し込みと区切り）。
+pub(crate) const SUB_CROSS: u64 = 8;
+pub(crate) const SUB_STEP: u64 = 1;
+/// 辺 1 本の 1 行の、副走査線の手間の前払い（交わりは副走査線ごとに 1 つまで。交わり 1 つごとに、交わりのある列の幅の
+/// 確かめと足し（副走査線の数の 3 倍）と、求め直す画素の集めと差し込み（[`SUB_MAX_CROSS`] まで）と区切りと
+/// 副走査線ごとの歩み。描く段と見積もりの式）。
+pub(crate) const SUB_EDGE_ROW: u64 =
+    (SUB_ROWS as u64) * (SUB_CROSS + (3 * SUB_ROWS as u64 + SUB_MAX_CROSS as u64 + 2 + SUB_ROWS as u64) * SUB_STEP);
+/// 見積もりの式の、辺 1 本の 1 行の副走査線の手間（前払いの分と、交わりを並びに足す push の払い）。
+pub(crate) const SUB_EDGE_ROW_WORK: u64 = SUB_EDGE_ROW + (SUB_ROWS as u64) * (OP_STEP + copy(16));
+
 /// 描く段の 1 行の手間（行の決まった分・掃く・セルを 0 に戻す・塗る。項目の矩形の幅 `width`。掃く範囲と戻す範囲は左の外の
 /// 1 列と右の 1 列を含みうるので 2 列多く数える）。
 pub(crate) const fn raster_row(width: u64) -> u64 {

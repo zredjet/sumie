@@ -86,11 +86,12 @@ impl Plan {
                 }
                 (cells, rows, started, skipped)
             };
+            // 副走査線の手間（ADR-103）
             work = work
                 .saturating_add(b.height().saturating_mul(crate::plan::row_work(b.width())))
                 .saturating_add(started.saturating_mul(crate::plan::EDGE_START_WORK))
                 .saturating_add(skipped.saturating_mul(cost::OP_STEP))
-                .saturating_add(rows.saturating_mul(crate::plan::EDGE_ROW_WORK))
+                .saturating_add(rows.saturating_mul(crate::plan::EDGE_ROW_WORK.saturating_add(cost::SUB_EDGE_ROW_WORK)))
                 .saturating_add(cells.saturating_mul(cost::RASTER_CELL))
                 .saturating_add(crate::plan::region_search(u64::from(it.edges[1])));
         }

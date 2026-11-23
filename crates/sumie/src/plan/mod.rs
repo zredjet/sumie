@@ -781,7 +781,7 @@ pub(crate) use cost::{
 fn render_work(rows: u64, width: u64, edges: u64, cells: u64, edge_rows: u64) -> u64 {
     rows.saturating_mul(row_work(width))
         .saturating_add(edges.saturating_mul(EDGE_START_WORK))
-        .saturating_add(edge_rows.saturating_mul(EDGE_ROW_WORK))
+        .saturating_add(edge_rows.saturating_mul(EDGE_ROW_WORK.saturating_add(cost::SUB_EDGE_ROW_WORK)))
         .saturating_add(cells.saturating_mul(cost::RASTER_CELL))
 }
 
@@ -1331,12 +1331,18 @@ impl Tree {
 /// 項目を選ぶ）。範囲の見積もりも同じ式。
 pub(crate) fn render_frame(width: u64, height: u64, max_item_edges: u64, items: u64) -> (u64, u64) {
     let clear = height.saturating_mul(cost::fill(width.saturating_mul(4)).saturating_add(cost::OP_STEP));
+    // 行の置き場：セル（cover と area）と、副走査線の列の欄（8 バイト × 副走査線の数）とつながりの頭（ADR-103）
+    let subs = cost::SUB_ROWS as u64;
     let row_bytes = width.saturating_add(1).saturating_mul(16);
+    let sub_bytes = width.saturating_add(1).saturating_mul(subs.saturating_mul(8).saturating_add(4));
+    // 行にかかる辺の番号と、副走査線の交わりの並び（16 バイト）。列の欄に列ごとのつながりの頭（4 バイト）
+    let crosses = max_item_edges.saturating_mul(subs);
+    let edge_bytes = max_item_edges.saturating_mul(4).saturating_add(crosses.saturating_mul(16));
     let work = clear
-        .saturating_add(cost::fill(row_bytes))
+        .saturating_add(cost::fill(row_bytes.saturating_add(sub_bytes)))
         .saturating_add(items.saturating_mul(cost::OP_STEP))
         .saturating_add(RENDER_SLACK);
-    (work, row_bytes.saturating_add(max_item_edges.saturating_mul(4)))
+    (work, row_bytes.saturating_add(sub_bytes).saturating_add(edge_bytes))
 }
 
 /// 見積もりが上限の内か。

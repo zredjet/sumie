@@ -587,7 +587,8 @@ fn huge_miter_limit_is_not_refused() {
         );
         let t = b.tree(100.0, 100.0);
         let est = t.estimate(&RenderOptions::DEFAULT, &Never).unwrap();
-        assert!(est.render.work < 1 << 26, "{limit}: {est:?}");
+        // 副走査線の重なりの確かめ（ADR-103）で辺の行の手間が増えた分を見込んで 2²⁷（既定の上限よりはるかに小さい）
+        assert!(est.render.work < 1 << 27, "{limit}: {est:?}");
         render_full(&t, 1.0).unwrap();
     }
 }
@@ -810,4 +811,84 @@ fn non_scaling_joints_are_judged_in_device_space() {
     let (_, _, b) = draw(&mk(false), 1.0);
     let differ = a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0.iter()).filter(|(p, q)| p != q).count();
     assert_eq!(differ, 0, "曲線と線分で {differ} 画素違う");
+}
+
+/// 同じ向きの縁が画素に重なっても、副走査線ごとに規則を当てる（Chrome・resvg と同じ。ADR-103。単位 2 の 5 回目の
+/// レビュー）：2 度書いた部分パスの縁は 1 度のときと同じ濃さ（非ゼロ）で、偶奇なら何も描かない。向きの逆な 2 つの形が画素の
+/// 中で上下に接しても透けない。
+#[test]
+fn overlapping_edges_follow_the_rule_per_subrow() {
+    let mk = |twice: bool, even_odd: bool| {
+        let mut b = Builder::new();
+        b.add(
+            |w| {
+                for _ in 0..if twice { 2 } else { 1 } {
+                    w.move_to(Point::new(0.5, 0.0)).unwrap();
+                    w.line_to(Point::new(4.5, 0.0)).unwrap();
+                    w.line_to(Point::new(4.5, 2.0)).unwrap();
+                    w.line_to(Point::new(0.5, 2.0)).unwrap();
+                    w.close().unwrap();
+                }
+            },
+            |n| {
+                n.flags = HAS_FILL | if even_odd { EVEN_ODD } else { 0 };
+                n.fill = GREEN;
+            },
+        );
+        b.tree(6.0, 2.0)
+    };
+    let row = |t: &Tree| -> Vec<u8> {
+        let (w, _, px) = draw(t, 1.0);
+        (0..6).map(|x| px[((w + x) * 4 + 3) as usize]).collect()
+    };
+    let once = row(&mk(false, false));
+    assert_eq!(once, vec![128, 255, 255, 255, 128, 0]);
+    assert_eq!(row(&mk(true, false)), once, "2 度書いた部分パス（非ゼロ）");
+    assert_eq!(row(&mk(true, true)), vec![0; 6], "2 度書いた部分パス（偶奇）");
+    // 向きの逆な 2 つの矩形が画素の行 5 の中（y = 5.5）で接する：行 5 は全部覆う
+    let mut b = Builder::new();
+    b.add(
+        |w| {
+            w.move_to(Point::new(0.0, 0.0)).unwrap();
+            w.line_to(Point::new(10.0, 0.0)).unwrap();
+            w.line_to(Point::new(10.0, 5.5)).unwrap();
+            w.line_to(Point::new(0.0, 5.5)).unwrap();
+            w.close().unwrap();
+            w.move_to(Point::new(0.0, 5.5)).unwrap();
+            w.line_to(Point::new(0.0, 10.0)).unwrap();
+            w.line_to(Point::new(10.0, 10.0)).unwrap();
+            w.line_to(Point::new(10.0, 5.5)).unwrap();
+            w.close().unwrap();
+        },
+        |n| {
+            n.flags = HAS_FILL;
+            n.fill = GREEN;
+        },
+    );
+    let (w, _, px) = draw(&b.tree(10.0, 10.0), 1.0);
+    for x in 0..10u32 {
+        assert_eq!(px[((5 * w + x) * 4 + 3) as usize], 255, "x = {x}：向きの逆な形の継ぎ目が透ける");
+    }
+    // なぞり返した線の縁は 1 本の線と同じ濃さ
+    let line = |retrace: bool| {
+        let mut b = Builder::new();
+        b.add(
+            |w| {
+                w.move_to(Point::new(10.0, 2.0)).unwrap();
+                w.line_to(Point::new(10.0, 18.0)).unwrap();
+                if retrace {
+                    w.line_to(Point::new(10.0, 6.0)).unwrap();
+                }
+            },
+            |n| {
+                n.flags = HAS_STROKE;
+                n.stroke = GREEN;
+                n.stroke_width = 1.5;
+                n.cap = crate::tree::CAP_ROUND;
+            },
+        );
+        let (w, _, px) = draw(&b.tree(20.0, 20.0), 1.0);
+        px[((10 * w + 9) * 4 + 3) as usize]
+    };
+    assert_eq!(line(true), line(false), "なぞり返した線の縁");
 }

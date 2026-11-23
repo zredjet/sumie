@@ -1389,7 +1389,8 @@ pub fn build_ops(data: &[u8]) -> StageOutcome {
 /// 単位 4 の 2 回目のレビュー。既定と同じく計画と描く段の上限より小さくする：ファズの作り直しの 1 回目のレビュー）。
 const FUZZ_RENDER_LIMITS: crate::limits::RenderLimits = crate::limits::RenderLimits {
     plan_work: 1 << 23,
-    render_work: 1 << 23,
+    // 描く段は副走査線の重なりの確かめ（ADR-103）の分を見込んで 2²⁴
+    render_work: 1 << 24,
     estimate_work: FUZZ_LIMITS.estimate_work,
     ..crate::limits::RenderLimits::DEFAULT
 };
