@@ -549,7 +549,7 @@ fn stage_cases(
 }
 
 /// 木を作る段の種のうち、確かめの終わりまで届かないもの（見積もりか作る段が安全に断る種）。
-const TREE_UNREACHED: &[&str] = &[];
+const TREE_UNREACHED: &[&str] = &["supports-unknown"];
 
 /// 描く段の種のうち、確かめの終わりまで届かないもの（見積もりが上限で安全に断る種）。
 const RENDER_UNREACHED: &[&str] = &[];

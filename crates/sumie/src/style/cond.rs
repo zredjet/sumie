@@ -22,7 +22,7 @@ use crate::mem::{MVec, Plain};
 use crate::style::ColorScheme;
 use crate::style::cascade::decl_prop;
 use crate::style::props::prop;
-use crate::style::valid::{Check, Ctx, check, wide};
+use crate::style::valid::{Check, Ctx, check, unread, wide};
 use crate::xml::lex::Span;
 
 /// 照らす環境。
@@ -327,7 +327,17 @@ fn condition(c: &mut Cur<'_, '_>, budget: &Budget<'_>, leaf: Leaf<'_>, mode: Mod
         }
         let depth = stack.len().saturating_sub(1);
         if end_here {
-            if stack.len() > 1 || !f.started || f.op != 0 {
+            // 閉じないまま終わったかっこは閉じたものとする（CSS Syntax。単位 3 の 9 回目のレビュー）
+            while stack.len() > 1 {
+                budget.spend(cost::OP_STEP)?;
+                let Some(g) = stack.pop() else { break };
+                let v = if g.started && g.op == 0 && !g.negate { g.acc } else { mode.general };
+                if let Some(p) = stack.last_mut() {
+                    apply(p, v);
+                }
+            }
+            let Some(f) = stack.last().copied() else { return Ok(Tri::Unknown) };
+            if !f.started || f.op != 0 {
                 return Ok(Tri::Unknown);
             }
             return Ok(f.acc);
@@ -382,20 +392,24 @@ fn apply(p: &mut Frame, v: Tri) {
     p.op = 0;
 }
 
-/// `selector(…)` の葉（`@supports`）。ほかの関数は知らない形。
+/// `selector(…)` の葉（`@supports`）。`font-tech(…)`・`font-format(…)` は分からない（sumie はフォントの技術を照らさない）。
+/// ほかの関数は知らない形。
 fn function_leaf(s: &[u8], f: Token, inner: Span, mode: Mode<'_>, budget: &Budget<'_>) -> Result<Tri, Error> {
-    if !ident_is(s, f.inner, f.escaped, b"selector") {
+    let is = |w: &[u8]| ident_is(s, f.inner, f.escaped, w);
+    if mode.general == Tri::False && (is(b"font-tech") || is(b"font-format")) {
+        return Ok(Tri::Unknown);
+    }
+    if !is(b"selector") {
         return Ok(mode.general);
     }
-    // 1 つの複雑なセレクタ（CSS Conditional 4）。当てないセレクタ（`:has()` など）は読めないものとする
+    // 1 つの複雑なセレクタ（CSS Conditional 4）。当てないセレクタ（`:has()` など）は読めないので分からない（Chrome は
+    // 読む。単位 3 の 9 回目のレビュー）
     let mut t = Tables::new(budget_ref(budget));
-    let ok = match parse_selector_list(s, inner, mode.ns, &mut t, budget)? {
-        Some(p) if !p.unsupported => {
-            t.selectors.get(p.first as usize).is_some_and(|x| x.next == crate::css::select::NONE)
-        }
-        _ => false,
-    };
-    Ok(Tri::of(ok))
+    Ok(match parse_selector_list(s, inner, mode.ns, &mut t, budget)? {
+        Some(p) if p.unsupported => Tri::Unknown,
+        Some(p) => Tri::of(t.selectors.get(p.first as usize).is_some_and(|x| x.next == crate::css::select::NONE)),
+        None => Tri::False,
+    })
 }
 
 /// `@media` の条件の読み方。
@@ -639,8 +653,6 @@ fn env_value(s: &[u8], name: Token, env: &Env) -> Option<(Val, Ty)> {
         (b"no-preference", &[b"no-preference", b"more", b"less", b"custom"])
     } else if is(b"forced-colors") {
         (b"none", &[b"none", b"active"])
-    } else if is(b"inverted-colors") {
-        (b"none", &[b"none", b"inverted"])
     } else if is(b"hover") || is(b"any-hover") {
         (b"none", &[b"none", b"hover"])
     } else if is(b"pointer") || is(b"any-pointer") {
@@ -853,9 +865,18 @@ pub(crate) fn supports(s: &[u8], range: Span, ns: NsTable<'_>, budget: &Budget<'
     condition(&mut c, budget, &mut leaf, mode)
 }
 
-/// `@import` の `supports(…)` の中身（`<supports-condition>` か 1 つの宣言）の値（CSS Cascade 5 §2.1）。
+/// `@import` の `supports(…)` の中身（`<supports-condition>` か 1 つの宣言）の値（CSS Cascade 5 §2.1）。名前と `:` で始まれば
+/// 宣言、そうでなければ条件で、条件の形でなければ偽（書き方の誤りを分からないにしない。単位 3 の 9 回目のレビュー）。
 pub(crate) fn supports_import(s: &[u8], range: Span, ns: NsTable<'_>, budget: &Budget<'_>) -> Result<Tri, Error> {
-    Ok(supports(s, range, ns, budget)?.or(declaration_leaf(s, range, budget_ref(budget))?))
+    let budget = budget_ref(budget);
+    let mut c = Cur::new(s, range, budget);
+    if c.peek()?.kind == Kind::Ident && c.peek2()?.kind == Kind::Colon {
+        return declaration_leaf(s, range, budget);
+    }
+    if !crate::css::sheet::supports_shape(s, range, budget)? {
+        return Ok(Tri::False);
+    }
+    supports(s, range, ns, budget)
 }
 
 /// `(名前: 値 [!important])` が sumie の読める宣言か（名前の escape を解く。宣言でない形は偽）。
@@ -890,13 +911,17 @@ fn declaration_leaf(s: &[u8], inner: Span, budget: &Budget<'_>) -> Result<Tri, E
     if d.name.of(s).starts_with(b"--") {
         return Ok(Tri::True);
     }
+    // sumie の知らないプロパティは偽（Chrome の知る名前でも。名前の表を持たないので、分からないにすると `(foo: bar)` でも
+    // 断る。ADR-107 の既知の差）
     let Some(p) = decl_prop(s, &d, budget)?.and_then(prop) else { return Ok(Tri::False) };
     if wide(s, d.value, budget)?.is_some() {
         return Ok(Tri::True);
     }
-    // 形だけを見る（表示の領域の単位も受ける）。確かめずに受ける値は分からない
+    // 形だけを見る（表示の領域の単位も受ける）。確かめずに受ける値と、sumie が読まないので壊れた値にした形（関数・読まない
+    // 単位）は分からない
     let cx = Ctx { attr: false, unitless: p.unitless, viewport: true };
     Ok(match check(p.kind, s, d.value, cx, budget)? {
+        Check::Bad if unread(s, d.value, budget)? => Tri::Unknown,
         Check::Bad => Tri::False,
         Check::Sure => Tri::True,
         Check::Unsure => Tri::Unknown,

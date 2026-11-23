@@ -88,8 +88,21 @@ pub(crate) fn check(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
         // `d` 属性はパスの書き方（SVG 2 では壊れた所までを描くので、形はパスを作る段で確かめる）
         Kind::Path if cx.attr => return Ok(Check::Sure),
         Kind::Font => return Ok(Check::of(font_parts(s, range, cx, budget)?.is_some())),
-        Kind::Background => return Ok(Check::of(background_color(s, range, budget)?.is_some())),
-        Kind::BackgroundImage => return Ok(Check::of(image_list(s, range, budget)?.is_some())),
+        // 画像の関数とグラデーションは引数を確かめずに受ける（`@supports` では分からない。単位 3 の 9 回目のレビュー）
+        Kind::Background => {
+            return Ok(match background_color(s, range, budget)? {
+                None => Check::Bad,
+                Some(b) if b.image & (IMAGE_GRADIENT | IMAGE_FUNCTION) != 0 => Check::Unsure,
+                Some(_) => Check::Sure,
+            });
+        }
+        Kind::BackgroundImage => {
+            return Ok(match image_list(s, range, budget)? {
+                None => Check::Bad,
+                Some(f) if f & (IMAGE_GRADIENT | IMAGE_FUNCTION) != 0 => Check::Unsure,
+                Some(_) => Check::Sure,
+            });
+        }
         Kind::CssBox(rule) => {
             return Ok(match css_box(rule, s, range, cx, budget)? {
                 None => Check::Bad,
@@ -292,7 +305,8 @@ pub(crate) fn check(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
             }
         }
         Kind::Path => {
-            // CSS の `d` は `none` か `path("…")`
+            // CSS の `d` は `none` か `path("…")`。文字列は最後までパスとして読めなければ壊れた値（Chrome と同じ。属性の `d`
+            // と違い、誤りの前までを描かない。単位 3 の 9 回目のレビュー）
             if v.eat_ident(b"none")? {
                 true
             } else {
@@ -300,7 +314,7 @@ pub(crate) fn check(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
                 if t.kind == Tk::Function && ident_is(s, t.inner, t.escaped, b"path") {
                     // 値の終わりで閉じない関数は閉じたものとする（CSS Syntax）
                     let a = v.next()?;
-                    a.kind == Tk::Str && matches!(v.next()?.kind, Tk::RParen | Tk::Eof)
+                    a.kind == Tk::Str && matches!(v.next()?.kind, Tk::RParen | Tk::Eof) && css_path_ok(s, a, budget)?
                 } else {
                     false
                 }
@@ -323,7 +337,77 @@ pub(crate) fn check(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
             false
         }
     };
-    Ok(Check::of(ok && v.at_end()?))
+    if !(ok && v.at_end()?) {
+        return Ok(Check::Bad);
+    }
+    // filter の関数と clip-path の形の関数は引数を確かめずに受ける（`@supports` では分からない。単位 3 の 9 回目のレビュー）
+    if matches!(kind, Kind::Filter | Kind::ClipPath) && has_function(s, range, budget)? {
+        return Ok(Check::Unsure);
+    }
+    Ok(Check::Sure)
+}
+
+/// CSS の `path("…")` の文字列（`a`）がパスのデータとして最後まで読めるか（escape を解いて読む。命令と座標は書かない）。
+fn css_path_ok(s: &[u8], a: crate::css::lex::Token, budget: &Budget<'_>) -> Result<bool, Error> {
+    let budget = budget_ref(budget);
+    let mut verbs: crate::mem::MVec<'_, u8> = crate::mem::MVec::new(budget);
+    let mut coords: crate::mem::MVec<'_, f64> = crate::mem::MVec::new(budget);
+    let mut w = crate::geom::PathWriter::dry(&mut verbs, &mut coords);
+    let r = if a.escaped {
+        let mut text: crate::mem::MVec<'_, u8> = crate::mem::MVec::new(budget);
+        for ch in crate::css::lex::decode_string(s, a.inner, budget) {
+            let (b, k) = crate::css::select::utf8_pub(ch?);
+            text.append_slice(b.get(..k).unwrap_or(&[]))?;
+        }
+        values::path::path_data(text.as_slice(), &mut w, budget)?
+    } else {
+        values::path::path_data(a.inner.of(s), &mut w, budget)?
+    };
+    Ok(matches!(r, values::path::Parsed::Complete))
+}
+
+/// sumie が読まないので壊れた値にした形か（関数（calc・var・env・attr・読まない色の関数・3 次元の変形など）か、長さとして
+/// 読まない単位（dvw・cqw など）の次元を含む）。`@supports` では偽でなく分からない（Chrome は受けうる。ADR-106 (4)(b)。
+/// 単位 3 の 9 回目のレビュー）。字句ごとに払う。
+pub(crate) fn unread(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<bool, Error> {
+    const OTHER_UNITS: &[&[u8]] =
+        &[b"deg", b"grad", b"rad", b"turn", b"s", b"ms", b"hz", b"khz", b"dpi", b"dpcm", b"dppx", b"x", b"fr"];
+    let budget = budget_ref(budget);
+    let mut lex = Lexer::over(s, range, budget);
+    loop {
+        budget.spend(cost::OP_STEP)?;
+        let t = lex.next()?;
+        match t.kind {
+            Tk::Eof => return Ok(false),
+            // url() と path()（CSS の d の文字列は最後まで読む）のほかの関数は、sumie が読み切らない形がある（calc-size()・
+            // anchor-size() の式・色の関数の `from` なども）
+            Tk::Function if !ident_is(s, t.inner, t.escaped, b"url") && !ident_is(s, t.inner, t.escaped, b"path") => {
+                return Ok(true);
+            }
+            Tk::Dimension => {
+                let mut v = Values::new(s, t.span, budget);
+                if v.length(false)?.is_none() && !OTHER_UNITS.iter().any(|w| ident_is(s, t.inner, t.escaped, w)) {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 値に `url()` でない関数があるか。字句ごとに払う。
+fn has_function(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<bool, Error> {
+    let budget = budget_ref(budget);
+    let mut lex = Lexer::over(s, range, budget);
+    loop {
+        budget.spend(cost::OP_STEP)?;
+        let t = lex.next()?;
+        match t.kind {
+            Tk::Eof => return Ok(false),
+            Tk::Function if !ident_is(s, t.inner, t.escaped, b"url") => return Ok(true),
+            _ => {}
+        }
+    }
 }
 
 /// 言葉の並びのどれか 1 つを読む。
@@ -511,11 +595,15 @@ pub(crate) fn offset_form(s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) -
     };
     let mut unsure = false;
     // 位置
-    match position(&mut v, true)? {
+    let placed = match position(&mut v, true)? {
         Some(Some(false)) => return Ok(None),
-        Some(None) => unsure = true,
-        _ => {}
-    }
+        Some(None) => {
+            unsure = true;
+            true
+        }
+        Some(Some(true)) => true,
+        None => false,
+    };
     // 道（関数・url・`none`）と箱の言葉（どちらも 1 つまで、順を問わない）
     let (mut func, mut none, mut boxed) = (false, false, false);
     loop {
@@ -553,13 +641,18 @@ pub(crate) fn offset_form(s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) -
             }
         }
     }
-    // anchor
+    // anchor（`auto` か位置。`normal` は書けない。前に位置も道もなければ壊れた値：`]!`。単位 3 の 9 回目のレビュー）
     if v.peek()?.is_delim(b'/') {
         v.next()?;
-        match position(&mut v, true)? {
-            None | Some(Some(false)) => return Ok(if func { Some(true) } else { None }),
-            Some(None) => unsure = true,
-            Some(Some(true)) => {}
+        if !(placed || func || none || boxed) {
+            return Ok(None);
+        }
+        if !v.eat_ident(b"auto")? {
+            match position(&mut v, false)? {
+                None | Some(Some(false)) => return Ok(if func { Some(true) } else { None }),
+                Some(None) => unsure = true,
+                Some(Some(true)) => {}
+            }
         }
     }
     if !v.at_end()? {

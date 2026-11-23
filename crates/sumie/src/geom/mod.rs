@@ -356,11 +356,18 @@ pub(crate) struct PathWriter<'v, 'b> {
     start: Point,
     /// 部分パスが始まっているか（MOVE を書いたか）
     open: bool,
+    /// 書かずに読むだけか（CSS の `d` の値を確かめる。[`PathWriter::dry`]）
+    dry: bool,
 }
 
 impl<'v, 'b> PathWriter<'v, 'b> {
     pub(crate) fn new(verbs: &'v mut MVec<'b, u8>, coords: &'v mut MVec<'b, f64>) -> PathWriter<'v, 'b> {
-        PathWriter { verbs, coords, cur: Point::new(0.0, 0.0), start: Point::new(0.0, 0.0), open: false }
+        PathWriter { verbs, coords, cur: Point::new(0.0, 0.0), start: Point::new(0.0, 0.0), open: false, dry: false }
+    }
+
+    /// 命令と座標を書かない口（読めるかだけを確かめる。`verbs`・`coords` は空のまま）。
+    pub(crate) fn dry(verbs: &'v mut MVec<'b, u8>, coords: &'v mut MVec<'b, f64>) -> PathWriter<'v, 'b> {
+        PathWriter { dry: true, ..PathWriter::new(verbs, coords) }
     }
 
     pub(crate) fn current(&self) -> Point {
@@ -372,6 +379,9 @@ impl<'v, 'b> PathWriter<'v, 'b> {
     }
 
     fn put(&mut self, verb: u8, c: &[f64]) -> Result<(), Error> {
+        if self.dry {
+            return Ok(());
+        }
         self.verbs.push(verb)?;
         self.coords.append_slice(c)
     }

@@ -1003,6 +1003,8 @@ fn unit3_round8() {
         "not (padding: 5foo)",
         "(fill: red) and (rotate: 1deg)",
         "(width: calc-size(auto, size + 1px)) or (rotate: 1deg)",
+        // calc-size() の式は M7 まで読まないので、壊れた引数も分からない（単位 3 の 9 回目のレビュー）
+        "(width: calc-size(auto, banana))",
     ] {
         assert_eq!(
             not_yet(&format!("<style>@supports {cond} {{ rect {{ fill: red }} }}</style>{rect}")),
@@ -1020,7 +1022,6 @@ fn unit3_round8() {
         "(border: solid dashed)",
         "(outline: 5px thick)",
         "(border: 5% solid)",
-        "(width: calc-size(auto, banana))",
         "(offset: banana)",
         "(fill: red) and (rotate: 1deg) and (fill: banana)",
     ] {
@@ -1124,6 +1125,101 @@ fn unit3_round8() {
     ] {
         assert_eq!(not_yet(&format!("{r} style=\"offset: {moving}\"/>")), Later::CssTransform, "{moving}");
     }
+}
+
+/// 単位 3 の 9 回目のレビュー：offset の anchor・CSS の `d` の文字列・`@supports` の分からない値・`@import` の supports・
+/// `inverted-colors`。
+#[test]
+fn unit3_round9() {
+    let r = "<rect width=\"5\" height=\"5\"";
+    let rect = "<rect width=\"40\" height=\"40\" fill=\"green\"/>";
+    // offset：anchor は auto か位置（normal は書けない）。前に位置も道もない `/` は壊れた値
+    for bad in ["10px 10px / normal", "/ left", "none / normal", "/ auto", "auto / normal"] {
+        assert_eq!(
+            not_yet(&format!("<style>rect {{ offset: path('M0 0 L50 50') }}</style>{r} style=\"offset: {bad}\"/>")),
+            Later::CssTransform,
+            "{bad}"
+        );
+    }
+    let fill = |src: &str| {
+        let t = build(&svg(src)).unwrap();
+        t.nodes.as_slice().first().map(|n| n.fill)
+    };
+    let green = fill(rect);
+    let red_if = |cond: &str| {
+        let src = format!("<style>@supports {cond} {{ rect {{ fill: red }} }}</style>{rect}");
+        let t = build(&svg(&src)).unwrap_or_else(|e| panic!("{cond}: {e:?}"));
+        t.nodes.as_slice().first().map(|n| n.fill)
+    };
+    for cond in ["(offset: / left)", "(offset: auto / normal)", "(offset: / auto)", "(offset: 10px 10px / normal)"] {
+        assert_eq!(red_if(cond), green, "{cond}");
+    }
+    assert_ne!(red_if("(offset: 10px 10px / auto)"), green);
+    // CSS の d：文字列が最後まで読めなければ壊れた値（前の宣言か d の属性が生きる）
+    let bounds = |src: &str| build(&svg(src)).unwrap().nodes.as_slice().first().map(|n| n.bounds);
+    let full = bounds("<path d=\"M0 0 H100 V100 H0 Z\"/>");
+    for css in [
+        "d: path('M0 0 H100 V100 H0 Z'); d: path('garbage')",
+        "d: path('M0 0 H100 V100 H0 Z'); d: path('M0 0 H50 V50 H0 Z L')",
+        "d: path('M0 0 H100 V100 H0 Z'); d: path('M0 0 H50 V50 H0 Z 1')",
+    ] {
+        assert_eq!(bounds(&format!("<path style=\"{css}\"/>")), full, "{css}");
+    }
+    assert_eq!(bounds("<path d=\"M0 0 H100 V100 H0 Z\" style=\"d: path('M0 0 H50 V50 H0 Z L')\"/>"), full);
+    assert_eq!(bounds("<style>path { d: path(\"M0 0 H\\31 00 V100 H0 Z\") }</style><path d=\"M0 0 H5 V5 Z\"/>"), full);
+    assert_eq!(red_if("(d: path('garbage'))"), green);
+    assert_ne!(red_if("(d: path('M0 0 H5'))"), green);
+    // @supports：引数を確かめずに受ける関数と、sumie が読まないので壊れた値にした形と、知らないプロパティは分からない
+    for cond in [
+        "(filter: blur(banana))",
+        "(filter: drop-shadow(banana))",
+        "(clip-path: circle(banana))",
+        "(clip-path: inset())",
+        "(background-image: linear-gradient(banana))",
+        "(fill: oklch(0.5 0.1 120))",
+        "(fill: color-mix(in srgb, red, blue))",
+        "(fill: rgb(from red r g b))",
+        "(stroke-width: calc(1px + 2px))",
+        "(fill: var(--x))",
+        "(transform: translateZ(1px))",
+        "(stroke-width: 1dvw)",
+        "selector(:has(a))",
+        "not selector(:has(a))",
+        "font-tech(color-COLRv1)",
+        "font-format(woff2)",
+    ] {
+        assert_eq!(
+            not_yet(&format!("<style>@supports {cond} {{ rect {{ fill: red }} }}</style>{rect}")),
+            Later::Supports,
+            "{cond}"
+        );
+    }
+    // 知らないプロパティの名前は偽（Chrome の知る `aspect-ratio` でも。既知の差）
+    for cond in [
+        "(fill: banana)",
+        "(stroke-width: 5deg)",
+        "(clip-path: banana)",
+        "(filter: url(#f) banana)",
+        "(d: none none)",
+        "(aspect-ratio: 1)",
+        "(foo: bar)",
+    ] {
+        assert_eq!(red_if(cond), green, "{cond}");
+    }
+    assert_ne!(red_if("(filter: url(#f))"), green);
+    // @import の supports(…)：宣言の形の誤りと閉じないかっこで文書ごと断らない
+    for c in ["fill: banana", "foo: bar", "(fill: red", "fill: red"] {
+        let src = format!("<style>@import url(a.css) layer(x) supports({c}); rect {{ fill: green }}</style>{rect}");
+        assert!(build(&svg(&src)).is_ok(), "{c}");
+    }
+    assert_eq!(
+        not_yet(&format!(
+            "<style>@import url(a.css) layer(x) supports(rotate: 1deg); rect {{ fill: green }}</style>{rect}"
+        )),
+        Later::Supports
+    );
+    // inverted-colors は Chrome が持たない特徴（偽）
+    assert_eq!(fill(&format!("<style>@media (inverted-colors: none) {{ rect {{ fill: red }} }}</style>{rect}")), green);
 }
 
 /// 根の svg の display: none と偽の条件は描くことを止めない（Chrome と同じ。ADR-102。子の display: none は効く）。

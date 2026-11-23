@@ -861,51 +861,7 @@ impl<'b> Ctx<'_, '_, 'b> {
     /// `@supports` の前置きが `<supports-condition>` の形か（CSS Conditional 3 §2.1。上の段だけを見る：`not` の 1 つの項か、
     /// `and` か `or` の一方だけでつないだ項の並び。項はかっこか関数で、中は問わない（一般の囲み））。
     fn supports_shape_ok(&self, prelude: Span) -> Result<bool, Error> {
-        let s = self.s;
-        let mut lex = Lexer::over(s, prelude, self.budget);
-        let mut items = 0u32;
-        // つなぎ：0 まだ、1 and、2 or
-        let mut op = 0u8;
-        let mut negated = false;
-        let mut want_item = true;
-        loop {
-            let t = lex.next()?;
-            match t.kind {
-                Kind::Whitespace => {}
-                Kind::Eof => return Ok(items > 0 && !want_item),
-                Kind::LParen | Kind::Function if want_item => {
-                    let mut nest = Nest::new(self.budget);
-                    nest.feed(&t)?;
-                    loop {
-                        let u = lex.next()?;
-                        // 閉じないまま終わったかっこは閉じたものとする（CSS Syntax）
-                        if u.kind == Kind::Eof || nest.feed(&u)? {
-                            break;
-                        }
-                    }
-                    items = items.saturating_add(1);
-                    want_item = false;
-                }
-                Kind::Ident if want_item && items == 0 && !negated && ident_is(s, t.inner, t.escaped, b"not") => {
-                    negated = true;
-                }
-                Kind::Ident if !want_item && !negated => {
-                    let o = if ident_is(s, t.inner, t.escaped, b"and") {
-                        1
-                    } else if ident_is(s, t.inner, t.escaped, b"or") {
-                        2
-                    } else {
-                        return Ok(false);
-                    };
-                    if op != 0 && op != o {
-                        return Ok(false);
-                    }
-                    op = o;
-                    want_item = true;
-                }
-                _ => return Ok(false),
-            }
-        }
+        supports_shape(self.s, prelude, self.budget)
     }
 
     /// `@import` の前置きの `layer`（名前のない層）か `layer(名前)` を層の順に入れる。層のあとの `supports(…)` と媒体の
@@ -1315,6 +1271,56 @@ fn canonicalize_layers<'b>(
         l.canon = c;
     }
     Ok(parents)
+}
+
+/// `@supports` の前置き（と `@import` の `supports(…)` の中身）が `<supports-condition>` の形か（CSS Conditional 3 §2.1。上の段
+/// だけを見る：`not` の 1 つの項か、`and` か `or` の一方だけでつないだ項の並び。項はかっこか関数で、中は問わない（一般の
+/// 囲み））。
+pub(crate) fn supports_shape(s: &[u8], prelude: Span, budget: &Budget<'_>) -> Result<bool, Error> {
+    let mut lex = Lexer::over(s, prelude, budget);
+    let mut items = 0u32;
+    // つなぎ：0 まだ、1 and、2 or
+    let mut op = 0u8;
+    let mut negated = false;
+    let mut want_item = true;
+    loop {
+        let t = lex.next()?;
+        match t.kind {
+            Kind::Whitespace => {}
+            Kind::Eof => return Ok(items > 0 && !want_item),
+            Kind::LParen | Kind::Function if want_item => {
+                let mut nest = Nest::new(budget);
+                nest.feed(&t)?;
+                loop {
+                    let u = lex.next()?;
+                    // 閉じないまま終わったかっこは閉じたものとする（CSS Syntax）
+                    if u.kind == Kind::Eof || nest.feed(&u)? {
+                        break;
+                    }
+                }
+                items = items.saturating_add(1);
+                want_item = false;
+            }
+            Kind::Ident if want_item && items == 0 && !negated && ident_is(s, t.inner, t.escaped, b"not") => {
+                negated = true;
+            }
+            Kind::Ident if !want_item && !negated => {
+                let o = if ident_is(s, t.inner, t.escaped, b"and") {
+                    1
+                } else if ident_is(s, t.inner, t.escaped, b"or") {
+                    2
+                } else {
+                    return Ok(false);
+                };
+                if op != 0 && op != o {
+                    return Ok(false);
+                }
+                op = o;
+                want_item = true;
+            }
+            _ => return Ok(false),
+        }
+    }
 }
 
 #[cfg(test)]

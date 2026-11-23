@@ -141,10 +141,14 @@ fn supports_selector_and_custom_properties() {
     };
     assert!(sp("(--x: 1)"));
     assert!(sp("(selector(a))"));
-    // 1 つの複雑なセレクタだけ。当てないセレクタは読めないもの
+    // 1 つの複雑なセレクタだけ。当てないセレクタ（`:has()` など）は読めないので分からない（単位 3 の 9 回目のレビュー）
     assert!(!sp("selector(rect, a)"));
-    assert!(!sp("selector(:has(a))"));
-    assert!(sp("not selector(:has(a))"));
+    let tri =
+        |q: &str| supports(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap();
+    assert_eq!(tri("selector(:has(a))"), Tri::Unknown);
+    assert_eq!(tri("not selector(:has(a))"), Tri::Unknown);
+    assert_eq!(tri("font-tech(color-COLRv1)"), Tri::Unknown);
+    assert_eq!(tri("foo(bar)"), Tri::False);
 }
 
 /// かっこの中が条件として読めなければ、そのかっこは知らない形として続ける（Media Queries 4・CSS Conditional 3）。言葉の
@@ -175,6 +179,24 @@ fn general_enclosed_and_feature_values() {
     };
     assert!(sp("(not foo) or (fill: red)"));
     assert!(!sp("(fill: red;)"));
+    // 閉じないまま終わったかっこは閉じたものとする（CSS Syntax。単位 3 の 9 回目のレビュー）
+    assert!(sp("((fill: red)"));
+    assert!(sp("(fill: red) and ((fill: blue)"));
+    assert!(!sp("(fill: red) and ((fill: banana)"));
+    let tri =
+        |q: &str| supports(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap();
+    assert_eq!(tri("((rotate: 1deg)"), Tri::Unknown);
+    // @import の supports(…)：宣言の形・条件の形・どちらでもない形
+    let imp = |q: &str| {
+        supports_import(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap()
+    };
+    assert_eq!(imp("fill: red"), Tri::True);
+    assert_eq!(imp("fill: banana"), Tri::False);
+    assert_eq!(imp("foo: bar"), Tri::False);
+    assert_eq!(imp("rotate: 1deg"), Tri::Unknown);
+    assert_eq!(imp("(fill: red) and (rotate: 1deg)"), Tri::Unknown);
+    assert_eq!(imp("fill red"), Tri::False);
+    assert_eq!(imp("(fill: red) banana"), Tri::False);
 }
 
 /// `not` の先読みは同じ字句の口で行い、`not` の長い並びでも手間は長さに比例する。
