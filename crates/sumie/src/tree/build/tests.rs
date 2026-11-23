@@ -942,9 +942,11 @@ fn unit3_round7() {
     for style in ["border: -5px red", "border: none -5px red", "margin: banana", "padding: -1px", "border: 5 solid"] {
         assert!(root(style).is_ok(), "{style}");
     }
-    assert!(css_box(build(&svg(
-        "<style>@supports (border: 1px solid oklch(0 0 0)) { svg { border: 5px solid red } }</style>"
-    ))));
+    // sumie の読まない色の関数の宣言の @supports は分からない（効けば断る。単位 3 の 8 回目のレビュー）
+    assert!(matches!(
+        build(&svg("<style>@supports (border: 1px solid oklch(0 0 0)) { svg { border: 5px solid red } }</style>")),
+        Err(Error::Unsupported(u)) if u.feature == Feature::NotYet(Later::Supports)
+    ));
     assert_eq!(not_yet(&format!("{r} style=\"outline: 5px solid red; outline: -1px red\"/>")), Later::CssBox);
     for css in ["offset: border-box", "offset: view-box 50%", "offset: fill-box 30%"] {
         assert!(build(&svg(&format!("{r} style=\"{css}\"/>"))).is_ok(), "{css}");
@@ -952,6 +954,176 @@ fn unit3_round7() {
     // 幅 0 の viewBox の文書の子の outline は描かない（断らない）
     let zv = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 0 10\"><rect width=\"5\" height=\"5\" style=\"outline: 2px solid red\"/></svg>";
     assert!(build(zv).is_ok());
+}
+
+/// 単位 3 の 8 回目のレビュー：calc-size の第 2 引数の頭・`@supports` の 3 値・枠の太さの割合・offset の形・箱の部品の重なり。
+#[test]
+fn unit3_round8() {
+    let r = "<rect width=\"5\" height=\"5\"";
+    let nodes = |css: &str| build(&svg(&format!("{r} style=\"{css}\"/>"))).unwrap().nodes.len();
+    // calc-size：頭が読めなければ壊れた値（属性の幅で描く）。頭が読めれば続く字句は見ない（auto で描かない）
+    for f in [
+        "calc-size(auto, banana)",
+        "calc-size(auto, 10)",
+        "calc-size(auto, 10deg)",
+        "calc-size(auto, red)",
+        "calc-size(auto, {size})",
+        "calc-size(auto, [size])",
+        "calc-size(auto, banana size)",
+        "calc-size(auto, size + )",
+        "calc-size(auto, size + 1px)",
+        "calc-size(auto, calc(size))",
+        "calc-size(auto, (size))",
+        "calc-size(auto,)",
+        "calc-size(calc-size(auto, banana), size)",
+    ] {
+        assert_eq!(nodes(&format!("width: {f}")), 1, "{f}");
+    }
+    for f in [
+        "calc-size(auto, size)",
+        "calc-size(auto, size banana)",
+        "calc-size(auto, 10px banana)",
+        "calc-size(auto, size, size)",
+        "calc-size(auto, 10px 10px)",
+        "calc-size(auto, 50%)",
+        "calc-size(-webkit-fill-available, size)",
+        "calc-size(-webkit-min-content, size)",
+        "calc-size(calc-size(auto, size), size)",
+    ] {
+        assert_eq!(nodes(&format!("width: {f}")), 0, "{f}");
+    }
+    // @supports：sumie が形を確かめずに受ける値は分からない。分からない条件の宣言が効けば断る
+    let rect = "<rect width=\"40\" height=\"40\" fill=\"green\"/>";
+    for cond in [
+        "(border: banana)",
+        "(padding: 5foo)",
+        "(margin: constant(safe-area-inset-top))",
+        "(border-radius: 5px foo())",
+        "(rotate: banana)",
+        "not (padding: 5foo)",
+        "(fill: red) and (rotate: 1deg)",
+        "(width: calc-size(auto, size + 1px)) or (rotate: 1deg)",
+    ] {
+        assert_eq!(
+            not_yet(&format!("<style>@supports {cond} {{ rect {{ fill: red }} }}</style>{rect}")),
+            Later::Supports,
+            "{cond}"
+        );
+    }
+    // 確かめた値の条件（真・偽）と、分からない条件でも効かない宣言は断らない
+    let fill = |src: &str| {
+        let t = build(&svg(src)).unwrap();
+        t.nodes.as_slice().first().map(|n| n.fill)
+    };
+    let green = fill(rect);
+    for cond in [
+        "(border: solid dashed)",
+        "(outline: 5px thick)",
+        "(border: 5% solid)",
+        "(width: calc-size(auto, banana))",
+        "(offset: banana)",
+        "(fill: red) and (rotate: 1deg) and (fill: banana)",
+    ] {
+        assert_eq!(fill(&format!("<style>@supports {cond} {{ rect {{ fill: red }} }}</style>{rect}")), green, "{cond}");
+    }
+    assert_ne!(
+        fill(&format!("<style>@supports (border: 5px solid red) {{ rect {{ fill: red }} }}</style>{rect}")),
+        green
+    );
+    assert_ne!(fill(&format!("<style>@supports (offset: 10px 20px) {{ rect {{ fill: red }} }}</style>{rect}")), green);
+    // 当たらない規則・負ける宣言・偽の外の条件
+    assert!(
+        build(&svg(&format!("<style>@supports (rotate: 1deg) {{ circle {{ fill: red }} }}</style>{rect}"))).is_ok()
+    );
+    assert!(
+        build(&svg("<style>@supports (rotate: 1deg) { rect { fill: red } }</style><rect width=\"4\" height=\"4\" style=\"fill: green\"/>"))
+            .is_ok()
+    );
+    assert!(
+        build(&svg(&format!(
+            "<style>@media print {{ @supports (rotate: 1deg) {{ rect {{ fill: red }} }} }}</style>{rect}"
+        )))
+        .is_ok()
+    );
+    assert_eq!(
+        not_yet(&format!(
+            "<style>@supports (rotate: 1deg) {{ @media screen {{ rect {{ fill: red }} }} }}</style>{rect}"
+        )),
+        Later::Supports
+    );
+    // 分からない条件の中で層の名前を書いた文書は断る（層の順が条件で変わりうる）
+    assert_eq!(
+        not_yet(&format!("<style>@supports (rotate: 1deg) {{ @layer a {{ }} }}</style>{rect}")),
+        Later::Supports
+    );
+    // 枠の太さの割合と、2 つ目の太さ・形・色は壊れた値（前の宣言が生きる）
+    let root = |style: &str| {
+        build(&format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\" style=\"{style}\"><rect width=\"5\" height=\"5\"/></svg>"
+        ))
+    };
+    let refused = |r: Result<Tree, Error>| match r {
+        Err(Error::Unsupported(u)) => match u.feature {
+            Feature::NotYet(l) => Some(l),
+            _ => None,
+        },
+        _ => None,
+    };
+    assert_eq!(refused(root("border: 5px solid red; border: 5% none")), Some(Later::CssBox));
+    assert_eq!(not_yet(&format!("{r} style=\"outline: 4px solid red; outline: 10% none\"/>")), Later::CssBox);
+    for style in [
+        "border: none; border: 5px thick",
+        "border: none; border: solid dashed",
+        "border: none; border: red blue",
+        "border: none; border: thin thick",
+        "border: none; border: 5%",
+    ] {
+        assert!(root(style).is_ok(), "{style}");
+    }
+    assert_eq!(nodes("inline-size: -5px calc(1px)"), 1);
+    // offset：道のない壊れた値は捨てる（前の道の宣言が生きる）。道のない正しい形は動かさない
+    for bad in [
+        "30px 30px 45deg",
+        "banana",
+        "45deg",
+        "left left",
+        "top 10px",
+        "10px left",
+        "1px 2px 3px 4px",
+        "path('M0 0') banana banana",
+    ] {
+        assert_eq!(
+            not_yet(&format!("<style>rect {{ offset: path('M0 0 L50 50') }}</style>{r} style=\"offset: {bad}\"/>")),
+            Later::CssTransform,
+            "{bad}"
+        );
+    }
+    for ok in [
+        "10px 20px",
+        "left top",
+        "top left",
+        "center",
+        "auto",
+        "normal",
+        "none",
+        "auto / center",
+        "10px 20px / left 5px top 5px",
+        "left 5px bottom 10%",
+        "border-box",
+        "view-box 50%",
+    ] {
+        assert_eq!(nodes(&format!("offset: path('M0 0 L50 50'); offset: {ok}")), 1, "{ok}");
+    }
+    for moving in [
+        "path('M0 0 L5 5') 30%",
+        "ray(45deg) auto",
+        "url(#p) 10px 30deg",
+        "none 45deg",
+        "border-box 45deg",
+        "left 5px top",
+    ] {
+        assert_eq!(not_yet(&format!("{r} style=\"offset: {moving}\"/>")), Later::CssTransform, "{moving}");
+    }
 }
 
 /// 根の svg の display: none と偽の条件は描くことを止めない（Chrome と同じ。ADR-102。子の display: none は効く）。

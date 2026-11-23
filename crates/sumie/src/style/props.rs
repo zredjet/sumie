@@ -72,8 +72,10 @@ pub(crate) enum Kind {
     ClipPath,
     /// `d`（`none` か `path("…")`）
     Path,
-    /// 細かく確かめない（空でなければ受ける）
+    /// 細かく確かめない（空でなければ受ける。`@supports` では分からない。単位 3 の 8 回目のレビュー）
     Raw,
+    /// `offset` のまとめ（道のない形は Chrome の文法で確かめる。道のある形は確かめずに受け、効けば NotYet）
+    Offset,
     /// CSS の箱のプロパティ（根の border・padding・margin など、要素の outline、rect の論理の大きさ）。値は細かく確かめず、
     /// 初期の値と同じ絵になるかを宣言ごとに 1 度だけ求める（同じ絵にならなければ NotYet。ADR-103）
     CssBox(BoxRule),
@@ -139,7 +141,17 @@ pub(crate) const SIZE_KEYWORDS: &[&[u8]] = &[
 ];
 
 /// `calc-size()` の基準で `auto` と同じになる大きさの言葉（Chrome。`any` と長さの基準は長さになる）。
-pub(crate) const SIZE_BASIS: &[&[u8]] = &[b"auto", b"min-content", b"max-content", b"fit-content", b"stretch"];
+pub(crate) const SIZE_BASIS: &[&[u8]] = &[
+    b"auto",
+    b"min-content",
+    b"max-content",
+    b"fit-content",
+    b"stretch",
+    b"-webkit-min-content",
+    b"-webkit-max-content",
+    b"-webkit-fit-content",
+    b"-webkit-fill-available",
+];
 /// `anchor-size()` の大きさの言葉。
 pub(crate) const ANCHOR_SIZES: &[&[u8]] = &[b"width", b"height", b"block", b"inline", b"self-block", b"self-inline"];
 
@@ -451,7 +463,7 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"mix-blend-mode", false, false, Kind::Keywords(BLEND)),
     // CSS の個別の変形と offset-path（CSS のプロパティとしてだけ。まだ描かないので、none でなければ NotYet。単位 3 の
     // 4 回目のレビュー）
-    p(b"offset", false, false, Kind::Raw),
+    p(b"offset", false, false, Kind::Offset),
     p(b"offset-path", false, false, Kind::Raw),
     p(b"opacity", false, true, Kind::Opacity),
     p(b"outline", false, false, Kind::CssBox(BoxRule::OutlineLine)),

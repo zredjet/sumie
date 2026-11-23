@@ -209,6 +209,11 @@ fn estimate_build_checks_instances_and_needs() {
             .is_ok()
     );
     assert!(est("<symbol id=\"s\"><image href=\"a.png\"/></symbol><use href=\"#s\"/>").is_err());
+    // content-visibility: hidden の pattern の href の先は描く（use だけを飛ばす。単位 3 の 8 回目のレビュー）
+    assert!(
+        est("<pattern id=\"p\" width=\"5\" height=\"5\"><image href=\"a.png\"/></pattern><pattern id=\"q\" href=\"#p\" style=\"content-visibility: hidden\"/><rect width=\"5\" height=\"5\" fill=\"url(#q)\"/>")
+            .is_err()
+    );
     // 根の display: none と偽の条件は描くのを止めないので、中の画像も要る（ADR-102 (1)。単位 3 の 5 回目のレビュー）
     for attrs in ["display=\"none\"", "style=\"display: none\"", "systemLanguage=\"xx\""] {
         let src = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" {attrs}><image href=\"a.png\"/></svg>");

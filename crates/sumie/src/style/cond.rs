@@ -5,7 +5,9 @@
 //!   色は 8 ビット、解像度は 1dppx（96dpi）、`hover`・`pointer` は `none`、`update` は `none`。幅・高さ・縦横比・向きは文書の
 //!   大きさ（CSS の px。width・height・viewBox で決まるとき）で照らし、決まらなければ偽。長さの em・rem は 16px（初期の値）
 //! - `@supports`：`(名前: 値 [!important])` は sumie が読めるプロパティと形か、`selector()` は sumie が読めるセレクタか。
-//!   `not`・`and`・`or`。知らない形（general-enclosed）は偽（CSS Conditional 3 §6.1）
+//!   `not`・`and`・`or`。知らない形（general-enclosed）は偽（CSS Conditional 3 §6.1）。sumie が形を確かめずに受ける値
+//!   （`Raw` のプロパティなど）の宣言は分からない（3 値のまま返す。分からない条件の規則が要素に効けば、木を作る段が
+//!   NotYet で断る。単位 3 の 8 回目のレビュー）
 //! - 書き方は仕様のとおりに確かめる：`not` の段には `and`・`or` を書けない、`and` と `or` を同じ段に混ぜない、媒体の種類の
 //!   あとには `or` を書けない。特徴の値は特徴ごとの形（長さ・解像度・比・整数）だけ。範囲の形の 2 つの比べは同じ向き
 //! - 再帰しない（入れ子のかっこは明示の積み上げ）
@@ -20,7 +22,7 @@ use crate::mem::{MVec, Plain};
 use crate::style::ColorScheme;
 use crate::style::cascade::decl_prop;
 use crate::style::props::prop;
-use crate::style::valid::{Ctx, valid, wide};
+use crate::style::valid::{Check, Ctx, check, wide};
 use crate::xml::lex::Span;
 
 /// 照らす環境。
@@ -36,7 +38,7 @@ pub(crate) struct Env {
 /// 3 値。
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tri {
+pub(crate) enum Tri {
     False,
     True,
     Unknown,
@@ -841,18 +843,19 @@ fn compare(cur: Val, op: u8, eq: bool, x: f64, flip: bool) -> Tri {
     })
 }
 
-/// `@supports` の条件が真か。
-pub(crate) fn supports(s: &[u8], range: Span, ns: NsTable<'_>, budget: &Budget<'_>) -> Result<bool, Error> {
+/// `@supports` の条件の値（sumie が形を確かめずに受ける値の宣言は分からない：[`Check::Unsure`]。単位 3 の 8 回目の
+/// レビュー）。
+pub(crate) fn supports(s: &[u8], range: Span, ns: NsTable<'_>, budget: &Budget<'_>) -> Result<Tri, Error> {
     let budget = budget_ref(budget);
     let mut c = Cur::new(s, range, budget);
     let mut leaf = |cur: &mut Cur<'_, '_>, inner: Span| declaration_leaf(cur.s, inner, budget);
     let mode = Mode { ns, stop_at_comma: false, without_or: false, general: Tri::False };
-    Ok(condition(&mut c, budget, &mut leaf, mode)? == Tri::True)
+    condition(&mut c, budget, &mut leaf, mode)
 }
 
-/// `@import` の `supports(…)` の中身（`<supports-condition>` か 1 つの宣言）が真か（CSS Cascade 5 §2.1）。
-pub(crate) fn supports_import(s: &[u8], range: Span, ns: NsTable<'_>, budget: &Budget<'_>) -> Result<bool, Error> {
-    Ok(supports(s, range, ns, budget)? || declaration_leaf(s, range, budget_ref(budget))? == Tri::True)
+/// `@import` の `supports(…)` の中身（`<supports-condition>` か 1 つの宣言）の値（CSS Cascade 5 §2.1）。
+pub(crate) fn supports_import(s: &[u8], range: Span, ns: NsTable<'_>, budget: &Budget<'_>) -> Result<Tri, Error> {
+    Ok(supports(s, range, ns, budget)?.or(declaration_leaf(s, range, budget_ref(budget))?))
 }
 
 /// `(名前: 値 [!important])` が sumie の読める宣言か（名前の escape を解く。宣言でない形は偽）。
@@ -891,9 +894,13 @@ fn declaration_leaf(s: &[u8], inner: Span, budget: &Budget<'_>) -> Result<Tri, E
     if wide(s, d.value, budget)?.is_some() {
         return Ok(Tri::True);
     }
-    // 形だけを見る（表示の領域の単位も受ける）
+    // 形だけを見る（表示の領域の単位も受ける）。確かめずに受ける値は分からない
     let cx = Ctx { attr: false, unitless: p.unitless, viewport: true };
-    Ok(Tri::of(valid(p.kind, s, d.value, cx, budget)?))
+    Ok(match check(p.kind, s, d.value, cx, budget)? {
+        Check::Bad => Tri::False,
+        Check::Sure => Tri::True,
+        Check::Unsure => Tri::Unknown,
+    })
 }
 
 #[cfg(test)]

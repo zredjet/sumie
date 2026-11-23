@@ -137,6 +137,10 @@ pub enum Later {
     /// CSS の箱のプロパティ（根の `border`・`padding`・`margin`・`box-shadow`・`position` など、要素の `outline`、rect の
     /// 論理の大きさ `inline-size`・`block-size`）が初期の値と同じ絵にならない（Chrome は描く。M3 で決める。ADR-103）
     CssBox,
+    /// 値の分からない `@supports` の条件（sumie が形を確かめずに受ける値の宣言。`rotate`・`mask` などの細かく確かめない
+    /// プロパティ・CSS の箱のプロパティの読めない部品・`offset` の道）の規則の宣言が、要素の値を決める（値を描く
+    /// マイルストーンで形を確かめる。単位 3 の 8 回目のレビュー）
+    Supports,
 }
 
 /// 壊れた入力・呼び手の誤り。

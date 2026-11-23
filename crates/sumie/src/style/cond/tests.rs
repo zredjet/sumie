@@ -62,8 +62,9 @@ fn media_queries() {
 #[test]
 fn supports_conditions() {
     let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
-    let sp =
-        |q: &str| supports(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap();
+    let sp = |q: &str| {
+        supports(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap() == Tri::True
+    };
     assert!(sp("(fill: green)"));
     assert!(sp("(FILL: inherit)"));
     assert!(!sp("(fill: 1px)"));
@@ -115,8 +116,9 @@ fn media_grammar_and_value_types() {
 #[test]
 fn supports_general_enclosed_and_important() {
     let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
-    let sp =
-        |q: &str| supports(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap();
+    let sp = |q: &str| {
+        supports(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap() == Tri::True
+    };
     // 知らない形は偽（CSS Conditional 3 §6.1）
     assert!(sp("not (foo)"));
     assert!(sp("(fill: red) and (not (foo))"));
@@ -134,8 +136,9 @@ fn supports_general_enclosed_and_important() {
 #[test]
 fn supports_selector_and_custom_properties() {
     let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
-    let sp =
-        |q: &str| supports(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap();
+    let sp = |q: &str| {
+        supports(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap() == Tri::True
+    };
     assert!(sp("(--x: 1)"));
     assert!(sp("(selector(a))"));
     // 1 つの複雑なセレクタだけ。当てないセレクタは読めないもの
@@ -167,8 +170,9 @@ fn general_enclosed_and_feature_values() {
         assert_eq!(m(q, s, l), want, "{q}");
     }
     let budget = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
-    let sp =
-        |q: &str| supports(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap();
+    let sp = |q: &str| {
+        supports(q.as_bytes(), Span::new(0, q.len()), crate::css::select::NsTable::EMPTY, &budget).unwrap() == Tri::True
+    };
     assert!(sp("(not foo) or (fill: red)"));
     assert!(!sp("(fill: red;)"));
 }

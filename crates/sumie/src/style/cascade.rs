@@ -18,7 +18,7 @@ use crate::css::sheet::{COND_MEDIA, COND_SUPPORTS_IMPORT, Sheet};
 use crate::error::Error;
 use crate::mem::{Frozen, MVec, Plain, stable_sort};
 use crate::report::WarningKind;
-use crate::style::cond::{Env, media, supports, supports_import};
+use crate::style::cond::{Env, Tri, media, supports, supports_import};
 use crate::style::props::{PROPS, PropertyId, lookup, lookup_css, prop};
 use crate::style::valid::{Ctx, Wide, font_parts, valid, wide};
 use crate::xml::lex::Span;
@@ -60,6 +60,9 @@ pub(crate) struct Styles {
     pub(crate) index: Frozen<u32>,
     /// 警告（種類と位置）
     pub(crate) warnings: Frozen<Warn>,
+    /// 値の分からない `@supports` の条件の規則の宣言が初めて効いた要素（なければ NONE。木を作る段が NotYet で断る。
+    /// 分からない条件の中で層の名前を書いた文書は根の 0。単位 3 の 8 回目のレビュー）
+    pub(crate) unsure: u32,
 }
 
 impl Styles {
@@ -102,6 +105,14 @@ struct DeclInfo {
 /// `IMAGE_DATA`・`IMAGE_FUNCTION`。まとめから分けたものは値の範囲を置かない）。
 pub(crate) const BG_IMAGE_FROM_SHORTHAND: u8 = 0x80;
 
+/// 値の分からない `@supports` の条件の規則の宣言の印（`pad[1]`）。
+pub(crate) const DECL_UNSURE: u8 = 1;
+
+/// 条件の値（`cond_ok` と規則の `active`）：偽・真・分からない（分からない規則は真とみなして照らし、宣言に印を付ける）。
+const COND_FALSE: u8 = 0;
+const COND_TRUE: u8 = 1;
+const COND_UNKNOWN: u8 = 2;
+
 /// CSS の箱のプロパティ（`Kind::CssBox`）の値が初期の値と同じ絵にならない印（`pad[0]`。宣言ごとに 1 度だけ求める。ADR-103）。
 pub(crate) const BOX_ON: u8 = 1;
 
@@ -114,13 +125,15 @@ pub(crate) const OFFSET_PATH: u8 = 1;
 fn box_flag(id: PropertyId, text: &[u8], value: Span, budget: &Budget<'_>) -> Result<Option<u8>, Error> {
     match prop(id) {
         Some(p) if p.name == b"offset" => {
-            Ok(Some(if crate::style::valid::offset_has_path(text, value, budget)? { OFFSET_PATH } else { 0 }))
+            let cx = crate::style::valid::Ctx { attr: false, unitless: false, viewport: true };
+            let path = crate::style::valid::offset_form(text, value, cx, budget)?.unwrap_or(true);
+            Ok(Some(if path { OFFSET_PATH } else { 0 }))
         }
         Some(p) => match p.kind {
             crate::style::props::Kind::CssBox(rule) => {
                 // 確かめは済んでいる（壊れた値は候補にならない）。同じ絵にならなければ BOX_ON
                 let cx = crate::style::valid::Ctx { attr: false, unitless: false, viewport: true };
-                let same = crate::style::valid::css_box(rule, text, value, cx, budget)?.unwrap_or(false);
+                let same = crate::style::valid::css_box(rule, text, value, cx, budget)?.is_some_and(|b| b.plain());
                 Ok(Some(if same { 0 } else { BOX_ON }))
             }
             _ => Ok(None),
@@ -280,24 +293,47 @@ pub(crate) fn cascade(
     let mut cond_ok: MVec<'_, u8> = MVec::with_capacity(budget, nconds)?;
     for c in sheet.conds.as_slice() {
         budget.spend(cost::OP_STEP)?;
-        let outer = c.parent == NONE || cond_ok.get(c.parent as usize).copied() == Some(1);
-        let ok = outer
-            && match c.kind {
-                COND_MEDIA => media(text, c.text, env, budget)?,
+        let outer = if c.parent == NONE { COND_TRUE } else { cond_ok.get(c.parent as usize).copied().unwrap_or(0) };
+        let own = if outer == COND_FALSE {
+            Tri::False
+        } else {
+            match c.kind {
+                COND_MEDIA => {
+                    if media(text, c.text, env, budget)? {
+                        Tri::True
+                    } else {
+                        Tri::False
+                    }
+                }
                 COND_SUPPORTS_IMPORT => supports_import(text, c.text, sheet.ns_table(c), budget)?,
                 _ => supports(text, c.text, sheet.ns_table(c), budget)?,
-            };
-        cond_ok.push(u8::from(ok))?;
+            }
+        };
+        let v = match own {
+            Tri::False => COND_FALSE,
+            Tri::Unknown => COND_UNKNOWN,
+            Tri::True => outer,
+        };
+        cond_ok.push(v)?;
     }
-    // 規則ごとに当てるか
+    // 規則ごとに当てるか（分からない条件の規則も照らす）
     let mut active: MVec<'_, u8> = MVec::with_capacity(budget, sheet.rules.len())?;
     for r in sheet.rules.as_slice() {
         budget.spend(cost::OP_STEP)?;
-        let ok = r.cond == NONE || cond_ok.get(r.cond as usize).copied() == Some(1);
-        active.push(u8::from(ok))?;
+        let v = if r.cond == NONE { COND_TRUE } else { cond_ok.get(r.cond as usize).copied().unwrap_or(0) };
+        active.push(v)?;
     }
-    // 層の順位（真の条件の所で名前を書いた順）
+    // 層の順位（真の条件の所で名前を書いた順）。分からない条件の中で層の名前を書けば、層の順が条件で変わりうるので、文書
+    // ごと断る印を付ける
     let ranks = sheet.layer_ranks(cond_ok.as_slice(), budget)?;
+    let mut unsure = NONE;
+    for l in sheet.layers.as_slice() {
+        budget.spend(cost::OP_STEP)?;
+        if l.cond != NONE && cond_ok.get(l.cond as usize).copied() == Some(COND_UNKNOWN) {
+            unsure = 0;
+            break;
+        }
+    }
     // 表示の領域の単位（vw など）は文書の大きさが決まるときだけ読める
     let viewport = env.size.is_some();
     // 規則の宣言を 1 度だけ確かめる（宣言は規則の順に続いて並ぶ。規則の外の宣言はない）
@@ -371,6 +407,9 @@ pub(crate) fn cascade(
         infos: infos.as_slice(),
         fonts: fonts.as_slice(),
         ranks: ranks.as_slice(),
+        active: active.as_slice(),
+        rule_unsure: false,
+        unsure,
         viewport,
         budget,
         slots: MVec::with_capacity(budget, PROPS.len())?,
@@ -395,7 +434,7 @@ pub(crate) fn cascade(
     let mut w: MVec<'_, Warn> = MVec::with_capacity(budget, out.warns.len())?;
     w.append_slice(out.warns.as_slice())?;
     let index = core::mem::replace(&mut out.index, MVec::new(budget));
-    Ok(Styles { specs: exact.freeze(), index: index.freeze(), warnings: w.freeze() })
+    Ok(Styles { specs: exact.freeze(), index: index.freeze(), warnings: w.freeze(), unsure: out.unsure })
 }
 
 fn budget_ref<'a>(b: &'a Budget<'_>) -> &'a Budget<'a> {
@@ -495,6 +534,12 @@ struct Out<'a, 'b> {
     fonts: &'a [FontRec],
     /// まとめた層ごとの順位
     ranks: &'a [u32],
+    /// 規則ごとの条件の値（`COND_*`）
+    active: &'a [u8],
+    /// 今の候補が値の分からない条件の規則から来たか（置くときに [`DECL_UNSURE`] を付ける）
+    rule_unsure: bool,
+    /// 値の分からない条件の宣言が初めて効いた要素（[`Styles::unsure`]）
+    unsure: u32,
     /// 表示の領域の単位を読めるか
     viewport: bool,
     budget: &'b Budget<'b>,
@@ -658,6 +703,12 @@ impl Out<'_, '_> {
             return Ok(());
         }
         let first = s.set == 0;
+        let spec = if self.rule_unsure {
+            let [a, b, c] = spec.pad;
+            Specified { pad: [a, b | DECL_UNSURE, c], ..spec }
+        } else {
+            spec
+        };
         *s = Slot {
             set: 1,
             pad: [0; 3],
@@ -699,6 +750,9 @@ impl Out<'_, '_> {
             s.set = 0;
             let spec = Specified { node: e, ..s.spec };
             if n.ns == NS_SVG {
+                if spec.pad[1] & DECL_UNSURE != 0 && self.unsure == NONE {
+                    self.unsure = e;
+                }
                 self.specs.push(spec)?;
             }
         }
@@ -845,7 +899,10 @@ impl MatchSink for Out<'_, '_> {
                 pad: [0; 3],
             };
             let font = self.fonts.get(info.font as usize).copied();
-            self.offer(info.prop, key, s, font)?;
+            self.rule_unsure = self.active.get(rule as usize).copied() == Some(COND_UNKNOWN);
+            let r = self.offer(info.prop, key, s, font);
+            self.rule_unsure = false;
+            r?;
         }
         Ok(())
     }

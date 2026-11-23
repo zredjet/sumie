@@ -205,10 +205,13 @@ pub(crate) fn needs(
                 c = nodes.get(c as usize).map_or(NONE, |x| x.next_sibling);
             }
         }
-        // 中身を作る参照の辺（clip-path の中身は画像を描かない）。輪として取り除いた辺もたどる（ADR-86 (1)）
+        // 中身を作る参照の辺（clip-path の中身は画像を描かない）。輪として取り除いた辺もたどる（ADR-86 (1)）。
+        // content-visibility: hidden の use は参照先を描かない（pattern・filter・feImage の href の先は描く。Chrome と同じ。
+        // 単位 3 の 8 回目のレビュー）
+        let hidden_use = cv_hidden && local == b"use";
         for e in refs.of(i) {
             budget.spend(cost::OP_STEP)?;
-            if e.kind == EDGE_HREF || e.kind == EDGE_TEXT || e.kind == EDGE_CLIP || (cv_hidden && e.kind == EDGE_USE) {
+            if e.kind == EDGE_HREF || e.kind == EDGE_TEXT || e.kind == EDGE_CLIP || (hidden_use && e.kind == EDGE_USE) {
                 continue;
             }
             stack.push((u64::from(e.target) << 3) | 1)?;

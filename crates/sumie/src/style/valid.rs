@@ -57,23 +57,58 @@ fn len_of(v: &mut Values<'_, '_>, cx: Ctx) -> Result<Option<values::Length>, Err
     Ok(v.length(cx.unitless)?.filter(|l| cx.viewport || !l.unit.viewport()))
 }
 
+/// 形を確かめた結果（`@supports` の 3 値のため。単位 3 の 8 回目のレビュー）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Check {
+    /// 壊れた値
+    Bad,
+    /// 形を確かめて受けた
+    Sure,
+    /// 形を確かめずに受けた（`Kind::Raw`・CSS の箱のプロパティの読めない部品・`offset` の道。Chrome が受けるかは分からない）
+    Unsure,
+}
+
+impl Check {
+    const fn of(b: bool) -> Check {
+        if b { Check::Sure } else { Check::Bad }
+    }
+}
+
 /// 値が `kind` の形か。
 pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) -> Result<bool, Error> {
+    Ok(check(kind, s, range, cx, budget)? != Check::Bad)
+}
+
+/// 値が `kind` の形かを、確かめて受けたか・確かめずに受けたかと分けて返す。
+pub(crate) fn check(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) -> Result<Check, Error> {
     let budget = budget_ref(budget);
     match kind {
-        Kind::Transform if cx.attr => return Ok(values::transform_attr(s, range, budget)?.is_some()),
-        Kind::Transform => return values::transform_css_valid(s, range, cx.viewport, budget),
+        Kind::Transform if cx.attr => return Ok(Check::of(values::transform_attr(s, range, budget)?.is_some())),
+        Kind::Transform => return Ok(Check::of(values::transform_css_valid(s, range, cx.viewport, budget)?)),
         // `d` 属性はパスの書き方（SVG 2 では壊れた所までを描くので、形はパスを作る段で確かめる）
-        Kind::Path if cx.attr => return Ok(true),
-        Kind::Font => return Ok(font_parts(s, range, cx, budget)?.is_some()),
-        Kind::Background => return Ok(background_color(s, range, budget)?.is_some()),
-        Kind::BackgroundImage => return Ok(image_list(s, range, budget)?.is_some()),
-        Kind::CssBox(rule) => return Ok(css_box(rule, s, range, cx, budget)?.is_some()),
+        Kind::Path if cx.attr => return Ok(Check::Sure),
+        Kind::Font => return Ok(Check::of(font_parts(s, range, cx, budget)?.is_some())),
+        Kind::Background => return Ok(Check::of(background_color(s, range, budget)?.is_some())),
+        Kind::BackgroundImage => return Ok(Check::of(image_list(s, range, budget)?.is_some())),
+        Kind::CssBox(rule) => {
+            return Ok(match css_box(rule, s, range, cx, budget)? {
+                None => Check::Bad,
+                Some(b) if b.unknown => Check::Unsure,
+                Some(_) => Check::Sure,
+            });
+        }
+        Kind::Offset => {
+            return Ok(match offset_form(s, range, cx, budget)? {
+                None => Check::Bad,
+                Some(true) => Check::Unsure,
+                Some(false) => Check::Sure,
+            });
+        }
         _ => {}
     }
     let mut v = Values::new(s, range, budget);
     if v.at_end()? {
-        return Ok(false);
+        return Ok(Check::Bad);
     }
     let ok = match kind {
         Kind::Paint => v.paint()?.is_some(),
@@ -276,14 +311,19 @@ pub(crate) fn valid(kind: Kind, s: &[u8], range: Span, cx: Ctx, budget: &Budget<
                 budget.spend(crate::cost::OP_STEP)?;
                 let t = v.next()?;
                 if matches!(t.kind, Tk::BadString | Tk::BadUrl) {
-                    return Ok(false);
+                    return Ok(Check::Bad);
                 }
             }
-            true
+            if v.at_end()? {
+                return Ok(Check::Unsure);
+            }
+            false
         }
-        Kind::Transform | Kind::Font | Kind::Background | Kind::BackgroundImage | Kind::CssBox(_) => false,
+        Kind::Transform | Kind::Font | Kind::Background | Kind::BackgroundImage | Kind::CssBox(_) | Kind::Offset => {
+            false
+        }
     };
-    Ok(ok && v.at_end()?)
+    Ok(Check::of(ok && v.at_end()?))
 }
 
 /// 言葉の並びのどれか 1 つを読む。
@@ -334,8 +374,31 @@ fn skip_args(v: &mut Values<'_, '_>, cx: Ctx) -> Result<bool, Error> {
     }
 }
 
+/// `calc-size()` の第 2 引数の頭を読む（Chrome：`size` か長さ・割合で、演算子が続かないものは受け、続く字句は見ない。数・
+/// ほかの次元・`size` 以外の言葉・`{`・`[`・空は壊れた値。演算子の続く式と、かっこ・関数の頭は、`calc()` と同じく M7 まで
+/// 壊れた値（ADR-66・ADR-83。単位 3 の 8 回目のレビュー））。
+fn calc_size_head(v: &mut Values<'_, '_>) -> Result<bool, Error> {
+    let t = v.peek()?;
+    let head = match t.kind {
+        Tk::Ident => {
+            let ok = ident_is(v.s, t.inner, t.escaped, b"size");
+            if ok {
+                v.next()?;
+            }
+            ok
+        }
+        Tk::Percentage | Tk::Dimension => v.length(false)?.is_some_and(|l| l.unit != Unit::None),
+        _ => false,
+    };
+    if !head {
+        return Ok(false);
+    }
+    let n = v.peek()?;
+    Ok(!(n.is_delim(b'+') || n.is_delim(b'-') || n.is_delim(b'*') || n.is_delim(b'/')))
+}
+
 /// width・height の大きさの関数で、Chrome が SVG の rect で `auto` と同じに扱うもの（単位 3 の 6・7 回目のレビュー）を 1 つ
-/// 読む：基準が大きさの言葉の `calc-size()`（入れ子の `calc-size()` の基準も同じ。続く式は空でなければ受ける）と、fallback の
+/// 読む：基準が大きさの言葉の `calc-size()`（入れ子の `calc-size()` の基準も同じ。続く式は頭を確かめる：[`calc_size_head`]）と、fallback の
 /// ない `anchor-size()`（anchor の名前と大きさの言葉をそれぞれ 1 つまで）。基準が `any` か長さの `calc-size()` と fallback の
 /// ある `anchor-size()` は長さになり、`calc()` と同じく M7 まで壊れた値（偽を返す。字句は読み進めてよい：値は壊れたもの）。
 pub(crate) fn size_function(v: &mut Values<'_, '_>, cx: Ctx) -> Result<bool, Error> {
@@ -360,7 +423,7 @@ pub(crate) fn size_function(v: &mut Values<'_, '_>, cx: Ctx) -> Result<bool, Err
             return Ok(false);
         }
         for _ in 0..depth {
-            if !v.eat(Tk::Comma)? || v.peek()?.kind == Tk::RParen || v.at_end()? {
+            if !v.eat(Tk::Comma)? || !calc_size_head(v)? {
                 return Ok(false);
             }
             skip_args(v, cx)?;
@@ -391,19 +454,120 @@ pub(crate) fn size_function(v: &mut Values<'_, '_>, cx: Ctx) -> Result<bool, Err
     Ok(false)
 }
 
-/// `offset` のまとめが道（関数か url）を持つか（位置・anchor・回転・距離と箱の言葉だけなら、Chrome でも SVG の要素は動かない。
-/// 単位 3 の 6・7 回目のレビュー）。字句ごとに払う。
-pub(crate) fn offset_has_path(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<bool, Error> {
+/// `offset` のまとめの形（CSS Motion Path 1 §2.6：`[ 位置? [ 道 [ 距離 || 回転 ]? ]? ]! [ / anchor ]?`）を確かめ、要素を
+/// 動かしうるかを返す（壊れた値は None）。道のない形（位置・`auto`・`normal`・`none`・箱の言葉と距離）は Chrome の文法で
+/// 確かめて Some(false)（Chrome でも SVG の要素は動かない）。道の関数（`path()`・`ray()`・`url()`・基本の形）か、道のあとの距離・回転が
+/// あれば、中身を確かめずに Some(true)（効けば NotYet。`@supports` では分からない）。読めない字句は、道の関数があれば
+/// Some(true)、なければ壊れた値（Chrome は壊れた値を捨てて前の宣言を生かす。単位 3 の 6〜8 回目のレビュー）。字句ごとに払う。
+pub(crate) fn offset_form(s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) -> Result<Option<bool>, Error> {
+    const BOXES: &[&[u8]] =
+        &[b"content-box", b"padding-box", b"border-box", b"margin-box", b"fill-box", b"stroke-box", b"view-box"];
     let budget = budget_ref(budget);
+    let cx = Ctx { unitless: false, ..cx };
     let mut v = Values::new(s, range, budget);
+    if v.at_end()? {
+        return Ok(None);
+    }
+    // 位置（`auto`・`normal` か 1〜4 つの項）。3 つの項は形を確かめない（Some(None)）
+    let position = |v: &mut Values<'_, '_>, words: bool| -> Result<Option<Option<bool>>, Error> {
+        if words && (v.eat_ident(b"auto")? || v.eat_ident(b"normal")?) {
+            return Ok(Some(Some(true)));
+        }
+        // 項の種類：0 横の言葉（left・right）、1 縦の言葉（top・bottom）、2 center、3 長さか割合
+        let mut items = [0u8; 4];
+        let mut n = 0usize;
+        while n < 4 {
+            budget.spend(cost::OP_STEP)?;
+            let item = if v.eat_ident(b"left")? || v.eat_ident(b"right")? {
+                0
+            } else if v.eat_ident(b"top")? || v.eat_ident(b"bottom")? {
+                1
+            } else if v.eat_ident(b"center")? {
+                2
+            } else if len_of(v, cx)?.is_some() {
+                3
+            } else {
+                break;
+            };
+            if let Some(x) = items.get_mut(n) {
+                *x = item;
+            }
+            n = n.saturating_add(1);
+        }
+        let [a, b, c, d] = items;
+        Ok(match n {
+            0 => None,
+            1 => Some(Some(true)),
+            // 言葉 2 つは順を問わない（同じ向きの 2 つは書けない）。長さを含む形は 横、縦 の順
+            2 => Some(Some(match (a, b) {
+                (0, 0) | (1, 1) => false,
+                (0..=2, 0..=2) => true,
+                (x, y) => matches!(x, 0 | 2 | 3) && matches!(y, 1..=3),
+            })),
+            3 => Some(None),
+            // 言葉 長さ 言葉 長さ（横と縦が 1 つずつ）
+            _ => Some(Some(a <= 1 && c <= 1 && a != c && b == 3 && d == 3)),
+        })
+    };
+    let mut unsure = false;
+    // 位置
+    match position(&mut v, true)? {
+        Some(Some(false)) => return Ok(None),
+        Some(None) => unsure = true,
+        _ => {}
+    }
+    // 道（関数・url・`none`）と箱の言葉（どちらも 1 つまで、順を問わない）
+    let (mut func, mut none, mut boxed) = (false, false, false);
     loop {
-        budget.spend(crate::cost::OP_STEP)?;
-        match v.next()?.kind {
-            Tk::Eof => return Ok(false),
-            Tk::Function | Tk::Url => return Ok(true),
-            _ => {}
+        budget.spend(cost::OP_STEP)?;
+        let t = v.peek()?;
+        if !func && !none && matches!(t.kind, Tk::Function | Tk::Url) {
+            v.next()?;
+            if t.kind == Tk::Function {
+                skip_args(&mut v, cx)?;
+            }
+            func = true;
+        } else if !func && !none && !boxed && v.eat_ident(b"none")? {
+            none = true;
+        } else if !boxed && !none && eat_any(&mut v, BOXES)? {
+            boxed = true;
+        } else {
+            break;
         }
     }
+    // 距離と回転（道のあとだけ。どちらも 1 つまで、順を問わない）
+    let (mut distance, mut rotate) = (false, false);
+    if func || none || boxed {
+        loop {
+            budget.spend(cost::OP_STEP)?;
+            if !distance && len_of(&mut v, cx)?.is_some() {
+                distance = true;
+            } else if !rotate && (v.eat_ident(b"auto")? || v.eat_ident(b"reverse")?) {
+                rotate = true;
+                v.angle(false)?;
+            } else if !rotate && v.angle(false)?.is_some() {
+                rotate = true;
+                let _ = v.eat_ident(b"auto")? || v.eat_ident(b"reverse")?;
+            } else {
+                break;
+            }
+        }
+    }
+    // anchor
+    if v.peek()?.is_delim(b'/') {
+        v.next()?;
+        match position(&mut v, true)? {
+            None | Some(Some(false)) => return Ok(if func { Some(true) } else { None }),
+            Some(None) => unsure = true,
+            Some(Some(true)) => {}
+        }
+    }
+    if !v.at_end()? {
+        return Ok(if func { Some(true) } else { None });
+    }
+    // 箱の言葉と距離だけなら Chrome でも動かない（単位 3 の 7 回目のレビュー）。`none` のあとの距離・回転と、箱の言葉のあとの
+    // 回転は確かめていないので、動かしうるとみなす
+    Ok(Some(func || unsure || (none && (distance || rotate)) || (boxed && rotate)))
 }
 
 /// `url()` か、決まった名前の関数の並び（1 つ以上）。
@@ -742,6 +906,22 @@ pub(crate) fn font_parts(s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) ->
     Ok(Some(p))
 }
 
+/// CSS の箱のプロパティの値を確かめた結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoxCheck {
+    /// 読めた部品が初期の値と同じ絵になる
+    pub(crate) same: bool,
+    /// 読めない部品がある（Chrome は受けうる。同じ絵になるかは分からない）
+    pub(crate) unknown: bool,
+}
+
+impl BoxCheck {
+    /// 初期の値と同じ絵になると分かるか。
+    pub(crate) const fn plain(self) -> bool {
+        self.same && !self.unknown
+    }
+}
+
 /// CSS の箱のプロパティの値を Chrome と同じ形で確かめ、初期の値と同じ絵になるかを返す（壊れた値は None：宣言ごと捨てる。
 /// [`BoxRule`]。宣言ごとに 1 度だけ求める。ADR-103）。字句ごとに払う。
 pub(crate) fn css_box(
@@ -750,7 +930,7 @@ pub(crate) fn css_box(
     range: Span,
     cx: Ctx,
     budget: &Budget<'_>,
-) -> Result<Option<bool>, Error> {
+) -> Result<Option<BoxCheck>, Error> {
     let budget = budget_ref(budget);
     const LINE: &[&[u8]] =
         &[b"none", b"hidden", b"dotted", b"dashed", b"solid", b"double", b"groove", b"ridge", b"inset", b"outset"];
@@ -805,33 +985,39 @@ pub(crate) fn css_box(
         BoxRule::BorderLine | BoxRule::OutlineLine => {
             let outline = rule == BoxRule::OutlineLine;
             let (mut width, mut line, mut color) = (false, None::<bool>, false);
+            // 2 つ目の太さ・形・色と、負か割合の太さは壊れた値（Chrome と同じ。読めない部品として読み飛ばさない。単位 3 の
+            // 8 回目のレビュー）
             while !v.at_end()? {
                 budget.spend(crate::cost::OP_STEP)?;
-                if line.is_none()
-                    && let Some(n) = style(&mut v, outline)?
-                {
+                if let Some(n) = style(&mut v, outline)? {
+                    if line.is_some() {
+                        return Ok(None);
+                    }
                     line = Some(n);
                     continue;
                 }
-                if !width && eat_any(&mut v, WIDTHS)? {
-                    width = true;
-                    continue;
-                }
-                if let Some(l) = len_of(&mut v, cx)? {
-                    // 負の太さと 2 つ目の太さは壊れた値（読み進めてから弾いて色として読まない）
-                    if width || l.value < 0.0 {
+                if eat_any(&mut v, WIDTHS)? {
+                    if width {
                         return Ok(None);
                     }
                     width = true;
                     continue;
                 }
-                if !color {
-                    let mut probe = v;
-                    if probe.color()?.is_some() {
-                        v = probe;
-                        color = true;
-                        continue;
+                if let Some(l) = len_of(&mut v, cx)? {
+                    if width || l.value < 0.0 || l.unit == Unit::Percent {
+                        return Ok(None);
                     }
+                    width = true;
+                    continue;
+                }
+                let mut probe = v;
+                if probe.color()?.is_some() {
+                    if color {
+                        return Ok(None);
+                    }
+                    v = probe;
+                    color = true;
+                    continue;
                 }
                 if unknown_piece(&mut v, true)? {
                     unknown = true;
@@ -916,11 +1102,17 @@ pub(crate) fn css_box(
             Some(none)
         }
         BoxRule::Logical => {
-            let ok = v.eat_ident(b"auto")?
-                || eat_any(&mut v, crate::style::props::SIZE_KEYWORDS)?
-                || len_of(&mut v, cx)?.is_some_and(|l| l.value >= 0.0)
-                || unknown_piece(&mut v, false)?;
-            ok.then_some(false)
+            // 負の長さは読めない部品を試す前に壊れた値（単位 3 の 8 回目のレビュー）
+            if v.eat_ident(b"auto")? || eat_any(&mut v, crate::style::props::SIZE_KEYWORDS)? {
+                Some(false)
+            } else if let Some(l) = len_of(&mut v, cx)? {
+                (l.value >= 0.0).then_some(false)
+            } else if unknown_piece(&mut v, false)? {
+                unknown = true;
+                Some(false)
+            } else {
+                None
+            }
         }
         BoxRule::Keyword { words, neutral } => {
             let t = v.next()?;
@@ -946,7 +1138,7 @@ pub(crate) fn css_box(
             }
         }
     };
-    Ok(if v.at_end()? { out.map(|same| same && !unknown) } else { None })
+    Ok(if v.at_end()? { out.map(|same| BoxCheck { same, unknown }) } else { None })
 }
 
 #[cfg(test)]

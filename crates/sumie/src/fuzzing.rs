@@ -699,18 +699,23 @@ pub const CSS_HEAD: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:x=
 pub const CSS_TAIL: &[u8] = b"]]></style><g id=\"g\" class=\"a b\" fill=\"red\"><rect id=\"r\" class=\"c\" width=\"5\" height=\"5\" style=\"stroke: blue\"/><x:q id=\"q\"/><circle r=\"1\" lang=\"fr\"/><g><g><path d=\"M0 0\"/></g></g><a xl:href=\"#r\"><text>t</text></a><g/></g></svg>";
 
 /// 値の読みの口（style の値の確かめ・values の読み・`@media`・`@supports`）を通す（ファズの `values` の対象）。頭の 1 バイトで
-/// プロパティ（下の 7 ビット）と、属性か（上の 1 ビット）を選び、残りを値の字句にする（正しい UTF-8 でなければ何もしない）。
+/// プロパティ（下の 7 ビット。0x7F なら次の 1 バイトを足して 127 番より後ろも選ぶ）と、属性か（上の 1 ビット）を選び、残りを
+/// 値の字句にする（正しい UTF-8 でなければ何もしない）。
 /// 1 回の払いが中止の間隔を超えないこと・同じ入力で同じ結果になること・手間が字句の長さにおおよそ比例することを確かめる。
 pub fn values_parse(data: &[u8]) -> Check {
     use crate::style::cond::{Env, media, supports};
     use crate::style::props::PROPS;
     use crate::style::valid::{Ctx, font_parts, valid, wide};
     let Some((&head, text)) = data.split_first() else { return Check::Ok };
+    let (index, text) = match (head & 0x7F, text.split_first()) {
+        (0x7F, Some((&more, rest))) => (0x7Fusize.saturating_add(usize::from(more)), rest),
+        (low, _) => (usize::from(low), text),
+    };
     if core::str::from_utf8(text).is_err() {
         return Check::Ok;
     }
     let range = crate::xml::lex::Span::new(0, text.len());
-    let Some(p) = PROPS.get(usize::from(head & 0x7F).checked_rem(PROPS.len()).unwrap_or(0)) else { return Check::Ok };
+    let Some(p) = PROPS.get(index.checked_rem(PROPS.len()).unwrap_or(0)) else { return Check::Ok };
     let attr = head & 0x80 != 0;
     let run = |viewport: bool| -> Result<[bool; 12], Error> {
         let b = Budget::new(Stage::Parse, u64::MAX, u64::MAX, &Never);
@@ -731,7 +736,7 @@ pub fn values_parse(data: &[u8]) -> Check {
             crate::values::aspect(text, range, &b)?.is_some(),
             font_parts(text, range, cx, &b)?.is_some(),
             media(text, range, &env, &b)?,
-            supports(text, range, crate::css::select::NsTable::EMPTY, &b)?,
+            supports(text, range, crate::css::select::NsTable::EMPTY, &b)? == crate::style::cond::Tri::True,
             values_at(text, range, &b).color()?.is_some(),
         ];
         if b.max_spend() >= CANCEL_INTERVAL || b.over_released() {

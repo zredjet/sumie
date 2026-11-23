@@ -168,6 +168,12 @@ const BUILD_FIXED_BYTES: u64 = 4096;
 /// 木を作る（`budget` は見積もりの値を上限にしたもの）。
 pub(crate) fn build_tree(d: &Document<'_>, budget: &Budget<'_>) -> Result<Tree, Error> {
     let budget = budget_ref(budget);
+    // 値の分からない `@supports` の条件の宣言が効く要素があれば断る（Chrome の値が条件の真偽で変わりうる）
+    let unsure = d.styles.unsure;
+    if unsure != crate::xml::NONE {
+        let pos = d.xml.nodes.as_slice().get(unsure as usize).map(|n| u64::from(n.pos));
+        return Err(Error::Unsupported(Unsupported { feature: Feature::NotYet(Later::Supports), position: pos }));
+    }
     let keys = collect_keys(d, budget)?;
     let mut slots: MVec<'_, DeclSlot> = MVec::with_capacity(budget, keys.len())?;
     slots.resize_to(keys.len(), SLOT_EMPTY)?;
