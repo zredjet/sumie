@@ -239,7 +239,6 @@ fn pseudo_names_and_pseudo_elements() {
         ":-webkit-any(rect)",
         ":-webkit-any-link",
         ":host(rect)",
-        ":playing",
         ":is(::before)",
         ":where(:not(::before))",
         "::marker",
@@ -550,4 +549,68 @@ fn pseudo_elements_follow_chrome_per_element() {
     ] {
         assert!(!valid(bad), "{bad}");
     }
+}
+
+/// 単位 3 の 13 回目のレビュー：要素に支えられた擬似要素（`::part()`・`::details-content`・`::picker()`）のあとは同じ表、
+/// `::column` のあとは論理の擬似クラスも書けない、`:-webkit-any()` の中の論理の擬似クラスに結合子は書けない、Chrome の
+/// 知らない擬似クラスは捨てる。
+#[test]
+fn element_backed_pseudo_elements_share_chromes_table() {
+    let valid = |sel: &str| parse(&format!("rect, {sel}")).is_some();
+    for pe in ["::part(x)", "::details-content", "::picker(select)"] {
+        for ok in [
+            ":enabled",
+            ":checked",
+            ":link",
+            ":visited",
+            ":defined",
+            ":open",
+            ":window-inactive",
+            ":hover",
+            ":state(x)",
+            ":dir(ltr)",
+            ":lang(en)",
+            ":active-view-transition-type(a)",
+            ":not(:enabled)",
+            "::before",
+            "::marker",
+        ] {
+            assert!(valid(&format!("{pe}{ok}")), "{pe}{ok}");
+        }
+        for bad in [
+            ":horizontal",
+            ":current",
+            ":host",
+            ":host(a)",
+            ":host-context(a)",
+            ":only-child",
+            ":first-child",
+            ":nth-child(1)",
+            ":root",
+            ":empty",
+            ":has(a)",
+            ":-webkit-any(a)",
+            ":not(:current)",
+            "::part(y)",
+            "::slotted(a)",
+        ] {
+            assert!(!valid(&format!("{pe}{bad}")), "{pe}{bad}");
+        }
+    }
+    assert!(valid("::slotted(a)::details-content:enabled"));
+    for bad in [
+        "::column:is(:hover)",
+        "::column:where(:focus)",
+        "::column:is()",
+        "::column:not(:hover)",
+        ":-webkit-any(:not(a b))",
+        ":-webkit-any(:is(a b))",
+        ":playing",
+        ":paused",
+        ":local-link",
+    ] {
+        assert!(!valid(bad), "{bad}");
+    }
+    assert!(valid("::column::scroll-marker:is(:hover)"));
+    assert!(valid("::before:is(:hover)"));
 }

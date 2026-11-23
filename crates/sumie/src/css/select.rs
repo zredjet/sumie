@@ -5,7 +5,8 @@
 //! - `:is()`・`:where()` の並びは寛容（壊れた選択子だけを捨てる）。`:not()`・`:has()`・`of S` と規則の並びは、1 つでも
 //!   壊れていれば全体が壊れる（壊れた中の並びは、外の寛容な並びまで上がって、その選択子を捨てる）
 //! - 当てない擬似クラス（`:hover` など）と擬似要素は正しいセレクタとして読み、当たらない印（`never`）を付ける。擬似要素は
-//!   いちばん外の並びにだけ書け、そのあとには利用者の動きの擬似クラス（`:hover` など）と決まった擬似要素だけが書ける
+//!   いちばん外の並びにだけ書け、そのあとに書ける擬似クラスと擬似要素は擬似要素ごとに決まる（Chrome 157 と照らした表。
+//!   ADR-109・ADR-110）
 //! - `:has()`・`:nth-child(… of S)` は中まで確かめて読むが当てず、それを含むいちばん外の選択子を捨てる（[`Parsed::unsupported`]。
 //!   当てないものを `:not()` で裏返して当てすぎないため）
 //! - 既定の名前空間（`@namespace` の接頭辞なし）は、型と `*` と、型のない複合（`:is()` などの中の右端の複合を除く）に効く
@@ -358,32 +359,31 @@ impl Spec {
     }
 }
 
-/// 擬似要素を読んだあと（そのあとに書けるもの）。
+/// 擬似要素を読んだあと（そのあとに書けるもの。Chrome 157 と照らした。ADR-109・ADR-110）。
 const PE_NONE: u8 = 0;
-/// `::before`・`::after`（`::marker` と利用者の動きの擬似クラス）
+/// `::before`・`::after`（`::marker` と論理の擬似クラス（中は空））
 const PE_BEFORE_AFTER: u8 = 1;
-/// `::part()`（擬似要素と、構造でない擬似クラス）
+/// 要素に支えられた擬似要素 `::part()`・`::details-content`・`::picker()`（`::part()`・`::slotted()` でない擬似要素と、構造・
+/// スクロールバーでない擬似クラス（`:state()`・`:dir()`・`:lang()`・`:active-view-transition-type()` も））
 const PE_PART: u8 = 2;
-/// ほかの擬似要素（利用者の動きの擬似クラス）
+/// ほかの擬似要素（論理の擬似クラス（中は空））
 const PE_OTHER: u8 = 3;
-/// `::selection`（利用者の動きの擬似クラスと `:window-inactive`）
+/// `::selection`（`:window-inactive`）
 const PE_SELECTION: u8 = 4;
-/// `::slotted()`（木に沿う擬似要素と、利用者の動きの擬似クラス。CSS Scoping 1 §3.2.2）
+/// `::slotted()`（木に沿う擬似要素。CSS Scoping 1 §3.2.2）
 const PE_SLOTTED: u8 = 5;
-/// `::column`（`::scroll-marker` と、利用者の動きの擬似クラス。CSS Overflow 5）
+/// `::column`（`::scroll-marker` だけ。論理の擬似クラスも書けない。CSS Overflow 5）
 const PE_COLUMN: u8 = 6;
-/// `::-webkit-scrollbar*`（利用者の動きの擬似クラスと、スクロールバーの擬似クラス。Chrome と同じ）
+/// `::-webkit-scrollbar*`（`:hover`・`:active`・スクロールバーの擬似クラス・`:window-inactive`・`:enabled`・`:disabled`）
 const PE_SCROLLBAR: u8 = 7;
-/// 表にないほかの `::-webkit-*`（利用者の動きの擬似クラス。Chrome と同じ）
+/// 表にないほかの `::-webkit-*`（利用者の動きの擬似クラス）
 const PE_WEBKIT: u8 = 8;
-/// `::file-selector-button`・`::cue`（関数でない形）・`::details-content`（利用者の動きの擬似クラス）
+/// `::file-selector-button`・`::cue`（関数でない形）（利用者の動きの擬似クラス）
 const PE_USER: u8 = 9;
 /// `::scroll-marker`（利用者の動きの擬似クラスと `:target-current`）
 const PE_SCROLL_MARKER: u8 = 10;
 /// `::scroll-button()`（利用者の動きの擬似クラスと `:enabled`・`:disabled`）
 const PE_SCROLL_BUTTON: u8 = 11;
-/// `::picker()`（利用者の動きの擬似クラスと `:open`・`:popover-open`）
-const PE_PICKER: u8 = 12;
 /// `::scroll-marker-group`（`:hover`・`:focus-within`）
 const PE_MARKER_GROUP: u8 = 13;
 /// `::view-transition-*()`（`:only-child`）
@@ -395,7 +395,7 @@ const PE_SEARCH_TEXT: u8 = 15;
 const AFTER_SLOTTED: &[&[u8]] =
     &[b"before", b"after", b"marker", b"placeholder", b"file-selector-button", b"details-content", b"scroll-marker"];
 
-/// 入れ子の並び（規則の並び・`:is()`・`:where()`・`:not()`・`:has()`・`of S`）を読んでいる所。
+/// 入れ子の並び（規則の並び・`:is()`・`:where()`・`:not()`・`:has()`・`of S`・関数の擬似の複合の引数）を読んでいる所。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct Frame {
@@ -447,6 +447,8 @@ struct Frame {
     compound: bool,
     /// 関数の擬似の引数の並び（閉じても単純な選択子を足さない）：0 でない、1 ちょうど 1 つ、2 は 1 つ以上
     arg: u8,
+    /// `:-webkit-any()` の中（入れ子の並びも寛容でない）
+    strict: bool,
 }
 
 impl Frame {
@@ -480,6 +482,7 @@ impl Frame {
             webkit_any: false,
             compound: false,
             arg: 0,
+            strict: false,
         }
     }
 
@@ -1078,7 +1081,8 @@ fn pseudo(
         let follows = match f.pe {
             PE_NONE => true,
             PE_BEFORE_AFTER => n.kind == Kind::Ident && is(b"marker"),
-            PE_PART => true,
+            // 要素に支えられた擬似要素のあとは `::part()`・`::slotted()` でない擬似要素（単位 3 の 13 回目のレビュー）
+            PE_PART => !(n.kind == Kind::Function && (is(b"part") || is(b"slotted"))),
             PE_SLOTTED => n.kind == Kind::Ident && any(AFTER_SLOTTED),
             PE_COLUMN => n.kind == Kind::Ident && is(b"scroll-marker"),
             _ => false,
@@ -1095,7 +1099,7 @@ fn pseudo(
             PE_SCROLLBAR
         } else if !listed {
             PE_WEBKIT
-        } else if func && is(b"part") {
+        } else if (func && (is(b"part") || is(b"picker"))) || (ident && is(b"details-content")) {
             PE_PART
         } else if ident && is(b"selection") {
             PE_SELECTION
@@ -1103,7 +1107,7 @@ fn pseudo(
             PE_SLOTTED
         } else if ident && is(b"column") {
             PE_COLUMN
-        } else if ident && (is(b"file-selector-button") || is(b"cue") || is(b"details-content")) {
+        } else if ident && (is(b"file-selector-button") || is(b"cue")) {
             PE_USER
         } else if ident && is(b"scroll-marker") {
             PE_SCROLL_MARKER
@@ -1113,8 +1117,6 @@ fn pseudo(
             PE_SEARCH_TEXT
         } else if func && is(b"scroll-button") {
             PE_SCROLL_BUTTON
-        } else if func && is(b"picker") {
-            PE_PICKER
         } else if func && pseudo_element_form(&nm) == Some(ArgForm::ViewTransition) {
             PE_VIEW_TRANSITION
         } else {
@@ -1163,7 +1165,12 @@ fn pseudo(
             let pe = f.pe_ctx();
             let user = any(USER_ACTION);
             let after_pe = match pe {
-                PE_PART => matches!(kind, S_NEVER | S_LINK | S_UNIVERSAL) && !any(SCROLLBAR_CLASSES),
+                PE_PART => {
+                    matches!(kind, S_NEVER | S_LINK | S_UNIVERSAL)
+                        && !any(SCROLLBAR_CLASSES)
+                        && !is(b"current")
+                        && !is(b"host")
+                }
                 PE_SCROLLBAR => {
                     is(b"hover")
                         || is(b"active")
@@ -1175,7 +1182,6 @@ fn pseudo(
                 PE_USER | PE_WEBKIT => user,
                 PE_SCROLL_MARKER => user || is(b"target-current"),
                 PE_SCROLL_BUTTON => user || is(b"enabled") || is(b"disabled"),
-                PE_PICKER => user || is(b"open") || is(b"popover-open"),
                 PE_MARKER_GROUP => is(b"hover") || is(b"focus-within"),
                 PE_VIEW_TRANSITION => is(b"only-child"),
                 PE_SEARCH_TEXT => is(b"current"),
@@ -1192,8 +1198,13 @@ fn pseudo(
         }
         Kind::Function => {
             let pe = f.pe_ctx();
-            // 擬似要素のあとに書ける関数は論理の擬似クラスだけ（中もそのあとに書ける擬似クラスだけ。Selectors 4 §3.6.3）
-            if pe != PE_NONE && !(is(b"not") || is(b"is") || is(b"where")) {
+            // 擬似要素のあとに書ける関数は論理の擬似クラスだけ（中もそのあとに書ける擬似クラスだけ。Selectors 4 §3.6.3）。
+            // 要素に支えられた擬似要素のあとは `:state()`・`:dir()`・`:lang()`・`:active-view-transition-type()` も、`::column`
+            // のあとは論理の擬似クラスも書けない（Chrome と同じ。単位 3 の 13 回目のレビュー）
+            let backed = pe == PE_PART;
+            let backed_fn = is(b"state") || is(b"dir") || is(b"lang") || is(b"active-view-transition-type");
+            let logical = is(b"not") || is(b"is") || is(b"where");
+            if pe != PE_NONE && !((logical && pe != PE_COLUMN) || (backed && backed_fn)) {
                 cur.skip_function()?;
                 return Err(invalid());
             }
@@ -1208,11 +1219,14 @@ fn pseudo(
                 } else {
                     (S_IS, true, false)
                 };
-                // 入れ子の並びを始める（外の複合の状態 `f` は、呼び手が外の段に書き戻す）
-                let mut g = Frame::new(kind, false, forgiving, zero, f.in_has).at(cur.depth());
+                // 入れ子の並びを始める（外の複合の状態 `f` は、呼び手が外の段に書き戻す）。`:-webkit-any()` の中の並びは
+                // 寛容でなく、結合子も書けない（Chrome と同じ。単位 3 の 13 回目のレビュー）
+                let strict = f.strict || f.webkit_any;
+                let mut g = Frame::new(kind, false, forgiving && !strict, zero, f.in_has).at(cur.depth());
                 g.outer_pe = pe;
                 g.webkit_any = webkit_any;
-                g.compound = f.compound;
+                g.strict = strict;
+                g.compound = f.compound || webkit_any || strict;
                 frames.push(g)?;
                 cur.skip_ws()?;
                 return Ok(());
@@ -1281,7 +1295,7 @@ fn pseudo(
                 let mut x = Simple::new(S_LANG);
                 x.a = ranges;
                 f.spec.b = f.spec.b.saturating_add(1);
-                return add_simple(f, t, x, false);
+                return add_simple(f, t, x, backed);
             }
             if is(b"dir") {
                 // SVG の要素の向きはいつも ltr（HTML の `dir` 属性を持たない）
@@ -1297,7 +1311,7 @@ fn pseudo(
                             kind = S_UNIVERSAL;
                         }
                         f.spec.b = f.spec.b.saturating_add(1);
-                        return add_simple(f, t, Simple::new(kind), false);
+                        return add_simple(f, t, Simple::new(kind), backed);
                     }
                 }
                 cur.skip_function()?;
@@ -1320,7 +1334,7 @@ fn pseudo(
                 if !args_ok(s, arg, form, budget)? {
                     return Err(invalid());
                 }
-                return add_simple(f, t, Simple::new(S_NEVER), false);
+                return add_simple(f, t, Simple::new(S_NEVER), backed);
             }
             cur.skip_function()?;
             Err(invalid())
@@ -1361,7 +1375,8 @@ const PSEUDO_ELEMENTS: &[&[u8]] = &[
 const USER_ACTION: &[&[u8]] = &[b"hover", b"active", b"focus", b"focus-visible", b"focus-within"];
 
 /// 静止した絵では当たらない擬似クラス（正しい名前として受ける。Selectors 4 と HTML などの仕様にあるもの、Chrome が受ける
-/// `-webkit-` のもの）。
+/// `-webkit-` のもの。Chrome の知らない `:playing`・`:paused`・`:seeking`・`:buffering`・`:stalled`・`:muted`・`:local-link`
+/// は除く。単位 3 の 13 回目のレビュー）。
 const DYNAMIC: &[&[u8]] = &[
     b"hover",
     b"active",
@@ -1371,7 +1386,6 @@ const DYNAMIC: &[&[u8]] = &[
     b"visited",
     b"target",
     b"target-current",
-    b"local-link",
     b"checked",
     b"disabled",
     b"enabled",
@@ -1390,12 +1404,6 @@ const DYNAMIC: &[&[u8]] = &[
     b"-webkit-autofill",
     b"user-invalid",
     b"user-valid",
-    b"playing",
-    b"paused",
-    b"seeking",
-    b"buffering",
-    b"stalled",
-    b"muted",
     b"current",
     b"past",
     b"future",
@@ -1551,12 +1559,8 @@ fn args_ok(s: &[u8], arg: Span, form: ArgForm, budget: &Budget<'_>) -> Result<bo
                         t.is_delim(b'.')
                     }
             }
-            ArgForm::Compound | ArgForm::CompoundList => {
-                !ws && (matches!(t.kind, Kind::Ident | Kind::Hash | Kind::Colon | Kind::Function | Kind::LBracket)
-                    || t.is_delim(b'.')
-                    || t.is_delim(b'*')
-                    || t.is_delim(b'|'))
-            }
+            // 複合の引数は入れ子の並びとして読む（ここへは来ない）
+            ArgForm::Compound | ArgForm::CompoundList => false,
         };
         if !ok {
             return Ok(false);
