@@ -29,6 +29,14 @@ pub(crate) const FLATTEN_CURVE: u64 = 64;
 pub(crate) const TURN_SEGMENT: u64 = 128;
 /// 線を作るときに区間 1 つのつなぎ目が滑らかかを決める手間（始めと終わりの接線（弧は `sin`・`cos`）と向きの比べ。ADR-99 (2)）。
 pub(crate) const JOIN_TANGENT: u64 = 64;
+/// 破線の部分の端の向きを、区間の両端の頂点の向きから内挿して求める手間（向きの正規化が数回。ADR-101）。
+pub(crate) const DASH_TANGENT: u64 = 32;
+/// 見積もり（`Tree::estimate`）が区間 1 つを数える手間：決まった分（描く座標系の長さ・行の帯と見る箱の切り取り）・線のとき
+/// の分（曲がる角の `atan2`・線を作る座標系の長さ）・曲線の分（分ける数・厳密な外接矩形・制御多角形の長さ）。前は区間ごとに
+/// 4 単位だけで、時間が手間の 15〜80 倍だった（単位 2 の 4 回目のレビュー。ADR-101）。
+pub(crate) const COUNT_SEGMENT: u64 = 32;
+pub(crate) const COUNT_STROKE: u64 = 32;
+pub(crate) const COUNT_CURVE: u64 = 160;
 /// 計画で辺を 1 本作る手間（描く座標系に写した線分を確かめ、箱で切り、固定小数にする。M2 の仮の校正。ADR-98）。
 pub(crate) const PLAN_EDGE: u64 = 16;
 /// 線の外形・破線の点を 1 つ作る手間。

@@ -599,12 +599,12 @@ pub(crate) fn seg_tangents(seg: &PathSeg) -> Option<(Point, Point)> {
     }
 }
 
-/// 2 つの向きが同じか（なす角がおよそ 0.06° 未満。曲線のつなぎ目の滑らかさ）。
+/// 2 つの向きが同じか（1 − cos θ ≤ 2⁻¹²、なす角がおよそ 1.27° 以下。曲線のつなぎ目の滑らかさ。Skia が継ぎ目を作らない
+/// 「ほぼまっすぐ」と同じ。小数を丸めて書いた曲線のつなぎ目の 0.1〜1° のずれを滑らかとみなす。ADR-101）。
 pub(crate) fn same_direction(u: Point, v: Point) -> bool {
-    let cross = u.x * v.y - u.y * v.x;
     let dot = u.x * v.x + u.y * v.y;
     let lens = math::hypot(u.x, u.y) * math::hypot(v.x, v.y);
-    dot > 0.0 && cross.abs() <= 1e-3 * lens && lens.is_finite()
+    dot > 0.0 && lens.is_finite() && lens > 0.0 && dot >= lens * (1.0 - 1.0 / 4096.0)
 }
 
 /// `line` の同じ形のパス。

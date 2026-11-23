@@ -541,3 +541,98 @@ fn r11_repeated_closes_are_paid() {
     let looks = c.0.load(Ordering::Relaxed) - 2 * e;
     assert!(looks >= 10, "計画が中止の印を見た回数 {looks}");
 }
+
+/// 見積もり（`Tree::estimate`）自身の時間 ÷ 払った手間（単位 2 の 4 回目のレビュー。release で `--ignored` で流して、
+/// 区間の種類ごとの係数を確かめる。目標 2 ns／単位以下）。
+#[test]
+#[ignore]
+fn estimate_time_per_unit() {
+    for (name, d) in [
+        ("線分", (0..200_000).map(|i| format!("L{} {}", i % 997, (i * 7) % 991)).collect::<String>()),
+        (
+            "3 次曲線",
+            (0..50_000)
+                .map(|i| format!("C{} {} {} {} {} {}", i % 97, i % 89, (i * 3) % 83, i % 79, i % 73, (i * 5) % 71))
+                .collect(),
+        ),
+        (
+            "弧",
+            (0..50_000).map(|i| format!("A{} {} 30 0 1 {} {}", 5 + i % 40, 3 + i % 30, i % 97, (i * 3) % 89)).collect(),
+        ),
+    ] {
+        for stroke in [false, true] {
+            let paint = if stroke { "fill=\"none\" stroke=\"black\" stroke-width=\"3\"" } else { "" };
+            let src = format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1000\" height=\"1000\"><path {paint} d=\"M0 0 {d}\"/></svg>"
+            );
+            let doc = crate::doc::parse(src.as_bytes(), &crate::style::ParseOptions::DEFAULT, &Never).unwrap();
+            let t = doc.build(&Never).unwrap();
+            let opts = RenderOptions {
+                limits: RenderLimits { plan_work: u64::MAX, render_work: u64::MAX, ..RenderLimits::DEFAULT },
+                ..RenderOptions::DEFAULT
+            };
+            let mut best = f64::INFINITY;
+            let mut work = 0;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                let (_, _, tot) = t.estimate_with(&opts, Quality::DEFAULT, &Never).unwrap();
+                best = best.min(start.elapsed().as_secs_f64());
+                work = tot.self_work;
+            }
+            println!("{name} 線={stroke}：{:.1} ms・{work} 単位・{:.2} ns／単位", best * 1e3, best * 1e9 / work as f64);
+        }
+    }
+}
+
+/// キャンバスの外の節は見積もりも計画も飛ばす（描ける文書を、外の節の平坦化の手間で断らない。単位 2 の 4 回目のレビュー）。
+#[test]
+fn off_canvas_nodes_are_skipped() {
+    let d: String = (0..100_000).map(|i| if i % 2 == 0 { "l3 3" } else { "l3 -3" }).collect::<Vec<_>>().join(" ");
+    let src = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"256\" height=\"256\"><rect width=\"10\" height=\"10\" fill=\"green\"/><path d=\"M5000 5000 {d}\" fill=\"none\" stroke=\"black\" stroke-width=\"20\" stroke-linejoin=\"round\"/></svg>"
+    );
+    let doc = crate::doc::parse(src.as_bytes(), &crate::style::ParseOptions::DEFAULT, &Never).unwrap();
+    let t = doc.build(&Never).unwrap();
+    let est = t.estimate(&RenderOptions::DEFAULT, &Never).unwrap();
+    assert!(est.plan.work < 1_000_000, "{:?}", est.plan);
+    let plan = t.plan(&RenderOptions::DEFAULT, &Never).unwrap();
+    assert_eq!(plan.items.len(), 1);
+}
+
+/// 見積もり（`Tree::estimate`）が通る上限なら、どの範囲の見積もりも見積もりの段の上限で断らない（範囲の見積もり自身の手間の
+/// 上限を `estimate_with` が比べる。単位 2 の 4 回目のレビュー）。
+#[test]
+fn region_estimates_fit_the_estimate_limit() {
+    let mut body = String::new();
+    for i in 0..4000 {
+        let (x, y) = (128.0 + f64::from(i % 50) * 0.01, 64.0 + f64::from(i / 50) * 0.01);
+        let pts: String = (0..16)
+            .map(|k| {
+                let a = 2.0 * core::f64::consts::PI * f64::from(k) / 16.0;
+                format!("{},{} ", x + 3.0 * crate::math::cos(a), y + 3.0 * crate::math::sin(a))
+            })
+            .collect();
+        body.push_str(&format!("<polygon points=\"{pts}\" stroke=\"black\"/>"));
+    }
+    let src = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"256\" height=\"128\">{body}</svg>");
+    let doc = crate::doc::parse(src.as_bytes(), &crate::style::ParseOptions::DEFAULT, &Never).unwrap();
+    let t = doc.build(&Never).unwrap();
+    let open = RenderOptions {
+        limits: RenderLimits { estimate_work: u64::MAX, ..RenderLimits::DEFAULT },
+        ..RenderOptions::DEFAULT
+    };
+    let (_, _, tot) = t.estimate_with(&open, Quality::DEFAULT, &Never).unwrap();
+    for extra in [0u64, 64, 1 << 20] {
+        let lim = RenderLimits { estimate_work: tot.self_work.saturating_add(extra), ..RenderLimits::DEFAULT };
+        let opts = RenderOptions { limits: lim, ..RenderOptions::DEFAULT };
+        let Ok(_) = t.estimate(&opts, &Never) else { continue };
+        let plan = t.plan(&opts, &Never).unwrap();
+        for rect in [
+            PixelRect { x: 0, y: 0, width: 128, height: 128 },
+            PixelRect { x: 128, y: 0, width: 128, height: 128 },
+            PixelRect { x: 100, y: 50, width: 60, height: 30 },
+        ] {
+            plan.estimate_region(rect, &Never).unwrap();
+        }
+    }
+}

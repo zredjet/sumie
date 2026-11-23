@@ -490,14 +490,14 @@ impl<'b> Scan<'b> {
     }
 }
 
-/// 範囲 `rect` の行ごとに、辺 `edges`（`y0` の順に並べたもの）の被覆を求め、被覆の同じ画素の並びごとに
-/// `span(x, y, 長さ, 被覆)` を呼ぶ（被覆 0 は呼ばない。被覆は 0〜`FULL`）。`rect` の x は `scan` を作った範囲の中。払う手間は
-/// 行・かかる辺・回ったセル・掃いた幅の分（`cost` の式）。
 /// 辺が範囲の右の境（固定小数 `right`）より右にあるか（セルは右の外を捨てるので、画素に効かない）。
 pub(crate) fn skips_right(e: &Edge, right: i64) -> bool {
     i64::from(e.x0.min(e.x1)) >= right
 }
 
+/// 範囲 `rect` の行ごとに、辺 `edges`（`y0` の順に並べたもの）の被覆を求め、被覆の同じ画素の並びごとに
+/// `span(x, y, 長さ, 被覆)` を呼ぶ（被覆 0 は呼ばない。被覆は 0〜`FULL`）。`rect` の x は `scan` を作った範囲の中。払う手間は
+/// 行・かかる辺・回ったセル・掃いた幅の分（`cost` の式）。
 pub(crate) fn fill_region(
     edges: &[Edge],
     rule: FillRule,

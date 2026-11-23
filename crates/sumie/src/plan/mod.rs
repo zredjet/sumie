@@ -6,7 +6,8 @@
 //!   線を作る座標系の制御多角形の長さと曲がる角の和）から閉じた式で上限を求める。曲がる角の和は、平坦化した折れ線の
 //!   曲がる角の和以上（内接する折れ線の曲がる角は曲線の全曲率以下、Bézier の全曲率は制御多角形の曲がる角以下）なので、
 //!   round の継ぎ目の円弧の点の和の上限になる
-//! - 辺の置き場は見積もりの上限の数で最初に取る（伸ばさない。持ち続ける量と山は見積もりと同じ）
+//! - 辺の置き場は見積もりの上限の数で最初に取り（伸ばさない）、最後に使った長さに詰めて写す（持ち続ける量は実際の量。
+//!   項目の置き場は見積もりの容量のまま）。一時の置き場は要るものだけ取る。キャンバスと交わらない節は見積もりも計画も飛ばす
 //! - 範囲の見積もり（`Plan::estimate_region`）は、計画で持った辺ごとの上限（辺を項目の矩形の行で切った部分の、セル ≤
 //!   (|Δx| + |Δy|) / 1 画素 + 4 と 行の数 × (幅 + 3) の小さい方）から求める。
 //!   同じ形の式なので、全体に含まれる範囲の見積もりは `RenderEstimate.render` を超えない（FR-OUT-06）
@@ -158,6 +159,9 @@ struct Counts {
     /// 平坦化の点（部分パスの始めの点を含む）・曲線（2 次・3 次・弧）の区間の数・部分パスの数・1 つの部分パスの点の最大
     points: u64,
     curves: u64,
+    /// 曲線から出る平坦化の点の数と、曲線の中の曲がる角の和（滑らかな点の外側の円弧の上限）
+    curve_points: u64,
+    curve_turning: f64,
     /// 区間の数（移動と閉じを含む。計画が部分パスを集める歩きで区間ごとに払う分）
     segs: u64,
     subpaths: u64,
@@ -254,6 +258,9 @@ fn turn_between(a: Point, b: Point) -> f64 {
 #[derive(Debug, Clone, Copy, Default)]
 struct Turning {
     sum: f64,
+    /// 曲線（2 次・3 次・弧）の中の曲がる角の和（区間のつなぎ目の角を含まない）と、曲線の区間の数
+    curve: f64,
+    curves: u64,
     first: Option<Point>,
     last: Option<Point>,
 }
@@ -302,13 +309,19 @@ impl Turning {
             }
             PathSeg::Line(a, b) => self.dir(v(a, b)),
             PathSeg::Quad(a, b, e) => {
+                self.curves = self.curves.saturating_add(1);
                 self.dir(v(a, b));
+                let start = self.sum;
                 self.dir(v(b, e));
+                self.curve += self.sum - start;
             }
             PathSeg::Cubic(a, b, d, e) => {
+                self.curves = self.curves.saturating_add(1);
                 self.dir(v(a, b));
+                let start = self.sum;
                 self.dir(v(b, d));
                 self.dir(v(d, e));
+                self.curve += self.sum - start;
             }
             PathSeg::ArcTo(_, arc) => {
                 // 始めと終わりの接線
@@ -324,11 +337,14 @@ impl Turning {
                 let (t0, tm, t1) =
                     (tangent(arc.theta1), tangent(arc.theta1 + arc.dtheta / 2.0), tangent(arc.theta1 + arc.dtheta));
                 let flat = |d: Point| !(d.x.is_finite() && d.y.is_finite()) || (d.x == 0.0 && d.y == 0.0);
-                self.sum += if flat(t0) || flat(tm) || flat(t1) {
+                let inner = if flat(t0) || flat(tm) || flat(t1) {
                     core::f64::consts::PI * (arc.dtheta.abs() / core::f64::consts::PI).ceil()
                 } else {
                     turn_between(t0, tm) + turn_between(tm, t1)
                 };
+                self.sum += inner;
+                self.curve += inner;
+                self.curves = self.curves.saturating_add(1);
                 // 弧の中の曲がりは上で足したので、2 つの接線の間は数えない
                 if let Some(l) = self.last {
                     self.sum += turn_between(l, t0);
@@ -350,6 +366,15 @@ fn round_join_extra(pen: &Pen, turning: f64) -> u64 {
     up(kk * turning)
 }
 
+/// 滑らかな点のつなぎ目の曲がる角の上限（`same_direction` の 1 − cos θ ≤ 2⁻¹² の θ ≈ 0.0221 を丸めて上へ）。
+const SMOOTH_JOIN_TURN: f64 = 0.0222;
+
+/// 継ぎ目の円弧に使う曲がる角：round の継ぎ目はすべての頂点、ほかは滑らかな点の外側だけ（曲線の中の角と、曲線の前後の
+/// つなぎ目の角の上限。ADR-101）。
+fn arc_turning(pen: &Pen, t: &Turning) -> f64 {
+    if pen.join == Join::Round { t.sum } else { t.curve + (t.curves as f64) * 2.0 * SMOOTH_JOIN_TURN }
+}
+
 /// 節を数える。`t` は描く座標系への変形、`stroke_space` は線を作る座標系への変形（ユーザー単位なら単位の行列）。
 #[allow(clippy::too_many_arguments, reason = "数えの箱を分けて渡す")]
 fn count(
@@ -360,11 +385,20 @@ fn count(
     reach: f64,
     view: &View,
     band: &View,
+    stroke: bool,
     budget: &Budget<'_>,
 ) -> Result<Counts, Error> {
     let mut c = Counts::default();
     let mut sub = 0u64;
     let mut turn = Turning::default();
+    // 区間ごとの手間（種類ごと。曲がる角と線を作る座標系の長さは線のときだけ求める。単位 2 の 4 回目のレビュー）
+    let seg_cost = |curve: bool| {
+        cost::COUNT_SEGMENT.saturating_add(if stroke { cost::COUNT_STROKE } else { 0 }).saturating_add(if curve {
+            cost::COUNT_CURVE
+        } else {
+            0
+        })
+    };
     let len = |a: Point, b: Point, m: &Transform| {
         let (p, r) = (m.apply(a), m.apply(b));
         math::hypot(r.x - p.x, r.y - p.y)
@@ -384,9 +418,12 @@ fn count(
         }
     };
     for seg in path.segments() {
-        budget.spend(cost::OP_STEP)?;
+        let curve = matches!(seg, PathSeg::Quad(..) | PathSeg::Cubic(..) | PathSeg::ArcTo(..));
+        budget.spend(seg_cost(curve))?;
         c.segs = c.segs.saturating_add(1);
-        turn.feed(&seg, stroke_space);
+        if stroke {
+            turn.feed(&seg, stroke_space);
+        }
         sub_end = match seg {
             PathSeg::Move(_) => sub_end,
             PathSeg::Close(_, b) => Some(b),
@@ -414,41 +451,52 @@ fn count(
             PathSeg::Line(..) => 1,
             _ => {
                 c.curves = c.curves.saturating_add(1);
-                pieces(&seg, t, q.tol, reach)
+                let n = pieces(&seg, t, q.tol, reach);
+                c.curve_points = c.curve_points.saturating_add(n);
+                n
             }
         };
         c.points = c.points.saturating_add(n);
         sub = sub.saturating_add(n);
         // 見る箱にかかる長さ（線分は箱の中の割合、曲線は厳密な外接矩形が箱にかかれば全体）
         in_view(&mut c, &seg, n, t, stroke_space, view, band, q.tol, reach, budget)?;
-        // 制御多角形の長さ
+        // 制御多角形の長さ（要素の座標系と線を作る座標系の長さは線のときだけ：pathLength の倍と破線の数に使う）
         let s = stroke_space;
+        let id = Transform::IDENTITY;
         match seg {
             PathSeg::Line(a, b) => {
                 c.len_dev += len(a, b, t);
-                c.len_user += len(a, b, &Transform::IDENTITY);
-                c.len_stroke += len(a, b, s);
+                if stroke {
+                    c.len_user += len(a, b, &id);
+                    c.len_stroke += len(a, b, s);
+                }
             }
             PathSeg::Quad(a, b, e) => {
                 c.len_dev += len(a, b, t) + len(b, e, t);
-                c.len_user += len(a, b, &Transform::IDENTITY) + len(b, e, &Transform::IDENTITY);
-                c.len_stroke += len(a, b, s) + len(b, e, s);
+                if stroke {
+                    c.len_user += len(a, b, &id) + len(b, e, &id);
+                    c.len_stroke += len(a, b, s) + len(b, e, s);
+                }
             }
             PathSeg::Cubic(a, b, d, e) => {
-                let id = Transform::IDENTITY;
                 c.len_dev += len(a, b, t) + len(b, d, t) + len(d, e, t);
-                c.len_user += len(a, b, &id) + len(b, d, &id) + len(d, e, &id);
-                c.len_stroke += len(a, b, s) + len(b, d, s) + len(d, e, s);
+                if stroke {
+                    c.len_user += len(a, b, &id) + len(b, d, &id) + len(d, e, &id);
+                    c.len_stroke += len(a, b, s) + len(b, d, s) + len(d, e, s);
+                }
             }
             PathSeg::ArcTo(_, arc) => {
                 c.len_dev += arc.dtheta.abs() * arc.transformed(t).max_radius();
-                c.len_user += arc.dtheta.abs() * arc.max_radius();
-                c.len_stroke += arc.dtheta.abs() * arc.transformed(s).max_radius();
+                if stroke {
+                    c.len_user += arc.dtheta.abs() * arc.max_radius();
+                    c.len_stroke += arc.dtheta.abs() * arc.transformed(s).max_radius();
+                }
             }
             _ => {}
         }
     }
     c.turning = turn.sum;
+    c.curve_turning = turn.curve;
     c.max_sub = c.max_sub.max(sub);
     implicit_close(&mut c, sub_end, sub_start);
     Ok(c)
@@ -542,6 +590,20 @@ struct Bounds {
     render_work: u64,
     /// 項目ごとの辺の数の最大
     max_item_edges: u64,
+    /// 計画が要る一時の置き場（[`BUF_STROKE`] など）
+    buffers: u8,
+}
+
+/// 計画の一時の置き場の印：線（まとめた点）・描く座標系で作る線（写した点）・破線（部分と最初の部分）。
+const BUF_STROKE: u8 = 1;
+const BUF_DEVICE: u8 = 2;
+const BUF_DASH: u8 = 4;
+
+/// 置き場の印から、点の置き場の数（部分パスの点は いつも 1 つ）。
+fn buffer_count(buffers: u8) -> u64 {
+    1u64.saturating_add(u64::from(buffers & BUF_STROKE != 0))
+        .saturating_add(u64::from(buffers & BUF_DEVICE != 0))
+        .saturating_add(2u64.saturating_mul(u64::from(buffers & BUF_DASH != 0)))
 }
 
 /// 浮動小数の上限を整数に（有限でなければ u64::MAX）。
@@ -715,6 +777,23 @@ pub(crate) fn item_bounds(e: &Edge, bbox: &PixelBox) -> (u64, u64) {
 }
 
 /// 節の見積もり（閉じた式）。
+/// 節の線の外形が届く幅（描く座標系。線がなければ 0）。見積もりと計画の両方が使う。
+fn reach_of(n: &PathNode, t: &Transform, mode: &StrokeMode, q: Quality) -> f64 {
+    if n.flags & HAS_STROKE != 0 && n.stroke_width > 0.0 {
+        let pen = pen_of(n, t, mode, q);
+        pen.half * mode.sigma * reach_factor(&pen)
+    } else {
+        0.0
+    }
+}
+
+/// 節の画素の箱（外接矩形 × 倍率 ± 届く幅）がキャンバスと交わらないか（見積もりと計画の両方で丸ごと飛ばす。キャンバスで
+/// 決めるので範囲に依らず、画素は変わらない。描ける文書を、キャンバスの外の節の平坦化の手間で断らない。単位 2 の 4 回目の
+/// レビュー）。
+fn off_canvas(n: &PathNode, t: &Transform, mode: &StrokeMode, q: Quality, scale: f64, canvas: PixelBox) -> bool {
+    node_box(n, scale, reach_of(n, t, mode, q), canvas).is_empty()
+}
+
 fn bound_node(
     tree: &Tree,
     n: &PathNode,
@@ -725,6 +804,9 @@ fn bound_node(
 ) -> Result<Bounds, Error> {
     let mut out = Bounds::default();
     let Some(t) = drawable(n, scale) else { return Ok(out) };
+    if off_canvas(n, &t, &stroke_mode(n, &t, scale), q, scale, canvas) {
+        return Ok(out);
+    }
     let path = tree.path(n);
     let has_fill = n.flags & HAS_FILL != 0;
     let has_stroke = n.flags & HAS_STROKE != 0 && n.stroke_width > 0.0;
@@ -736,7 +818,7 @@ fn bound_node(
     // 平坦化の点は外形の届く距離で数える（塗りの点の数以上なので、塗りの上限にも使える）
     let view = View::new(canvas, reach_dev);
     let band = View::band(canvas, reach_dev);
-    let c = count(path, &t, &stroke_space, q, reach_dev, &view, &band, budget)?;
+    let c = count(path, &t, &stroke_space, q, reach_dev, &view, &band, has_stroke, budget)?;
     let bx = node_box(n, scale, reach_dev, canvas);
     let (rows, width) = (bx.height(), bx.width());
     // 箱の境で辺が分かれうるか（x の箱の外に出る節だけ。y は切っても分かれない）。点は節の変形で写すので、外接矩形 ×
@@ -746,6 +828,15 @@ fn bound_node(
     let crosses = b.x0 * scale - reach_dev < -edge || b.x1 * scale + reach_dev > edge;
     let split: u64 = if crosses { 2 } else { 1 };
     out.scratch_points = c.max_sub.saturating_add(4);
+    if has_stroke {
+        out.buffers |= BUF_STROKE;
+        if mode.device {
+            out.buffers |= BUF_DEVICE;
+        }
+        if n.dashes[1] > 0 {
+            out.buffers |= BUF_DASH;
+        }
+    }
     if has_fill {
         let e = c.points.saturating_add(c.subpaths).saturating_mul(split);
         // 描く段の行とセル：行の帯にかかる辺だけ（区間と暗黙の閉じの帯の中の長さ）
@@ -777,7 +868,14 @@ fn bound_node(
             Cap::Square => 4,
             Cap::Round => r.saturating_add(1),
         };
-        let k_join = if pen.join == Join::Round { round_join_extra(&pen, c.turning).saturating_add(v) } else { 0 };
+        // round の継ぎ目と、滑らかな点の外側の円弧（ほかの継ぎ目は曲線の中と曲線の前後のつなぎ目だけ。ADR-101）
+        let arc_turn = arc_turning(
+            &pen,
+            &Turning { sum: c.turning, curve: c.curve_turning, curves: c.curves, ..Turning::default() },
+        );
+        let arc_vertices =
+            if pen.join == Join::Round { v } else { c.curve_points.saturating_add(c.curves.saturating_mul(2)) };
+        let k_join = round_join_extra(&pen, arc_turn).saturating_add(arc_vertices);
         // 破線の数（pathLength="0" は実線）
         let dashes = if n.flags & PATH_LENGTH_ZERO != 0 { &[][..] } else { tree.dash_list(n) };
         let mut total = 0.0;
@@ -829,7 +927,8 @@ fn bound_node(
         let outer = if pen.join == Join::Miter && pen.miter_limit > 1.0 { pen.miter_limit } else { 1.0 };
         let per_vertex = 2.0 * pen.half * (outer + 1.0);
         let piece_len = 2.0 * pen.half * 12.0;
-        let round_len = if pen.join == Join::Round { pen.half * c.turning } else { 0.0 };
+        // round の継ぎ目と滑らかな点の外側の円弧（ADR-101）
+        let round_len = pen.half * arc_turn;
         // 描く段の行とセル：行の帯にかかる外形の辺だけ（帯の外の頂点の外形は線の届く幅の内なので帯の外）
         let out_band = pieces_n
             .saturating_mul(per_piece)
@@ -854,12 +953,15 @@ fn bound_node(
         // 位相を進める手間と、区間ごとに見えない所を飛ばす手間（前と後ろで 2 度まで）
         let phase_steps =
             s.saturating_add(dash_pieces).saturating_add(if dash_pieces > 0 { v.saturating_mul(2) } else { 0 });
+        // 破線の部分の端の向き（境ごとに 1 つと、部分パスごとに始めと終わり。ADR-101）
+        let dash_tangents =
+            if dash_pieces > 0 { dash_pieces.saturating_mul(2).saturating_add(s.saturating_mul(2)) } else { 0 };
         out.plan_work = out
             .plan_work
             .saturating_add(v.saturating_mul(passes).saturating_mul(cost::FLATTEN_POINT.saturating_add(POINT_WORK)))
             .saturating_add(c.curves.saturating_mul(passes).saturating_mul(cost::FLATTEN_CURVE))
             .saturating_add(c.segs.saturating_mul(passes).saturating_mul(cost::OP_STEP))
-            .saturating_add(if pen.join == Join::Round { c.segs.saturating_mul(cost::TURN_SEGMENT) } else { 0 })
+            .saturating_add(c.segs.saturating_mul(cost::TURN_SEGMENT))
             .saturating_add(c.segs.saturating_mul(cost::JOIN_TANGENT))
             .saturating_add(if mode.device { v.saturating_mul(POINT_WORK) } else { 0 })
             .saturating_add(dash_pts.saturating_mul(cost::OUTLINE_POINT.saturating_add(POINT_WORK)))
@@ -868,6 +970,7 @@ fn bound_node(
             .saturating_add(dash_segs.saturating_mul(cost::OP_STEP))
             .saturating_add(joins.saturating_mul(POINT_WORK.saturating_add(cost::OP_STEP)))
             .saturating_add(phase_steps.saturating_mul(cost::OP_STEP))
+            .saturating_add(dash_tangents.saturating_mul(cost::DASH_TANGENT))
             .saturating_add(cull.saturating_mul(cost::OP_STEP.saturating_mul(2)))
             .saturating_add(out_pts.saturating_mul(cost::OUTLINE_POINT.saturating_add(cost::OP_STEP)))
             .saturating_add(pieces_n.saturating_mul(2).saturating_mul(cost::OP_STEP))
@@ -896,6 +999,11 @@ pub(crate) struct Totals {
     max_item_edges: u64,
     /// 節の破線の並びの数の最大
     max_dashes: u64,
+    /// 見積もり自身が払った手間（計測と試験のため）
+    #[allow(dead_code, reason = "試験と計測が読む")]
+    pub(crate) self_work: u64,
+    /// 計画が要る一時の置き場の印
+    buffers: u8,
 }
 
 impl Tree {
@@ -947,6 +1055,7 @@ impl Tree {
             tot.scratch_points = tot.scratch_points.max(b.scratch_points);
             tot.render_work = tot.render_work.saturating_add(b.render_work);
             tot.max_item_edges = tot.max_item_edges.max(b.max_item_edges);
+            tot.buffers |= b.buffers;
             // 破線の並び：解いて写す・奇数個なら 2 度並べる・型を作るときになめる（2 倍の長さまで）
             let nd = u64::from(n.dashes[1]).saturating_mul(2);
             tot.max_dashes = tot.max_dashes.max(nd);
@@ -958,10 +1067,11 @@ impl Tree {
         let item_bytes = tot.items.saturating_mul(size_of::<DrawItem>() as u64);
         // 計画の一時の置き場：部分パスの点・まとめた点・破線の部分の点（どれも点の最大の分。点と滑らかな点の印 1 バイト）と、
         // 辺の並べ替えの作業の領域
+        // 置き場は要るものだけ取る（塗りだけなら部分パスの点だけ。単位 2 の 4 回目のレビュー）
         let scratch = tot
             .scratch_points
             .saturating_mul((size_of::<Point>() as u64).saturating_add(1))
-            .saturating_mul(5)
+            .saturating_mul(buffer_count(tot.buffers))
             .saturating_add(tot.max_dashes.saturating_mul(8));
         let sort = cost::stable_sort_bytes(tot.max_item_edges, size_of::<Edge>() as u64);
         let held = edge_bytes.saturating_add(item_bytes);
@@ -987,6 +1097,17 @@ impl Tree {
         check(plan.result_bytes, lim.plan_bytes, Resource::Memory, Stage::Plan)?;
         check(render.work, lim.render_work, Resource::Work, Stage::Render)?;
         check(render.peak_bytes, lim.temp_bytes, Resource::Memory, Stage::Render)?;
+        // 計画の一時の山（持ち続ける量を除く）は temp_bytes と比べる（ADR-101。ユーザーの判断）
+        check(plan.peak_bytes.saturating_sub(plan.result_bytes), lim.temp_bytes, Resource::Memory, Stage::Plan)?;
+        // 範囲の見積もり自身の手間の上限（どの範囲でも：項目ごとの決まった分と 2 分の探索、辺ごとの分）。これが通れば、
+        // タイルの範囲の見積もりも見積もりの段の上限で断らない（単位 2 の 4 回目のレビュー）
+        let region_self = tot
+            .items
+            .saturating_mul(cost::OP_STEP.saturating_add(region_search(tot.max_item_edges)))
+            .saturating_add(tot.edges.saturating_mul(cost::OP_STEP))
+            .saturating_add(cost::OP_STEP.saturating_mul(4));
+        check(region_self, lim.estimate_work, Resource::Work, Stage::Estimate)?;
+        let tot = Totals { self_work: budget.work(), ..tot };
         Ok((RenderEstimate { plan, render }, px, tot))
     }
 
@@ -1005,17 +1126,23 @@ impl Tree {
         let mut edges: MVec<'_, Edge> = MVec::with_capacity(b, cap(tot.edges)?)?;
         let mut items: MVec<'_, DrawItem> = MVec::with_capacity(b, cap(tot.items)?)?;
         let sp = cap(tot.scratch_points)?;
+        // 置き場は見積もりと同じ印で、要るものだけ取る
+        let need = |bit: u8| tot.buffers & bit != 0;
+        let buf = |on: bool| if on { PolyBuf::with_capacity(b, sp) } else { Ok(PolyBuf::new(b)) };
         let mut poly = PolyBuf::with_capacity(b, sp)?;
-        let mut scratch = PolyBuf::with_capacity(b, sp)?;
-        let mut dashbuf = PolyBuf::with_capacity(b, sp)?;
-        let mut devbuf = PolyBuf::with_capacity(b, sp)?;
-        let mut head = PolyBuf::with_capacity(b, sp)?;
+        let mut scratch = buf(need(BUF_STROKE))?;
+        let mut dashbuf = buf(need(BUF_DASH))?;
+        let mut devbuf = buf(need(BUF_DEVICE))?;
+        let mut head = buf(need(BUF_DASH))?;
         let mut dash_scaled: MVec<'_, f64> = MVec::with_capacity(b, cap(tot.max_dashes)?)?;
         let mut max_item = 0u64;
         for n in self.nodes.as_slice() {
             b.spend(cost::OP_STEP)?;
             let Some(t) = drawable(n, opts.scale) else { continue };
             let mode = stroke_mode(n, &t, opts.scale);
+            if off_canvas(n, &t, &mode, q, opts.scale, canvas) {
+                continue;
+            }
             let order: [u8; 2] =
                 if n.flags & STROKE_FIRST != 0 { [HAS_STROKE, HAS_FILL] } else { [HAS_FILL, HAS_STROKE] };
             for what in order {
@@ -1166,22 +1293,36 @@ pub(crate) fn subpaths(
     poly.clear();
     let mut open = false;
     // 曲線の内側の点は滑らかな点、区間のつなぎ目は角。ただし曲線の前か後ろのつなぎ目で接線が続くものは滑らかな点
-    // （ADR-99 (2)）。前の区間の終わりの接線と曲線か、部分パスの最初の区間の始めの接線と曲線か
+    // （ADR-99 (2)・ADR-101）。前の区間の終わりの接線と曲線か、部分パスの最初の区間の始めの接線と曲線か
     let mut last: Option<(Point, bool)> = None;
     let mut first: Option<(Point, bool)> = None;
+    // 描く区間があったか（長さ 0 の区間だけの部分パスは、点を重ねて長さ 0 の線として渡す）
+    let mut drew = false;
+    // 部分パスを渡す（線のときは、長さ 0 の区間だけの部分パスを長さ 0 の線にする）
+    let emit = |poly: &mut PolyBuf<'_>, closed: bool, drew: bool, f: &mut SubpathFn<'_>| -> Result<(), Error> {
+        if smooth
+            && drew
+            && poly.len() == 1
+            && let Some(&p) = poly.pts.last()
+        {
+            poly.push(p, false)?;
+        }
+        f(poly.view(), closed)
+    };
     for seg in path.segments() {
         // 区間ごとに払う（続く閉じ（`ZZZ…`）も。単位 2 の 3 回目のレビュー）
         budget.spend(cost::OP_STEP)?;
         match seg {
             PathSeg::Move(p) => {
                 if open {
-                    f(poly.view(), false)?;
+                    emit(poly, false, drew, f)?;
                 }
                 poly.clear();
                 poly.push(p, false)?;
                 open = true;
                 last = None;
                 first = None;
+                drew = false;
             }
             PathSeg::Close(a, b) => {
                 if open && smooth {
@@ -1207,9 +1348,13 @@ pub(crate) fn subpaths(
                     {
                         poly.set_first_smooth(true);
                     }
+                    // 終わりの点が始めの点と同じなら除く（輪の始めの点の印を残す。破線の閉じのつなぎで角に戻らない）
+                    if poly.len() > 1 && poly.pts.last() == poly.pts.as_slice().first() {
+                        poly.pop();
+                    }
                 }
                 if open {
-                    f(poly.view(), true)?;
+                    emit(poly, true, drew, f)?;
                 }
                 poly.clear();
                 open = false;
@@ -1219,9 +1364,13 @@ pub(crate) fn subpaths(
             }
             _ => {
                 budget.spend(cost::JOIN_TANGENT)?;
+                drew = true;
                 let curve = !matches!(seg, PathSeg::Line(..));
-                let tans = crate::geom::seg_tangents(&seg);
-                if let (Some((lt, lc)), Some((st, _))) = (last, tans)
+                let Some((st, et)) = crate::geom::seg_tangents(&seg) else {
+                    // 長さ 0 の区間（接線がない）は点を足さない（前後のつなぎ目の滑らかさを角に戻さない。ADR-101）
+                    continue;
+                };
+                if let Some((lt, lc)) = last
                     && (lc || curve)
                     && crate::geom::same_direction(lt, st)
                 {
@@ -1229,17 +1378,15 @@ pub(crate) fn subpaths(
                 }
                 flatten_seg(&seg, t, q.tol, reach, budget, &mut |p| poly.push(p, curve))?;
                 poly.set_last_smooth(false);
-                if let Some((st, et)) = tans {
-                    if first.is_none() {
-                        first = Some((st, curve));
-                    }
-                    last = Some((et, curve));
+                if first.is_none() {
+                    first = Some((st, curve));
                 }
+                last = Some((et, curve));
             }
         }
     }
     if open {
-        f(poly.view(), false)?;
+        emit(poly, false, drew, f)?;
     }
     Ok(())
 }
@@ -1396,16 +1543,14 @@ fn stroke_edges(
     // 破線の部分は見る箱にかかるものだけを作る（ADR-30 (4)。見積もりと同じ箱）
     let cull = Cull { to_dev, view: View::new(canvas, reach) };
     // round の継ぎ目の点の残り：制御多角形の曲がる角の和から、見積もりと同じ式で（区間ごとに払う）
-    let mut round_left = 0u64;
-    if pen.join == Join::Round {
-        let stroke_space = if device { *t } else { Transform::IDENTITY };
-        let mut turn = Turning::default();
-        for seg in path.segments() {
-            budget.spend(cost::TURN_SEGMENT)?;
-            turn.feed(&seg, &stroke_space);
-        }
-        round_left = round_join_extra(&pen, turn.sum);
+    // （滑らかな点の外側は継ぎ目の形に依らず円弧なので、どの継ぎ目でも求める。ADR-101）
+    let stroke_space = if device { *t } else { Transform::IDENTITY };
+    let mut turn = Turning::default();
+    for seg in path.segments() {
+        budget.spend(cost::TURN_SEGMENT)?;
+        turn.feed(&seg, &stroke_space);
     }
+    let mut round_left = round_join_extra(&pen, arc_turning(&pen, &turn));
     let round_left = &mut round_left;
     subpaths(path, t, q, reach, poly, true, budget, &mut |line, closed| {
         if device {
