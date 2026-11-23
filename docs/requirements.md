@@ -115,7 +115,7 @@
 | FR-CO-02 | M | `clipPath`：`clipPathUnits`・`clip-rule`・clipPath と子の `transform`・clipPath への `clip-path`・中の `use`・`text`。中の塗り・線・不透明度は見ない |
 | FR-CO-03 | M | `mask`：`maskUnits`・`maskContentUnits`・`x`・`y`・`width`・`height`・`mask-type`（`luminance`・`alpha`。SVG 2）・mask への `mask` |
 | FR-CO-04 | M | `mix-blend-mode`（16 種）・`isolation` |
-| FR-CO-05 | M | 参照の輪（clip・mask・pattern・filter・marker・use・gradient の href・祖先から受け継いだ塗りで自分を描き直す pattern）は、保守的に作った参照の辺（architecture.md §4.3）の上で明示の積み上げで見つけ、resvg と同じ扱いにする（usvg は輪になる参照を取り除いて残りを描く。M1 で照らして決め、警告を出す） |
+| FR-CO-05 | M | 参照の輪（clip・mask・pattern・filter・marker・use・gradient の href・祖先から受け継いだ塗りで自分を描き直す pattern）は、保守的に作った参照の辺（architecture.md §4.3）の上で明示の積み上げで見つけ、resvg と同じ扱いにする（usvg は輪になる参照を取り除いて残りを描く。M1 で照らして決め、警告を出す）。保守的な辺で取り除いた参照のうち use の文脈では輪でないものは、M2 が先を 1 段だけ描き直す（ADR-78 (8)・ADR-86 (1)） |
 | FR-CO-06 | M | 今の Kura は輪を前段で `Unsupported` にしているが、この描画器は受ける側に倒す（ADR-24） |
 | FR-CO-07 | M | 参照先がない・種類が違う参照は、仕様の誤りの扱い（塗りなら代わりの色、clip・mask・filter なら resvg と同じ扱い。M3 で照らす） |
 
