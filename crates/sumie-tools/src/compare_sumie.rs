@@ -112,9 +112,11 @@ const KNOWN: &[Known] = &[
 /// 曲線の上の破線の境（ユーザーの判断。ADR-103）。
 const DASH: &str = "ADR-103：曲線の上の破線の境の位置（Skia は粗い平坦化で長さを測るので、境が 0.5 画素ほど先にずれる。sumie は描く平坦化で測る。太い線の端の数画素）";
 /// フォントの寸法に依る単位（ユーザーの判断。ADR-103）。
-const FONT_UNITS: &str = "ADR-103：ex・ch・lh・rlh はフォントなしの既定（0.5em・1.2）で解く（Chrome は書体の寸法。M5 でフォントから解く）";
+const FONT_UNITS: &str =
+    "ADR-103：ex・ch・lh・rlh はフォントなしの既定（0.5em・1.2）で解く（Chrome は書体の寸法。M5 でフォントから解く）";
 /// 細い線の試し（ADR-97 (2)）。
-const THIN_PROBE: &str = "ADR-97 (2)：細い線を描く座標系の 1 画素の線を太さの α で描く（Skia の細い線の反エイリアスと縁の画素が違う）";
+const THIN_PROBE: &str =
+    "ADR-97 (2)：細い線を描く座標系の 1 画素の線を太さの α で描く（Skia の細い線の反エイリアスと縁の画素が違う）";
 
 /// 寄せた制御点（ADR-101 (6)）。
 const CLAMP: &str =
@@ -178,6 +180,8 @@ struct Outcome {
     fractional: bool,
     /// Chrome の絵を版の分からない写しから使った
     legacy_chrome: bool,
+    /// 使った Chrome の絵の版（写しの版か、今撮った版。版の分からない写しは None：次の回にも版の分からない写しとして数える）
+    chrome_used: Option<String>,
     sr: Option<Metrics>,
     sc: Option<Metrics>,
     rc: Option<Metrics>,
@@ -213,6 +217,13 @@ impl Outcome {
     /// 不具合の候補の理由（候補でなければ空）。
     fn candidate(&self) -> Vec<&'static str> {
         let mut why = Vec::new();
+        // sumie だけが断る・大きさが resvg と違う（Chrome と比べられないので、理由を求める。単位 4 の 4 回目のレビュー）
+        if self.refusal == Refusal::SumieOnly {
+            why.push("sumie だけが断る");
+        }
+        if !self.size_mismatch.is_empty() {
+            why.push("大きさが resvg と違う");
+        }
         if self.rc_pass() && !self.sr_pass() && !self.sc_pass() {
             why.push("resvg と Chrome は近いのに両方から外れる");
         }
@@ -335,7 +346,9 @@ fn load_items(ws: &Path, args: &[String], min_side: u32) -> Result<(Vec<Item>, b
     if limit {
         out.truncate(crate::corpus::num_arg::<usize>(args, "--limit", 0)?);
     }
-    Ok((out, root.is_some() || filter.is_some() || limit || all))
+    // 既定でない倍率の下限も一部とみなす（既知の差の上限は既定の倍率で測った値。単位 4 の 4 回目のレビュー）
+    let other_scale = min_side != DEFAULT_MIN_SIDE;
+    Ok((out, root.is_some() || filter.is_some() || limit || all || other_scale))
 }
 
 /// `compare` か `compare-sumie` の出力の絵の 1 つ（フォルダ・id・倍率・入力のダイジェスト・Chrome の版・前の合否）。
@@ -543,11 +556,13 @@ fn one(
             .filter(|(b, _)| b.w == w && b.h == h);
         if let Some((b, legacy)) = cached {
             o.legacy_chrome = legacy;
+            o.chrome_used = (!legacy).then(|| chrome.version.clone());
             return Some(b);
         }
         match chrome.render(&item.file, w, h, css, work) {
             Ok((b, attempts)) => {
                 o.chrome_attempts = attempts;
+                o.chrome_used = Some(chrome.version.clone());
                 Some(b)
             }
             Err(e) => {
@@ -587,8 +602,9 @@ fn one(
         }
     };
     o.scale = k;
+    // sumie だけが断っても resvg と Chrome は撮る（resvg と Chrome の差を測って候補を決める。単位 4 の 4 回目のレビュー）
     let c = match render_sumie(&svg, k) {
-        Drawn::Image(c) => c,
+        Drawn::Image(c) => Some(c),
         Drawn::Excluded(reason) => {
             o.excluded = reason;
             return o;
@@ -596,7 +612,7 @@ fn one(
         Drawn::Refused(e) => {
             o.error = e;
             o.refusal = Refusal::SumieOnly;
-            return o;
+            None
         }
     };
     let cached = cache.get(&item.path).and_then(|v| v.iter().find(|c| c.scale == u64::from(k) && c.input == digest));
@@ -605,18 +621,33 @@ fn one(
         None => match resvg.render(&svg, k as f32) {
             Ok(r) => r.img,
             Err(e) => {
-                o.error = format!("resvg：{e}");
-                o.refusal = Refusal::Both;
+                // resvg の描画だけが断った：sumie が描けば Chrome と比べる（resvg だけが断るものと同じ。単位 4 の 4 回目の
+                // レビュー）
+                let Some(c) = c else {
+                    o.error = format!("両方が断る：resvg：{e}・{}", o.error);
+                    o.refusal = Refusal::Both;
+                    return o;
+                };
+                o.refusal = Refusal::ResvgOnly;
+                o.error = format!("resvg だけが断る：{e}");
+                let _ = image::write_png(&img.join(format!("{id}-s.png")), &c);
+                if let Some(b) = shot(&mut o, c.w, c.h, css, k) {
+                    let _ = image::write_png(&img.join(format!("{id}-b.png")), &b);
+                    o.sc = measure(&c, &b).map(|x| x.0);
+                    o.big = big_diffs(&c, &b);
+                }
                 return o;
             }
         },
     };
     let b = shot(&mut o, a.w, a.h, css, k);
-    let _ = image::write_png(&img.join(format!("{id}-s.png")), &c);
     let _ = image::write_png(&img.join(format!("{id}-a.png")), &a);
     if let Some(b) = &b {
         let _ = image::write_png(&img.join(format!("{id}-b.png")), b);
+        o.rc = measure(&a, b).map(|x| x.0);
     }
+    let Some(c) = c else { return o };
+    let _ = image::write_png(&img.join(format!("{id}-s.png")), &c);
     match measure(&c, &a) {
         Some((m, d)) => {
             let _ = image::write_png(&img.join(format!("{id}-d.png")), &d);
@@ -626,7 +657,6 @@ fn one(
     }
     if let Some(b) = &b {
         o.sc = measure(&c, b).map(|x| x.0);
-        o.rc = measure(&a, b).map(|x| x.0);
         o.big = big_diffs(&c, b);
     }
     o
@@ -656,8 +686,11 @@ fn write_outputs(
             .int("id", o.id as u64)
             .str("path", o.path.as_str())
             .int("scale", o.scale)
-            .str("input", o.input.as_str())
-            .str("chrome", chrome);
+            .str("input", o.input.as_str());
+        // 使った Chrome の絵の版（版の分からない写しを使ったものは書かない：次の回も版の分からない写しとして数える）
+        if let Some(v) = o.chrome_used.as_deref() {
+            l = l.str("chrome", v);
+        }
         if let Some(m) = o.sr.as_ref().or(o.sc.as_ref()) {
             l = l.int("w", m.w).int("h", m.h).int("n_all", m.n_all);
         }
@@ -795,9 +828,27 @@ fn write_outputs(
             let _ = writeln!(s, "  {p}");
         }
     }
-    // 前の回との件ごとの比べ（Chrome と通ったものが外れれば不合格。resvg とだけ外れたものは並べるだけ）
-    let prev =
-        |o: &Outcome| cache.get(&o.path).and_then(|v| v.iter().find(|c| c.sc_pass.is_some() || c.sr_pass.is_some()));
+    // 前の回との件ごとの比べ（Chrome と通ったものが外れれば不合格。resvg とだけ外れたものは並べるだけ）。同じ入力と倍率の
+    // 写しだけを照らす（単位 4 の 4 回目のレビュー）
+    let prev = |o: &Outcome| {
+        cache.get(&o.path).and_then(|v| {
+            v.iter().find(|c| {
+                (c.sc_pass.is_some() || c.sr_pass.is_some()) && c.input == o.input && c.scale == u64::from(o.scale)
+            })
+        })
+    };
+    // 前の回に集まりの内（合否のある写し）だったのに、今回は外したか sumie だけが断った・大きさが違うもの（新しい NotYet の
+    // 広がりや断りを見逃さない。入力が同じものだけ。単位 4 の 4 回目のレビュー）
+    let was_in = |o: &Outcome| {
+        cache
+            .get(&o.path)
+            .is_some_and(|v| v.iter().any(|c| (c.sc_pass.is_some() || c.sr_pass.is_some()) && c.input == o.input))
+    };
+    let set_lost: Vec<&Outcome> = results
+        .iter()
+        .filter(|o| !o.excluded.is_empty() || o.refusal == Refusal::SumieOnly || !o.size_mismatch.is_empty())
+        .filter(|o| was_in(o))
+        .collect();
     let sc_lost: Vec<&&&Outcome> = with_chrome
         .iter()
         .copied()
@@ -819,13 +870,26 @@ fn write_outputs(
     for o in &sr_lost {
         let _ = writeln!(s, "  resvg：{}（id {}）", o.path, o.id);
     }
+    let _ = writeln!(s, "前の回に集まりの内だったのに外したか断ったもの：{} 件", set_lost.len());
+    for o in &set_lost {
+        let why = if !o.excluded.is_empty() {
+            o.excluded.as_str()
+        } else if !o.error.is_empty() {
+            o.error.as_str()
+        } else {
+            o.size_mismatch.as_str()
+        };
+        let _ = writeln!(s, "  {}（id {}）：{why}", o.path, o.id);
+    }
     let ok_count = pass_c >= rc_pass;
     let ok_known = unknown.is_empty();
-    let ok_prev = sc_lost.is_empty();
+    let ok_prev = sc_lost.is_empty() && set_lost.is_empty();
     let verdict = if partial {
         "参考（一部か別の集まりを流した）"
     } else if !no_chrome.is_empty() {
         "不確か（Chrome を撮れないものがある）"
+    } else if cache.is_empty() {
+        "不確か（前の回の写しがない：--cache で前の回を渡す）"
     } else if ok_count && ok_known && ok_prev {
         "合格"
     } else {
@@ -834,11 +898,12 @@ fn write_outputs(
     let yes = |b: bool| if b { "満たす" } else { "満たさない" };
     let _ = writeln!(
         s,
-        "\n## M2 の合否（ADR-101 (2)・ADR-103）：{verdict}\n  sumie と Chrome が通る数 {pass_c} ≥ resvg と Chrome が通る数 {rc_pass}：{}\n  理由のない不具合の候補 0 件（{} 件）：{}\n  前の回に Chrome と通ったものが外れない（{} 件）：{}\n  Chrome を撮れないもの 0 件（{} 件）：{}",
+        "\n## M2 の合否（ADR-101 (2)・ADR-103・ADR-104）：{verdict}\n  sumie と Chrome が通る数 {pass_c} ≥ resvg と Chrome が通る数 {rc_pass}：{}\n  理由のない不具合の候補 0 件（{} 件）：{}\n  前の回に Chrome と通ったもの・集まりの内だったものが外れない（{} 件・{} 件）：{}\n  Chrome を撮れないもの 0 件（{} 件）：{}",
         yes(ok_count),
         unknown.len(),
         yes(ok_known),
         sc_lost.len(),
+        set_lost.len(),
         yes(ok_prev),
         no_chrome.len(),
         yes(no_chrome.is_empty())
