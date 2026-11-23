@@ -104,6 +104,7 @@
 | FR-PT-03 | M | `fill-rule`・`fill-opacity`・`stroke-opacity`・`stroke-width`・`stroke-linecap`・`stroke-linejoin`（`miter`・`round`・`bevel`。SVG 2 の `miter-clip`・`arcs` は Chrome と同じく壊れた値。ADR-91 (1)）・`stroke-miterlimit`（負だけが壊れた値。1 未満は継ぎ目がいつも bevel。ADR-76）・`stroke-dasharray`（奇数個は 2 度並べる・% ・負や合計 0 は実線）・`stroke-dashoffset` |
 | FR-PT-04 | M | `paint-order`・`vector-effect: non-scaling-stroke`・`shape-rendering`（`crispEdges` は反エイリアスなし。`optimizeSpeed` は resvg と同じ扱い。M2 で照らす） |
 | FR-PT-04b | M | 描く座標系の太さが 1 画素以下の反エイリアスの線は、描く座標系の 1 画素の線を太さ（2 つの軸の太さの平均）の α で描く（Chrome・resvg の細い線と同じ。ADR-97 (2)） |
+| FR-PT-04c | M | 曲がりの半径より太い線は、曲線の縁を曲線のまま写したものとして描く（円の中に半径「太さの半分 − 半径」の穴が残る。多角形の頂点は頂点を通す。resvg・Chrome と同じ。ADR-99 (2)） |
 | FR-PT-05 | M | `linearGradient`・`radialGradient`：`gradientUnits`・`gradientTransform`・`spreadMethod`（pad・reflect・repeat）・`href` の鎖での属性と stop の受け継ぎ（輪は FR-CO-05）・焦点（`fx`・`fy`・SVG 2 の `fr`）・stop の offset の切り詰めと単調化・`stop-color`・`stop-opacity`。stop が 1 つなら単色、0 なら塗らない。stop が多くても・同じ offset が多くても、画素ごとの仕事は stop の数に比例しない（Kura の S2・S3） |
 | FR-PT-06 | M | `pattern`：`patternUnits`・`patternContentUnits`・`patternTransform`・`viewBox`・`preserveAspectRatio`・`x`・`y`・`width`・`height`・`href` の鎖での受け継ぎ・入れ子の pattern |
 | FR-PT-07 | M | `marker`：`marker-start`・`marker-mid`・`marker-end` と CSS の `marker`、`orient`（角度・`auto`・`auto-start-reverse`）・`markerUnits`・`refX`・`refY`・`viewBox`・`preserveAspectRatio`・`markerWidth`・`markerHeight`・切り取り。付ける図形は SVG 2・resvg と同じ図形のすべて（`path`・`line`・`polyline`・`polygon`・`rect`・`circle`・`ellipse`。Chrome は前の 4 つだけ。ADR-87 (3)）。marker の中の marker は描かない |
@@ -211,11 +212,11 @@
 
 | ID | 優先 | 要件 |
 |---|---|---|
-| FR-OUT-01 | M | 大きさ：外側の svg の `width`・`height`（単位つき、96 dpi）。ない・% なら `viewBox` から。どちらもなければ、usvg と同じく中身の外接矩形の右下を大きさにする（usvg 0.48.1 の振る舞い。100 × 100 ではない。ADR-58 (1)）。その文書の大きさは木を作るまで決まらない（`Document::size` は `None` を返し、大きさは `Tree` から読む。ADR-63 (3)）。resvg と照らして決めた規則（ADR-64 (8)）：viewBox がなく、幅か高さが欠ける・%・壊れた値なら、幅と高さの両方を中身の外接矩形の右下にする（片方だけある値も使わない）。外接矩形は線の太さを含まず、`visibility: hidden` は含め、`display: none` は含めない。中身がなければ 100 × 100。viewBox があれば、% は viewBox の大きさに対する割合、片方だけなら viewBox の縦横の比で補う。幅か高さが 0 か負なら `Invalid`。壊れた viewBox（幅か高さが 0 以下）は大きさを決めるときは無いものとする（描く段では、幅か高さが 0 の viewBox の要素を描かない。SVG 2 §8.2。ADR-78 (7)）。画素は倍率を掛けたものを f32 にしてから四捨五入する（0.5 は遠い側。最小 1。resvg の `to_int_size` と同じ。10.5 は 11・0.3 は 1・233.33 は 233。ADR-78 (5)） |
+| FR-OUT-01 | M | 大きさ：外側の svg の `width`・`height`（単位つき、96 dpi）。ない・% なら `viewBox` から。どちらもなければ、usvg と同じく中身の外接矩形の右下を大きさにする（usvg 0.48.1 の振る舞い。100 × 100 ではない。ADR-58 (1)）。その文書の大きさは木を作るまで決まらない（`Document::size` は `None` を返し、大きさは `Tree` から読む。ADR-63 (3)）。resvg と照らして決めた規則（ADR-64 (8)）：viewBox がなく、幅か高さが欠ける・%・壊れた値なら、幅と高さの両方を中身の外接矩形の右下にする（片方だけある値も使わない）。外接矩形は線の太さを含まず、`visibility: hidden` は含め、`display: none` は含めない。移動の点は、続く移動に置き換わるものと描く区間のないパスのものを含めない（末尾の移動は含める。ADR-98 (8)）。中身がなければ 100 × 100。この文書の % の長さは 100 × 100 の表示の領域で解く（usvg の既定の大きさ。ADR-99 (1)）。viewBox があれば、% は viewBox の大きさに対する割合、片方だけなら viewBox の縦横の比で補う。幅か高さが 0 か負なら `Invalid`。壊れた viewBox（幅か高さが 0 以下）は大きさを決めるときは無いものとする（描く段では、幅か高さが 0 の viewBox の要素を描かない。SVG 2 §8.2。ADR-78 (7)）。画素は倍率を掛けたものを f32 にしてから四捨五入する（0.5 は遠い側。最小 1。resvg の `to_int_size` と同じ。10.5 は 11・0.3 は 1・233.33 は 233。ADR-78 (5)） |
 | FR-OUT-02 | M | 大きさは、照合の集まりのすべての入力で resvg 0.48.1 と同じ画素になる（Kura の編集の文書は画素の座標を持つので、大きさが変わると壊れる）。resvg の 32 ビットの丸めに合わせる必要があれば、大きさの計算だけ合わせる（M1 で確かめる） |
 | FR-OUT-03 | M | 倍率（正の有限の数）。描く座標系は「ユーザー単位 × 倍率」。倍率・出力のバッファの大きさと行のバイト数・範囲が正しくなければ `Invalid`（理由は呼び手の誤り。位置なし） |
 | FR-OUT-04 | M | 出力は呼び手が渡す RGBA8 の乗算済みのバッファ（幅・高さ・行のバイト数）。描く前に全体を透明にする。色は sRGB のまま（色の管理をしない。ADR-17） |
-| FR-OUT-04b | M | 根の svg の CSS の `background-color`（属性でなくプロパティ。`currentColor` は根の `color`）で、描く前にキャンバスの全体を塗る（resvg・Chrome と同じ。`background` のまとめは読まない。ADR-97 (4)） |
+| FR-OUT-04b | M | 根の svg の CSS の `background-color`（属性でなくプロパティ。`currentColor` は根の `color`）で、描く前にキャンバスの全体を塗る（resvg・Chrome と同じ。ADR-97 (4)）。`background` のまとめは最後の層の色を `background-color` として読む（画像は描かない。Chrome と同じ。ADR-99 (4)） |
 | FR-OUT-05 | M | 範囲の描画（`render_region`・`estimate_region`）：全体を描いて同じ範囲を切り出したものとビット単位で同じ（ADR-13） |
 | FR-OUT-06 | M | 形（§1.3）を通ったものは、同じ上限・同じ資源・同じ倍率なら、計画と描く段で `Limit`・`Unsupported` にならない（確保の失敗と中止を除く）。どの誤りをどの段で決めるかは architecture.md §3.1（ADR-37）。範囲が全体に含まれるなら、範囲の見積もりは全体の描画の見積もりを超えない |
 
