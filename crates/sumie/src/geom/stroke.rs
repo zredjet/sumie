@@ -327,6 +327,11 @@ fn joint_dir(line: Poly<'_>, i: usize, closed: bool) -> Option<Point> {
     }
 }
 
+/// 2 つの点が f32 に丸めると同じか（Chrome の Skia は座標を f32 で持つ。破線の境を角に寄せる。ADR-104）。
+fn same32(p: Point, q: Point) -> bool {
+    p.x as f32 == q.x as f32 && p.y as f32 == q.y as f32
+}
+
 /// 逆の向き。
 fn neg(d: Point) -> Point {
     Point::new(-d.x, -d.y)
@@ -455,7 +460,11 @@ pub(crate) fn stroke_polyline(
                 let (back, ahead) = (ring_prev(i, n), ring_next(i, n));
                 let (a, b) = if forward { (back, ahead) } else { (ahead, back) };
                 let (Some(&p), Some(&a), Some(&b)) = (v.get(i), v.get(a), v.get(b)) else { continue };
-                let tan = corner_tangents(view, i, true, forward, budget)?;
+                let tan = if pen.join == Join::None {
+                    (None, None)
+                } else {
+                    corner_tangents(view, i, true, forward, budget)?
+                };
                 vertex(&mut e, pen, a, p, b, forward, view.smooth_at(i), tan)?;
             }
         }
@@ -478,7 +487,7 @@ pub(crate) fn stroke_polyline(
         let (Some(&a), Some(&p), Some(&b)) = (v.get(ring_prev(i, n)), v.get(i), v.get(ring_next(i, n))) else {
             continue;
         };
-        let tan = corner_tangents(view, i, false, true, budget)?;
+        let tan = if pen.join == Join::None { (None, None) } else { corner_tangents(view, i, false, true, budget)? };
         vertex(&mut e, pen, a, p, b, true, view.smooth_at(i), tan)?;
     }
     let dn = unit(view.end_dir)
@@ -490,7 +499,7 @@ pub(crate) fn stroke_polyline(
         let (Some(&a), Some(&p), Some(&b)) = (v.get(ring_next(i, n)), v.get(i), v.get(ring_prev(i, n))) else {
             continue;
         };
-        let tan = corner_tangents(view, i, false, false, budget)?;
+        let tan = if pen.join == Join::None { (None, None) } else { corner_tangents(view, i, false, false, budget)? };
         vertex(&mut e, pen, a, p, b, false, view.smooth_at(i), tan)?;
     }
     cap(&mut e, pen, first, Point::new(-d0.x, -d0.y))?;
@@ -872,6 +881,13 @@ pub(crate) fn dash_polyline(
             budget.spend(cost::OUTLINE_POINT)?;
             at_boundary = true;
             let next_t = t0 + remain;
+            // f32 で区間の終わりの点と同じになる境は、次の区間の頭（角）の境にする（Chrome は座標を f32 で持つので、角に
+            // ごく近い境はごく短い部分を作らない。ユーザーの判断。ADR-104）
+            let un = next_t / seg;
+            if next_t > t0 && same32(Point::new(a.x + dx * un, a.y + dy * un), b) {
+                remain = seg - t0;
+                break;
+            }
             if next_t > t0 {
                 stall = 0;
             } else {
@@ -894,8 +910,13 @@ pub(crate) fn dash_polyline(
                 }
             }
             t0 = next_t;
-            let u = t0 / seg;
-            let at = Point::new(a.x + dx * u, a.y + dy * u);
+            let mut u = t0 / seg;
+            let mut at = Point::new(a.x + dx * u, a.y + dy * u);
+            // f32 で区間の頭の点と同じになる境は、角の境にする（上と同じ）
+            if u > 0.0 && same32(at, a) {
+                u = 0.0;
+                at = a;
+            }
             if on {
                 buf.push(at, false)?;
                 // 区間の頭（角）で終わる部分は、前の区間の向きで終わる
@@ -936,19 +957,26 @@ pub(crate) fn dash_polyline(
             buf.push_flag(b, line.flag_at(ring_next(k, pts.len())))?;
         }
     }
+    // 最後の部分が始めの点でちょうど終わり（残りが 0）、続く隙間も 0 なら、始めの点で継がない（境が角に当たるほかの所と
+    // 同じ。隙間が正なら継ぐ。Chrome で確かめた。resvg はいつも継ぐ。stroke-dasharray/n-0。単位 1 の 8 回目のレビュー）
+    let next_gap = dashes.dashes.get(ring_next(idx, n)).copied().unwrap_or(0.0);
+    let ends_at_start = remain <= 0.0 && next_gap <= 0.0;
     if holding {
         // 最初の部分が終わらなかった（閉じた部分パスの全体が線）：閉じた線として描く（始めの角も継ぎ目。ADR-92 (1)・
-        // Chrome と同じ。単位 1 の 2 回目のレビュー）
+        // Chrome と同じ。単位 1 の 2 回目のレビュー）。始めの点でちょうど終わり、続く隙間が 0 なら開いた線として描く
         if buf.len() > 1 {
-            piece(buf.view(), true)?;
+            if ends_at_start {
+                buf.end_dir = tangent(np.saturating_sub(1), 1.0)?;
+                piece(buf.view(), false)?;
+            } else {
+                piece(buf.view(), true)?;
+            }
         }
         return Ok(());
     }
     if on && buf.len() > 1 {
         buf.end_dir = if closed { tangent(np.saturating_sub(1), 1.0)? } else { tangent(np.saturating_sub(2), 1.0)? };
-        // 最後の部分が終わりの点でちょうど終わる（残りが 0）なら、最初の部分につながない（境が角に当たるほかの所と同じく
-        // 継ぎ目を作らない。Chrome と同じ。resvg はつなぐ。tests/painting/stroke-dasharray/n-0）
-        if hold_head && !head.is_empty() && remain > 0.0 {
+        if hold_head && !head.is_empty() && !ends_at_start {
             // 最後の部分（始めの点で終わる）に最初の部分をつなぐ（始めの点を 2 度入れない）
             buf.append_from(head.view(), 1, budget)?;
             buf.end_dir = head.end_dir;

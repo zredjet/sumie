@@ -121,7 +121,10 @@ impl<'s, 'b> Scanner<'s, 'b> {
         if !any {
             return Ok(None);
         }
-        if matches!(self.at(j)?, Some(b'e' | b'E')) {
+        // 指数の字は、後ろにバイトがあり、それが小文字の m・x（em・ex の単位）でないときだけ指数として読む（ほかは e の前で数を
+        // 終え、e は次の字句：Chrome と同じ。単位 1 の 8 回目のレビュー）
+        let exp_follows = matches!(self.at(j.saturating_add(1))?, Some(c) if c != b'm' && c != b'x');
+        if matches!(self.at(j)?, Some(b'e' | b'E')) && exp_follows {
             let k = j.saturating_add(1);
             let sign = self.at(k)?;
             let digits = if matches!(sign, Some(b'+' | b'-')) { k.saturating_add(1) } else { k };

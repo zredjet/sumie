@@ -127,6 +127,16 @@ fn errors_draw_up_to_the_error() {
     assert!(matches!(r, Parsed::Error(_)));
     let (s, _, _) = read("M10 10 H90 V90e+ H10 Z");
     assert_eq!(s.len(), 2);
+    // 指数の字がデータの終わりにある・後ろが m か x（em・ex）なら、数は e の前で終わり、e は次の字句（その前の命令は
+    // 描く。Chrome と同じ。単位 1 の 8 回目のレビュー）
+    for d in ["M10 10 L90 10 L90 90e", "M10 10 L90 10 L90 90em", "M10 10 L90 10 L90 90ex"] {
+        let (s, r, _) = read(d);
+        assert_eq!(s.len(), 3, "{d}");
+        assert!(matches!(r, Parsed::Error(_)), "{d}");
+    }
+    // 後ろに空白なら指数で、数字がないので壊れた数（Chrome と同じ）
+    let (s, _, _) = read("M10 10 L90 10 L90 90e ");
+    assert_eq!(s.len(), 2);
     // Z のあとの数は誤り
     let (s, r, _) = read("M10 10 H90 V90 Z 10 90 90 90");
     assert_eq!(s.len(), 4);

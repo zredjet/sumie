@@ -218,6 +218,17 @@ fn dashes_split_by_length() {
     assert_eq!(p.len(), 4, "{p:?}");
     assert!(p.iter().all(|s| s.windows(2).all(|w| w[0].x == w[1].x || w[0].y == w[1].y)), "{p:?}");
     assert_eq!(p.iter().filter(|s| s.len() > 1 && s[0] == Point::new(0.0, 0.0)).count(), 1);
+    // 最後の部分が始めの点でちょうど終わっても、続く隙間が正なら最初の部分につなぐ（Chrome と同じ。単位 1 の 8 回目の
+    // レビュー）：周 40 に [4, 2] は 36〜40 の部分が 0〜4 の部分につながる
+    let p = pieces(&sq, true, &[4.0, 2.0], 0.0);
+    assert_eq!(p.len(), 6, "{p:?}");
+    assert!(p.iter().any(|s| s[0] == Point::new(0.0, 4.0) && *s.last().unwrap() == Point::new(4.0, 0.0)), "{p:?}");
+    // 全体が 1 本の部分で始めの点でちょうど終わるとき、続く隙間が 0 なら開いた線、正なら閉じた線
+    let p = pieces_closed(&sq, true, &[40.0, 0.0], 0.0);
+    assert_eq!(p.len(), 1);
+    assert!(!p[0].1, "{p:?}");
+    let p = pieces_closed(&sq, true, &[40.0, 5.0], 0.0);
+    assert!(p[0].1, "{p:?}");
     // 頭が隙間ならつながない
     let p = pieces(&sq, true, &[5.0, 5.0], 5.0);
     assert!(p.iter().all(|s| s[0] != Point::new(0.0, 0.0) || s.len() > 1));
@@ -349,4 +360,25 @@ fn tiny_gaps_do_not_drop_the_rest() {
     // 線の部分も隙間も小さすぎて 1 周しても進まない：残りは線（区間の中の位置が大きくなってから）
     let p = pieces(&[(0.0, 0.0), (1e6, 0.0)], false, &[999_999.0, 1e-12, 1e-12, 1e-12], 0.0);
     assert_eq!(p.last().unwrap().last().unwrap().x, 1e6);
+}
+
+/// 破線の境が f32 で区間の端の点と同じになるときは、角の境にする（ごく短い部分や、隣の区間の向きの端を作らない。Chrome は
+/// 座標を f32 で持つ。ユーザーの判断。単位 1 の 8 回目・単位 2 の 6 回目のレビュー。ADR-104）。
+#[test]
+fn dash_boundaries_snap_to_corners_in_f32() {
+    // 縦の辺の長さは 30.000000000000004 なので、30 の境は角の 4e-15 手前に来る
+    let bent = [(50.2, 10.3), (50.2, 40.3), (10.2, 40.3)];
+    let p = pieces(&bent, false, &[30.0, 10.0], 0.0);
+    // 角ちょうどの境と同じ形（角の点が 2 度入り、線を作るときにまとめる）
+    let mut first = p[0].clone();
+    first.dedup();
+    assert_eq!(first, [Point::new(50.2, 10.3), Point::new(50.2, 40.3)], "{p:?}");
+    // 角の 1e-4 手前の境は寄せない（f32 で別の点）
+    let p = pieces(&bent, false, &[29.9999, 10.0], 0.0);
+    assert_ne!(*p[0].last().unwrap(), Point::new(50.2, 40.3));
+    // 閉じた形で、境が角のわずかに先に来るときも角から始まる
+    let rect = [(10.2, 10.7), (50.2, 10.7), (50.2, 40.7), (10.2, 40.7)];
+    let p = pieces(&rect, true, &[7.0, 3.0], 0.0);
+    assert!(p.iter().all(|s| s.windows(2).all(|w| w[0] == w[1] || w[0].x == w[1].x || w[0].y == w[1].y)), "{p:?}");
+    assert!(p.iter().any(|s| s[0] == Point::new(50.2, 40.7) || *s.last().unwrap() == Point::new(50.2, 40.7)), "{p:?}");
 }

@@ -682,14 +682,24 @@ pub(crate) fn stroke_mode(n: &PathNode, t: &Transform, scale: f64) -> StrokeMode
     let w = n.stroke_width;
     let aa = n.flags & CRISP == 0;
     // Chrome が Skia の枠の描き方で描く rect（角の丸みなし・miter で miterlimit ≥ √2・破線なし・non-scaling でない・軸に
-    // そった変形）は、細い線でも角を四角くする（書いた miter の継ぎ目で描く。ADR-103）
+    // そった変形）は、細い線でも本当の太さで描き、角を四角くする（書いた miter の継ぎ目。ADR-103・ADR-104）
     let frame = n.shape == crate::tree::SHAPE_RECT
         && n.join == crate::tree::JOIN_MITER
         && n.miter_limit >= core::f64::consts::SQRT_2
         && n.dashes[1] == 0
         && n.flags & NON_SCALING == 0
         && axis_aligned(t);
-    let hair = !frame;
+    if frame {
+        return StrokeMode {
+            device: false,
+            half: w / 2.0,
+            alpha: 1.0,
+            dash_unit: 1.0,
+            sigma: t.max_scale(),
+            hair: false,
+        };
+    }
+    let hair = true;
     if n.flags & NON_SCALING != 0 {
         let wd = w * scale;
         if aa && wd <= 1.0 {
@@ -709,7 +719,7 @@ pub(crate) fn stroke_mode(n: &PathNode, t: &Transform, scale: f64) -> StrokeMode
 /// 変形が矩形を軸にそった矩形に写すか（Skia の rectStaysRect。Chromium は 90° の倍数の回転を正確な 0・±1 にするので、
 /// 大きさに対して 1e-12 の内の成分は 0 とみなす）。
 fn axis_aligned(t: &Transform) -> bool {
-    let tiny = 1e-12 * (t.a.abs() + t.b.abs() + t.c.abs() + t.d.abs());
+    let tiny = 1e-12 * math::max(math::max(t.a.abs(), t.b.abs()), math::max(t.c.abs(), t.d.abs()));
     (t.b.abs() <= tiny && t.c.abs() <= tiny) || (t.a.abs() <= tiny && t.d.abs() <= tiny)
 }
 
