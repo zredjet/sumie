@@ -183,7 +183,21 @@ struct Counts {
     len_dev_band: f64,
     len_stroke_band: f64,
     pts_band: u64,
+    /// 行の帯の中の区間の、描く座標系の y の変化の和（線分は帯で切った部分の縦の差、2 次・3 次は制御多角形の縦の差の和、
+    /// 弧は長さ）。辺の行と副走査線の交わりの上限（長さで抑えると横長の辺の多い文書で 15〜80 倍緩い。単位 2 の 9 回目の
+    /// レビュー）
+    dy_dev_band: f64,
+    /// 描く座標系の区間の外接矩形（変形の項の大きさに比べた丸めの余白を足したもの。外接矩形 × 倍率は、項の打ち消し合う
+    /// 変形で計画の点と数千画素ずれた。単位 2 の 9 回目のレビュー）。空なら x0 > x1
+    ext_x0: f64,
+    ext_y0: f64,
+    ext_x1: f64,
+    ext_y1: f64,
 }
+
+/// 変形の項の大きさに比べた丸めの余白の倍（写した座標の丸めは項の絶対値の和 × 2⁻⁵² ほど。計画は別の順の演算で写すので
+/// 大きめに）。
+const EXTENT_PREC: f64 = 1.0 / (1u64 << 44) as f64;
 
 /// 見る箱（描く座標系。キャンバスを広げたもの）。破線の部分はこの箱にかかるものだけを作る（範囲に依らない）。
 #[derive(Debug, Clone, Copy)]
@@ -243,24 +257,24 @@ impl View {
     }
 }
 
-/// 線分（描く座標系の `p` → `r`）のうち、描く段の行とセルにかかる分の割合（0〜1。行の帯 `band` の中の割合以下）：見る箱
-/// `view` の中の部分は長さで、帯の中で箱の横の外の部分は y の差だけで数える（描く段は範囲の左の外を 1 列にまとめ、右の外を
-/// 落とすので、横の外の部分は行ごとに 1 セル。巨大な線分の、キャンバスの横の外の長さを数えない）。有限でなければ帯の割合。
-/// `f`・`g` は見る箱と行の帯の中の割合（呼び手が求めたもの。切り取りを 2 度求めない。単位 2 の 5 回目のレビュー）。
-fn raster_fraction(view: &View, band: &View, p: Point, r: Point, f: f64, g: f64) -> f64 {
-    if g <= 0.0 {
-        return 0.0;
-    }
+/// 線分（描く座標系の `p` → `r`）のうち、描く段の行とセルにかかる分（行の帯 `band` にかからなければ None）：描く座標系の
+/// 長さと、帯の中の縦の差。見る箱 `view` の中の部分は長さで、帯の中で箱の横の外の部分は y の差だけで数える（描く段は範囲の
+/// 左の外を 1 列にまとめ、右の外を落とすので、横の外の部分は行ごとに 1 セル。巨大な線分の、キャンバスの横の外の長さを
+/// 数えない）。割合でなく絶対の量で返す（長い軸の差で測る割合は、x が 1e42 の線分の帯の中の部分を丸めで 0 にした。単位 1 の
+/// 11 回目のレビュー）。有限でなければ全体の長さと縦の差。
+fn raster_part(view: &View, band: &View, p: Point, r: Point) -> Option<(f64, f64)> {
     let l = math::hypot(r.x - p.x, r.y - p.y);
-    if !(l.is_finite() && l > 0.0) {
-        return g;
+    if !(p.finite() && r.finite() && l.is_finite()) {
+        return Some((l, (r.y - p.y).abs()));
     }
-    let Some((a, b)) = band.clip(p, r) else { return g };
+    let (a, b) = band.clip(p, r)?;
     let dy_band = (b.y - a.y).abs();
-    let dy_view = if f > 0.0 { view.clip(p, r).map_or(0.0, |(c, d)| (d.y - c.y).abs()) } else { 0.0 };
+    let (lv, dy_view) = match view.clip(p, r) {
+        Some((c, d)) => (math::hypot(d.x - c.x, d.y - c.y), (d.y - c.y).abs()),
+        None => (0.0, 0.0),
+    };
     let out = dy_band - dy_view;
-    let h = (f * l + if out > 0.0 { out } else { 0.0 }) / l;
-    if h.is_finite() { math::min(h, g) } else { g }
+    Some((lv + if out > 0.0 { out } else { 0.0 }, dy_band))
 }
 
 /// 曲線の区間の、描く座標系の y の変化の上限（制御多角形の y の差の和。曲線は制御多角形より y の変化が小さい）。弧と
@@ -394,8 +408,9 @@ impl Turning {
 
 /// round の継ぎ目の円弧で、頂点ごとの 1 つを超えて使ってよい点の数（`turning` は [`Turning`] の和。見積もりの式と同じ）。
 fn round_join_extra(pen: &Pen, turning: f64) -> u64 {
+    // 頂点ごとの数は ⌈max(kk θ, θ × 8/π)⌉ ≤ (kk ＋ 8/π) θ ＋ 1（[`Pen::round_pieces`] の下限）
     let kk = (pen.half * pen.scale / (8.0 * pen.tol)).sqrt();
-    up(kk * turning)
+    up((kk + pen.pieces_per_radian()) * turning)
 }
 
 /// 滑らかな点のつなぎ目の曲がる角の上限（`same_direction` の 1 − cos θ ≤ 2⁻¹² の θ ≈ 0.0221 を丸めて上へ）。
@@ -443,16 +458,40 @@ fn count(
     let mut sub_start: Option<Point> = None;
     let mut sub_end: Option<Point> = None;
     let implicit_close = |c: &mut Counts, a: Option<Point>, b: Option<Point>| {
-        if let (Some(a), Some(b)) = (a, b) {
-            let (p, r) = (t.apply(a), t.apply(b));
-            let f = raster_fraction(view, band, p, r, view.inside_fraction(p, r), band.inside_fraction(p, r));
-            c.len_dev_band += f * math::hypot(r.x - p.x, r.y - p.y);
+        if let (Some(a), Some(b)) = (a, b)
+            && let Some((l, dy)) = raster_part(view, band, t.apply(a), t.apply(b))
+        {
+            c.len_dev_band += l;
+            c.dy_dev_band += dy;
         }
+    };
+    // 描く座標系の外接矩形と、変形の項の大きさに比べた丸めの余白
+    c.ext_x0 = f64::INFINITY;
+    c.ext_y0 = f64::INFINITY;
+    c.ext_x1 = f64::NEG_INFINITY;
+    c.ext_y1 = f64::NEG_INFINITY;
+    let extent = |c: &mut Counts, seg: &PathSeg| {
+        let mut u = crate::geom::Rect::EMPTY;
+        crate::geom::add_bounds(&mut u, seg);
+        let mut d = crate::geom::Rect::EMPTY;
+        crate::geom::add_bounds(&mut d, &crate::geom::transform_seg(seg, t));
+        if u.is_empty() || d.is_empty() {
+            return;
+        }
+        let ux = math::max(u.x0.abs(), u.x1.abs());
+        let uy = math::max(u.y0.abs(), u.y1.abs());
+        let mx = (t.a.abs() * ux + t.c.abs() * uy + t.e.abs() + d.x0.abs() + d.x1.abs()) * EXTENT_PREC;
+        let my = (t.b.abs() * ux + t.d.abs() * uy + t.f.abs() + d.y0.abs() + d.y1.abs()) * EXTENT_PREC;
+        c.ext_x0 = math::min(c.ext_x0, d.x0 - mx);
+        c.ext_y0 = math::min(c.ext_y0, d.y0 - my);
+        c.ext_x1 = math::max(c.ext_x1, d.x1 + mx);
+        c.ext_y1 = math::max(c.ext_y1, d.y1 + my);
     };
     for seg in path.segments() {
         let curve = matches!(seg, PathSeg::Quad(..) | PathSeg::Cubic(..) | PathSeg::ArcTo(..));
         budget.spend(seg_cost(curve))?;
         c.segs = c.segs.saturating_add(1);
+        extent(&mut c, &seg);
         if stroke {
             turn.feed(&seg, stroke_space);
         }
@@ -562,12 +601,18 @@ fn in_view(
             c.len_stroke_in += f * len_in(a, b, s);
             c.segs_in = c.segs_in.saturating_add(1);
         }
-        // 帯の中で見る箱の横の外の部分は y の差だけ（描く段の行とセル。[`raster_fraction`]）
-        let gb = band.inside_fraction(p, r);
-        let g = raster_fraction(view, band, p, r, f, gb);
-        if gb > 0.0 {
-            c.len_dev_band += g * len_in(a, b, t);
-            c.len_stroke_band += g * len_in(a, b, s);
+        // 帯の中で見る箱の横の外の部分は y の差だけ（描く段の行とセル。[`raster_part`]）。線を作る座標系の長さは同じ倍で。
+        // 描く座標系でちょうど水平な弦は、塗りの辺も線の縁の辺も計画が落とすので長さを数えない（横縞で描く見積もりが 40 倍
+        // 緩かった。単位 2 の 9 回目のレビュー）
+        if let Some((l, dy)) = raster_part(view, band, p, r) {
+            if p.y != r.y {
+                let ld = math::hypot(r.x - p.x, r.y - p.y);
+                let ls = len_in(a, b, s);
+                let k = if ld > 0.0 && (ls / ld).is_finite() { ls / ld } else { 1.0 };
+                c.len_dev_band += l;
+                c.len_stroke_band += if ld > 0.0 && l.is_finite() { l * k } else { ls };
+            }
+            c.dy_dev_band += dy;
             c.pts_band = c.pts_band.saturating_add(pts);
         }
     };
@@ -606,12 +651,14 @@ fn in_view(
                 // 見る箱の外の曲線は、描く段の行とセルに y の変化だけかかる（2 次・3 次は制御多角形の y の差の和で抑え、
                 // 線を作る座標系の長さも同じ割合にする。[`raster_fraction`]）
                 let (ld, ls) = (lens(t), lens(s));
-                let k = match curve_dy(seg, t) {
+                let dy = curve_dy(seg, t);
+                let k = match dy {
                     Some(dy) if !mv && ld > 0.0 && (dy / ld).is_finite() => math::min(dy / ld, 1.0),
                     _ => 1.0,
                 };
                 c.len_dev_band += k * ld;
                 c.len_stroke_band += k * ls;
+                c.dy_dev_band += dy.map_or(ld, |dy| math::min(dy, ld));
                 c.pts_band = c.pts_band.saturating_add(n);
             }
         }
@@ -666,8 +713,13 @@ pub(crate) struct StrokeMode {
     pub(crate) half: f64,
     /// 線の色の α に掛ける（細い線の被覆。ほかは 1）
     pub(crate) alpha: f64,
-    /// 破線の長さ 1 の、外形を作る座標系の長さ（pathLength の倍は別に掛ける）
+    /// 破線の長さ 1 の、外形を作る座標系の長さ（pathLength の倍は別に掛ける。`dash_metric` があれば要素の座標系の長さで
+    /// 測るので 1）
     pub(crate) dash_unit: f64,
+    /// 描く座標系で作る細い線の破線を、要素の座標系の長さで区切る写し（変形の線形の部分の逆。Skia は破線を要素の座標系で
+    /// 区切ってから写すので、縦横の倍率の違う変形でも Chrome・resvg と同じ。ADR-97 (2) を改める。単位 1 の 11 回目・単位 2 の
+    /// 9 回目のレビュー）
+    pub(crate) dash_metric: Option<[f64; 4]>,
     /// 外形を作る座標系から描く座標系への最大の倍率
     pub(crate) sigma: f64,
     /// 細い線（描く座標系の 1 画素の線を太さの α で描く）で、継ぎ目を作らない（Skia の細い線は区間ごとに描いて継ぎ目を
@@ -696,6 +748,7 @@ pub(crate) fn stroke_mode(n: &PathNode, t: &Transform, scale: f64) -> StrokeMode
             half: w / 2.0,
             alpha: 1.0,
             dash_unit: 1.0,
+            dash_metric: None,
             sigma: t.max_scale(),
             hair: false,
         };
@@ -704,9 +757,25 @@ pub(crate) fn stroke_mode(n: &PathNode, t: &Transform, scale: f64) -> StrokeMode
     if n.flags & NON_SCALING != 0 {
         let wd = w * scale;
         if aa && wd <= 1.0 {
-            return StrokeMode { device: true, half: 0.5, alpha: wd, dash_unit: scale, sigma: 1.0, hair };
+            return StrokeMode {
+                device: true,
+                half: 0.5,
+                alpha: wd,
+                dash_unit: scale,
+                dash_metric: None,
+                sigma: 1.0,
+                hair,
+            };
         }
-        return StrokeMode { device: true, half: wd / 2.0, alpha: 1.0, dash_unit: scale, sigma: 1.0, hair: false };
+        return StrokeMode {
+            device: true,
+            half: wd / 2.0,
+            alpha: 1.0,
+            dash_unit: scale,
+            dash_metric: None,
+            sigma: 1.0,
+            hair: false,
+        };
     }
     // 変形した太さの長さは Skia と同じく max(|x|, |y|) ＋ min(|x|, |y|) / 2 で測る（細い線にするかの判定と α の両方。
     // 回した細い線が 10〜14% 薄かった。ユーザーの判断。ADR-106）
@@ -717,10 +786,30 @@ pub(crate) fn stroke_mode(n: &PathNode, t: &Transform, scale: f64) -> StrokeMode
     let len0 = skia_len(t.a * w, t.b * w);
     let len1 = skia_len(t.c * w, t.d * w);
     if aa && len0 <= 1.0 && len1 <= 1.0 {
-        let geo = t.det().abs().sqrt();
-        return StrokeMode { device: true, half: 0.5, alpha: (len0 + len1) / 2.0, dash_unit: geo, sigma: 1.0, hair };
+        // 破線は要素の座標系の長さで区切る（変形の線形の部分の逆で測る。逆にできなければ面積の倍の平方根：0 なら実線）
+        let det = t.det();
+        let inv = [t.d / det, -t.c / det, -t.b / det, t.a / det];
+        let metric = (det != 0.0 && inv.iter().all(|v| v.is_finite())).then_some(inv);
+        let dash_unit = if metric.is_some() { 1.0 } else { det.abs().sqrt() };
+        return StrokeMode {
+            device: true,
+            half: 0.5,
+            alpha: (len0 + len1) / 2.0,
+            dash_unit,
+            dash_metric: metric,
+            sigma: 1.0,
+            hair,
+        };
     }
-    StrokeMode { device: false, half: w / 2.0, alpha: 1.0, dash_unit: 1.0, sigma: t.max_scale(), hair: false }
+    StrokeMode {
+        device: false,
+        half: w / 2.0,
+        alpha: 1.0,
+        dash_unit: 1.0,
+        dash_metric: None,
+        sigma: t.max_scale(),
+        hair: false,
+    }
 }
 
 /// 変形が矩形を軸にそった矩形に写すか（Skia の rectStaysRect。Chromium は 90° の倍数の回転を正確な 0・±1 にするので、
@@ -776,21 +865,34 @@ pub(crate) fn reach_factor(pen: &Pen) -> f64 {
     f
 }
 
-/// 節の、描く座標系の外接矩形の画素（線の広がりを含め、1 画素の余白）とキャンバスの交わり。
+/// 節の、描く座標系の外接矩形の画素（線の広がりを含め、1 画素の余白）とキャンバスの交わり（見積もりと計画が節を丸ごと
+/// 飛ばすかだけに使う。描く段の行と列の上限は [`extent_box`]）。
 fn node_box(n: &PathNode, scale: f64, reach_dev: f64, canvas: PixelBox) -> PixelBox {
     let b = n.bounds;
     if b.is_empty() {
         return PixelBox { x0: 0, y0: 0, x1: 0, y1: 0 };
     }
+    pixel_box(b.x0 * scale, b.y0 * scale, b.x1 * scale, b.y1 * scale, reach_dev, canvas)
+}
+
+/// 描く座標系の矩形を届く幅と 1 画素の余白で広げた画素の箱とキャンバスの交わり。
+fn pixel_box(x0: f64, y0: f64, x1: f64, y1: f64, reach_dev: f64, canvas: PixelBox) -> PixelBox {
     let lo = |v: f64| {
-        let f = (v * scale - reach_dev).floor() - 1.0;
+        let f = (v - reach_dev).floor() - 1.0;
         if f.is_nan() { i64::MIN } else { f as i64 }
     };
     let hi = |v: f64| {
-        let f = (v * scale + reach_dev).ceil() + 1.0;
+        let f = (v + reach_dev).ceil() + 1.0;
         if f.is_nan() { i64::MAX } else { f as i64 }
     };
-    PixelBox { x0: lo(b.x0), y0: lo(b.y0), x1: hi(b.x1), y1: hi(b.y1) }.intersect(&canvas)
+    PixelBox { x0: lo(x0), y0: lo(y0), x1: hi(x1), y1: hi(y1) }.intersect(&canvas)
+}
+
+/// 数えた区間の外接矩形（[`Counts`] の `ext_*`。計画の点と同じ変形で写し、丸めの余白を足したもの）の画素の箱（描く段の行と
+/// 列の上限）。外接矩形が空（有限な点がない）なら None。
+fn extent_box(c: &Counts, reach_dev: f64, canvas: PixelBox) -> Option<PixelBox> {
+    let ok = c.ext_x0 <= c.ext_x1 && c.ext_y0 <= c.ext_y1;
+    ok.then(|| pixel_box(c.ext_x0, c.ext_y0, c.ext_x1, c.ext_y1, reach_dev, canvas))
 }
 
 /// 1 つの要素を入れ物に足す手間の上限（伸ばさない置き場：決まった手間と写し）。
@@ -824,20 +926,23 @@ fn render_work(rows: u64, width: u64, edges: u64, cells: u64, edge_rows: u64, cr
         .saturating_add(edge_rows.saturating_mul(EDGE_ROW_WORK))
         .saturating_add(crossings.saturating_mul(cost::SUB_CROSS_WORK))
         .saturating_add(cells.saturating_mul(cost::RASTER_CELL))
+        .saturating_add(cost::raster_spans(cells, rows, width))
 }
 
-/// 辺の行とセルの数の上限：辺の長さの和 `l`（描く座標系）からの式と、節の画素の箱（`rows` 行・`width` 列）で抑えた式の
-/// 小さい方（描く段は箱の行の中だけを回り、1 本の辺の 1 行のセルは幅 ＋ 3 以下。巨大な図形でキャンバスの外の長さに
-/// 比例させない。単位 1・2 のレビュー）。計画が項目ごとに数える上限（[`item_bounds`]）は、辺ごとにこの両方より小さい。
-/// 副走査線の交わりの数の上限は、辺ごとに「4 × 縦の差 ＋ 1」（縦の差の和は長さ以下）と「4 × 行の数」の小さい方（ADR-104）。
-fn raster_bounds(l: f64, e: u64, rows: u64, width: u64) -> (u64, u64, u64) {
-    let by_len_rows = up(l).saturating_add(e.saturating_mul(2));
+/// 辺の行とセルの数の上限：辺の長さの和 `l` と縦の差の和 `dy`（描く座標系）からの式と、節の画素の箱（`rows` 行・`width`
+/// 列）で抑えた式の小さい方（描く段は箱の行の中だけを回り、1 本の辺の 1 行のセルは幅 ＋ 3 以下。巨大な図形でキャンバスの
+/// 外の長さに比べさせない。単位 1・2 のレビュー）。計画が項目ごとに数える上限（[`item_bounds`]）は、辺ごとにこの両方より
+/// 小さい。辺の行は辺ごとに「縦の差 ＋ 2」、副走査線の交わりは辺ごとに「4 × 縦の差 ＋ 1」と「4 × 行の数」の小さい方（ADR-104。
+/// 縦の差の和で数える。単位 2 の 9 回目のレビュー）。
+fn raster_bounds(l: f64, dy: f64, e: u64, rows: u64, width: u64) -> (u64, u64, u64) {
+    let dy = if dy.is_nan() { l } else { math::min(dy, l) };
+    let by_len_rows = up(dy).saturating_add(e.saturating_mul(2));
     let by_box_rows = e.saturating_mul(rows.saturating_add(2));
     let edge_rows = by_len_rows.min(by_box_rows);
     let by_len_cells = up(1.5 * l).saturating_add(e.saturating_mul(CELLS_PER_EDGE));
     let by_box_cells = by_box_rows.saturating_mul(width.saturating_add(3));
     let subs = cost::SUB_ROWS as u64;
-    let crossings = up(l).saturating_mul(subs).saturating_add(e).min(edge_rows.saturating_mul(subs));
+    let crossings = up(dy).saturating_mul(subs).saturating_add(e).min(edge_rows.saturating_mul(subs));
     (edge_rows, by_len_cells.min(by_box_cells), crossings)
 }
 
@@ -913,15 +1018,17 @@ fn bound_node(
     let view = View::new(canvas, reach_dev);
     let band = View::band(canvas, reach_dev);
     let c = count(path, &t, &stroke_space, q, reach_dev, &view, &band, has_stroke, budget)?;
-    let bx = node_box(n, scale, reach_dev, canvas);
+    // 描く段の行と列の上限は、計画と同じ変形で写した区間の外接矩形で（外接矩形 × 倍率は項の打ち消し合う変形で計画の点と
+    // ずれる。単位 2 の 9 回目のレビュー）
+    let bx = extent_box(&c, reach_dev, canvas).unwrap_or_else(|| node_box(n, scale, reach_dev, canvas));
     let (rows, width) = (bx.height(), bx.width());
     // 箱の境で辺が分かれうるか（x の箱の外に出る節だけ。y は切っても分かれない）。左右の外の部分はどちらも縦の辺に
-    // なるので、左と右の両方へ出る節の線分は 3 本まで（ADR-105 (2)。単位 1 の 10 回目・単位 2 の 8 回目のレビュー）。点は
-    // 節の変形で写すので、外接矩形 × 倍率との丸めの差を 1 画素の余白で吸う（単位 2 のレビュー）
-    let b = n.bounds;
+    // なるので、左と右の両方へ出る節の線分は 3 本まで（ADR-105 (2)。単位 1 の 10 回目・単位 2 の 8 回目のレビュー）。写した
+    // 外接矩形は丸めの余白を含み、ほかに 1 画素の余白をとる。空の外接矩形（有限でない点など）は両方へ出るとみなす
     let edge = BOX - 1.0;
-    let left_out = b.x0 * scale - reach_dev < -edge;
-    let right_out = b.x1 * scale + reach_dev > edge;
+    let empty = c.ext_x0.is_nan() || c.ext_x1.is_nan() || c.ext_x0 > c.ext_x1;
+    let left_out = empty || c.ext_x0 - reach_dev < -edge;
+    let right_out = empty || c.ext_x1 + reach_dev > edge;
     let split: u64 = 1u64.saturating_add(u64::from(left_out)).saturating_add(u64::from(right_out));
     out.scratch_points = c.max_sub.saturating_add(4);
     if has_stroke {
@@ -938,7 +1045,7 @@ fn bound_node(
         // 描く段の行とセル：行の帯にかかる辺だけ（区間と暗黙の閉じの帯の中の長さ）
         // 続く閉じは帯の点を数えても辺を作らないので、辺の数を超えない
         let e_band = c.pts_band.saturating_add(c.subpaths).saturating_mul(split).min(e);
-        let (edge_rows, cells, crossings) = raster_bounds(c.len_dev_band, e_band, rows, width);
+        let (edge_rows, cells, crossings) = raster_bounds(c.len_dev_band, c.dy_dev_band, e_band, rows, width);
         out.plan_work = out
             .plan_work
             .saturating_add(c.points.saturating_mul(cost::FLATTEN_POINT.saturating_add(POINT_WORK)))
@@ -994,13 +1101,21 @@ fn bound_node(
         let (dash_pieces, dash_vis) = if dashes.is_empty() || total.is_nan() || total <= 0.0 {
             (0, 0)
         } else if n.path_length > 0.0 {
-            let sig = if mode.device { t.max_scale() / mode.dash_unit } else { 1.0 };
+            // 要素の座標系で区切る細い線は、部分の数も要素の座標系の長さで決まる
+            let sig = if mode.device && mode.dash_metric.is_none() { t.max_scale() / mode.dash_unit } else { 1.0 };
             let all = up(n.path_length * sig / total).saturating_add(s.saturating_mul(2)).saturating_add(1);
             let all = all.saturating_mul(half_k);
             (all, all)
         } else {
-            let period = total * mode.dash_unit;
-            if period.is_nan() || period <= 0.0 {
+            // 描く座標系の周期の下限（要素の座標系で区切る細い線は、変形の最小の倍 |det| ÷ 最大の倍）
+            let period = match mode.dash_metric {
+                Some(_) => total * (t.det().abs() / t.max_scale()),
+                None => total * mode.dash_unit,
+            };
+            if mode.dash_metric.is_some() && (period.is_nan() || period <= 0.0) {
+                // 要素の座標系で区切る線は、描く座標系の周期が丸めで 0 でも破線にする（上限なしに数えて断る）
+                (u64::MAX, u64::MAX)
+            } else if period.is_nan() || period <= 0.0 {
                 (0, 0)
             } else {
                 let all = up(c.len_stroke / period).saturating_add(s.saturating_mul(2)).saturating_add(1);
@@ -1048,7 +1163,11 @@ fn bound_node(
                 + (pieces_n as f64) * piece_len
                 + round_len
                 + curve_corner_len);
-        let (edge_rows, cells, crossings) = raster_bounds(l_dev, e_band, rows, width);
+        // 外形の辺の縦の差の和：縁の 2 本は中心の線の縦の差（区間の法線は区間の中で変わらない）と、頂点・端・円弧の分（長さで
+        // 抑える。単位 2 の 9 回目のレビュー）
+        let dy_dev = 2.0 * c.dy_dev_band
+            + sigma * ((c.pts_band as f64) * per_vertex + (pieces_n as f64) * piece_len + round_len + curve_corner_len);
+        let (edge_rows, cells, crossings) = raster_bounds(l_dev, dy_dev, e_band, rows, width);
         // pathLength の長さを測る平坦化（計画と同じ条件：破線の並びがあり pathLength がある）
         let passes: u64 = if !dashes.is_empty() && n.path_length > 0.0 { 2 } else { 1 };
         // 破線の部分の点（区間の境の 2 つと、部分の中の頂点）と、まとめる写し（部分ごとに端の 2 つ）
@@ -1700,7 +1819,8 @@ fn stroke_edges(
             dash_scaled.push(v)?;
         }
     }
-    let dashes = Dashes::new(dash_scaled.as_slice(), n.dash_offset * dash_scale, budget)?;
+    let dashes = Dashes::new(dash_scaled.as_slice(), n.dash_offset * dash_scale, budget)?
+        .map(|d| d.with_metric(mode.dash_metric));
     let mut sink = EdgeSink { edges, t: to_dev, first: None, prev: None, budget: budget_ref(budget) };
     // 破線の部分は見る箱にかかるものだけを作る（ADR-30 (4)。見積もりと同じ箱）
     let cull = Cull { to_dev, view: View::new(canvas, reach) };

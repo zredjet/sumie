@@ -95,6 +95,7 @@ impl Plan {
                 .saturating_add(rows.saturating_mul(crate::plan::EDGE_ROW_WORK))
                 .saturating_add(crossings.saturating_mul(cost::SUB_CROSS_WORK))
                 .saturating_add(cells.saturating_mul(cost::RASTER_CELL))
+                .saturating_add(cost::raster_spans(cells, b.height(), b.width()))
                 .saturating_add(crate::plan::region_search(u64::from(it.edges[1])));
         }
         let (frame, peak_bytes) =

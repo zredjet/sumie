@@ -151,6 +151,10 @@ fn round_pieces_follow_the_arc_formula() {
     assert_eq!(p.round_pieces(core::f64::consts::PI), 25);
     let tiny = Pen { scale: 1e-6, ..p };
     assert_eq!(tiny.round_pieces(core::f64::consts::PI), 1);
+    // 半径 0.5 画素以上は π/8 ごとに 1 つの下限（半円 8・一周 16。単位 1 の 11 回目のレビュー）
+    let dot = Pen { half: 0.6, scale: 1.0, ..p };
+    assert_eq!(dot.round_pieces(core::f64::consts::PI), 8);
+    assert_eq!(dot.round_pieces(2.0 * core::f64::consts::PI), 16);
     let huge = Pen { half: 1e300, scale: 1e300, ..p };
     assert_eq!(huge.round_pieces(1.0), u64::MAX);
 }

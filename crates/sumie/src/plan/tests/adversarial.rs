@@ -1137,3 +1137,106 @@ fn thin_round_caps_dots_and_rotated_widths_follow_skia() {
     assert!(m.hair && (m.alpha - 0.982).abs() < 1e-3, "{}", m.alpha);
     assert!(!stroke_mode(&PathNode { stroke_width: 0.91, ..n }, &rot, 1.0).hair);
 }
+
+/// 横長の辺の多い形（1 本のパスの横縞と、細い線のハッチ）で、描く見積もりが範囲の見積もり（全体）から大きく離れない
+/// （辺の行と副走査線の交わりを縦の差の和で数える。単位 2 の 9 回目のレビュー）。
+#[test]
+fn horizontal_stripes_are_not_overestimated() {
+    let stripes = |stroke: bool| {
+        let mut b = Builder::new();
+        b.add(
+            |w| {
+                for k in 0..1500 {
+                    let y = 2.0 * k as f64;
+                    if stroke {
+                        w.move_to(Point::new(0.0, y + 0.5)).unwrap();
+                        w.line_to(Point::new(3000.0, y + 0.5)).unwrap();
+                    } else {
+                        w.move_to(Point::new(0.0, y)).unwrap();
+                        w.line_to(Point::new(3000.0, y)).unwrap();
+                        w.line_to(Point::new(3000.0, y + 1.0)).unwrap();
+                        w.line_to(Point::new(0.0, y + 1.0)).unwrap();
+                        w.close().unwrap();
+                    }
+                }
+            },
+            |n| {
+                if stroke {
+                    n.flags = HAS_STROKE;
+                    n.stroke = RED;
+                    n.stroke_width = 0.8;
+                } else {
+                    n.flags = HAS_FILL;
+                    n.fill = GREEN;
+                }
+            },
+        );
+        b.tree(3000.0, 3000.0)
+    };
+    for stroke in [false, true] {
+        let t = stripes(stroke);
+        let est = t.estimate(&RenderOptions::DEFAULT, &Never).unwrap();
+        let plan = t.plan(&RenderOptions::DEFAULT, &Never).unwrap();
+        let region = plan.estimate_region(PixelRect { x: 0, y: 0, width: 3000, height: 3000 }, &Never).unwrap();
+        eprintln!("線 {stroke}：描く見積もり {}・範囲の見積もり {}", est.render.work, region.work);
+        assert!(
+            est.render.work <= region.work.saturating_mul(4),
+            "線 {stroke}：描く見積もり {} が範囲の見積もり {} の 4 倍を超える",
+            est.render.work,
+            region.work
+        );
+    }
+}
+
+/// 縦横の倍率の違う変形の細い線の破線は、要素の座標系の長さで区切る（Skia と同じ。`scale(2 0.5)` の `5 5` は横の線で
+/// 10 画素、縦の線で 2.5 画素。単位 1 の 11 回目・単位 2 の 9 回目のレビュー）。
+#[test]
+fn thin_dashes_follow_element_lengths_under_anisotropic_scales() {
+    let mut b = Builder::new();
+    let d = b.dashes(&[5.0, 5.0]);
+    b.add(
+        |w| {
+            w.move_to(Point::new(5.0, 51.0)).unwrap();
+            w.line_to(Point::new(95.0, 51.0)).unwrap();
+            w.move_to(Point::new(50.25, 5.0)).unwrap();
+            w.line_to(Point::new(50.25, 95.0)).unwrap();
+        },
+        |n| {
+            n.flags = HAS_STROKE;
+            n.stroke = RED;
+            n.stroke_width = 0.4;
+            n.dashes = d;
+            n.transform = Transform { a: 2.0, b: 0.0, c: 0.0, d: 0.5, e: 0.0, f: 0.0 };
+        },
+    );
+    let t = b.tree(200.0, 50.0);
+    let (w, _, px) = render_full(&t, 1.0).unwrap();
+    let a = |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+    // 横の線（行 25）：x 10〜20 は線、20〜30 は隙間、30〜40 は線
+    assert!(a(17, 25) > 0 && a(12, 25) > 0, "横の破線の 1 つ目");
+    assert_eq!(a(25, 25), 0, "横の破線の隙間");
+    assert!(a(35, 25) > 0, "横の破線の 2 つ目");
+    // 縦の線（列 100）：y 2.5〜5 は線、5〜7.5 は隙間、7.5〜10 は線
+    assert!(a(100, 3) > 0, "縦の破線の 1 つ目");
+    assert_eq!(a(100, 5) + a(100, 6), 0, "縦の破線の隙間");
+    assert!(a(100, 8) > 0, "縦の破線の 2 つ目");
+    draws_regions(&t, 1.0);
+}
+
+/// レビューのファズが見つけた見積もりの下回り（ファズの render の対象の入力：頭の 4 バイトが倍率と範囲）。巨大でほぼ水平な
+/// 線分の帯の数え漏れ（単位 1 の 11 回目）と、項の打ち消し合う変形の外接矩形（単位 2 の 9 回目）。変異の親にすると多くが
+/// 上限で断られるので、種でなくここで確かめる。
+#[test]
+fn review_fuzz_inputs_stay_within_the_estimates() {
+    let inputs: [(&str, &[u8]); 5] = [
+        ("huge-flat-segment", include_bytes!("regress/huge-flat-segment")),
+        ("huge-flat-segment-2", include_bytes!("regress/huge-flat-segment-2")),
+        ("huge-flat-segment-3", include_bytes!("regress/huge-flat-segment-3")),
+        ("huge-flat-polyline", include_bytes!("regress/huge-flat-polyline")),
+        ("cancelling-transform-box", include_bytes!("regress/cancelling-transform-box")),
+    ];
+    for (name, data) in inputs {
+        let out = crate::fuzzing::render_ops(data);
+        assert_eq!(out.check, crate::fuzzing::Check::Ok, "{name}");
+    }
+}

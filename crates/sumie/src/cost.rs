@@ -37,10 +37,11 @@ pub(crate) const CURVE_SIDE: u64 = 32;
 /// 見積もり（`Tree::estimate`）が区間 1 つを数える手間：決まった分（描く座標系の長さ・行の帯と見る箱の切り取り）・線のとき
 /// の分（曲がる角の `atan2`・線を作る座標系の長さ）・曲線の分（分ける数・厳密な外接矩形・制御多角形の長さ）。前は区間ごとに
 /// 4 単位だけで、時間が手間の 15〜80 倍だった（単位 2 の 4 回目のレビュー。ADR-101）。見る箱をまたぐ線分ばかりの塗りで
-/// 2.1 ns／単位だったので、区間の決まった分を 32 → 40 にした（単位 2 の 5 回目のレビュー）。
-pub(crate) const COUNT_SEGMENT: u64 = 40;
+/// 2.1 ns／単位だったので、区間の決まった分を 32 → 40 にした（単位 2 の 5 回目のレビュー）。区間の外接矩形を要素と描く座標系で
+/// 求める分（単位 2 の 9 回目のレビュー）を足して、決まった分を 64、曲線の分を 224 にした。
+pub(crate) const COUNT_SEGMENT: u64 = 64;
 pub(crate) const COUNT_STROKE: u64 = 32;
-pub(crate) const COUNT_CURVE: u64 = 160;
+pub(crate) const COUNT_CURVE: u64 = 224;
 /// 計画で辺を 1 本作る手間（描く座標系に写した線分を確かめ、箱で切り、固定小数にする。M2 の仮の校正。ADR-98）。
 pub(crate) const PLAN_EDGE: u64 = 16;
 /// 線の外形・破線の点を 1 つ作る手間。
@@ -49,6 +50,18 @@ pub(crate) const OUTLINE_POINT: u64 = 8;
 pub(crate) const RASTER_ROW: u64 = 8;
 pub(crate) const RASTER_EDGE_ROW: u64 = 8;
 pub(crate) const RASTER_CELL: u64 = 4;
+/// 被覆の同じ画素の並び（span）1 つを渡す決まった手間（閉包の呼び・被覆から α・合成の頭）。横長の辺が行の全幅にかかる形で
+/// span が 1 画素ずつになり、2.1〜2.4 ns／単位だった（単位 2 の 9 回目のレビュー）。
+pub(crate) const RASTER_SPAN: u64 = 3;
+
+/// 描く段の span を渡す手間の上限（`cells` セル・`rows` 行・幅 `width` の項目）：1 行の span は触れたセルの 2 倍 ＋ 1 以下
+/// （被覆が変わるのは触れたセルとその右の列だけ）で、幅 ＋ 1 以下。範囲の見積もりと描く見積もりの式。
+pub(crate) const fn raster_spans(cells: u64, rows: u64, width: u64) -> u64 {
+    let by_cells = cells.saturating_mul(2).saturating_add(rows);
+    let by_width = rows.saturating_mul(width.saturating_add(1));
+    let n = if by_cells < by_width { by_cells } else { by_width };
+    n.saturating_mul(RASTER_SPAN)
+}
 pub(crate) const RASTER_SWEEP: u64 = 1;
 /// 描く段の、辺 1 本を行にかける手間（かかる辺の並びに足す（push：決まった分と 4 バイトの写し）・最後に終わったと見る）と、
 /// 辺 1 本の 1 行の手間（セルを積む・終わったかを見る）。範囲の見積もりと描く段の払いの式。

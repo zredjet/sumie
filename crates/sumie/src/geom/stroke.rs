@@ -201,15 +201,23 @@ pub(crate) struct Pen {
 }
 
 impl Pen {
+    /// 円弧を分ける数の下限（1 ラジアンあたり）：半径が 0.5 画素以上なら π/8 ごとに 1 つ（一周 16）、小さければ 0（半径が
+    /// 画素ほどの丸い点と端が 5〜6 角形になり、面積が 17〜24% 欠けた。単位 1 の 11 回目のレビュー）。見積もりの継ぎ目の点の
+    /// 式も使う。
+    pub(crate) fn pieces_per_radian(&self) -> f64 {
+        if self.half * self.scale >= 0.5 { ROUND_PIECES_PER_RADIAN } else { 0.0 }
+    }
+
     /// 向き `d`（単位の長さ）の区間の、垂直の太さの半分（細い線は主軸の方向に `half`：`half × max(|dx|, |dy|)`）。
     fn half_for(&self, d: Point) -> f64 {
         if self.major { self.half * math::max(d.x.abs(), d.y.abs()) } else { self.half }
     }
 
-    /// 角 `angle`（ラジアン）の円弧を分ける数（1 以上）。平坦化の弧と同じ式（`⌈|θ| √(r / (8 tol))⌉`）。
+    /// 角 `angle`（ラジアン）の円弧を分ける数（1 以上）。平坦化の弧と同じ式（`⌈|θ| √(r / (8 tol))⌉`）と、半径が 0.5 画素
+    /// 以上なら π/8 ごとに 1 つの下限（[`Pen::pieces_per_radian`]）の大きい方。
     pub(crate) fn round_pieces(&self, angle: f64) -> u64 {
         let r = self.half * self.scale;
-        let x = angle.abs() * (r / (8.0 * self.tol)).sqrt();
+        let x = math::max(angle.abs() * (r / (8.0 * self.tol)).sqrt(), angle.abs() * self.pieces_per_radian());
         if x.is_nan() || x >= 1.8e19 {
             return u64::MAX;
         }
@@ -217,6 +225,9 @@ impl Pen {
         if n < 1.0 { 1 } else { n as u64 }
     }
 }
+
+/// 円弧を分ける数の下限（1 ラジアンあたり。π/8 ごとに 1 つ：一周 16）。
+const ROUND_PIECES_PER_RADIAN: f64 = 8.0 / core::f64::consts::PI;
 
 /// 外形の輪を受け取る口。
 pub(crate) trait LoopSink {
@@ -708,6 +719,9 @@ pub(crate) struct Dashes<'a> {
     start_left: f64,
     /// 線の部分の和が正か（境の足し算が進まないとき、残りを線にするか。作るときに 1 度だけ求める）
     on_positive: bool,
+    /// 区間の長さを測る線形の写し `[m0 m1; m2 m3]`（描く座標系の細い線の破線を要素の座標系の長さで区切る。None なら区間の
+    /// 長さそのもの。単位 1 の 11 回目・単位 2 の 9 回目のレビュー）
+    metric: Option<[f64; 4]>,
 }
 
 impl<'a> Dashes<'a> {
@@ -751,8 +765,20 @@ impl<'a> Dashes<'a> {
                 break;
             }
         }
-        Ok(Some(Dashes { dashes, total, phase, start: idx, start_left: left, on_positive }))
+        Ok(Some(Dashes { dashes, total, phase, start: idx, start_left: left, on_positive, metric: None }))
     }
+
+    /// 区間の長さを線形の写し `m` で測る（[`Dashes::metric`]）。
+    pub(crate) fn with_metric(self, m: Option<[f64; 4]>) -> Dashes<'a> {
+        Dashes { metric: m, ..self }
+    }
+}
+
+/// 区間の長さを線形の写し `m` で測る（差を半分にしてから写し、[`seg_len`] と同じくあふれを避ける）。
+fn metric_len(m: [f64; 4], a: Point, b: Point) -> f64 {
+    let (hx, hy) = (b.x / 2.0 - a.x / 2.0, b.y / 2.0 - a.y / 2.0);
+    let [m0, m1, m2, m3] = m;
+    seg_len(Point::new(0.0, 0.0), Point::new(2.0 * (m0 * hx + m1 * hy), 2.0 * (m2 * hx + m3 * hy)))
 }
 
 /// 破線の部分を受け取る口（部分の折れ線と、閉じた線として描くか）。
@@ -870,7 +896,10 @@ pub(crate) fn dash_polyline(
     for k in 0..count {
         budget.spend(cost::OP_STEP)?;
         let (Some(&a), Some(&b)) = (pts.get(k), pts.get(ring_next(k, pts.len()))) else { continue };
-        let seg = seg_len(a, b);
+        let seg = match dashes.metric {
+            Some(m) => metric_len(m, a, b),
+            None => seg_len(a, b),
+        };
         if !seg.is_finite() {
             break;
         }

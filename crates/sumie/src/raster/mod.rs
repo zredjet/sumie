@@ -921,6 +921,7 @@ pub(crate) fn fill_region(
                     run_len = run_len.saturating_add(1);
                 } else {
                     if run_len > 0 && run_cov != 0 {
+                        budget.spend(cost::RASTER_SPAN)?;
                         span(run_start, row, run_len, run_cov)?;
                     }
                     run_start = col;
@@ -938,6 +939,7 @@ pub(crate) fn fill_region(
                     run_len = run_len.saturating_add(len);
                 } else {
                     if run_len > 0 && run_cov != 0 {
+                        budget.spend(cost::RASTER_SPAN)?;
                         span(run_start, row, run_len, run_cov)?;
                     }
                     run_start = tail_from;
@@ -946,6 +948,7 @@ pub(crate) fn fill_region(
                 }
             }
             if run_len > 0 && run_cov != 0 {
+                budget.spend(cost::RASTER_SPAN)?;
                 span(run_start, row, run_len, run_cov)?;
             }
         }
