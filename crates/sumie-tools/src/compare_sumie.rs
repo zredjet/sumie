@@ -68,6 +68,8 @@ struct Outcome {
     sc: Option<Metrics>,
     rc: Option<Metrics>,
     scale: u32,
+    /// 描いた入力の BLAKE3（この出力を次の回の `--cache` に使えるように）
+    input: String,
 }
 
 /// 基準（図形と単色。ADR-56 (1)・ADR-61）。
@@ -273,6 +275,7 @@ fn one(
         }
     };
     let digest = blake3::hash(&svg).to_hex().to_string();
+    o.input = digest.clone();
     let cached = cache.get(&item.path).and_then(|v| v.iter().find(|c| c.scale == u64::from(k) && c.input == digest));
     let from_cache = |suffix: &str| -> Option<Rgba> {
         let c = cached?;
@@ -332,7 +335,11 @@ fn metrics_line(l: Line, key: &str, m: &Option<Metrics>) -> Line {
 fn write_outputs(out_dir: &Path, results: &[Outcome], chrome: &str) -> Result<(), String> {
     let mut jsonl = String::new();
     for o in results {
-        let mut l = Line::new().int("id", o.id as u64).str("path", o.path.as_str()).int("scale", o.scale);
+        let mut l = Line::new()
+            .int("id", o.id as u64)
+            .str("path", o.path.as_str())
+            .int("scale", o.scale)
+            .str("input", o.input.as_str());
         if let Some(m) = &o.sr {
             l = l.int("w", m.w).int("h", m.h).int("n_all", m.n_all);
         }

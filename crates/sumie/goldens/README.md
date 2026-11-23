@@ -43,6 +43,9 @@ determinism.md §10。入力と画素のダイジェストを版つきで凍結�
 | `report` | 警告（`w 種類 位置` を位置の順）と読まなかった参照（`u 中身の 16 進 位置`）の行の数と、行をつないだものの BLAKE3 |
 | `needs` | 要るもの（文字・ラスターの画像・SVG の画像を `0`・`1` で） |
 | `size` | `Document::size`（Rust の `{}` の字句で `幅 高さ`）か、中身で決まるなら `content` |
+| `tree` | `build` の結果：`ok 幅 高さ`（`Tree::size`）か `err 誤り`（NotYet は木を作る段で決まる。読めなければ `-`） |
+| `render` | 倍率 1・既定の上限の `Tree::estimate`：`ok 計画の手間 山 持ち続ける量 描く手間 一時の量` か `err 誤り`（木がなければ `-`） |
+| `region` | 計画の左上の 64 × 64（キャンバスの内）の `Plan::estimate_region`：`ok 手間 山 0` か `err 誤り`（計画がなければ `-`） |
 
 入れる入力は `tests/svg/` のすべてと、`corpus/` のうち BLAKE3 の頭の 16 進が 0・1・2 のもの（3/16）。全ターゲット
 （debug・release・`target-cpu=native`・x86_64）で `cargo test -p sumie --test golden` が照らす。見積もりの式・警告・誤りの

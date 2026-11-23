@@ -350,7 +350,8 @@ fn canonical_lexemes() {
 // ---- D2 のゴールデン（goldens/estimate.jsonl。ADR-63 (4)・goldens/README.md） ----
 
 /// estimate.jsonl の行の鍵（この順。値はすべて文字列）。
-const ESTIMATE_KEYS: &[&str] = &["name", "input", "parse", "build", "report", "needs", "size"];
+const ESTIMATE_KEYS: &[&str] =
+    &["name", "input", "parse", "build", "report", "needs", "size", "tree", "render", "region"];
 
 /// 見積もりの結果の字句（`ok 手間 山 持ち続ける量` か `err 誤り`）。
 fn estimate_text(r: Result<sumie::Estimate, sumie::Error>) -> String {
@@ -366,8 +367,33 @@ fn estimate_text(r: Result<sumie::Estimate, sumie::Error>) -> String {
 fn estimate_line(name: &str, data: &[u8]) -> Line {
     let opts = sumie::ParseOptions::DEFAULT;
     let parse = estimate_text(sumie::estimate_parse(data, &opts, &sumie::Never));
+    let (mut tree, mut render, mut region) = ("-".to_string(), "-".to_string(), "-".to_string());
     let (build, report, needs, size) = match sumie::parse(data, &opts, &sumie::Never) {
         Ok(d) => {
+            // M2 の段：木を作る段の断り（NotYet は build で決まる）・倍率 1 の Tree::estimate・左上の 64 × 64 の範囲の見積もり
+            // （単位 4 の 2 回目のレビュー）
+            match d.build(&sumie::Never) {
+                Ok(t) => {
+                    tree = format!("ok {} {}", t.size().width, t.size().height);
+                    let ropts = sumie::RenderOptions::DEFAULT;
+                    match t.estimate(&ropts, &sumie::Never) {
+                        Ok(e) => {
+                            render = format!(
+                                "ok {} {} {} {} {}",
+                                e.plan.work, e.plan.peak_bytes, e.plan.result_bytes, e.render.work, e.render.peak_bytes
+                            );
+                            if let Ok(plan) = t.plan(&ropts, &sumie::Never) {
+                                let px = plan.pixel_size();
+                                let rect =
+                                    sumie::PixelRect { x: 0, y: 0, width: px.width.min(64), height: px.height.min(64) };
+                                region = estimate_text(plan.estimate_region(rect, &sumie::Never));
+                            }
+                        }
+                        Err(e) => render = format!("err {e:?}"),
+                    }
+                }
+                Err(e) => tree = format!("err {e:?}"),
+            }
             let mut text = String::new();
             let mut n = 0usize;
             for w in d.report().warnings() {
@@ -401,6 +427,9 @@ fn estimate_line(name: &str, data: &[u8]) -> Line {
         .str("report", report)
         .str("needs", needs)
         .str("size", size)
+        .str("tree", tree)
+        .str("render", render)
+        .str("region", region)
 }
 
 /// estimate.jsonl に入れる入力：`tests/svg/` のすべてと、`corpus/` のうち BLAKE3 の頭の 16 進が 0・1・2 のもの（3/16。
