@@ -53,7 +53,6 @@ const LATER: &[&str] = &[
 /// 既知の差（道と、方式の差の理由を書いた ADR）：resvg と Chrome は近いのに sumie が両方から外れるが、方式の差として認めた
 /// もの（ADR-101）。ここにない不具合の候補が 1 つでもあれば M2 の合否は不合格。
 const KNOWN: &[(&str, &str)] = &[
-    ("real/flag-icons/flags/4x3/af.svg", THIN),
     ("real/flag-icons/flags/4x3/bt.svg", THIN),
     ("real/flag-icons/flags/4x3/eac.svg", THIN),
     ("real/flag-icons/flags/4x3/ec.svg", THIN),

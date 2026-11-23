@@ -227,24 +227,79 @@ fn seg_len(a: Point, b: Point) -> f64 {
 /// でなければ None（接線が続くつなぎ目でも、端の区間が直線なら直線の向き）。
 fn curve_end_dir(line: Poly<'_>, at_start: bool) -> Option<Point> {
     let n = line.pts.len();
-    if n < 3 {
-        return None;
-    }
-    let (a, b, c, inner) = if at_start {
-        (line.pts.first()?, line.pts.get(1)?, line.pts.get(2)?, 1)
+    if at_start {
+        curve_side(line, 0, true, false)
     } else {
-        let at = |k: usize| n.checked_sub(k);
-        (line.pts.get(at(1)?)?, line.pts.get(at(2)?)?, line.pts.get(at(3)?)?, at(2)?)
+        // 終わりの向きは終わりの点へ向かう向き
+        curve_side(line, n.checked_sub(1)?, false, false).map(neg)
+    }
+}
+
+/// 点 `i` から曲線にそって出ていく向き（`ahead` なら次の点の側へ、でなければ前の点の側へ向かう向き）。隣の点が曲線の内側の
+/// 点（[`INTERIOR`]）で、その先の点もあるときだけ、2 本の弦（どちらも同じ曲線のもの）から外挿する（1.5 d0 − 0.5 d1。
+/// ADR-101 (7)(c)）。隣の点が角かつなぎ目なら、その側の区間は直線（か 1 本の弦の曲線）なので None。
+fn curve_side(line: Poly<'_>, i: usize, ahead: bool, closed: bool) -> Option<Point> {
+    let n = line.pts.len();
+    let step = |k: usize| -> Option<usize> {
+        match (ahead, closed) {
+            (true, true) => Some(ring_next(k, n)),
+            (false, true) => Some(ring_prev(k, n)),
+            (true, false) => k.checked_add(1).filter(|&j| j < n),
+            (false, false) => k.checked_sub(1),
+        }
     };
-    // 2 本の弦が同じ曲線のものだけ（接線が続くつなぎ目の向こうは直線か別の曲線。端の区間が直線なら、その向きのまま）
-    if line.flag_at(inner) != INTERIOR {
+    let j = step(i)?;
+    if j == i || line.flag_at(j) != INTERIOR {
         return None;
     }
+    let k = step(j)?;
+    if k == i || k == j {
+        return None;
+    }
+    let (a, b, c) = (line.pts.get(i)?, line.pts.get(j)?, line.pts.get(k)?);
     let (d0, d1) = (direction(*a, *b)?, direction(*b, *c)?);
-    let e = Point::new(1.5 * d0.x - 0.5 * d1.x, 1.5 * d0.y - 0.5 * d1.y);
-    let d = direction(Point::new(0.0, 0.0), e)?;
-    // 終わりの向きは終わりの点へ向かう向き
-    Some(if at_start { d } else { Point::new(-d.x, -d.y) })
+    direction(Point::new(0.0, 0.0), Point::new(1.5 * d0.x - 0.5 * d1.x, 1.5 * d0.y - 0.5 * d1.y))
+}
+
+/// 角の点 `i` の、曲線の側の向き（入る向き・出る向き。`forward` でなければ後ろへ回る向きで）。角でなければ両方 None。
+/// 曲線の側を求めるたびに `cost::CURVE_SIDE` を払う（見積もりは曲線ごとに 8 回まで）。
+fn corner_tangents(
+    line: Poly<'_>,
+    i: usize,
+    closed: bool,
+    forward: bool,
+    budget: &Budget<'_>,
+) -> Result<(Option<Point>, Option<Point>), Error> {
+    if line.flag_at(i) != CORNER {
+        return Ok((None, None));
+    }
+    let side = |ahead: bool| -> Result<Option<Point>, Error> {
+        let n = line.pts.len();
+        let j = if ahead { ring_next(i, n) } else { ring_prev(i, n) };
+        if line.flag_at(j) != INTERIOR {
+            return Ok(None);
+        }
+        budget.spend(cost::CURVE_SIDE)?;
+        Ok(curve_side(line, i, ahead, closed))
+    };
+    let (ahead, behind) = (side(true)?, side(false)?);
+    Ok(if forward { (behind.map(neg), ahead) } else { (ahead.map(neg), behind) })
+}
+
+/// 接線が続くつなぎ目（[`JOINT`]）の点 `i` の向き：片側が直線ならその向き、両側が曲線なら両側の外挿の平均（ADR-101 (7)(d)）。
+fn joint_dir(line: Poly<'_>, i: usize, closed: bool) -> Option<Point> {
+    let n = line.pts.len();
+    let (prev, next) = (ring_prev(i, n), ring_next(i, n));
+    match (curve_side(line, i, false, closed), curve_side(line, i, true, closed)) {
+        (None, _) => direction(*line.pts.get(prev)?, *line.pts.get(i)?),
+        (_, None) => direction(*line.pts.get(i)?, *line.pts.get(next)?),
+        (Some(a), Some(b)) => direction(Point::new(0.0, 0.0), Point::new(b.x - a.x, b.y - a.y)),
+    }
+}
+
+/// 逆の向き。
+fn neg(d: Point) -> Point {
+    Point::new(-d.x, -d.y)
 }
 
 /// 左の法線（向き `d` を 90° 回したもの。y が下向きの座標で画面の右回り）。
@@ -340,7 +395,7 @@ pub(crate) fn stroke_polyline(
         return Ok(());
     }
     dedup(line, scratch, budget)?;
-    // 閉じた折れ線の終わりが始めと同じなら 1 つにする（始めの点は角）
+    // 閉じた折れ線の終わりが始めと同じなら 1 つにする（始めの点の印は残す）
     if closed && scratch.len() > 1 && scratch.pts.last() == scratch.pts.as_slice().first() {
         let n = scratch.len().saturating_sub(1);
         scratch.truncate(n);
@@ -365,7 +420,8 @@ pub(crate) fn stroke_polyline(
                 let (back, ahead) = (ring_prev(i, n), ring_next(i, n));
                 let (a, b) = if forward { (back, ahead) } else { (ahead, back) };
                 let (Some(&p), Some(&a), Some(&b)) = (v.get(i), v.get(a), v.get(b)) else { continue };
-                vertex(&mut e, pen, a, p, b, forward, view.smooth_at(i))?;
+                let tan = corner_tangents(view, i, true, forward, budget)?;
+                vertex(&mut e, pen, a, p, b, forward, view.smooth_at(i), tan)?;
             }
         }
         return Ok(());
@@ -387,7 +443,8 @@ pub(crate) fn stroke_polyline(
         let (Some(&a), Some(&p), Some(&b)) = (v.get(ring_prev(i, n)), v.get(i), v.get(ring_next(i, n))) else {
             continue;
         };
-        vertex(&mut e, pen, a, p, b, true, view.smooth_at(i))?;
+        let tan = corner_tangents(view, i, false, true, budget)?;
+        vertex(&mut e, pen, a, p, b, true, view.smooth_at(i), tan)?;
     }
     let dn = unit(view.end_dir)
         .or_else(|| curve_end_dir(view, false))
@@ -398,7 +455,8 @@ pub(crate) fn stroke_polyline(
         let (Some(&a), Some(&p), Some(&b)) = (v.get(ring_next(i, n)), v.get(i), v.get(ring_prev(i, n))) else {
             continue;
         };
-        vertex(&mut e, pen, a, p, b, false, view.smooth_at(i))?;
+        let tan = corner_tangents(view, i, false, false, budget)?;
+        vertex(&mut e, pen, a, p, b, false, view.smooth_at(i), tan)?;
     }
     cap(&mut e, pen, first, Point::new(-d0.x, -d0.y))?;
     Ok(())
@@ -417,6 +475,7 @@ fn ring_next(i: usize, n: usize) -> usize {
 /// 頂点 `p`（前の点 `a`・次の点 `b`）の左の縁の点：入る区間の終わりの縁・継ぎ目・出る区間の始めの縁。ちょうどの折り返し
 /// （外積 0・内積が負）は左右のどちらも外側に見えるので、前へ回る縁（`forward`）だけを外側にし、後ろへ回る縁は内側として
 /// 頂点を通す（継ぎ目を 2 度作らない。塗る所は同じ。単位 1 の 2 回目のレビュー）。
+#[allow(clippy::too_many_arguments, reason = "頂点の前後の点と、曲線の側の向きを分けて渡す")]
 fn vertex(
     e: &mut Emit<'_, '_>,
     pen: &Pen,
@@ -425,6 +484,7 @@ fn vertex(
     b: Point,
     forward: bool,
     smooth: bool,
+    tan: (Option<Point>, Option<Point>),
 ) -> Result<(), Error> {
     e.budget.spend(cost::OP_STEP)?;
     let (Some(d1), Some(d2)) = (direction(a, p), direction(p, b)) else { return Ok(()) };
@@ -463,24 +523,43 @@ fn vertex(
     // 滑らかな点の外側は、継ぎ目の形に依らず円弧（縁は曲線を写したもの。尖りに半径 h の丸が付く。resvg・Chrome と同じ。
     // ADR-101）
     let join = if smooth { Join::Round } else { pen.join };
+    // 曲線に接する角の外側の継ぎ目は、曲線の側を弦でなく外挿した向きで作る（miter の先・miterlimit の判定・bevel の向きを
+    // Chrome・resvg にそろえる。ADR-101 (7)(f)）。縁は弦の法線の点 → 向きの法線の点 → 継ぎ目 → 向きの法線の点 → 弦の法線の点と
+    // つなぐ（間は頂点から太さの半分の円の内なので線の中）。向きの曲がる側が弦と逆なら弦のまま
+    let (m1, m2, jc, jd) = match tan {
+        (t_in, t_out) if !smooth && (t_in.is_some() || t_out.is_some()) => {
+            let (t1, t2) = (t_in.unwrap_or(d1), t_out.unwrap_or(d2));
+            let tc = t1.x * t2.y - t1.y * t2.x;
+            if tc < 0.0 { (normal(t1), normal(t2), tc, t1.x * t2.x + t1.y * t2.y) } else { (n1, n2, cross, dot) }
+        }
+        _ => (n1, n2, cross, dot),
+    };
+    if m1 != n1 {
+        e.point(add(p, m1, pen.half))?;
+    }
     match join {
         Join::Bevel => {}
         Join::Round => {
             // 外側の円弧（曲がる角だけ。左の縁が外なので負の向き。折り返し（外積 0・内積が負）は半回り）
-            let turn = if cross == 0.0 { -core::f64::consts::PI } else { math::atan2(cross, dot) };
+            let turn = if jc == 0.0 { -core::f64::consts::PI } else { math::atan2(jc, jd) };
             // 頂点ごとに 1 つと、節の残りの分まで（丸めで乱れた折れ線でも見積もりの式を超えない。単位 1 の 4 回目のレビュー）
             let n = pen.round_pieces(turn).min(e.round_left.saturating_add(1));
             *e.round_left = e.round_left.saturating_sub(n.saturating_sub(1));
-            return e.arc_n(pen, p, n1, turn, n);
+            e.arc_n(pen, p, m1, turn, n)?;
+            // 円弧は向きの法線の点で終わる
+            return if m2 != n2 { e.point(start_out) } else { Ok(()) };
         }
         Join::Miter => {
             // 比の 2 乗の逆数 = (1 + cos φ) / 2 ≥ 1 / limit²
             let limit = pen.miter_limit;
-            if limit >= 1.0 && (1.0 + dot) * limit * limit >= 2.0 {
-                let k = pen.half / (1.0 + dot);
-                e.point(Point::new(p.x + (n1.x + n2.x) * k, p.y + (n1.y + n2.y) * k))?;
+            if limit >= 1.0 && (1.0 + jd) * limit * limit >= 2.0 {
+                let k = pen.half / (1.0 + jd);
+                e.point(Point::new(p.x + (m1.x + m2.x) * k, p.y + (m1.y + m2.y) * k))?;
             }
         }
+    }
+    if m2 != n2 {
+        e.point(add(p, m2, pen.half))?;
     }
     e.point(start_out)
 }
@@ -651,26 +730,33 @@ pub(crate) fn dash_polyline(
         let bisect = |a: Option<Point>, b: Point| {
             a.and_then(|a| direction(Point::new(0.0, 0.0), Point::new(a.x + b.x, a.y + b.y))).unwrap_or(b)
         };
+        // 頂点の向き：曲線の内側の点は前後の弦の二等分、つなぎ目は片側の直線か両側の外挿の平均、曲線に接する角は曲線の
+        // 側の外挿（ADR-101 (7)(d)）
         let ta = if k == 0 && !closed {
             unit(line.start_dir).or_else(|| curve_end_dir(line, true)).unwrap_or(dk)
-        } else if line.smooth_at(k) {
-            bisect(seg_dir(ring_prev(k, np)), dk)
         } else {
-            dk
+            match line.flag_at(k) {
+                INTERIOR => bisect(seg_dir(ring_prev(k, np)), dk),
+                JOINT => joint_dir(line, k, closed).unwrap_or(dk),
+                _ => curve_side(line, k, true, closed).unwrap_or(dk),
+            }
         };
         let kb = ring_next(k, np);
         let tb = if !closed && kb.saturating_add(1) >= np {
             unit(line.end_dir).or_else(|| curve_end_dir(line, false)).unwrap_or(dk)
-        } else if line.smooth_at(kb) {
-            seg_dir(kb).map_or(dk, |dn| bisect(Some(dk), dn))
         } else {
-            dk
+            match line.flag_at(kb) {
+                INTERIOR => seg_dir(kb).map_or(dk, |dn| bisect(Some(dk), dn)),
+                JOINT => joint_dir(line, kb, closed).unwrap_or(dk),
+                _ => curve_side(line, kb, false, closed).map_or(dk, neg),
+            }
         };
         Ok(unit(Some(Point::new(ta.x * (1.0 - u) + tb.x * u, ta.y * (1.0 - u) + tb.y * u))).or(Some(dk)))
     };
     if on {
         buf.push_flag(first, line.flag_at(0))?;
-        buf.start_dir = if closed { tangent(0, 0.0)? } else { line.start_dir };
+        // 開いた線の始めも、曲線で始まれば (c) の向き（最初の部分が最初の弦の中で終わっても。単位 1 の 6 回目のレビュー）
+        buf.start_dir = tangent(0, 0.0)?;
     }
     // 境の足し算が進まない（今の位置に比べて値が小さすぎる）ときは長さ 0 の部分と同じに切り替えて続け、並びを 1 周しても
     // 進まなければ、部分パスの残りを線の部分の和が正なら線、0 なら隙間として扱う（残りを捨てない。Skia は破線が多すぎると
@@ -789,7 +875,7 @@ pub(crate) fn dash_polyline(
         return Ok(());
     }
     if on && buf.len() > 1 {
-        buf.end_dir = if closed { tangent(np.saturating_sub(1), 1.0)? } else { line.end_dir };
+        buf.end_dir = if closed { tangent(np.saturating_sub(1), 1.0)? } else { tangent(np.saturating_sub(2), 1.0)? };
         if hold_head && !head.is_empty() {
             // 最後の部分（始めの点で終わる）に最初の部分をつなぐ（始めの点を 2 度入れない）
             buf.append_from(head.view(), 1, budget)?;

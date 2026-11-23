@@ -963,7 +963,13 @@ fn bound_node(
         let pieces_n = if dash_pieces > 0 { dash_vis.max(s) } else { s };
         // 外形の点：部分パス（か破線）ごとに輪 2 つと端 2 つと長さ 0 の円、頂点ごとに 6、round の継ぎ目の円弧
         let per_piece = 2u64.saturating_add(cap_pts.saturating_mul(2)).saturating_add(r2).saturating_add(16);
-        let out_pts = pieces_n.saturating_mul(per_piece).saturating_add(v.saturating_mul(6)).saturating_add(k_join);
+        // 曲線に接する角の外側は、向きの法線の点を 2 つ足す（曲線の端ごとに角 1 つ・2 つ。ADR-101 (7)(f)）
+        let curve_corner_pts = c.curves.saturating_mul(4);
+        let out_pts = pieces_n
+            .saturating_mul(per_piece)
+            .saturating_add(v.saturating_mul(6))
+            .saturating_add(k_join)
+            .saturating_add(curve_corner_pts);
         let e = out_pts.saturating_add(pieces_n.saturating_mul(2)).saturating_mul(split);
         // 外形の辺の長さの和（線を作る座標系。描く座標系へは σ を掛ける）：縁の 2 本と、頂点ごとの継ぎ目（外側は miter なら
         // 2r × miterlimit、ほかは 2r。内側で頂点を通す分 2r）、部分（か破線）ごとの端・長さ 0 の円・輪の継ぎ（2r × 12 で
@@ -979,10 +985,17 @@ fn bound_node(
             .saturating_mul(per_piece)
             .saturating_add(c.pts_band.saturating_mul(6))
             .saturating_add(k_join)
+            .saturating_add(curve_corner_pts)
             .min(out_pts);
         let e_band = out_band.saturating_add(pieces_n.saturating_mul(2)).saturating_mul(split);
+        // 曲線に接する角の、弦の法線の点と向きの法線の点の間の辺（角ごとに 2 本、長さ 2r まで）
+        let curve_corner_len = (c.curves as f64) * 8.0 * pen.half;
         let l_dev = sigma
-            * (2.0 * c.len_stroke_band + (c.pts_band as f64) * per_vertex + (pieces_n as f64) * piece_len + round_len);
+            * (2.0 * c.len_stroke_band
+                + (c.pts_band as f64) * per_vertex
+                + (pieces_n as f64) * piece_len
+                + round_len
+                + curve_corner_len);
         let (edge_rows, cells) = raster_bounds(l_dev, e_band, rows, width);
         // pathLength の長さを測る平坦化（計画と同じ条件：破線の並びがあり pathLength がある）
         let passes: u64 = if !dashes.is_empty() && n.path_length > 0.0 { 2 } else { 1 };
@@ -1016,6 +1029,8 @@ fn bound_node(
             .saturating_add(joins.saturating_mul(POINT_WORK.saturating_add(cost::OP_STEP)))
             .saturating_add(phase_steps.saturating_mul(cost::OP_STEP))
             .saturating_add(dash_tangents.saturating_mul(cost::DASH_TANGENT))
+            // 曲線に接する角の曲線の側の向き（角ごとに前へと後ろへの 2 回 × 両側。曲線の端ごとに 4 回）
+            .saturating_add(c.curves.saturating_mul(8).saturating_mul(cost::CURVE_SIDE))
             .saturating_add(cull.saturating_mul(cost::OP_STEP.saturating_mul(2)))
             .saturating_add(out_pts.saturating_mul(cost::OUTLINE_POINT.saturating_add(cost::OP_STEP)))
             .saturating_add(pieces_n.saturating_mul(2).saturating_mul(cost::OP_STEP))

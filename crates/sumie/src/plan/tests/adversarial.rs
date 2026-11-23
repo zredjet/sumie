@@ -686,3 +686,95 @@ fn line_after_curve_keeps_its_cap_direction() {
         }
     }
 }
+
+/// 試しの木：パスを 1 本書いて線を引く（`dashes` が空なら実線）。
+fn stroked(build: impl FnOnce(&mut PathWriter<'_, '_>), width: f64, join: u8, cap: u8, dashes: &[f64]) -> Tree {
+    let mut b = Builder::new();
+    let d = b.dashes(dashes);
+    b.add(build, |n| {
+        n.flags = HAS_STROKE;
+        n.stroke = GREEN;
+        n.stroke_width = width;
+        n.join = join;
+        n.cap = cap;
+        if !dashes.is_empty() {
+            n.dashes = d;
+        }
+    });
+    b.tree(200.0, 200.0)
+}
+
+/// 開いた線の最初の破線が最初の弦の中で終わっても、始めの端は曲線の向き（弦の向きでない）で作る（単位 1 の 6 回目の
+/// レビュー。円弧の始めの接線は真上なので、butt の端は y = 120 の横の縁）。
+#[test]
+fn first_dash_on_a_curve_starts_along_the_curve() {
+    let t = stroked(
+        |w| {
+            w.move_to(Point::new(40.0, 120.0)).unwrap();
+            w.arc_to(30.0, 30.0, 0.0, false, true, Point::new(100.0, 120.0)).unwrap();
+        },
+        40.0,
+        JOIN_MITER,
+        CAP_BUTT,
+        &[2.0, 1000.0],
+    );
+    let (w, _, px) = draw(&t, 1.0);
+    for x in 15..66u32 {
+        assert_eq!(px[((121 * w + x) * 4 + 3) as usize], 0, "x = {x}：始めの端が傾く");
+    }
+}
+
+/// 曲線に接する角の外側の継ぎ目は、曲線の側を接線の向きで作る（単位 1 の 6 回目のレビュー）。接線のなす角が miterlimit 4
+/// の境より鋭い角は bevel（弦の向きでは miter の尖りが出ていた）、境より鈍い角は miter（弦の向きでは bevel だった）。
+#[test]
+fn joins_beside_curves_use_the_curve_direction() {
+    let sharp = stroked(
+        |w| {
+            w.move_to(Point::new(20.0, 170.0)).unwrap();
+            w.quad_to(Point::new(80.65, 107.6), Point::new(100.0, 30.0)).unwrap();
+            w.quad_to(Point::new(119.35, 107.6), Point::new(180.0, 170.0)).unwrap();
+        },
+        20.0,
+        JOIN_MITER,
+        CAP_BUTT,
+        &[],
+    );
+    let (w, _, px) = draw(&sharp, 1.0);
+    assert_eq!(px[((18 * w + 100) * 4 + 3) as usize], 0, "鋭い角に miter の尖りが出る");
+    let blunt = stroked(
+        |w| {
+            w.move_to(Point::new(60.0, 190.0)).unwrap();
+            w.quad_to(Point::new(120.0, 120.0), Point::new(100.0, 50.0)).unwrap();
+            w.quad_to(Point::new(80.0, 120.0), Point::new(140.0, 190.0)).unwrap();
+        },
+        12.0,
+        JOIN_MITER,
+        CAP_BUTT,
+        &[],
+    );
+    let (w, _, px) = draw(&blunt, 1.0);
+    assert!(px[((35 * w + 100) * 4 + 3) as usize] > 200, "鈍い角に miter の先がない");
+}
+
+/// 破線の部分の端が、直線と曲線のつなぎ目のすぐ後ろの曲線の上にあるとき、端は曲線の向き（つなぎ目の弦の二等分でない）で
+/// 作る（単位 1 の 6 回目のレビュー）。円弧は真横の向きで始まり、1 進んだ所の端は 1.4° だけ傾いた縁（上の端で x ≈ 61.5、
+/// 下の端で x ≈ 60.5）。弦の二等分の向きでは傾きが 2 倍ほどになり、上の端が列 61 をほぼ埋め、下の端が列 60 に届かなかった。
+#[test]
+fn dash_ends_after_a_joint_follow_the_curve() {
+    let t = stroked(
+        |w| {
+            w.move_to(Point::new(20.0, 60.0)).unwrap();
+            w.line_to(Point::new(60.0, 60.0)).unwrap();
+            w.arc_to(40.0, 40.0, 0.0, false, true, Point::new(100.0, 100.0)).unwrap();
+        },
+        40.0,
+        JOIN_MITER,
+        CAP_BUTT,
+        &[41.0, 1000.0],
+    );
+    let (w, _, px) = draw(&t, 1.0);
+    let alpha = |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+    assert!(alpha(61, 42) < 180, "上の端が右へ傾きすぎる：{}", alpha(61, 42));
+    assert!(alpha(60, 78) > 64, "下の端が左へ傾きすぎる：{}", alpha(60, 78));
+    assert_eq!(alpha(62, 60), 0);
+}
