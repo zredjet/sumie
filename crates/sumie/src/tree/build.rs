@@ -176,11 +176,21 @@ pub(crate) fn build_tree(d: &Document<'_>, budget: &Budget<'_>) -> Result<Tree, 
         bbox: Rect::EMPTY,
         root: None,
     };
-    let mut root_drawn = false;
+    // 背景は、根が svg で display: none でなく条件で隠れていなければ塗る（viewBox の幅か高さが 0・変形が逆にできないなどで
+    // 中身を描かない根でも塗る。Chrome と同じ。ADR-101）
+    let mut paint_background = false;
     walk_with(d, WalkOptions { build: true }, budget, &mut |item| {
         if item.node == 0 {
             out.root = Some(item.computed);
-            root_drawn = item.rendered;
+            let hidden = d.refs.hidden.as_slice().first().copied().unwrap_or(0) != 0;
+            paint_background = d
+                .xml
+                .nodes
+                .as_slice()
+                .first()
+                .is_some_and(|n| n.ns == crate::xml::NS_SVG && n.local.of(d.input) == b"svg")
+                && item.computed.display_none == 0
+                && !hidden;
         }
         if !item.rendered {
             return Ok(());
@@ -194,7 +204,7 @@ pub(crate) fn build_tree(d: &Document<'_>, budget: &Budget<'_>) -> Result<Tree, 
         None => content_size(&bbox)?,
     };
     let root = root.unwrap_or(Computed::initial(d.font_size));
-    let background = if root_drawn { background_of(d, &root, budget)? } else { [0.0; 4] };
+    let background = if paint_background { background_of(d, &root, budget)? } else { [0.0; 4] };
     let report = d.report.copy_in(budget)?;
     Ok(Tree {
         size,
@@ -218,7 +228,14 @@ fn background_of(d: &Document<'_>, root: &Computed, budget: &Budget<'_>) -> Resu
     let bufs = Bufs { input: d.input, store: d.xml.store.as_slice(), sheet: d.sheet.text.as_slice() };
     for s in d.styles.of(0) {
         budget.spend(cost::OP_STEP)?;
-        if s.prop != id || s.wide != WIDE_NONE {
+        if s.prop != id {
+            continue;
+        }
+        // background のまとめのグラデーションの層はまだ描かない（Chrome は描く。黙って違う絵にしない。ADR-101）
+        if s.pad[0] != 0 {
+            return Err(Error::Unsupported(Unsupported { feature: Feature::NotYet(Later::Gradient), position: None }));
+        }
+        if s.wide != WIDE_NONE {
             continue;
         }
         let c = match Values::new(bufs.of(s.src), s.value, budget).color()? {
@@ -516,8 +533,10 @@ fn visit(
         return Ok(());
     }
     // 塗りと線（use の中身の context-fill・context-stroke は use の塗り）
-    let fill = paint(d, item, c.fill, true, budget)?;
-    let stroke = paint(d, item, c.stroke, false, budget)?;
+    // 塗らない line の塗りと、太さ 0 の線の塗りは解かない（グラデーションを指していても NotYet にしない。Chrome は描く。
+    // 単位 3 の 3 回目のレビュー）
+    let fill = if local == b"line" { Painted::None } else { paint(d, item, c.fill, true, budget)? };
+    let stroke = if c.stroke_width > 0.0 { paint(d, item, c.stroke, false, budget)? } else { Painted::None };
     let fill = match fill {
         // line は塗らない（面がない。resvg・Chrome と同じ。ADR-90 (3)）
         _ if local == b"line" => None,
@@ -642,13 +661,15 @@ enum Painted {
 /// 要素の塗り（use の中身の context-fill・context-stroke は use の塗りで。ほかの文脈の塗りは none）。
 fn paint(d: &Document<'_>, item: &WalkItem, p: CPaint, is_fill: bool, budget: &Budget<'_>) -> Result<Painted, Error> {
     let c = &item.computed;
-    let (p, color, node) = match (p.kind, item.context) {
-        (PAINT_CONTEXT_FILL, Some(x)) => (x.fill, x.fill_color, x.fill_node),
-        (PAINT_CONTEXT_STROKE, Some(x)) => (x.stroke, x.stroke_color, x.stroke_node),
+    // 文脈の塗りは、使う側の種類（use の fill か stroke か）で解く（輪で切った塗りの辺を正しく見る。単位 3 の 3 回目の
+    // レビュー）
+    let (p, color, node, side) = match (p.kind, item.context) {
+        (PAINT_CONTEXT_FILL, Some(x)) => (x.fill, x.fill_color, x.fill_node, true),
+        (PAINT_CONTEXT_STROKE, Some(x)) => (x.stroke, x.stroke_color, x.stroke_node, false),
         (PAINT_CONTEXT_FILL | PAINT_CONTEXT_STROKE, None) => return Ok(Painted::None),
-        _ => (p, c.color, item.node),
+        _ => (p, c.color, item.node, is_fill),
     };
-    Ok(match used_paint(d, node, &p, is_fill, color, budget)? {
+    Ok(match used_paint(d, node, &p, side, color, budget)? {
         Used::None | Used::ContextFill | Used::ContextStroke => Painted::None,
         Used::Color(col) => Painted::Color(col),
         Used::Server(t) => {

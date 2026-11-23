@@ -178,6 +178,18 @@ fn content_size() {
     assert_eq!((t.size().width, t.size().height), (30.0, 30.0));
     let t = build(&doc("<rect x=\"50%\" width=\"10\" height=\"10\"/>")).unwrap();
     assert_eq!((t.size().width, t.size().height), (60.0, 10.0));
+    // 大きさを中身で決める文書の根の変形の原点は (0, 0)（usvg と同じ大きさ。ADR-101）
+    let root = |attrs: &str, body: &str| format!("<svg xmlns=\"http://www.w3.org/2000/svg\" {attrs}>{body}</svg>");
+    let t = build(&root("transform=\"scale(2)\"", "<rect width=\"10\" height=\"10\"/>")).unwrap();
+    assert_eq!((t.size().width, t.size().height), (20.0, 20.0));
+    let t = build(&root("transform=\"scale(2)\"", "<rect width=\"80\" height=\"60\"/>")).unwrap();
+    assert_eq!((t.size().width, t.size().height), (160.0, 120.0));
+    // 線の太さと破線の % も 100 × 100 で解く（対角 / √2 = 100）
+    let a = alpha_at(&root(
+        "",
+        "<rect width=\"200\" height=\"100\" fill=\"none\"/><path d=\"M0 50 H100\" stroke=\"black\" stroke-width=\"10%\" stroke-dasharray=\"20% 20%\"/>",
+    ));
+    assert_eq!((a(10, 50), a(10, 56), a(30, 50)), (255, 0, 0));
 }
 
 #[test]
@@ -464,28 +476,72 @@ fn decl_sizes_match_the_estimate() {
 }
 
 /// 根の svg の `background` のまとめは、最後の層の色を `background-color` として描く（Chrome と同じ。画像は描かない。
-/// まとめの後ろの `background-color` が勝ち、色のないまとめは透明に戻す。ADR-99 (4)）。
+/// まとめの後ろの `background-color` が勝ち、色のないまとめは透明に戻す。ADR-99 (4)）。形は Chrome と同じに確かめ（ADR-101）、
+/// グラデーションの層は NotYet。根を描かない（viewBox の幅が 0 など）ときも背景は塗る（Chrome と同じ）。
 #[test]
 fn background_shorthand() {
-    let root = |style: &str| {
-        let a = alpha_at(&format!(
-            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\" style=\"{style}\"><rect width=\"1\" height=\"1\"/></svg>"
-        ));
-        a(5, 5)
+    use crate::plan::RenderOptions;
+    use crate::render::PixmapMut;
+    let pixel = |attrs: &str| -> Result<[u8; 4], Error> {
+        let t = build(&format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\" {attrs}><rect width=\"1\" height=\"1\"/></svg>"
+        ))?;
+        let plan = t.plan(&RenderOptions::DEFAULT, &Never).unwrap();
+        let mut px = vec![0u8; 10 * 10 * 4];
+        plan.render(&mut PixmapMut::new(&mut px, 10, 10, 40).unwrap(), &Never).unwrap();
+        let i = (5 * 10 + 5) * 4;
+        Ok([px[i], px[i + 1], px[i + 2], px[i + 3]])
     };
-    assert_eq!(root("background: lime"), 255);
-    assert_eq!(root("background: url(x.png) center / cover no-repeat #0000ff80"), 128);
-    assert_eq!(root("background: none"), 0);
+    let style = |v: &str| pixel(&format!("style=\"{v}\"")).unwrap();
+    const LIME: [u8; 4] = [0, 255, 0, 255];
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const NONE: [u8; 4] = [0, 0, 0, 0];
+    assert_eq!(style("background: lime"), LIME);
+    assert_eq!(style("background: url(x.png) center / cover no-repeat #0000ff80"), [0, 0, 128, 128]);
+    assert_eq!(style("background: none"), NONE);
+    assert_eq!(style("background: calc(50%) lime"), LIME);
     // 色は最後の層だけ（前の層の色は壊れた形で、宣言ごと無視する）
-    assert_eq!(root("background-color: lime; background: red, url(x.png)"), 255);
-    assert_eq!(root("background: url(a.png), lime"), 255);
+    assert_eq!(style("background-color: lime; background: red, url(x.png)"), LIME);
+    assert_eq!(style("background: url(a.png), lime"), LIME);
     // 後ろが勝つ
-    assert_eq!(root("background: lime; background-color: transparent"), 0);
-    assert_eq!(root("background-color: lime; background: url(x.png)"), 0);
-    // 壊れた形は無視する
-    assert_eq!(root("background-color: lime; background: lime red"), 255);
-    assert_eq!(root("background-color: lime; background: center /"), 255);
-    assert_eq!(root("background-color: lime; background: banana"), 255);
+    assert_eq!(style("background: lime; background-color: transparent"), NONE);
+    assert_eq!(style("background-color: lime; background: url(x.png)"), NONE);
+    // 壊れた形は無視する（Chrome と同じ。どれも前の lime が残る）
+    for bad in [
+        "lime red",
+        "center /",
+        "banana",
+        "left red top",
+        "left right red",
+        "1px 2px 3px red",
+        "10deg red",
+        "center red / cover",
+        "center / -5px red",
+        "repeat red no-repeat",
+    ] {
+        assert_eq!(style(&format!("background-color: lime; background: {bad}")), LIME, "{bad}");
+    }
+    // 正しい形
+    for good in ["left 10px top 5px red", "center / 10px auto red", "top left red", "repeat-x fixed padding-box red"] {
+        assert_eq!(style(&format!("background-color: lime; background: {good}")), RED, "{good}");
+    }
+    // グラデーションの層はまだ描かない
+    for g in [
+        "linear-gradient(red, red) lime",
+        "-webkit-linear-gradient(top, red, red) lime",
+        "url(a), radial-gradient(red, red)",
+    ] {
+        assert!(matches!(pixel(&format!("style=\"background: {g}\"")), Err(Error::Unsupported(_))), "{g}");
+    }
+    // 根を描かなくても背景は塗る
+    assert_eq!(pixel("viewBox=\"0 0 0 0\" style=\"background: red\"").unwrap(), RED);
+    assert_eq!(pixel("transform=\"scale(0)\" style=\"background: red\"").unwrap(), RED);
+    assert_eq!(pixel("style=\"display: none; background: red\"").unwrap(), NONE);
+    // 規則で書いても同じ（!important と後ろ勝ち）
+    assert_eq!(
+        pixel("class=\"k\"><style>.k { background: red !important } svg { background: lime }</style").unwrap(),
+        RED
+    );
 }
 
 /// 根の svg の background-color を描く（resvg・Chrome と同じ。ADR-97 (4)）。1 画素より細い線は 1 画素の線を太さの α で
@@ -500,4 +556,18 @@ fn background_and_hairlines() {
     // 1 画素の幅で、α は太さ（0.3 × 255 ≈ 77）
     assert!((70..=80).contains(&a(50, 50)), "{}", a(50, 50));
     assert_eq!(a(50, 49), 0);
+}
+
+/// `background` のまとめを規則で多くの要素に当てても、読む段の手間は要素の数 × 値の長さにならない（宣言ごとに 1 度だけ色の
+/// 範囲を求める。単位 3 の 3 回目のレビュー）。
+#[test]
+fn background_shorthand_is_checked_once_per_declaration() {
+    let work = |layers: usize, elements: usize| {
+        let value: String = (0..layers).map(|_| "url(a),").collect::<String>() + "red";
+        let doc = svg(&format!("<style>*{{background: {value}}}</style>{}", "<g/>".repeat(elements)));
+        crate::doc::estimate_parse(doc.as_bytes(), &ParseOptions::DEFAULT, &Never).unwrap().work
+    };
+    let (a, b) = (work(500, 500), work(1000, 1000));
+    // 値と要素をどちらも 2 倍にしても、手間はおよそ 2 倍（2 乗なら 4 倍）
+    assert!(b < a * 3, "{a} → {b}");
 }

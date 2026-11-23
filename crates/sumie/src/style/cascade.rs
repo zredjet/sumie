@@ -94,7 +94,7 @@ struct DeclInfo {
     prop: u16,
     wide: u8,
     ok: u8,
-    /// `font` のまとめの長い名前の範囲（`fonts` の番号。ほかは NONE）
+    /// `font` のまとめの長い名前の範囲・`background` のまとめの色の範囲（`fonts` の番号。ほかは NONE）
     font: u32,
 }
 
@@ -111,6 +111,20 @@ struct FontRec {
 impl Plain for FontRec {}
 
 impl FontRec {
+    /// `background` のまとめの最後の層の色の範囲（`spans[0]`。色があれば `present` の 1、グラデーションの層があれば 2。
+    /// ADR-99 (4)・ADR-101）。
+    fn background(b: crate::style::valid::Background) -> FontRec {
+        let mut r = FontRec::default();
+        if let Some(c) = b.color {
+            r.spans[0] = c;
+            r.present = 1;
+        }
+        if b.gradient {
+            r.present |= 2;
+        }
+        r
+    }
+
     fn of(p: &crate::style::valid::FontParts) -> FontRec {
         let parts = [p.style, p.variant, p.weight, p.stretch, p.size, p.line_height, p.family];
         let mut r = FontRec::default();
@@ -256,6 +270,7 @@ pub(crate) fn cascade(
     infos.resize_to(sheet.decls.len(), DeclInfo { prop: u16::MAX, wide: 0, ok: 0, font: NONE })?;
     let mut fonts: MVec<'_, FontRec> = MVec::new(budget);
     let font_id = lookup(b"font", false);
+    let background_id = lookup(b"background", false);
     for (ri, r) in sheet.rules.as_slice().iter().enumerate() {
         // 当たらない規則（条件が偽）の宣言は確かめない（警告も出さない）
         if active.get(ri).copied().unwrap_or(0) == 0 {
@@ -269,13 +284,22 @@ pub(crate) fn cascade(
             if info.prop != u16::MAX && info.ok == 0 {
                 warns.push(Warn { pos: r.pos, kind: WarningKind::InvalidValue, pad: 0 })?;
             }
-            // `font` のまとめは長い名前の範囲を 1 度だけ求める
+            // `font` のまとめは長い名前の範囲を、`background` のまとめは色の範囲を、宣言ごとに 1 度だけ求める（当たった要素
+            // ごとに求め直すと、要素の数 × 値の長さの手間になる。単位 3 の 3 回目のレビュー）
             if Some(info.prop) == font_id && info.ok != 0 && info.wide == WIDE_NONE {
                 let cx = Ctx { attr: false, unitless: false, viewport };
                 if let Some(p) = font_parts(text, d.value, cx, budget)? {
                     info.font = fonts.len() as u32;
                     fonts.push(FontRec::of(&p))?;
                 }
+            }
+            if Some(info.prop) == background_id
+                && info.ok != 0
+                && info.wide == WIDE_NONE
+                && let Some(c) = crate::style::valid::background_color(text, d.value, budget)?
+            {
+                info.font = fonts.len() as u32;
+                fonts.push(FontRec::background(c))?;
             }
             if let Some(x) = infos.get_mut(k as usize) {
                 *x = info;
@@ -387,6 +411,7 @@ struct Shorthands {
     font: Option<PropertyId>,
     font_longhands: [Option<PropertyId>; 11],
     markers: [Option<PropertyId>; 3],
+    background: Option<PropertyId>,
     background_color: Option<PropertyId>,
 }
 
@@ -396,6 +421,7 @@ impl Shorthands {
             font: lookup(b"font", false),
             font_longhands: FONT_LONGHANDS.map(|n| lookup(n, false)),
             markers: [b"marker-start".as_slice(), b"marker-mid", b"marker-end"].map(|n| lookup(n, false)),
+            background: lookup(b"background", false),
             background_color: lookup(b"background-color", false),
         }
     }
@@ -448,7 +474,7 @@ impl Out<'_, '_> {
             return self.offer_font(key, spec, font);
         }
         if name == b"background" {
-            return self.offer_background(key, spec);
+            return self.offer_background(key, spec, font);
         }
         // use・symbol・入れ子の svg の width・height は CSS のプロパティでない（木を作る段が属性として読む）
         if (name == b"width" || name == b"height")
@@ -490,23 +516,20 @@ impl Out<'_, '_> {
     }
 
     /// `background` を `background-color` に分ける（最後の層の色の範囲。色がなければ `initial`。全体の言葉はそのまま。
-    /// ほかの長い名前は描かないので置かない。ADR-99 (4)）。
-    fn offer_background(&mut self, key: Key, spec: Specified) -> Result<(), Error> {
+    /// ほかの長い名前は描かないので置かない。色の範囲は宣言ごとに 1 度だけ求めたもの（`rec`）。ADR-99 (4)）。
+    fn offer_background(&mut self, key: Key, spec: Specified, rec: Option<FontRec>) -> Result<(), Error> {
         let Some(id) = self.short.background_color else { return Ok(()) };
         if spec.wide != WIDE_NONE {
             return self.put(id, key, Specified { prop: id, ..spec });
         }
-        let buf = match spec.src {
-            SRC_STORE => self.doc.store.as_slice(),
-            SRC_SHEET => self.sheet.text.as_slice(),
-            _ => self.input,
-        };
-        let s = match crate::style::valid::background_color(buf, spec.value, self.budget)? {
-            Some(Some(range)) => Specified { prop: id, value: range, ..spec },
-            Some(None) => Specified { prop: id, value: Span::default(), wide: WIDE_INITIAL, ..spec },
+        // グラデーションの層は描かないので、印（pad[0]）を付けて木を作る段で NotYet にする（ADR-101）
+        let s = match rec {
+            Some(r) if r.present & 1 != 0 => Specified { prop: id, value: r.spans[0], ..spec },
+            Some(_) => Specified { prop: id, value: Span::default(), wide: WIDE_INITIAL, ..spec },
             None => return Ok(()),
         };
-        self.put(id, key, s)
+        let gradient = rec.is_some_and(|r| r.present & 2 != 0);
+        self.put(id, key, Specified { pad: [u8::from(gradient), 0, 0], ..s })
     }
 
     fn put(&mut self, prop: PropertyId, key: Key, spec: Specified) -> Result<(), Error> {
@@ -641,10 +664,12 @@ impl Out<'_, '_> {
                 wide: info.wide,
                 pad: [0; 3],
             };
-            // `style` 属性の `font` は、その宣言の長い名前の範囲をここで求める
+            // `style` 属性の `font` は長い名前の範囲を、`background` は色の範囲を、ここで（宣言ごとに 1 度）求める
             let font = if self.short.font == Some(info.prop) && info.wide == WIDE_NONE {
                 let cx = Ctx { attr: false, unitless: false, viewport: self.viewport };
                 font_parts(buf, d.value, cx, budget)?.map(|p| FontRec::of(&p))
+            } else if self.short.background == Some(info.prop) && info.wide == WIDE_NONE {
+                crate::style::valid::background_color(buf, d.value, budget)?.map(FontRec::background)
             } else {
                 None
             };

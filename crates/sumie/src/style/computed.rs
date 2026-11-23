@@ -374,6 +374,8 @@ pub(crate) struct PropIds {
     mask: Option<PropertyId>,
     blend: Option<PropertyId>,
     isolation: Option<PropertyId>,
+    /// 接頭辞つきの効果と `mask-image`（none でなければまだ描かない。ADR-101）
+    prefixed: [Option<PropertyId>; 5],
 }
 
 /// 幾何の欄のプロパティの名前（[`G_X`] などの順）。
@@ -412,6 +414,13 @@ impl PropIds {
             mask: lookup(b"mask", false),
             blend: lookup(b"mix-blend-mode", false),
             isolation: lookup(b"isolation", false),
+            prefixed: [
+                lookup(b"-webkit-clip-path", false),
+                lookup(b"-webkit-filter", false),
+                lookup(b"-webkit-mask", false),
+                lookup(b"-webkit-mask-image", false),
+                lookup(b"mask-image", false),
+            ],
         }
     }
 }
@@ -449,6 +458,7 @@ struct Picked {
     mask: Option<Specified>,
     blend: Option<Specified>,
     isolation: Option<Specified>,
+    prefixed: [Option<Specified>; 5],
 }
 
 fn pick(specs: &[Specified], ids: &PropIds, budget: &Budget<'_>) -> Result<Picked, Error> {
@@ -514,6 +524,11 @@ fn pick(specs: &[Specified], ids: &PropIds, budget: &Budget<'_>) -> Result<Picke
             &mut p.blend
         } else if id == ids.isolation {
             &mut p.isolation
+        } else if let Some(k) = ids.prefixed.iter().position(|g| id == *g) {
+            match p.prefixed.get_mut(k) {
+                Some(x) => x,
+                None => continue,
+            }
         } else if let Some(k) = ids.geo.iter().position(|g| id == *g) {
             match p.geo.get_mut(k) {
                 Some(x) => x,
@@ -1163,6 +1178,30 @@ fn effects(
             Some(true) => parent.fx & bit != 0,
             Some(false) => false,
             None => other(s, keep)?,
+        };
+        if on {
+            c.fx |= bit;
+        }
+    }
+    // 接頭辞つきの効果と mask-image：none でなければ（url でも。参照の辺を持たないので）まだ描かない
+    let none_only = |s: &Specified| -> Result<bool, Error> {
+        let buf = bufs.of(s.src);
+        let mut v = Values::new(buf, s.value, budget);
+        let t = v.next()?;
+        Ok(t.kind == Tk::Ident && ident_is(buf, t.inner, t.escaped, b"none") && v.at_end()?)
+    };
+    for (k, sp) in p.prefixed.iter().enumerate() {
+        let Some(s) = sp.as_ref() else { continue };
+        budget.spend(cost::OP_STEP)?;
+        let bit = match k {
+            0 => FX_CLIP,
+            1 => FX_FILTER,
+            _ => FX_MASK,
+        };
+        let on = match wide(s) {
+            Some(true) => parent.fx & bit != 0,
+            Some(false) => false,
+            None => !none_only(s)?,
         };
         if on {
             c.fx |= bit;

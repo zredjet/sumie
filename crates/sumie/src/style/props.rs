@@ -231,6 +231,12 @@ const POINTER_EVENTS: &[&[u8]] = &[
 
 /// 表（名前のバイトの順）。
 pub(crate) const PROPS: &[Prop] = &[
+    // Chrome が SVG の要素に効かせる接頭辞つきの効果（CSS のプロパティとしてだけ。まだ描かないので、none でなければ
+    // NotYet。ADR-101）
+    p(b"-webkit-clip-path", false, false, Kind::ClipPath),
+    p(b"-webkit-filter", false, false, Kind::Filter),
+    p(b"-webkit-mask", false, false, Kind::Raw),
+    p(b"-webkit-mask-image", false, false, Kind::Raw),
     p(b"alignment-baseline", false, true, Kind::Keywords(ALIGNMENT)),
     // 根の svg の背景（CSS のプロパティとしてだけ。属性は読まない。resvg・Chrome と同じく描く。ADR-97 (4)）。まとめは
     // カスケードで `background-color` に分ける（最後の層の色。画像は描かない。Chrome と同じ。ADR-99 (4)）
@@ -283,6 +289,7 @@ pub(crate) const PROPS: &[Prop] = &[
     p(b"marker-mid", true, true, Kind::UrlOrNone),
     p(b"marker-start", true, true, Kind::UrlOrNone),
     p(b"mask", false, true, Kind::UrlOrNone),
+    p(b"mask-image", false, false, Kind::Raw),
     p(b"mask-type", false, true, Kind::Keywords(MASK_TYPE)),
     p(b"mix-blend-mode", false, false, Kind::Keywords(BLEND)),
     p(b"opacity", false, true, Kind::Opacity),

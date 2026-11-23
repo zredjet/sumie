@@ -2,6 +2,7 @@
 //! 文脈（文字の大きさ・表示の領域）を使って読み直す。
 
 use crate::budget::Budget;
+use crate::cost;
 use crate::css::lex::{Kind as Tk, Lexer, ident_is};
 use crate::error::Error;
 use crate::style::props::Kind;
@@ -652,164 +653,321 @@ pub(crate) fn font_parts(s: &[u8], range: Span, cx: Ctx, budget: &Budget<'_>) ->
 #[cfg(test)]
 mod tests;
 
-/// 層の部分の数 `n[k]` を 1 つ足す（`max` を超えれば偽：壊れた形）。
-fn bump(n: &mut [u8; 7], k: usize, max: u8) -> bool {
-    match n.get_mut(k) {
-        Some(c) if *c < max => {
-            *c = c.saturating_add(1);
-            true
-        }
-        _ => false,
+/// `background` のまとめの読み（最後の層の色の範囲と、グラデーションの層があるか）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Background {
+    pub(crate) color: Option<Span>,
+    pub(crate) gradient: bool,
+}
+
+/// まとめの部分（字句 1 つか、関数なら対応する `)` まで）と、その頭の字句（範囲から読み直す）。
+#[derive(Debug, Clone, Copy)]
+struct Part {
+    t: crate::css::lex::Token,
+    span: Span,
+}
+
+impl Part {
+    fn of(s: &[u8], span: Span, budget: &Budget<'_>) -> Result<Part, Error> {
+        let mut v = Values::new(s, span, budget_ref(budget));
+        Ok(Part { t: v.peek()?, span })
     }
 }
 
-/// `background` のまとめ（CSS Backgrounds 3 §3.10）の形を確かめ、最後の層の色の範囲を返す（色がなければ `Some(None)`、
-/// 形が壊れていれば None）。層は `,` で分け、層ごとに 画像（`none`・`url()`・グラデーションなどの関数）1 つまで・位置（言葉と
-/// 長さか割合）4 つまで・`/` のあとの大きさ（`auto`・`cover`・`contain`・長さか割合）2 つまで・繰り返し 2 つまで・付き方 1 つ
-/// まで・箱 2 つまで。色は最後の層に 1 つまで（ADR-99 (4)）。
-pub(crate) fn background_color(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<Option<Option<Span>>, Error> {
+/// `background` のまとめ（CSS Backgrounds 3 §3.10）の形を確かめ、最後の層の色の範囲とグラデーションの層があるかを返す（形が
+/// 壊れていれば None）。層は `,` で分け、層ごとに 画像（`none`・`url()`・グラデーション・`image-set()` など）・位置（続いた
+/// `<bg-position>`）と、その直後の `/` と大きさ（負でない長さか割合か `auto` を 2 つまで、か `cover`・`contain`）・繰り返し
+/// （`repeat-x`・`repeat-y` か、続いた 2 つまでの言葉）・付き方・箱 2 つまでを、それぞれ 1 度まで。色は最後の層に 1 つまで
+/// （Chrome と同じ。ADR-99 (4)・ADR-101）。
+pub(crate) fn background_color(s: &[u8], range: Span, budget: &Budget<'_>) -> Result<Option<Background>, Error> {
     let budget = budget_ref(budget);
     let mut lex = Lexer::over(s, range, budget);
-    let mut color: Option<Span> = None;
-    // 層ごとの数：何かある・画像・位置・大きさ・繰り返し・付き方・箱・色、`/` のあと（大きさを待つ）
-    let mut n = [0u8; 7];
-    let (mut any, mut slash, mut layer_color) = (false, false, false);
-    loop {
-        let t = lex.next()?;
-        match t.kind {
-            Tk::Eof => break,
-            Tk::Whitespace => continue,
-            Tk::Comma => {
-                // 色は最後の層だけ。空の層と `/` で終わる層は壊れた形
-                if layer_color || !any || (slash && n[2] == 0) {
-                    return Ok(None);
+    let mut out = Background { color: None, gradient: false };
+    let mut layer: crate::mem::MVec<'_, Span> = crate::mem::MVec::new(budget);
+    let mut ended = false;
+    let mut last_layer = false;
+    while !ended {
+        // 層を 1 つ集める
+        layer.clear();
+        loop {
+            let t = lex.next()?;
+            match t.kind {
+                Tk::Eof => {
+                    ended = true;
+                    last_layer = true;
+                    break;
                 }
-                n = [0; 7];
-                any = false;
-                slash = false;
-                continue;
+                Tk::Comma => break,
+                Tk::Whitespace => continue,
+                Tk::BadString | Tk::BadUrl => return Ok(None),
+                _ => {}
             }
-            _ => {}
-        }
-        // 部分の範囲：字句 1 つか、関数なら対応する `)` まで（閉じなければ値の終わりまで）
-        let start = t.span.start;
-        let mut end = t.span.end;
-        if t.kind == Tk::Function {
-            let mut depth = 1u32;
-            loop {
-                let u = lex.next()?;
-                match u.kind {
-                    Tk::Eof => {
-                        end = range.end;
-                        break;
-                    }
-                    Tk::Function | Tk::LParen | Tk::LBracket | Tk::LBrace => depth = depth.saturating_add(1),
-                    Tk::RParen | Tk::RBracket | Tk::RBrace => {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            end = u.span.end;
+            let mut end = t.span.end;
+            if t.kind == Tk::Function {
+                let mut depth = 1u32;
+                loop {
+                    let u = lex.next()?;
+                    match u.kind {
+                        Tk::Eof => {
+                            end = range.end;
                             break;
                         }
+                        Tk::Function | Tk::LParen | Tk::LBracket | Tk::LBrace => depth = depth.saturating_add(1),
+                        Tk::RParen | Tk::RBracket | Tk::RBrace => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                end = u.span.end;
+                                break;
+                            }
+                        }
+                        Tk::BadString | Tk::BadUrl => return Ok(None),
+                        _ => {}
                     }
-                    Tk::BadString | Tk::BadUrl => return Ok(None),
-                    _ => {}
                 }
-            }
-        }
-        let part = Span { start, end };
-        any = true;
-        let is = |w: &[u8]| t.kind == Tk::Ident && ident_is(s, t.inner, t.escaped, w);
-        let fname = |w: &[u8]| t.kind == Tk::Function && ident_is(s, t.inner, t.escaped, w);
-        if slash {
-            // `/` のあとは大きさ（1 つか 2 つ。cover・contain は 1 つだけ）。大きさのあとはほかの部分に戻る
-            let keyword = is(b"cover") || is(b"contain");
-            let size = keyword
-                || is(b"auto")
-                || matches!(t.kind, Tk::Percentage | Tk::Dimension)
-                || (t.kind == Tk::Number && t.value == 0.0);
-            let first = n.get(2).copied().unwrap_or(0);
-            if size && first == 0 {
-                bump(&mut n, 2, 2);
-                if keyword {
-                    bump(&mut n, 2, 2);
-                }
-                continue;
-            }
-            if size && first == 1 {
-                bump(&mut n, 2, 2);
-                continue;
-            }
-            if first == 0 {
+            } else if matches!(t.kind, Tk::LParen | Tk::LBracket | Tk::LBrace) {
                 return Ok(None);
             }
-            slash = false;
+            layer.push(Span { start: t.span.start, end })?;
         }
-        if t.kind == Tk::Delim && t.is_delim(b'/') {
-            // 位置のあとだけ。大きさを待つ
-            if n.get(1).copied().unwrap_or(0) == 0 || n.get(2).copied().unwrap_or(0) != 0 {
-                return Ok(None);
+        match layer_of(s, layer.as_slice(), last_layer, budget)? {
+            Some((color, gradient)) => {
+                if last_layer {
+                    out.color = color;
+                }
+                out.gradient |= gradient;
             }
-            slash = true;
-            continue;
+            None => return Ok(None),
         }
-        let ok = if matches!(t.kind, Tk::Hash | Tk::Ident | Tk::Function) && {
-            let mut v = Values::new(s, part, budget);
+    }
+    Ok(Some(out))
+}
+
+/// 1 つの層を確かめる（色の範囲とグラデーションか。壊れていれば None）。部分は範囲で受け、頭の字句をその都度読み直す。
+fn layer_of(s: &[u8], spans: &[Span], last: bool, budget: &Budget<'_>) -> Result<Option<(Option<Span>, bool)>, Error> {
+    let budget = budget_ref(budget);
+    if spans.is_empty() {
+        return Ok(None);
+    }
+    let part = |i: usize| -> Result<Option<Part>, Error> {
+        match spans.get(i) {
+            Some(&sp) => Ok(Some(Part::of(s, sp, budget)?)),
+            None => Ok(None),
+        }
+    };
+    let is = |p: &Part, w: &[u8]| p.t.kind == Tk::Ident && ident_is(s, p.t.inner, p.t.escaped, w);
+    let fname = |p: &Part, w: &[u8]| p.t.kind == Tk::Function && ident_is(s, p.t.inner, p.t.escaped, w);
+    // 長さか割合（負でもよい：位置）か calc()
+    let lp = |p: &Part| -> Result<bool, Error> {
+        if fname(p, b"calc") {
+            return Ok(true);
+        }
+        match p.t.kind {
+            Tk::Percentage => Ok(true),
+            Tk::Number => Ok(p.t.value == 0.0),
+            Tk::Dimension => {
+                let mut v = Values::new(s, p.span, budget);
+                Ok(v.length(false)?.is_some() && v.at_end()?)
+            }
+            _ => Ok(false),
+        }
+    };
+    let h = |p: &Part| is(p, b"left") || is(p, b"right");
+    let vt = |p: &Part| is(p, b"top") || is(p, b"bottom");
+    let c = |p: &Part| is(p, b"center");
+    let pos_token = |p: &Part| -> Result<bool, Error> { Ok(h(p) || vt(p) || c(p) || lp(p)?) };
+    let mut color: Option<Span> = None;
+    let (mut image, mut position, mut repeat, mut attach, mut boxes) = (false, false, false, false, 0u8);
+    let mut gradient = false;
+    let mut i = 0usize;
+    while let Some(p) = part(i)? {
+        budget.spend(cost::OP_STEP)?;
+        // 色（最後の層だけ。1 つまで）
+        if matches!(p.t.kind, Tk::Hash | Tk::Ident | Tk::Function) && {
+            let mut v = Values::new(s, p.span, budget);
             v.color()?.is_some() && v.at_end()?
         } {
-            if layer_color {
-                false
-            } else {
-                layer_color = true;
-                color = Some(part);
-                true
+            if !last || color.is_some() {
+                return Ok(None);
             }
-        } else if t.kind == Tk::Url
-            || is(b"none")
+            color = Some(p.span);
+            i = i.saturating_add(1);
+            continue;
+        }
+        // 画像
+        let grad = [
+            b"linear-gradient".as_slice(),
+            b"radial-gradient",
+            b"conic-gradient",
+            b"repeating-linear-gradient",
+            b"repeating-radial-gradient",
+            b"repeating-conic-gradient",
+            b"-webkit-linear-gradient",
+            b"-webkit-radial-gradient",
+            b"-webkit-repeating-linear-gradient",
+            b"-webkit-repeating-radial-gradient",
+            b"-webkit-gradient",
+        ]
+        .iter()
+        .any(|w| fname(&p, w));
+        let other_image = p.t.kind == Tk::Url
+            || is(&p, b"none")
             || [
                 b"url".as_slice(),
-                b"linear-gradient",
-                b"radial-gradient",
-                b"conic-gradient",
-                b"repeating-linear-gradient",
-                b"repeating-radial-gradient",
-                b"repeating-conic-gradient",
                 b"image",
                 b"image-set",
+                b"-webkit-image-set",
                 b"cross-fade",
+                b"-webkit-cross-fade",
                 b"element",
             ]
             .iter()
-            .any(|w| fname(w))
-        {
-            bump(&mut n, 0, 1)
-        } else if is(b"left")
-            || is(b"right")
-            || is(b"top")
-            || is(b"bottom")
-            || is(b"center")
-            || matches!(t.kind, Tk::Percentage | Tk::Dimension)
-            || (t.kind == Tk::Number && t.value == 0.0)
-        {
-            bump(&mut n, 1, 4)
-        } else if is(b"repeat-x") || is(b"repeat-y") {
-            // 1 つで両方の軸を決めるので、ほかの繰り返しと並べない
-            bump(&mut n, 3, 1) && bump(&mut n, 3, 2)
-        } else if is(b"repeat") || is(b"space") || is(b"round") || is(b"no-repeat") {
-            bump(&mut n, 3, 2)
-        } else if is(b"scroll") || is(b"fixed") || is(b"local") {
-            bump(&mut n, 4, 1)
-        } else if is(b"border-box") || is(b"padding-box") || is(b"content-box") || is(b"text") {
-            bump(&mut n, 5, 2)
-        } else {
-            false
-        };
-        if !ok {
-            return Ok(None);
+            .any(|w| fname(&p, w));
+        if grad || other_image {
+            if image {
+                return Ok(None);
+            }
+            image = true;
+            gradient |= grad;
+            i = i.saturating_add(1);
+            continue;
         }
-    }
-    // `/` のあとに大きさがない・空の値か空の最後の層は壊れた形
-    if (slash && n.get(2).copied().unwrap_or(0) == 0) || !any {
+        // 位置（続いた 4 つまでの字句）と、直後の `/` と大きさ
+        if pos_token(&p)? {
+            if position {
+                return Ok(None);
+            }
+            position = true;
+            let mut run: [Option<Part>; 4] = [None; 4];
+            let mut n = 0usize;
+            while n < 4 {
+                match part(i)? {
+                    Some(q) if pos_token(&q)? => {
+                        if let Some(slot) = run.get_mut(n) {
+                            *slot = Some(q);
+                        }
+                        n = n.saturating_add(1);
+                        i = i.saturating_add(1);
+                    }
+                    _ => break,
+                }
+            }
+            if !position_ok(run.get(..n).unwrap_or(&[]), &h, &vt, &c, &lp)? {
+                return Ok(None);
+            }
+            if part(i)?.is_some_and(|q| q.t.kind == Tk::Delim && q.t.is_delim(b'/')) {
+                i = i.saturating_add(1);
+                if part(i)?.is_some_and(|q| is(&q, b"cover") || is(&q, b"contain")) {
+                    i = i.saturating_add(1);
+                    continue;
+                }
+                let mut k = 0u32;
+                while k < 2 {
+                    match part(i)? {
+                        Some(q) if is(&q, b"auto") || (lp(&q)? && q.t.value >= 0.0) => {
+                            k = k.saturating_add(1);
+                            i = i.saturating_add(1);
+                        }
+                        _ => break,
+                    }
+                }
+                if k == 0 {
+                    return Ok(None);
+                }
+            }
+            continue;
+        }
+        // 繰り返し（repeat-x・repeat-y は 1 つで、ほかは続いた 2 つまで）
+        if is(&p, b"repeat-x") || is(&p, b"repeat-y") {
+            if repeat {
+                return Ok(None);
+            }
+            repeat = true;
+            i = i.saturating_add(1);
+            continue;
+        }
+        let rep = |q: &Part| is(q, b"repeat") || is(q, b"space") || is(q, b"round") || is(q, b"no-repeat");
+        if rep(&p) {
+            if repeat {
+                return Ok(None);
+            }
+            repeat = true;
+            i = i.saturating_add(1);
+            if part(i)?.is_some_and(|q| rep(&q)) {
+                i = i.saturating_add(1);
+            }
+            continue;
+        }
+        if is(&p, b"scroll") || is(&p, b"fixed") || is(&p, b"local") {
+            if attach {
+                return Ok(None);
+            }
+            attach = true;
+            i = i.saturating_add(1);
+            continue;
+        }
+        if is(&p, b"border-box") || is(&p, b"padding-box") || is(&p, b"content-box") {
+            if boxes >= 2 {
+                return Ok(None);
+            }
+            boxes = boxes.saturating_add(1);
+            i = i.saturating_add(1);
+            continue;
+        }
         return Ok(None);
     }
-    Ok(Some(color))
+    Ok(Some((color, gradient)))
+}
+
+/// 続いた位置の字句が `<bg-position>` の形か（1 つ：どれでも。2 つ：言葉どうしは横 2 つ・縦 2 つでなければ順を問わず、長さを
+/// 含めば 1 つ目が横（left・center・right・長さ）で 2 つ目が縦（top・center・bottom・長さ）。3・4 つ：`center` か「言葉
+/// 長さ?」の 2 つの組で、横と縦が 1 つずつ）。
+fn position_ok(
+    run: &[Option<Part>],
+    h: &dyn Fn(&Part) -> bool,
+    v: &dyn Fn(&Part) -> bool,
+    c: &dyn Fn(&Part) -> bool,
+    lp: &dyn Fn(&Part) -> Result<bool, Error>,
+) -> Result<bool, Error> {
+    let kw = |p: &Part| h(p) || v(p) || c(p);
+    match run {
+        [Some(_)] => Ok(true),
+        [Some(a), Some(b)] => {
+            if kw(a) && kw(b) {
+                return Ok(!(h(a) && h(b)) && !(v(a) && v(b)));
+            }
+            Ok((h(a) || c(a) || lp(a)?) && (v(b) || c(b) || lp(b)?))
+        }
+        _ => {
+            // 組の種類：1 横・2 縦・3 center
+            let mut kinds = [0u8; 2];
+            let mut count = 0usize;
+            let mut i = 0usize;
+            while let Some(Some(p)) = run.get(i) {
+                let kind = if c(p) {
+                    3
+                } else if h(p) {
+                    1
+                } else if v(p) {
+                    2
+                } else {
+                    return Ok(false);
+                };
+                i = i.saturating_add(1);
+                if kind != 3
+                    && let Some(Some(q)) = run.get(i)
+                    && !kw(q)
+                    && lp(q)?
+                {
+                    i = i.saturating_add(1);
+                }
+                match kinds.get_mut(count) {
+                    Some(k) => *k = kind,
+                    None => return Ok(false),
+                }
+                count = count.saturating_add(1);
+            }
+            let [a, b] = kinds;
+            Ok(count == 2 && (a != b || a == 3))
+        }
+    }
 }

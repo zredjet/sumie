@@ -5,7 +5,8 @@
 //! - 根からの変形：根の viewBox の変形 × 祖先の変形 × 要素の変形。use は自分の変形のあとに x・y の平行移動を掛け、入れ子の
 //!   svg は子に x・y の平行移動と viewBox の変形を掛ける（svg 自身の変形には含めない）。根の svg 自身の変形は viewBox の
 //!   変形の外側に掛ける
-//! - 表示の領域（% の基準）：根は文書の大きさ（viewBox があればその幅・高さ）。入れ子の svg は `width`・`height`（既定
+//! - 表示の領域（% の基準）：根は文書の大きさ（viewBox があればその幅・高さ。大きさを中身で決める文書は 100 × 100：usvg の
+//!   既定の大きさ。ADR-99 (1)。その根の変形の原点の % は 0 × 0 で解く：ADR-101）。入れ子の svg は `width`・`height`（既定
 //!   100%。属性だけを読む）と viewBox
 //! - 描く木に入るか：SVG の名前空間の知っている要素で、子を描く入れ物（svg・g・a・switch と文字の要素）の子であり、内容の
 //!   モデルに合い（文字の中は文字の中身の要素と a だけ、文字の外では tspan・stop・fe… を描かない。`refs::fits`）、描かない
@@ -165,10 +166,10 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
         let Some(root) = nodes.first().filter(|n| n.kind == KIND_ELEMENT) else { return Ok(None) };
         let ids = PropIds::new();
         let bufs = Bufs { input, store: doc.store.as_slice(), sheet: d.sheet.text.as_slice() };
-        let size = d.size.known().map(|s| (s.width, s.height));
+        let known = d.size.known().map(|s| (s.width, s.height));
         // 大きさを中身で決める文書（幅・高さ・viewBox のない根）の表示の領域は 100 × 100（usvg の既定の大きさ。% の長さを
         // 解く基準。大きさそのものは中身の外接矩形で決める。ADR-99 (1)）
-        let size = size.or(Some(CONTENT_SIZED_VIEWPORT));
+        let size = known.or(Some(CONTENT_SIZED_VIEWPORT));
         let initial = Computed::initial(d.font_size);
         let mut base = Base {
             default_font: d.font_size,
@@ -180,14 +181,18 @@ impl<'a, 'd, 'b> Walker<'a, 'd, 'b> {
             outermost: true,
         };
         budget.spend(cost::OP_STEP)?;
-        let c0 = compute(&initial, d.styles.of(0), &ids, &bufs, &base, budget)?;
+        // 中身で大きさを決める文書の根の変形の原点の % は 0 × 0 で解く（既定の 50% 50% は (0, 0)。usvg と同じ。大きさが
+        // 変形に依るので、表示の領域の真ん中は決まらない。ADR-101）
+        let root_base = if known.is_none() { Base { viewport: Some((0.0, 0.0)), ..base } } else { base };
+        let c0 = compute(&initial, d.styles.of(0), &ids, &bufs, &root_base, budget)?;
         base.root_font = c0.font_size;
         base.root_line = c0.line_height;
         base.outermost = false;
         // 根の viewBox の変形と、子の表示の領域
         // 幅か高さが 0 の viewBox の根は描かない（大きさは viewBox がないものとして決める。ADR-78 (7)）
         let mut root_drawn = true;
-        let (root_ctm, root_vp) = match (size, view_box_of(doc, input, root, budget)?) {
+        // 大きさが決まる文書だけが viewBox の変形を持つ（中身で決める文書の表示の領域は 100 × 100 で、変形はない）
+        let (root_ctm, root_vp) = match (known, view_box_of(doc, input, root, budget)?) {
             (Some((w, h)), Some((vb, aspect))) => match view_box_transform(&vb, aspect, w, h) {
                 Some(t) => (t, Some((vb.w, vb.h))),
                 None => {
