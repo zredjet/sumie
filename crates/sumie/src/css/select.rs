@@ -363,8 +363,9 @@ impl Spec {
 const PE_NONE: u8 = 0;
 /// `::before`・`::after`（`::marker` と論理の擬似クラス（中は空））
 const PE_BEFORE_AFTER: u8 = 1;
-/// 要素に支えられた擬似要素 `::part()`・`::details-content`・`::picker()`（`::part()`・`::slotted()` でない擬似要素と、構造・
-/// スクロールバーでない擬似クラス（`:state()`・`:dir()`・`:lang()`・`:active-view-transition-type()` も））
+/// 要素に支えられた擬似要素 `::part()`・`::details-content`・`::picker()`（`::part()`・`::slotted()`・関数の形の `::cue()`・
+/// 表にない関数の形の `::-webkit-*()` でない擬似要素と、構造・スクロールバーでない擬似クラス（`:state()`・`:dir()`・`:lang()`・
+/// `:active-view-transition-type()` も）。ADR-110 (1)・ADR-111 (2)）
 const PE_PART: u8 = 2;
 /// ほかの擬似要素（論理の擬似クラス（中は空））
 const PE_OTHER: u8 = 3;
@@ -443,7 +444,8 @@ struct Frame {
     outer_pe: u8,
     /// `:-webkit-any()`（寛容でない複合の並び。詳細度は擬似クラス 1 つ。Chrome と同じ）
     webkit_any: bool,
-    /// 結合子を書けない並び（`:host()`・`:host-context()`・`::slotted()`・`::cue()` の引数と、その中の論理の擬似クラス）
+    /// 結合子を書けない並び（`:host()`・`:host-context()`・`::slotted()`・`::cue()` の引数と `:-webkit-any()`、その中の論理の
+    /// 擬似クラス。`:-webkit-any()` の中の `:is()`・`:where()` は寛容なまま。ADR-111 (1)）
     compound: bool,
     /// 関数の擬似の引数の並び（閉じても単純な選択子を足さない）：0 でない、1 ちょうど 1 つ、2 は 1 つ以上
     arg: u8,
